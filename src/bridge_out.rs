@@ -2702,7 +2702,7 @@ mod tests {
     }
 
     fn embedded_address(account: AccountId) -> [u8; 20] {
-        miden_base_agglayer::EthEmbeddedAccountId::from(account).into()
+        miden_standards::interop::eth::EthEmbeddedAccountId::from(account).into()
     }
 
     /// A canonical AggLayer MINT: empty outer assets and the fungible asset +
@@ -2833,10 +2833,10 @@ mod tests {
         crate::store::ExpectedMint,
     ) {
         use miden_base_agglayer::{
-            ClaimNoteStorage, EthAddress, EthAmount, ExitRoot, GlobalIndex, LeafData, MetadataHash,
-            ProofData, SmtNode,
+            ClaimNoteStorage, ExitRoot, GlobalIndex, LeafData, MetadataHash, ProofData, SmtNode,
         };
         use miden_protocol::Felt;
+        use miden_standards::interop::eth::{EthAddress, EthAmount};
 
         let storage = ClaimNoteStorage {
             proof_data: ProofData {

@@ -1,0 +1,78 @@
+# cargo-deny — machine-checked license policy.
+#
+# Added because an SCA scanner reported four HIGH "license detected" findings
+# against this tree. All four were false positives, and re-deriving that by hand
+# each time a scanner runs is not a policy. This file records the decision so it
+# is enforced, reviewable, and fails CI if the licensing situation ever actually
+# changes.
+#
+# The findings and why each is not a problem:
+#
+#   r-efi  (reported twice: 5.3.0 and 6.0.0)
+#       "MIT OR Apache-2.0 OR LGPL-2.1-or-later". OR — we take MIT/Apache-2.0.
+#       It is ALSO never built here: getrandom gates it behind
+#       `cfg(all(target_os = "uefi", getrandom_backend = "efi_rng"))` and this
+#       service targets Linux. Zero compiled artifacts in target/release/deps.
+#
+#   generator  (via loom, via miden-utils-sync)
+#       LGPL-2.1, and the only single-licensed one — so it is the one that would
+#       matter. It is not linked: `loom` is a concurrency-model checker used
+#       under `cfg(loom)`, and neither loom nor generator produces a compiled
+#       artifact in a normal build. Verified: zero artifacts.
+#
+#   priority-queue  (via pubgrub, via miden-package-registry)
+#       "LGPL-3.0-or-later OR MPL-2.0". OR — we ELECT MPL-2.0, recorded below.
+#       This one IS linked, so the election matters: MPL-2.0 is file-level
+#       copyleft and imposes no obligation on the rest of the binary.
+#
+# Net: nothing places an LGPL obligation on the shipped binary. The scanner
+# reported the LGPL arm of OR-expressions as if it were the only option, and did
+# not exclude target-gated crates that never compile.
+
+[licenses]
+# Permissive + weak-copyleft that is safe to link.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "CC0-1.0",
+  "MPL-2.0",
+  "Unlicense",
+  "BSL-1.0",
+  # webpki-roots / webpki-root-certs: the Mozilla CA root bundle. A permissive
+  # DATA license (not code), and the bundle is exactly what TLS verification
+  # needs to ship.
+  "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+# Explicit SPDX elections for OR-licensed crates. Without these, cargo-deny
+# would pick by allow-list order; stating them makes the choice auditable and
+# is exactly the information the scanner failed to evaluate.
+[[licenses.exceptions]]
+name = "priority-queue"
+allow = ["MPL-2.0"]
+
+[[licenses.exceptions]]
+name = "r-efi"
+allow = ["MIT", "Apache-2.0"]
+
+# `generator` (LGPL-2.1) is reachable in the dependency GRAPH via loom but is
+# never compiled or linked. It is deliberately NOT added to `allow`: if a change
+# ever makes it a real build dependency, this must fail so the decision is
+# revisited rather than inherited silently.
+
+[bans]
+multiple-versions = "allow"
+
+[advisories]
+version = 2
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "allow"

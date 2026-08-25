@@ -178,15 +178,33 @@ async fn submit_update_ger_note(
                 );
                 let tx_request = TransactionRequestBuilder::new()
                     .own_output_notes(vec![note])
+                    // rc.4: the fee manager FPIs into the note's network
+                    // TARGET (the bridge) — declare it so the fetch is pinned
+                    // to the reference block (see network_target_foreign_account).
+                    .foreign_accounts([crate::miden_client::network_target_foreign_account(
+                        bridge_id,
+                    )?])
                     // Bound the creating tx's inclusion window so a prepared-but-
                     // unconfirmed handoff can be declared dead and re-driven by
                     // recovery (Miden's default is "never expire", which strands it).
                     .expiration_delta(crate::claim::submission_note_expiration_delta())
                     .build()?;
                 crate::miden_client::ensure_writable(ger_manager_id)?;
-                let tx_result = client
-                    .execute_transaction(ger_manager_id, tx_request)
-                    .await?;
+                let tx_result = match client.execute_transaction(ger_manager_id, tx_request).await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        // Stale tracked bridge record (the fee-manager FPI
+                        // target) — force-refresh from the node so the
+                        // writer's next retry rebuilds from chain truth. See
+                        // `heal_bridge_after_executor_failure` for why plain
+                        // syncing cannot converge here.
+                        crate::miden_client::heal_bridge_after_executor_failure(
+                            client, bridge_id, &e,
+                        )
+                        .await;
+                        return Err(e.into());
+                    }
+                };
                 let tx_id = tx_result.executed_transaction().id();
                 let expiration_block = tx_result
                     .executed_transaction()
@@ -397,9 +415,40 @@ pub async fn insert_ger(
                     .await?
                     .is_some()
                 {
+                    // Refusing to rebuild the note is correct — after the
+                    // durable handoff a second UpdateGerNote risks the #86
+                    // poison-note class. But returning here WITHOUT healing the
+                    // account left the actual cause in place: the local
+                    // commitment stays stale, so aggkit's retry (and every
+                    // retry after it) hits the identical rejection and GER
+                    // injection wedges on a condition whose cure we declined to
+                    // apply. Reimport is side-effect-free with respect to the
+                    // note — it only refreshes local account state — so it is
+                    // safe on the ambiguous path and makes the NEXT attempt the
+                    // one that succeeds.
+                    let ger_manager_id = accounts
+                        .0
+                        .ger_manager
+                        .as_ref()
+                        .map(|a| a.0)
+                        .unwrap_or(accounts.0.service.0);
+                    if let Err(heal_err) = crate::account_recovery::reimport_account(
+                        miden_client,
+                        ger_manager_id,
+                        "ger_manager",
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            %txn_hash, error = %heal_err,
+                            "GER submission: account reimport after an ambiguous handoff failed; \
+                             the next attempt will retry the heal"
+                        );
+                    }
                     tracing::error!(
                         %txn_hash, error = %err,
-                        "GER submission outcome is ambiguous after durable handoff; refusing to rebuild a second note"
+                        "GER submission outcome is ambiguous after durable handoff; refusing to \
+                         rebuild a second note (account reimported so the retry sees fresh state)"
                     );
                     return Err(err);
                 }

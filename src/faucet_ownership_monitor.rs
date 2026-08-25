@@ -184,13 +184,26 @@ mod tests {
     #[test]
     fn cantina_4_owner_decodes_from_real_0_16_faucet_storage() {
         let bridge = aid("0xac0000000000dd110000ee000000fc");
-        let faucet = miden_base_agglayer::create_agglayer_faucet(
+        // Same production builder path faucet_ops uses (rc.4): admin is any
+        // account (irrelevant to the owner decode), fees are zero against a
+        // dummy fee faucet — pure construction, no chain access.
+        let admin = aid("0xac0000000000dd110000ee000000ad");
+        let fee_faucet = aid("0x9a0000000000dd110000ee000000fc");
+        let faucet = miden_base_agglayer::AggLayerFaucet::account_builder(
             Word::from([1u32, 2, 3, 4]),
             "TST",
             8,
             Felt::new(1_000_000).unwrap(),
+            Felt::new(0).unwrap(),
+            admin,
             bridge,
-        );
+            crate::fee_policy::zero_fee_policy_manager_for(
+                miden_base_agglayer::AggLayerFaucet::allowed_notes(),
+                fee_faucet,
+            ),
+        )
+        .build()
+        .expect("agglayer faucet account");
 
         let observed = miden_base_agglayer::AggLayerFaucet::owner_account_id(&faucet)
             .expect("0.16 faucet storage must decode to an owner");
@@ -229,7 +242,7 @@ mod tests {
         let key = AuthSecretKey::new_falcon512_poseidon2();
         let account = miden_protocol::account::AccountBuilder::new([7u8; 32])
             .with_component(native)
-            .with_auth_component(AuthSingleSig::new(Approver::new(
+            .with_component(AuthSingleSig::new(Approver::new(
                 key.public_key().to_commitment(),
                 AuthScheme::Falcon512Poseidon2,
             )))

@@ -4,14 +4,14 @@ use crate::miden_client::{MidenClient, MidenClientLib};
 use crate::store::{FaucetEntry, Store};
 use alloy::primitives::{BlockNumber, Bytes, FixedBytes};
 use miden_base_agglayer::{
-    ClaimNoteStorage, EthAddress, EthAmount, ExitRoot, GlobalIndex, LeafData, MetadataHash,
-    ProofData, SmtNode,
+    ClaimNoteStorage, ExitRoot, GlobalIndex, LeafData, MetadataHash, ProofData, SmtNode,
 };
 use miden_client::transaction::{TransactionProver, TransactionRequestBuilder};
 use miden_protocol::account::AccountId;
 use miden_protocol::crypto::rand::FeltRng;
 use miden_protocol::note::Note;
 use miden_protocol::transaction::TransactionId;
+use miden_standards::interop::eth::{EthAddress, EthAmount};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
@@ -723,7 +723,7 @@ fn scale_claim_amount(
         })?;
     let scale = u32::from(scale_byte);
     amount
-        .scale_to_token_amount(scale)
+        .scale_to_asset_amount(scale)
         .map_err(|e| anyhow::anyhow!("claim amount is not representable on Miden: {e}"))
 }
 
@@ -796,7 +796,7 @@ pub fn claim_storage_from_call(
     };
     let miden_claim_amount = leaf_data
         .amount
-        .scale_to_token_amount(scale_exp)
+        .scale_to_asset_amount(scale_exp)
         .map_err(|e| anyhow::anyhow!("claim amount is not representable on Miden: {e}"))?;
     Ok(ClaimNoteStorage {
         proof_data,
@@ -894,6 +894,11 @@ async fn publish_claim_internal(
     // `MidenClient::with` slot for every queued write.
     let txn_request = TransactionRequestBuilder::new()
         .own_output_notes(vec![claim_note])
+        // rc.4: the fee manager FPIs into the note's network TARGET (the
+        // bridge) — declare it so the fetch is pinned to the reference block.
+        .foreign_accounts([crate::miden_client::network_target_foreign_account(
+            accounts.bridge.0,
+        )?])
         // Bound the creating tx's inclusion window (see
         // `submission_note_expiration_delta`) so a prepared-but-unconfirmed claim
         // handoff can be declared dead and re-driven by recovery rather than
@@ -904,9 +909,20 @@ async fn publish_claim_internal(
     // Execute and check the output notes before submission. `ExecutedTransaction` still
     // produces `RawOutputNote::{Full, Partial}`, but the proven transaction now produces
     // `OutputNote::{Public, Private}` — 0.14.x renamed the final-form variants.
-    let tx_result = client
+    let tx_result = match client
         .execute_transaction(accounts.service.0, txn_request)
-        .await?;
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            // Stale tracked bridge record (the fee-manager FPI target) —
+            // force-refresh so the claim watcher's retry converges. See
+            // `heal_bridge_after_executor_failure`.
+            crate::miden_client::heal_bridge_after_executor_failure(client, accounts.bridge.0, &e)
+                .await;
+            return Err(e.into());
+        }
+    };
     let exec_tx = tx_result.executed_transaction();
     let expiration_block = exec_tx.expiration_block_num().as_u64();
     for (i, note) in exec_tx.output_notes().iter().enumerate() {
@@ -1184,9 +1200,15 @@ pub(crate) async fn publish_claim(
                 .await?
                 .is_some()
             {
+                // Same reasoning as the GER path: not rebuilding the note is
+                // right, but returning without reimporting leaves the stale
+                // local commitment that caused the rejection, so every retry
+                // fails identically. Reimport touches only local account state.
+                crate::account_recovery::reimport_known_accounts(client, &accounts.0).await;
                 tracing::error!(
                     eth_tx = %txn_hash, error = %err,
-                    "claim outcome is ambiguous after durable handoff; refusing to build a second note"
+                    "claim outcome is ambiguous after durable handoff; refusing to build a second \
+                     note (accounts reimported so the retry sees fresh state)"
                 );
                 return Err(err);
             }
@@ -1844,7 +1866,7 @@ mod tests {
         /// `verify_u256_to_native_amount_conversion` advertises a 2^128 outer gate
         /// but the inner verifier algebra only succeeds for x < ~2^123; values in
         /// [2^123, 2^128) panic later with `ERR_UNDERFLOW`. Aggkit's scaling path
-        /// goes through `EthAmount::scale_to_token_amount` which enforces the
+        /// goes through `EthAmount::scale_to_asset_amount` which enforces the
         /// real protocol cap (`FungibleAsset::MAX_AMOUNT = 2^63 - 2^31`), so any
         /// amount that falls in the upstream gap is rejected here BEFORE we
         /// build a CLAIM note that would panic on Miden. This test pins that
@@ -2090,7 +2112,7 @@ mod tests {
             MAX_ORIGIN_DECIMALS, MAX_SCALING_FACTOR, MIDEN_DECIMALS, parse_token_metadata,
         };
         use alloy::primitives::{Address, Bytes, U256};
-        use miden_base_agglayer::{EthAmount, EthAmountError};
+        use miden_standards::interop::eth::{EthAmount, EthAmountError};
 
         fn eth_amount(wei: U256) -> EthAmount {
             EthAmount::new(wei.to_be_bytes::<32>())
@@ -2114,7 +2136,7 @@ mod tests {
 
         /// Documents the boundary the bug crossed: a 27-decimal token routes at
         /// `scale = 27 - min(27, 8) = 19`, which the shared scale gate
-        /// (`EthAmount::scale_to_token_amount`) rejects. Under the audit-aligned
+        /// (`EthAmount::scale_to_asset_amount`) rejects. Under the audit-aligned
         /// fix such a token is refused up-front (27 > 26) instead of persisting an
         /// unclaimable route.
         #[test]
@@ -2124,7 +2146,7 @@ mod tests {
             let service_scale = 27u32 - u32::from(MIDEN_DECIMALS); // 27 - min(27,8) = 19
             assert_eq!(service_scale, 19);
             assert!(matches!(
-                amount.scale_to_token_amount(service_scale),
+                amount.scale_to_asset_amount(service_scale),
                 Err(EthAmountError::ScaleTooLarge)
             ));
         }
@@ -2179,7 +2201,7 @@ mod tests {
                 // (d <= 26) and 10^8 fits FungibleAsset::MAX_AMOUNT.
                 let wei = U256::from(10u64).pow(U256::from(u64::from(d)));
                 let token = eth_amount(wei)
-                    .scale_to_token_amount(u32::from(scale))
+                    .scale_to_asset_amount(u32::from(scale))
                     .unwrap_or_else(|e| {
                         panic!("d={d}: scale {scale} rejected by EthAmount gate: {e}")
                     });

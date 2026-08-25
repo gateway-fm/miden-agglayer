@@ -8,16 +8,14 @@ use crate::metadata_recovery::{EmitMetadata, FaucetConversion, recover_bridge_ou
 use crate::miden_client::MidenClientLib;
 use crate::store::FaucetEntry;
 use alloy::primitives::{Address, Bytes};
-use miden_base_agglayer::{
-    AggLayerFaucet, ConfigAggBridgeNote, ConversionMetadata, EthAddress, MetadataHash,
-    create_agglayer_faucet,
-};
+use miden_base_agglayer::{AggLayerFaucet, ConfigAggBridgeNote, ConversionMetadata, MetadataHash};
 use miden_client::Felt;
 use miden_client::asset::FungibleAsset;
 use miden_client::crypto::FeltRng;
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_protocol::account::{Account, AccountId};
 use miden_standards::account::faucets::FungibleFaucet;
+use miden_standards::interop::eth::EthAddress;
 
 /// The faucet account types this bridge proxy SUPPORTS. Every faucet registered in the
 /// bridge must be one of these. An account that matches none is an UNKNOWN type — treated
@@ -62,7 +60,7 @@ pub fn classify_faucet_account(
 /// Create a faucet on Miden, deploy it, and register it in the bridge.
 ///
 /// This is the full lifecycle for adding a new token faucet:
-/// 1. Create the faucet account via `create_agglayer_faucet()`
+/// 1. Create the faucet account via `AggLayerFaucet::account_builder()`
 /// 2. Deploy it to the Miden network
 /// 3. Register it in the bridge via `ConfigAggBridgeNote` (required for CLAIM FPI validation)
 #[allow(clippy::too_many_arguments)]
@@ -84,17 +82,29 @@ pub async fn create_and_register_faucet(
         Felt::new(u64::from(FungibleAsset::MAX_AMOUNT)).expect("value is a valid field element");
     let origin_addr = EthAddress::new(*origin_token_address);
 
-    // Protocol 0.15: the faucet no longer stores conversion metadata. `create_agglayer_faucet`
-    // is now 5-arg (seed, symbol, decimals, max_supply, bridge_id). The origin token address,
-    // network, scale and metadata hash are registered on the bridge's `faucet_metadata_map`
-    // via the CONFIG_AGG_BRIDGE note in `register_faucet_in_bridge` below.
-    let account = create_agglayer_faucet(
+    // rc.4: component-based faucet creation. The origin token address, network,
+    // scale and metadata hash are still registered on the bridge's
+    // `faucet_metadata_map` via the CONFIG_AGG_BRIDGE note in
+    // `register_faucet_in_bridge` below. The faucet is bridge-owned
+    // (Ownable2Step -> bridge) with the SERVICE account as RBAC admin, and
+    // carries the mandatory zero-fee components against the chain's real fee
+    // faucet.
+    let fee_faucet_id = crate::fee_policy::fee_faucet_id_from_chain(client).await?;
+    let account = AggLayerFaucet::account_builder(
         client.rng().draw_word(),
         symbol,
         miden_decimals,
         max_supply,
+        Felt::new(0).expect("zero is a valid field element"),
+        service_id,
         bridge_id,
-    );
+        crate::fee_policy::zero_fee_policy_manager_for(
+            AggLayerFaucet::allowed_notes(),
+            fee_faucet_id,
+        ),
+    )
+    .build()
+    .map_err(|e| anyhow::anyhow!("faucet account build failed: {e}"))?;
     client.add_account(&account, false).await?;
 
     // Deploy
@@ -279,13 +289,29 @@ pub async fn register_faucet_in_bridge(
 
     let txn = TransactionRequestBuilder::new()
         .own_output_notes(vec![note])
+        // rc.4: the fee manager FPIs into the note's network TARGET (the
+        // bridge) — declare it so the fetch is pinned to the reference block.
+        .foreign_accounts([crate::miden_client::network_target_foreign_account(
+            bridge_id,
+        )?])
         .build()?;
 
-    let txn_id = crate::metrics::meter_proof(
+    let txn_id = match crate::metrics::meter_proof(
         crate::metrics::ProofKind::Faucet,
         crate::miden_client::submit_new_transaction(client, service_id, txn),
     )
-    .await?;
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            // Stale tracked bridge record (the fee-manager FPI target) —
+            // force-refresh so the registration retry converges. See
+            // `heal_bridge_after_executor_failure`.
+            crate::miden_client::heal_bridge_after_executor_failure_anyhow(client, bridge_id, &e)
+                .await;
+            return Err(e);
+        }
+    };
     tracing::info!(
         "registered {} faucet in bridge with txn_id {txn_id}",
         faucet_name,
@@ -421,7 +447,7 @@ const _: () = assert!(MIDEN_DECIMALS <= MAX_MIDEN_DECIMALS);
 /// Maximum decimal downscaling factor `scale = origin_decimals - MIDEN_DECIMALS`
 /// supported by the bridge stack. This is `MAX_SCALING_FACTOR` in the agglayer
 /// `asset_conversion.masm`, enforced at runtime by
-/// [`miden_base_agglayer::EthAmount::scale_to_token_amount`], which returns
+/// [`miden_standards::interop::eth::EthAmount::scale_to_asset_amount`], which returns
 /// `EthAmountError::ScaleTooLarge` for `scale > 18`. The upstream constant is
 /// not `pub`, so it is mirrored here; keep in sync with the MASM.
 pub const MAX_SCALING_FACTOR: u8 = 18;

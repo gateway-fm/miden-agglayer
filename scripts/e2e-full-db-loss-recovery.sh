@@ -315,9 +315,22 @@ getlogs_dump() { # $1 = output file
                 (.topics|join(",")), .data, .transactionIndex, (.removed|tostring),
                 .transactionHash ] | @tsv' >> "$raw" || return 1
     done
-    # NUMERIC sort by (block, log_index) — hex strings of differing width do not sort
-    # lexically, and window boundaries mean the raw append order is only block-major.
-    sort -t"$(printf '\t')" -k1,1n -k2,2n "$raw" > "$1"
+    # DO NOT SORT THE SUBJECT UNDER TEST. The served (block, logIndex) order IS
+    # the contract aggkit consumes; sorting the capture before comparing it
+    # means a projector that returns the right entries in the WRONG order
+    # compares equal on both sides and the drill certifies the one property it
+    # exists to protect. Instead: assert the served stream is ALREADY ordered
+    # (that is the real assertion), then compare it as served.
+    #
+    # Pagination appends windows in ascending block order, so a correctly
+    # ordered feed yields an already-sorted concatenation.
+    if ! sort -c -t"$(printf '\t')" -k1,1n -k2,2n "$raw" 2>/dev/null; then
+        say "getlogs: SERVED ORDER VIOLATION — the feed is not ascending by (block, logIndex)."
+        say "         First out-of-order boundary:"
+        sort -c -t"$(printf '\t')" -k1,1n -k2,2n "$raw" 2>&1 | head -3 | sed 's/^/         /'
+        return 1
+    fi
+    cp "$raw" "$1"
     [[ -s "$1" ]]
 }
 
@@ -436,7 +449,12 @@ if [[ "$RESTORE_EXIT" -ne 0 ]]; then
     echo "        incomplete history). Fix the cause shown above, then re-run the one-shot:" >&2
     echo "          docker compose <files> run --rm --no-deps miden-agglayer <live-cmd> \\" >&2
     echo "              --reset-miden-store --restore" >&2
-    echo "        (idempotent; safe to repeat). Start the proxy ONLY after it exits 0." >&2
+    echo "        (idempotent; safe to repeat). Start the proxy ONLY after it exits 0.
+        THEN re-base every tx-holder that survived the restore, or the pipeline
+        stays frozen even though the proxy is healthy (#90 proxy ledger is done
+        by the restore itself; the other two are NOT):
+          scripts/bridge-claimtxman-heal.sh          # bridge-service claimtxman (#111)
+          scripts/aggkit-preserve-heal.sh aggkit     # aggoracle ethtxmanager (#113)" >&2
     fail "reset+restore one-shot exited $RESTORE_EXIT (proxy left stopped; repair + re-run --restore)"
 fi
 [[ "$RESTORE_EXIT" -eq 0 ]] || { tail -15 "$RESTORE_LOG" | tee -a "$EVIDENCE"; fail "restore one-shot failed"; }
@@ -521,6 +539,88 @@ pass "BridgeEvent (count $NBR1) + ClaimEvent (count $NCL1) rows identical"
 
 # ── Phase 4: no poison minted, pipeline alive ────────────────────────────────
 step "Phase 4 — no ERR_GER_ALREADY_REGISTERED poison; pipeline processes NEW traffic"
+
+# FINDING #111 (loop cycles 1-3, 2026-08-18): the restore COMPACTS the
+# ClaimTxManager sponsor's chain nonce (live ~177 -> restored 66 observed), but
+# the bridge-service claimtxman allocates nonces from its own monitored-tx
+# history — every post-restore claim it creates is R4-rejected forever and the
+# retry storm starves the shared synchronizer loop, so the L1-GER index falls
+# behind unboundedly and /merkle-proof 500s (code=2 l1GER-not-found) for every
+# net-1 deposit. Same class as the aggkit ethtxmanager wipe: any component
+# holding nonces across a restore must be re-based. FORCE=1 — post-restore the
+# stranded state is deterministic, no detection needed.
+# The heal is RELEASE-REQUIRED, so its failure is the drill's failure. It used
+# to be advisory (missing script → skipped, non-zero → a WARN), which meant the
+# drill could print FULL DB LOSS RECOVERY while claimtxman was still
+# nonce-wedged and every post-restore claim was being R4-rejected. `pipefail` is
+# set, but `| tee` would otherwise mask the exit status, so capture it directly.
+[[ -x "$SCRIPT_DIR/bridge-claimtxman-heal.sh" ]] \
+    || fail "bridge-claimtxman-heal.sh is missing/not executable — the #111 heal is required after a full DB loss"
+# rc 3 = "wipe done, service running, but no local proof was available" — the
+# expected outcome on a quiet post-restore stack, where sync.block records only
+# event-bearing blocks so the cursor legitimately does not move. This drill
+# proves the claim pipeline itself further down (the exact deposit reaching
+# ready_for_claim), which is what makes accepting 3 honest here rather than a
+# shrug. Any OTHER non-zero rc is a real failure.
+#
+# `set -e` is active, so a bare invocation would exit before $? is read.
+if PROJECT="$COMPOSE_PROJECT_NAME" FORCE=1 L1_RPC="$L1_RPC" \
+        "$SCRIPT_DIR/bridge-claimtxman-heal.sh" >>"$EVIDENCE" 2>&1; then
+    CTM_RC=0
+else
+    CTM_RC=$?
+fi
+case "$CTM_RC" in
+    0) say "claimtxman heal confirmed L1 sync progress" ;;
+    3) say "claimtxman heal completed the wipe; no local proof available (quiet stack) — this drill proves the claim pipeline below" ;;
+    *)
+        tail -20 "$EVIDENCE" || true
+        fail "claimtxman heal FAILED (#111, rc=$CTM_RC) — post-restore claims would be R4-rejected and the L1-GER index starved"
+        ;;
+esac
+
+# FINDING #113 (drill-caught 2026-08-19, RELEASE-REQUIRED): the restore heals
+# the proxy nonce ledger (#90) and the bridge-service claimtxman (#111) — but
+# NOT aggkit's aggoracle ethtxmanager. Any GER-inject tx in flight when the
+# store is dropped is lost in transit: aggkit's monitoring DB still holds it,
+# its deterministic-ID dedup refuses to re-send, and GER INJECTION FREEZES
+# PERMANENTLY (observed: proxy received ZERO txs for 5+ min, aggoracle looping
+# "already exists in monitoring DB" on a tx the proxy had never seen; Phase 4
+# then fails with "no NEW GER injected+consumed"). Healed live by wiping ONLY
+# ethtxmanager-aggoracle.sqlite, after which injections resumed immediately.
+# Every tx-holder that survives a restore must be re-based — this is the third.
+[[ -x "$SCRIPT_DIR/aggkit-preserve-heal.sh" ]] \
+    || fail "aggkit-preserve-heal.sh is missing/not executable — the #113 heal is required after a full DB loss"
+# HEAL_ALLOW_DEFERRED_PROOF=1: on a quiet stack there may be no pending
+# injection for the heal to await, and this drill proves the injection pipeline
+# itself a few lines below (the NINJECTED1 -> INJ2 gate). The heal must still
+# fail on every NEGATIVE signal — crash loop, re-wedge, restore mismatch.
+# `set -e` is active: a bare invocation that exits 3 aborts the WHOLE script
+# before `$?` is ever read, so the exit-3 contract below would never run — the
+# same shape as the psql subshell bug. `if ...; then ... else HEAL_RC=$?; fi`
+# is the form that survives it.
+if PROJECT="$COMPOSE_PROJECT_NAME" FORCE=1 HEAL_ALLOW_DEFERRED_PROOF=1 \
+        "$SCRIPT_DIR/aggkit-preserve-heal.sh" aggkit >>"$EVIDENCE" 2>&1; then
+    HEAL_RC=0
+else
+    HEAL_RC=$?
+fi
+# rc 3 = "restored and running, but the healer observed no injection to prove
+# the pipeline with". That is the expected outcome on a quiet stack and is why
+# this drill passes HEAL_ALLOW_DEFERRED_PROOF=1 — the NINJECTED1 -> INJ2 gate
+# below is the proof. Any OTHER non-zero rc is a real heal failure.
+case "$HEAL_RC" in
+    0) say "aggkit aggoracle heal confirmed an injection" ;;
+    # "did not confirm" — NOT "confirmed no". Failing to observe an injection is
+    # not evidence that none occurred, and exit 3 also covers the path where
+    # NO target was extracted and no wait ran at all, so "watches one target"
+    # would be wrong there too.
+    3) say "aggkit aggoracle heal restored the service but did not confirm an exact injection (it checks at most one extracted target; it does not observe all injections) — this drill proves the pipeline itself below" ;;
+    *)
+        tail -20 "$EVIDENCE" || true
+        fail "aggkit aggoracle heal FAILED (#113, rc=$HEAL_RC) — GER injection would stay frozen"
+        ;;
+esac
 sleep 45   # window for aggoracle to (wrongly) re-inject + ntx to (wrongly) assert
 NTX_NOW=$(docker logs "$NTX_CONTAINER" 2>&1 | grep -c "1007209807211405110" || true)
 [[ "$NTX_NOW" -le "$NTX_MARK" ]] \
@@ -554,20 +654,114 @@ PYEOF
 [[ ${#SVC_HEX} -eq 30 ]] || fail "liveness dest: decoded service id is not 15 bytes ('$SVC_HEX')"
 DEST="0x00000000${SVC_HEX:0:16}${SVC_HEX:16:14}00"
 say "liveness: bridgeAsset cnt=$CNT dest=$DEST (embeds service account $SVC_BECH32)"
-cast send --rpc-url "$L1_RPC" --private-key "$SIGNER_KEY" "$L1_BRIDGE_ADDRESS" \
+# Keep the receipt: depositCount() was read BEFORE the send, so on a stack with
+# concurrent traffic (the soak runs loadtests against this same stack) another
+# deposit can take that index and leave ours at count+1 — the drill would then
+# validate somebody else's deposit. The transaction hash is ours alone.
+LIVE_TX=$(cast send --rpc-url "$L1_RPC" --private-key "$SIGNER_KEY" "$L1_BRIDGE_ADDRESS" \
   'bridgeAsset(uint32,address,uint256,address,bool,bytes)' \
   1 "$DEST" "$DEPOSIT_WEI" 0x0000000000000000000000000000000000000000 true 0x \
-  --value "$DEPOSIT_WEI" >/dev/null
+  --value "$DEPOSIT_WEI" --json | jq -r '.transactionHash')
+[[ "$LIVE_TX" =~ ^0x[0-9a-fA-F]{64}$ ]] \
+    || fail "liveness bridgeAsset did not return a transaction hash (got '${LIVE_TX:-<none>}')"
+say "liveness: bridgeAsset tx=$LIVE_TX (expected deposit_cnt≈$CNT on network 0)"
 
+# Assert on THIS deposit, by its exact index. `$DEST` is derived from the
+# service account, so it is the SAME destination in every drill on a
+# compounding stack: "any of the latest 25 deposits is ready_for_claim" was
+# satisfied by deposits from previous cycles (and by concurrent soak traffic),
+# i.e. it could pass with the post-restore pipeline completely dead. `$CNT` was
+# read from depositCount() immediately BEFORE the bridgeAsset call, so it is
+# this deposit's own deposit_cnt.
+# Match on (tx_hash, network_id=0): the transaction identifies OUR deposit
+# uniquely and cannot be satisfied by a concurrent one, and pinning the
+# origin network stops an equal deposit_cnt on another network from
+# answering for it.
 deadline=$((SECONDS + 300))
 while :; do
-    READY=$(curl -sf "$BRIDGE_SERVICE_URL/bridges/$DEST?limit=25&offset=0" 2>/dev/null \
-        | python3 -c "import json,sys; ds=json.load(sys.stdin).get('deposits',[]); print(any(d.get('ready_for_claim') for d in ds))" 2>/dev/null || echo err)
+    READY=$(curl -sf --max-time 20 "$BRIDGE_SERVICE_URL/bridges/$DEST?limit=100&offset=0" 2>/dev/null \
+        | LIVE_TX="$LIVE_TX" python3 -c "
+import json, os, sys
+want = os.environ['LIVE_TX'].lower()
+ds = json.load(sys.stdin).get('deposits', [])
+mine = [d for d in ds
+        if str(d.get('tx_hash', '')).lower() == want and int(d.get('network_id', -1)) == 0]
+if not mine:
+    print('absent')
+elif len(mine) > 1:
+    print('ambiguous')
+else:
+    print('True' if mine[0].get('ready_for_claim') else 'notready')
+" 2>/dev/null || echo err)
     [[ "$READY" == "True" ]] && break
-    (( SECONDS >= deadline )) && fail "post-restore deposit never ready_for_claim in 300s — pipeline dead after restore"
+    (( SECONDS >= deadline )) && fail "the post-restore deposit from tx $LIVE_TX (network 0, dest $DEST) never became ready_for_claim in 300s (last state: $READY) — pipeline dead after restore"
     sleep 5
 done
-pass "post-restore deposit ready_for_claim"
+DEPOSIT_CNT_SEEN=$(curl -sf --max-time 20 "$BRIDGE_SERVICE_URL/bridges/$DEST?limit=100&offset=0" 2>/dev/null \
+    | LIVE_TX="$LIVE_TX" python3 -c "
+import json, os, sys
+want = os.environ['LIVE_TX'].lower()
+ds = json.load(sys.stdin).get('deposits', [])
+print(next((d.get('deposit_cnt') for d in ds if str(d.get('tx_hash','')).lower() == want), '?'))
+" 2>/dev/null || echo '?')
+pass "post-restore deposit from OUR tx $LIVE_TX (deposit_cnt=$DEPOSIT_CNT_SEEN, network 0) is ready_for_claim"
+
+# READY IS NOT CLAIMED. ready_for_claim proves the INDEXER caught up; it says
+# nothing about ClaimTxManager actually submitting and settling the claim — and
+# claimtxman starvation (#111) is precisely a failure that leaves deposits ready
+# forever while no money moves. Both healers above are allowed to end UNPROVEN
+# on the promise that this drill supplies the functional proof, so it has to be
+# a real one: the claim transaction for OUR deposit must land.
+deadline=$((SECONDS + 600))
+CLAIM_TX=""
+CLAIM_GI=""
+while :; do
+    # --max-time: without a per-request bound, one accepted-but-stalled request
+    # holds the loop open forever and the deadline below is never evaluated —
+    # the drill would hang instead of naming the #111 shape. The pinned server
+    # sets no response deadline of its own.
+    CLAIM_TX=$(curl -sf --max-time 20 "$BRIDGE_SERVICE_URL/bridges/$DEST?limit=100&offset=0" 2>/dev/null \
+        | LIVE_TX="$LIVE_TX" python3 -c "
+import json, os, sys
+want = os.environ['LIVE_TX'].lower()
+ds = json.load(sys.stdin).get('deposits', [])
+print(next((d.get('claim_tx_hash') or '' for d in ds
+            if str(d.get('tx_hash','')).lower() == want and int(d.get('network_id', -1)) == 0), ''))
+" 2>/dev/null || echo "")
+    [[ "$CLAIM_TX" =~ ^0x[0-9a-fA-F]{64}$ ]] && break
+    (( SECONDS >= deadline )) && fail "the post-restore deposit from tx $LIVE_TX became ready_for_claim but was NEVER CLAIMED within 600s — the sponsor (claimtxman) is not settling claims, which is exactly the #111 shape both heals above were allowed to leave unproven"
+    sleep 10
+done
+
+# A claim_tx_hash alone is NOT settlement. The RD-860 short-circuit accepts a
+# claim whose destination cannot be resolved and emits a note-less ClaimEvent —
+# the deposit gets a claim tx hash and no asset ever moves. A transient
+# mapping-store error can put a perfectly good destination on that path, so the
+# marker must be checked rather than assumed absent: the proxy records exactly
+# these in `unclaimable_claims`, keyed by global index.
+CLAIM_GI=$(curl -sf --max-time 20 "$BRIDGE_SERVICE_URL/bridges/$DEST?limit=100&offset=0" 2>/dev/null \
+    | LIVE_TX="$LIVE_TX" python3 -c "
+import json, os, sys
+want = os.environ['LIVE_TX'].lower()
+ds = json.load(sys.stdin).get('deposits', [])
+print(next((str(d.get('global_index','')) for d in ds
+            if str(d.get('tx_hash','')).lower() == want and int(d.get('network_id', -1)) == 0), ''))
+" 2>/dev/null || echo "")
+[[ -n "$CLAIM_GI" ]] || fail "could not read the global index of our deposit (tx $LIVE_TX) to verify the claim was not a note-less short-circuit"
+# global_index is a U256 and routinely exceeds 64 bits (a Miden-destined
+# deposit starts at 2^64). `printf '0x%x'` CLAMPS those to 0xffffffffffffffff
+# and still exits 0 — with only a warning on stderr — so the hex form never
+# matched the stored value and this gate silently passed every time, which is
+# precisely the false "money moved" it exists to prevent. Convert with
+# arbitrary precision, and refuse to guess if the value is not a plain decimal.
+[[ "$CLAIM_GI" =~ ^[0-9]+$ ]] \
+    || fail "global index '$CLAIM_GI' is not a decimal integer — cannot verify the claim against unclaimable_claims"
+CLAIM_GI_HEX=$(python3 -c 'import sys; print(hex(int(sys.argv[1])))' "$CLAIM_GI") \
+    || fail "could not convert global index '$CLAIM_GI' to hex"
+UNCLAIMABLE=$(pgq "SELECT count(*) FROM unclaimable_claims WHERE global_index IN ('$CLAIM_GI_HEX', '$CLAIM_GI')")
+[[ "$UNCLAIMABLE" == "0" ]] \
+    || fail "our deposit (gi=$CLAIM_GI) has a claim tx ($CLAIM_TX) but is recorded in unclaimable_claims — that is the RD-860 note-less short-circuit: an event was emitted and NO asset moved (#103)"
+pass "post-restore claim SETTLED for our deposit: claim_tx=$CLAIM_TX, gi=$CLAIM_GI ($CLAIM_GI_HEX), no unclaimable_claims row (a real claim, not a note-less short-circuit)"
 
 # PR#164 re-review — compare COUNT to COUNT. `INJ1` is the injected-set MD5 from
 # `fingerprint()`, not a number: `[[ "$INJ2" -gt "$INJ1" ]]` compared an integer to

@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
 use clap::Parser;
-use miden_base_agglayer::{B2AggNote, EthAddress};
+use miden_base_agglayer::B2AggNote;
 use miden_client::ClientError;
 use miden_client::RemoteTransactionProver;
 use miden_client::asset::{Asset, FungibleAsset};
@@ -23,6 +23,7 @@ use miden_client::note::NoteAssets;
 use miden_client::transaction::{TransactionProver, TransactionRequestBuilder};
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use miden_protocol::account::AccountId;
+use miden_standards::interop::eth::EthAddress;
 
 #[derive(Parser)]
 #[command(version, about = "Create and submit a B2AGG bridge-out note")]
@@ -120,7 +121,7 @@ struct Args {
     /// on-chain (polling sync), up to this many seconds. 0 disables the wait
     /// (legacy behaviour: 5 blind sync cycles). Load tests MUST wait: pacing on
     /// tx acceptance alone floods the bridge with in-flight consumptions.
-    #[arg(long, env = "B2AGG_WAIT_CONSUMED_SECS", default_value_t = 180)]
+    #[arg(long, env = "B2AGG_WAIT_CONSUMED_SECS", default_value_t = 360)]
     wait_consumed_secs: u64,
 
     /// Foreign-deployment provision mode (claim-provenance e2e): stand up a
@@ -300,6 +301,113 @@ fn parse_account_id(s: &str) -> anyhow::Result<AccountId> {
 /// left the suite failure undiagnosable — the gRPC status (DeadlineExceeded /
 /// ResourceExhausted / Unavailable, each with retry guidance) lives in the
 /// source chain that only Debug formatting surfaces.
+/// Is this submission failure AMBIGUOUS — i.e. might the node have accepted the
+/// transaction even though we got an error?
+///
+/// This is the guard that decides whether it is safe to build a NEW B2AGG note
+/// and try again. Getting it wrong in the permissive direction double-bridges
+/// real funds, so it matches narrowly and by TYPE only:
+///
+/// * `RpcError::RequestError { endpoint: SubmitProvenTx, endpoint_error: None }`
+///   — the submit call itself failed at the transport layer (connection reset,
+///   deadline, stream closed). The node may have processed it before the
+///   response was lost. INDETERMINATE.
+/// * The same endpoint WITH an `endpoint_error` — the node answered with an
+///   application-level rejection (state conflict, expired, capacity). It
+///   processed and refused the transaction, so nothing landed. Determinate.
+/// * Any other endpoint (`GetBlockHeaderByNumber`, `SyncState`, …) — the
+///   failure happened while gathering inputs, before submission. Determinate.
+/// * Any non-RPC `ClientError` (proving, execution, store) — pre-submission by
+///   construction: `submit_new_transaction` proves before it submits, and a
+///   post-submit local failure has its own typed variant
+///   (`ApplyTransactionAfterSubmitFailed`, handled separately). Determinate.
+fn submit_is_indeterminate(err: &ClientError) -> bool {
+    use miden_client::rpc::{GrpcError, RpcEndpoint, RpcError};
+    match err {
+        ClientError::RpcError(RpcError::RequestError {
+            endpoint: RpcEndpoint::SubmitProvenTx,
+            endpoint_error: None,
+            error_kind,
+            ..
+        }) => match error_kind {
+            // PRE-ADMISSION REJECTIONS. The validator answers these BEFORE the
+            // transaction reaches the block producer, so nothing can have
+            // landed — treating them as ambiguous costs a 90s probe and an
+            // exit 4 where the honest answer is "definitely not admitted, retry
+            // freely".
+            //   * FailedPrecondition — stale transaction-encryption key id; the
+            //     client evicts the key and the caller re-submits.
+            //   * ResourceExhausted — validator busy (e.g. backup in progress).
+            // Matched by TYPED gRPC status, never by message text.
+            GrpcError::FailedPrecondition | GrpcError::ResourceExhausted => false,
+            // Everything else on this endpoint is a transport-level failure
+            // with no answer from the node: the transaction may have been
+            // accepted and only the response lost. INDETERMINATE.
+            _ => true,
+        },
+        _ => false,
+    }
+}
+
+/// Does `note_id` exist on chain? Polls for up to `probe_secs`.
+///
+/// Used only after an INDETERMINATE submit, to tell "the node never got it"
+/// from "the node got it and we lost the answer". The B2AGG note is addressed
+/// to the bridge account, which this tool tracks, so once the transaction is in
+/// a block `sync_state` pulls the note into the local store and the scoped
+/// `List` query finds it.
+///
+/// Returns `Ok(false)` only after the full window elapsed with no sighting —
+/// deliberately longer than mempool-to-block latency, because a premature
+/// `false` is what causes a double bridge-out. A sync/store failure is
+/// propagated rather than reported as "absent": callers must be able to tell
+/// "proven absent" from "could not tell".
+async fn note_landed_on_chain(
+    client: &mut miden_agglayer_service::miden_client::MidenClientLib,
+    note_id: miden_protocol::note::NoteId,
+    probe_secs: u64,
+) -> anyhow::Result<bool> {
+    use miden_client::store::NoteFilter;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(probe_secs);
+    // Assigned by every arm below before it is read: `None` records a clean look
+    // at the chain (so expiry means "proven absent"), `Some` records that we
+    // never got one (so expiry means "unprovable, do not retry").
+    let mut last_err: Option<anyhow::Error>;
+    loop {
+        // A sync failure here is not evidence of absence; remember it and keep
+        // trying, and surface it if the window expires without a sighting.
+        match client.sync_state().await {
+            Ok(_) => {
+                let inputs = client
+                    .get_input_notes(NoteFilter::List(vec![note_id]))
+                    .await
+                    .context("probing input notes for an indeterminate B2AGG submit")?;
+                if !inputs.is_empty() {
+                    return Ok(true);
+                }
+                let outputs = client
+                    .get_output_notes(NoteFilter::List(vec![note_id]))
+                    .await
+                    .context("probing output notes for an indeterminate B2AGG submit")?;
+                if !outputs.is_empty() {
+                    return Ok(true);
+                }
+                last_err = None;
+            }
+            Err(e) => last_err = Some(anyhow!("sync during indeterminate-submit probe: {e:?}")),
+        }
+        if std::time::Instant::now() >= deadline {
+            return match last_err {
+                // The window closed on a failing sync: we never got a clean
+                // look at the chain, so we cannot claim the note is absent.
+                Some(e) => Err(e),
+                None => Ok(false),
+            };
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
 async fn sync_with_retry(
     client: &mut miden_agglayer_service::miden_client::MidenClientLib,
     label: &str,
@@ -641,7 +749,7 @@ async fn main() -> anyhow::Result<()> {
         use miden_agglayer_service::miden_client::{
             submit_new_transaction, wait_for_transaction_commit,
         };
-        use miden_base_agglayer::{MetadataHash, create_bridge_account};
+        use miden_base_agglayer::{AggLayerBridge, BridgeRoles, MetadataHash};
         use miden_client::crypto::FeltRng;
 
         println!(
@@ -669,16 +777,30 @@ async fn main() -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow!("foreign ger_manager deploy commit wait failed: {e:?}"))?;
 
-        // Foreign bridge (mirrors init.rs::add_bridge). 0.16.0-alpha.5: the
-        // network id is a per-bridge storage slot set at creation, and the GER
-        // role is split injector/remover — same account fills both here.
-        let bridge = create_bridge_account(
+        // Foreign bridge (mirrors init.rs::add_bridge). rc.4: role-based
+        // creation — the foreign service is ADMIN + faucet manager, the
+        // foreign ger_manager fills both injector and remover; zero fees
+        // against the chain's real fee faucet.
+        let fee_faucet_id =
+            miden_agglayer_service::fee_policy::fee_faucet_id_from_chain(&client).await?;
+        let roles = BridgeRoles::new(
+            std::collections::BTreeSet::from([service.id()]),
+            std::collections::BTreeSet::from([ger_manager.id()]),
+            std::collections::BTreeSet::from([ger_manager.id()]),
+        )
+        .map_err(|e| anyhow!("foreign bridge role construction failed: {e}"))?;
+        let bridge = AggLayerBridge::account_builder(
             client.rng().draw_word(),
             service.id(),
-            ger_manager.id(),
-            ger_manager.id(),
+            roles,
             args.foreign_network_id,
-        );
+            miden_agglayer_service::fee_policy::zero_fee_policy_manager_for(
+                AggLayerBridge::allowed_notes(),
+                fee_faucet_id,
+            ),
+        )
+        .build()
+        .map_err(|e| anyhow!("foreign bridge account build failed: {e}"))?;
         client
             .add_account(&bridge, false)
             .await
@@ -800,7 +922,7 @@ async fn main() -> anyhow::Result<()> {
             .account_type(AccountType::Public)
             .with_component(faucet_component)
             .with_components(policy_manager)
-            .with_auth_component(auth_component)
+            .with_component(auth_component)
             .build_with_schema_commitment()
             .map_err(|e| anyhow!("faucet account build failed: {e:?}"))?;
         if let Some(key_pair) = key_pair.as_ref() {
@@ -1198,10 +1320,27 @@ async fn main() -> anyhow::Result<()> {
     // surfaces as "transaction proving failed". Proving happens BEFORE node
     // submission, so retrying is clean. If the node accepts the tx and only the
     // local store update fails, never resubmit; retry the attached store update.
-    const SUBMIT_ATTEMPTS: u32 = 4;
+    // Retry budget for the SUBMISSION phase only (pre-acceptance, so a retry
+    // can never double-bridge). Default 6 with exponential backoff 5..60s —
+    // shared-prover backpressure on a busy stack outlives the old fixed
+    // 4x10s budget (loop cycle-4 back#3, 2026-08-18).
+    let submit_attempts: u32 = std::env::var("B2AGG_SUBMIT_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(6);
+    // How long to keep probing for the note after an INDETERMINATE submit
+    // before concluding it never landed. Must comfortably exceed
+    // mempool-to-block latency, since the whole point is to avoid mistaking a
+    // not-yet-committed acceptance for a failure and bridging twice.
+    let probe_secs: u64 = std::env::var("B2AGG_INDETERMINATE_PROBE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(90);
     let mut tx_id = None;
     let mut submitted_note_id = None;
-    for attempt in 1..=SUBMIT_ATTEMPTS {
+    for attempt in 1..=submit_attempts {
         // Sync right before each attempt to minimize the window where the
         // service's background sync loop can change our shared SQLite state.
         sync_with_retry(&mut client, "bridge-out pre-submit").await?;
@@ -1223,7 +1362,7 @@ async fn main() -> anyhow::Result<()> {
             .build()
             .map_err(|e| anyhow!("tx request build failed: {e}"))?;
 
-        println!("[bridge-out] submitting transaction (attempt {attempt}/{SUBMIT_ATTEMPTS})...");
+        println!("[bridge-out] submitting transaction (attempt {attempt}/{submit_attempts})...");
         match miden_agglayer_service::metrics::meter_proof(
             miden_agglayer_service::metrics::ProofKind::BridgeOut,
             client.submit_new_transaction(wallet_id, tx_request),
@@ -1248,7 +1387,7 @@ async fn main() -> anyhow::Result<()> {
                 );
                 let pending_update = *pending_update;
                 let mut last_reapply_err = None;
-                for recovery_attempt in 1..=SUBMIT_ATTEMPTS {
+                for recovery_attempt in 1..=submit_attempts {
                     match client
                         .apply_transaction_update(pending_update.clone())
                         .await
@@ -1263,10 +1402,10 @@ async fn main() -> anyhow::Result<()> {
                         }
                         Err(reapply_err) => {
                             eprintln!(
-                                "[bridge-out] recovery apply attempt {recovery_attempt}/{SUBMIT_ATTEMPTS} failed for transaction {accepted_tx}: {reapply_err:#}"
+                                "[bridge-out] recovery apply attempt {recovery_attempt}/{submit_attempts} failed for transaction {accepted_tx}: {reapply_err:#}"
                             );
                             last_reapply_err = Some(reapply_err);
-                            if recovery_attempt < SUBMIT_ATTEMPTS {
+                            if recovery_attempt < submit_attempts {
                                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                             }
                         }
@@ -1278,27 +1417,120 @@ async fn main() -> anyhow::Result<()> {
                 let last_reapply_err = last_reapply_err
                     .map(|err| format!("{err:#}"))
                     .unwrap_or_else(|| "unknown recovery error".to_string());
-                return Err(anyhow!(
-                    "submit accepted transaction {accepted_tx} at block {submission_height}, but local store recovery failed after {SUBMIT_ATTEMPTS} attempts: {last_reapply_err}"
-                ));
-            }
-            Err(e) if attempt < SUBMIT_ATTEMPTS => {
+                // The transaction IS on chain — a caller re-running the tool
+                // would create a SECOND B2AGG note (double-bridge). Exit 4 =
+                // "submitted, do not retry" (script contract; exit 3 = safe).
                 eprintln!(
-                    "[bridge-out] submit attempt {attempt} failed: {e:?}; retrying in 10s \
-                     (prover backpressure is the common cause)"
+                    "[bridge-out] SUBMITTED-NOT-SETTLED tx={accepted_tx}: local store recovery failed after {submit_attempts} attempts: {last_reapply_err}"
                 );
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                std::process::exit(4);
             }
             Err(e) => {
-                return Err(anyhow!(
-                    "submit failed after {SUBMIT_ATTEMPTS} attempts: {e}"
-                ));
+                // Every retry below BUILDS A NEW NOTE, which is only safe when
+                // the failed attempt provably never reached the node. If the
+                // node accepted the transaction and merely the response was
+                // lost, a retry bridges the amount a SECOND time.
+                //
+                // `submit_is_indeterminate` is the typed test for exactly that
+                // ambiguous case: a transport-level failure on the
+                // SubmitProvenTx endpoint. Everything else — proving
+                // backpressure, executor errors, RPC failures on other
+                // endpoints, and node-level REJECTIONS at submit (the node
+                // answered, so it did not accept) — is provably pre-acceptance
+                // and keeps the cheap immediate retry.
+                if submit_is_indeterminate(&e) {
+                    eprintln!(
+                        "[bridge-out] INDETERMINATE submit on attempt {attempt}/{submit_attempts}: \
+                         {e}. The node may have accepted this transaction — probing for note \
+                         {b2agg_note_id} before deciding (never blind-retry an ambiguous submit)."
+                    );
+                    match note_landed_on_chain(&mut client, b2agg_note_id, probe_secs).await {
+                        Ok(true) => {
+                            // The note IS on chain: the submit succeeded and
+                            // only its response was lost. Adopt it rather than
+                            // bridging a second time.
+                            println!(
+                                "[bridge-out] probe: note {b2agg_note_id} IS on chain — the \
+                                 ambiguous submit landed; adopting it (no second bridge-out)"
+                            );
+                            submitted_note_id = Some(b2agg_note_id);
+                            break;
+                        }
+                        Ok(false) => {
+                            // Absence after a finite window is EVIDENCE, not
+                            // PROOF: a transaction still sitting in the mempool
+                            // can commit after the probe gives up, and by then
+                            // a replacement note would already be in flight —
+                            // two bridge-outs for one intent. The default is
+                            // therefore to stop, not to replace.
+                            //
+                            // B2AGG_REPLACE_AFTER_ABSENT_PROBE=1 opts into the
+                            // old behaviour for throughput-oriented harness
+                            // runs where a duplicate bridge-out is an
+                            // accounting nuisance rather than a loss; it must
+                            // never be set where funds matter.
+                            if std::env::var("B2AGG_REPLACE_AFTER_ABSENT_PROBE").as_deref()
+                                == Ok("1")
+                            {
+                                eprintln!(
+                                    "[bridge-out] probe: note {b2agg_note_id} absent after \
+                                     {probe_secs}s and B2AGG_REPLACE_AFTER_ABSENT_PROBE=1 — \
+                                     replacing (accepted risk: a late commit double-bridges)"
+                                );
+                            } else {
+                                eprintln!(
+                                    "[bridge-out] INDETERMINATE-UNRESOLVED note={b2agg_note_id}: \
+                                     the submit may have reached the node and the note has not \
+                                     appeared within {probe_secs}s. Refusing to replace it — a \
+                                     late commit would make this a SECOND bridge-out. Re-check \
+                                     the note before any manual retry; set \
+                                     B2AGG_REPLACE_AFTER_ABSENT_PROBE=1 only where a duplicate \
+                                     bridge-out is acceptable."
+                                );
+                                std::process::exit(4);
+                            }
+                        }
+                        Err(probe_err) => {
+                            // Unprovable either way. Fail closed with exit 4
+                            // ("may be submitted, DO NOT retry"): a wrong retry
+                            // double-bridges, a wrong stop only costs an
+                            // operator a look.
+                            eprintln!(
+                                "[bridge-out] INDETERMINATE-UNPROVABLE note={b2agg_note_id}: the \
+                                 submit outcome is unknown and the probe itself failed \
+                                 ({probe_err:#}). Refusing to retry — re-running this tool could \
+                                 bridge twice. Check whether note {b2agg_note_id} exists on chain \
+                                 before any manual retry."
+                            );
+                            std::process::exit(4);
+                        }
+                    }
+                }
+
+                if attempt < submit_attempts {
+                    let delay = (5u64 << (attempt - 1)).min(60);
+                    eprintln!(
+                        "[bridge-out] submit attempt {attempt}/{submit_attempts} failed: {e:?}; \
+                         retrying in {delay}s (prover backpressure is the common cause)"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                } else {
+                    // Nothing was accepted on chain — a whole-op retry is SAFE.
+                    // Exit 3 = "failed pre-submission, retryable" (script contract).
+                    eprintln!("[bridge-out] submit failed after {submit_attempts} attempts: {e}");
+                    std::process::exit(3);
+                }
             }
         }
     }
-    let tx_id = tx_id.expect("loop either sets tx_id or returns");
+    // An adopted ambiguous submit has a note but no TransactionId — the id was
+    // in the response we never received.
+    let tx_label = tx_id.map_or_else(
+        || "<adopted after an indeterminate submit; id unknown>".to_string(),
+        |id| id.to_string(),
+    );
 
-    println!("[bridge-out] transaction submitted: {tx_id}");
+    println!("[bridge-out] transaction submitted: {tx_label}");
 
     // Wait for the B2AGG to be CONSUMED on-chain (not merely accepted). Pacing
     // on tx acceptance alone lets a load test flood the bridge with in-flight
@@ -1327,10 +1559,15 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         if !consumed {
-            return Err(anyhow!(
-                "B2AGG note {note_id} not consumed within {}s",
+            // The note EXISTS on chain and may still be consumed later — a
+            // caller re-running the tool would bridge a second amount. Emit a
+            // parseable marker and exit 4 ("submitted, do not retry"); the
+            // caller decides whether to keep waiting on the deposit downstream.
+            eprintln!(
+                "[bridge-out] PENDING-CONSUMPTION note={note_id} tx={tx_label}: not consumed within {}s",
                 args.wait_consumed_secs
-            ));
+            );
+            std::process::exit(4);
         }
         println!("[bridge-out] B2AGG consumed");
     } else {
@@ -1355,4 +1592,107 @@ async fn main() -> anyhow::Result<()> {
     println!("[bridge-out] done");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::submit_is_indeterminate;
+    use miden_client::ClientError;
+    use miden_client::rpc::node::AddTransactionError;
+    use miden_client::rpc::{EndpointError, GrpcError, RpcEndpoint, RpcError};
+
+    fn request_error(
+        endpoint: RpcEndpoint,
+        error_kind: GrpcError,
+        endpoint_error: Option<EndpointError>,
+    ) -> ClientError {
+        ClientError::RpcError(RpcError::RequestError {
+            endpoint,
+            error_kind,
+            endpoint_error,
+            source: None,
+        })
+    }
+
+    /// The ONLY ambiguous case: the submit call failed at the transport layer,
+    /// so the node may have accepted the transaction before the response was
+    /// lost. Retrying here builds a second B2AGG note and bridges twice.
+    #[test]
+    fn transport_failure_on_submit_is_indeterminate() {
+        for kind in [
+            GrpcError::Unavailable,
+            GrpcError::DeadlineExceeded,
+            GrpcError::Internal,
+        ] {
+            let label = format!("{kind:?}");
+            assert!(
+                submit_is_indeterminate(&request_error(RpcEndpoint::SubmitProvenTx, kind, None)),
+                "a {label} transport failure on SubmitProvenTx must be treated as indeterminate"
+            );
+        }
+    }
+
+    /// The node ANSWERED with an application-level rejection — it processed the
+    /// transaction and refused it, so nothing landed and a retry is safe.
+    #[test]
+    fn node_rejection_at_submit_is_determinate() {
+        for endpoint_error in [
+            EndpointError::AddTransaction(AddTransactionError::StateConflict {
+                message: "transaction conflicts with current mempool state".into(),
+            }),
+            EndpointError::AddTransaction(AddTransactionError::Expired),
+            EndpointError::AddTransaction(AddTransactionError::CapacityExceeded),
+        ] {
+            assert!(
+                !submit_is_indeterminate(&request_error(
+                    RpcEndpoint::SubmitProvenTx,
+                    GrpcError::InvalidArgument,
+                    Some(endpoint_error),
+                )),
+                "a node-level rejection means the node did not accept the transaction"
+            );
+        }
+    }
+
+    /// Pre-admission rejections: the validator answers BEFORE the block
+    /// producer sees the transaction, so nothing landed. Classifying them as
+    /// ambiguous would cost a 90s probe and a refusal to retry, where the truth
+    /// is "definitely not admitted".
+    #[test]
+    fn pre_admission_rejections_are_determinate() {
+        for kind in [GrpcError::FailedPrecondition, GrpcError::ResourceExhausted] {
+            let label = format!("{kind:?}");
+            assert!(
+                !submit_is_indeterminate(&request_error(RpcEndpoint::SubmitProvenTx, kind, None)),
+                "{label} is answered before admission — nothing can have landed"
+            );
+        }
+    }
+
+    /// Failures on other endpoints happen while gathering inputs, i.e. before
+    /// anything is submitted.
+    #[test]
+    fn failures_on_other_endpoints_are_determinate() {
+        for endpoint in [
+            RpcEndpoint::SyncNotes,
+            RpcEndpoint::GetBlockHeaderByNumber,
+            RpcEndpoint::GetAccount,
+        ] {
+            let label = format!("{endpoint:?}");
+            assert!(
+                !submit_is_indeterminate(&request_error(endpoint, GrpcError::Unavailable, None)),
+                "{label} is not the submission call — the transaction was never sent"
+            );
+        }
+    }
+
+    /// Non-RPC client errors are pre-submission by construction (proving and
+    /// execution both precede the submit call), and the post-submit local
+    /// failure has its own variant handled elsewhere.
+    #[test]
+    fn non_rpc_client_errors_are_determinate() {
+        assert!(!submit_is_indeterminate(&ClientError::RpcError(
+            RpcError::DeserializationError("bad response".into())
+        )));
+    }
 }

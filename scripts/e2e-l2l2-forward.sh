@@ -176,10 +176,27 @@ PG_OPT0_FID=$(pgq "SELECT lower(faucet_id) FROM faucet_registry WHERE encode(ori
 [[ -n "$PG_OPT0_FID" ]] || fail "no faucet_registry row for (OPT0, net $L2B_NETWORK_ID) in PG"
 [[ "$(echo "$OPT0_FAUCET_ID" | tr 'A-F' 'a-f')" == "$PG_OPT0_FID" ]] \
     || fail "faucet id mismatch RPC=$OPT0_FAUCET_ID vs PG=$PG_OPT0_FID"
-# Negative control: (OPT0, net 0) must resolve to NOTHING (key includes network).
-OPT0_NET0_ROWS=$(pgq "SELECT COUNT(*) FROM faucet_registry WHERE encode(origin_address,'hex') = '${OPT0_HEX}' AND origin_network = 0;")
-[[ "$OPT0_NET0_ROWS" == "0" ]] || fail "(OPT0, net 0) unexpectedly resolves to a faucet — keying broken"
-pass "foreign-origin faucet keyed (OPT0, net $L2B_NETWORK_ID): $OPT0_FAUCET_ID (net-0 lookup empty)"
+# Negative control: the registry key INCLUDES the network, so this run's
+# (OPT0, net 2) faucet must not be reachable under a net-0 lookup.
+#
+# This is deliberately NOT "no net-0 row exists". Both anvils are seeded from the
+# same dev keys, so once their deployer nonces coincide CREATE yields the SAME
+# address on L1 and on L2B, and an unrelated L1 token legitimately occupies it.
+# Observed on a compounding stack: 0xAC77A07dD1683DeA96c08F286b67783fB1e4B583 is
+# TT on L1 (net 0) and OPT0 on L2B (net 2), both real contracts. A collision is a
+# valid state. What would mean broken keying is ONE faucet_id answering for BOTH
+# networks -- so that is what we assert against.
+OPT0_NET0_FID=$(pgq "SELECT lower(faucet_id) FROM faucet_registry WHERE encode(origin_address,'hex') = '${OPT0_HEX}' AND origin_network = 0;")
+[[ "$OPT0_NET0_FID" != "$PG_OPT0_FID" ]] \
+    || fail "(OPT0, net 0) resolves to the SAME faucet as net $L2B_NETWORK_ID ($PG_OPT0_FID) — network is not part of the registry key"
+OPT0_NET2_ROWS=$(pgq "SELECT COUNT(*) FROM faucet_registry WHERE encode(origin_address,'hex') = '${OPT0_HEX}' AND origin_network = ${L2B_NETWORK_ID};")
+[[ "$OPT0_NET2_ROWS" == "1" ]] \
+    || fail "expected exactly 1 faucet row for (OPT0, net $L2B_NETWORK_ID), got $OPT0_NET2_ROWS"
+if [[ -n "$OPT0_NET0_FID" ]]; then
+    pass "foreign-origin faucet keyed (OPT0, net $L2B_NETWORK_ID): $OPT0_FAUCET_ID (net-0 address collision present, correctly isolated as $OPT0_NET0_FID)"
+else
+    pass "foreign-origin faucet keyed (OPT0, net $L2B_NETWORK_ID): $OPT0_FAUCET_ID (net-0 lookup empty)"
+fi
 
 # (b) Wrapped balance credited to the destination wallet.
 BALANCE=0

@@ -628,6 +628,12 @@ sponsor_nonce() {
 # deterministic resubmission still requires the receipt path explicitly.
 DEDUP_METRIC="claim_landed_dedup_reverted_total"
 ESTIMATE_ALREADY_CLAIMED_METRIC="rpc_estimate_gas_already_claimed_total"
+# Third valid window (first observed on node-0.16.0-rc.1, run 2026-08-17): the
+# sponsor's duplicate arrives while the user's winning claim is SUBMITTED but
+# not yet LANDED (claim lock held, no ClaimEvent) — rc.1 proving stretches this
+# window to ~30s. The duplicate is accepted at RPC and fails in the writer with
+# a status-0 receipt, counted by claim_inflight_dedup_total.
+INFLIGHT_DEDUP_METRIC="claim_inflight_dedup_total"
 metric_value() { # <metric-name>
     local body
     body=$(curl -sf "${L2_RPC}/metrics") || fail "metrics endpoint unreachable: ${L2_RPC}/metrics"
@@ -706,7 +712,7 @@ sponsor_probe_round() {
         PROBE_VERDICT="advancing"; return 0
     fi
     rejections=$(printf '%s\n' "$window" \
-        | grep -cE "nonce mismatch for $SPONSOR_ADDR_LC|claim already submitted for global_index" || true)
+        | grep -cE "nonce too (low|high).*guard for $SPONSOR_ADDR_LC|nonce mismatch for $SPONSOR_ADDR_LC|claim already submitted for global_index" || true)
     if [[ "${rejections:-0}" -eq 0 ]]; then
         PROBE_VERDICT="transient"; return 0
     fi
@@ -820,7 +826,7 @@ verify_sponsor_recovers_automatically() {
     sleep 15
     fresh_mismatch=$(docker logs --tail 8000 "$AGGLAYER_CONTAINER" 2>&1 | strip_ansi \
         | awk -v ts="$settle_ts" '$1 >= ts' \
-        | grep -cE "nonce mismatch for $SPONSOR_ADDR_LC" || true)
+        | grep -cE "nonce too (low|high).*guard for $SPONSOR_ADDR_LC|nonce mismatch for $SPONSOR_ADDR_LC" || true)
     log "sponsor nonce: before-settle=$nonce_a after-settle=$nonce_b; fresh nonce-mismatch lines since settle=$fresh_mismatch"
     [[ "${fresh_mismatch:-0}" -eq 0 ]] \
         || fail "sponsor STILL emitting nonce-mismatch spam ($fresh_mismatch lines in ~15s after a settle) — permanent wedge NOT healed (#55 regression)"
@@ -830,16 +836,26 @@ verify_sponsor_recovers_automatically() {
     # race leg below separately pins the sendRaw status-0/no-log contract.
     dedup_after=$(metric_value "$DEDUP_METRIC")
     estimate_after=$(metric_value "$ESTIMATE_ALREADY_CLAIMED_METRIC")
+    inflight_after=$(metric_value "$INFLIGHT_DEDUP_METRIC")
     log "$DEDUP_METRIC: baseline=$DEDUP_BEFORE now=$dedup_after"
     log "$ESTIMATE_ALREADY_CLAIMED_METRIC: baseline=$ESTIMATE_ALREADY_CLAIMED_BEFORE now=$estimate_after"
+    log "$INFLIGHT_DEDUP_METRIC: baseline=$INFLIGHT_DEDUP_BEFORE now=$inflight_after"
     if [[ "$dedup_after" -gt "$DEDUP_BEFORE" ]]; then
         pass "$DEDUP_METRIC incremented ($DEDUP_BEFORE → $dedup_after): signed duplicate received status-0/no-log reconciliation"
     elif [[ "$estimate_after" -gt "$ESTIMATE_ALREADY_CLAIMED_BEFORE" ]]; then
         proxy_is_claimed "$LEG1_GI" \
             || fail "$ESTIMATE_ALREADY_CLAIMED_METRIC incremented but isClaimed for exact front-run gi=$LEG1_GI is not true"
         pass "$ESTIMATE_ALREADY_CLAIMED_METRIC incremented ($ESTIMATE_ALREADY_CLAIMED_BEFORE → $estimate_after) and isClaimed(gi=$LEG1_GI)=true: AggKit reconciled before submission"
+    elif [[ "$inflight_after" -gt "$INFLIGHT_DEDUP_BEFORE" ]]; then
+        # The duplicate collided INSIDE the winner's proving window. Positive
+        # proof mirrors the other paths: the front-run gi must still have
+        # landed exactly once (isClaimed true; the single-ClaimEvent assertion
+        # above already pinned the winner).
+        proxy_is_claimed "$LEG1_GI" \
+            || fail "$INFLIGHT_DEDUP_METRIC incremented but isClaimed for exact front-run gi=$LEG1_GI is not true"
+        pass "$INFLIGHT_DEDUP_METRIC incremented ($INFLIGHT_DEDUP_BEFORE → $inflight_after) and isClaimed(gi=$LEG1_GI)=true: sponsor duplicate reconciled inside the in-flight window (status-0 writer receipt)"
     else
-        fail "neither already-claimed reconciliation metric incremented: sendRaw $DEDUP_BEFORE→$dedup_after, estimateGas $ESTIMATE_ALREADY_CLAIMED_BEFORE→$estimate_after"
+        fail "no already-claimed reconciliation metric incremented: sendRaw $DEDUP_BEFORE→$dedup_after, estimateGas $ESTIMATE_ALREADY_CLAIMED_BEFORE→$estimate_after, inflight $INFLIGHT_DEDUP_BEFORE→$inflight_after"
     fi
 }
 
@@ -850,19 +866,51 @@ verify_sponsor_recovers_automatically() {
 # front-run so the inter-leg assertion can prove which path healed AggKit.
 DEDUP_BEFORE=$(metric_value "$DEDUP_METRIC")
 ESTIMATE_ALREADY_CLAIMED_BEFORE=$(metric_value "$ESTIMATE_ALREADY_CLAIMED_METRIC")
+INFLIGHT_DEDUP_BEFORE=$(metric_value "$INFLIGHT_DEDUP_METRIC")
 log "baseline $DEDUP_METRIC = $DEDUP_BEFORE"
 log "baseline $ESTIMATE_ALREADY_CLAIMED_METRIC = $ESTIMATE_ALREADY_CLAIMED_BEFORE"
+log "baseline $INFLIGHT_DEDUP_METRIC = $INFLIGHT_DEDUP_BEFORE"
 
 step "Leg 1 — deposit L1→L2, then the USER claims it manually"
 
 LEG1_GI=""; LEG1_TX=""
 for attempt in $(seq 1 "$MAX_LEG1_ATTEMPTS"); do
     log "Leg 1 attempt $attempt/$MAX_LEG1_ATTEMPTS"
+    # QUIESCE, then RE-BASELINE. These are process-wide counters and the
+    # assertion below attributes their growth to the attempt that produced
+    # LEG1_GI. Two ways that attribution can be wrong:
+    #   * a baseline taken once, before the loop, also captures every EARLIER
+    #     attempt's increments (fixed by re-reading here); and
+    #   * an earlier attempt's sponsor claim can still be IN FLIGHT and
+    #     increment the counter AFTER this baseline — a late increment credited
+    #     to the wrong attempt, which re-reading alone does not fix.
+    # So wait for every previous attempt to reach a terminal state (its global
+    # index claimed on chain) before taking the new baseline. Then any increment
+    # observed after it belongs to THIS attempt.
+    for prior_gi in ${PRIOR_ATTEMPT_GIS:-}; do
+        quiesce_deadline=$((SECONDS + 180))
+        while ! proxy_is_claimed "$prior_gi"; do
+            if (( SECONDS >= quiesce_deadline )); then
+                fail "attempt $attempt cannot establish a clean metric baseline: the previous \
+attempt's global index $prior_gi is still unclaimed after 180s, so its sponsor claim may still be \
+in flight and would be credited to this attempt"
+            fi
+            sleep 3
+        done
+        log "previous attempt gi=$prior_gi is terminal (claimed) — safe to baseline"
+    done
+    DEDUP_BEFORE=$(metric_value "$DEDUP_METRIC")
+    ESTIMATE_ALREADY_CLAIMED_BEFORE=$(metric_value "$ESTIMATE_ALREADY_CLAIMED_METRIC")
+    INFLIGHT_DEDUP_BEFORE=$(metric_value "$INFLIGHT_DEDUP_METRIC")
+    log "attempt $attempt baselines: sendRaw=$DEDUP_BEFORE estimateGas=$ESTIMATE_ALREADY_CLAIMED_BEFORE inflight=$INFLIGHT_DEDUP_BEFORE"
     do_l1_deposit
     pass "L1 deposit sent (tx $L1_DEP_TX → deposit_cnt $L1_DEP_CNT)"
     fetch_deposit_json "$L1_DEP_CNT" 300
     GI=$(echo "$DEP_JSON" | dep_field global_index)
     log "deposit_cnt=$L1_DEP_CNT globalIndex=$GI"
+    # Remembered so the NEXT attempt can wait for this one to go terminal
+    # before it baselines the shared counters.
+    PRIOR_ATTEMPT_GIS="${PRIOR_ATTEMPT_GIS:-} $GI"
 
     # Start submitting IMMEDIATELY (before ready_for_claim): the loop retries
     # the C6 "GER not observed yet" rejections sub-second, so the user grabs

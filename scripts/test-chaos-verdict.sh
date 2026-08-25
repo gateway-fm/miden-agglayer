@@ -46,16 +46,19 @@ ok  "complete ops + VC_RC=0 passes"     chaos_verdict  0  1  0  0  0  0  3  2  1
 
 echo "── mixed_ops_ok: MIX_VERIFY=0 must still enforce every operation ──"
 #           desc                                          fn           F_OK F_SUB B_OK B_SUB CLASH    LT SKIP VC   LOCKS
-nok "incomplete forwards fail even with vc=skip"    mixed_ops_ok  1  2  2  2  distinct 0  0  skip 0
-nok "incomplete backs fail even with vc=skip"       mixed_ops_ok  2  2  1  2  distinct 0  0  skip 0
-nok "zero submitted forwards fail (empty run)"      mixed_ops_ok  0  0  2  2  distinct 0  0  skip 0
-nok "non-distinct clash fails even with vc=skip"    mixed_ops_ok  2  2  2  2  same     0  0  skip 0
-nok "L1 loadtest fail (not skipped) fails"          mixed_ops_ok  2  2  2  2  distinct 1  0  skip 0
-ok  "L1 loadtest fail but SKIP_L1=1 passes"         mixed_ops_ok  2  2  2  2  distinct 1  1  skip 0
-nok "store locks fail even with vc=skip"            mixed_ops_ok  2  2  2  2  distinct 0  0  skip 2
-nok "verifier fail (MIX_VERIFY=1) fails"            mixed_ops_ok  2  2  2  2  distinct 0  0  1    0
-ok  "all ops complete + vc=skip passes"             mixed_ops_ok  2  2  2  2  distinct 0  0  skip 0
-ok  "all ops complete + vc=0 passes"                mixed_ops_ok  2  2  2  2  distinct 0  0  0    0
+nok "incomplete forwards fail even with vc=skip"    mixed_ops_ok  1  2  2  2  distinct 0  0  skip 0  2 2
+nok "incomplete backs fail even with vc=skip"       mixed_ops_ok  2  2  1  2  distinct 0  0  skip 0  2 2
+nok "zero submitted forwards fail (empty run)"      mixed_ops_ok  0  0  2  2  distinct 0  0  skip 0  2 2
+nok "fewer submitted than requested fails"          mixed_ops_ok  1  1  2  2  distinct 0  0  skip 0  2 2
+ok  "zero-requested L2L2 legs pass on 0/0 (chaos fresh-op shape)" mixed_ops_ok 0 0 0 0 distinct 0 0 skip 0 0 0
+nok "zero-requested but ops submitted anyway fails" mixed_ops_ok  1  1  0  0  distinct 0  0  skip 0  0 0
+nok "non-distinct clash fails even with vc=skip"    mixed_ops_ok  2  2  2  2  same     0  0  skip 0  2 2
+nok "L1 loadtest fail (not skipped) fails"          mixed_ops_ok  2  2  2  2  distinct 1  0  skip 0  2 2
+ok  "L1 loadtest fail but SKIP_L1=1 passes"         mixed_ops_ok  2  2  2  2  distinct 1  1  skip 0  2 2
+nok "store locks fail even with vc=skip"            mixed_ops_ok  2  2  2  2  distinct 0  0  skip 2  2 2
+nok "verifier fail (MIX_VERIFY=1) fails"            mixed_ops_ok  2  2  2  2  distinct 0  0  1    0  2 2
+ok  "all ops complete + vc=skip passes"             mixed_ops_ok  2  2  2  2  distinct 0  0  skip 0  2 2
+ok  "all ops complete + vc=0 passes"                mixed_ops_ok  2  2  2  2  distinct 0  0  0    0  2 2
 
 
 # ── l1_ops_ok (PR#145 follow-up: the nested L1<->Miden child's STRICT_OPS
@@ -67,6 +70,14 @@ nok "l1: target shortfall L2->L1 (sub < plan) fails"       l1_ops_ok 15 15 12 15
 nok "l1: explicit submission failure fails"                l1_ops_ok 15 15 15 15 1 0 30 30
 nok "l1: submitted-but-unclaimed work fails"               l1_ops_ok 15 15 15 15 0 0 28 30
 nok "l1: empty/unset counters fail closed"                 l1_ops_ok "" "" "" "" "" "" "" ""
+# NUMERIC zero is a different shape from the empty string, and it is the one a
+# real all-failed run produces: every equality in the predicate holds trivially
+# when nothing was planned, submitted, failed or claimed, so this returned OK
+# and a run that did NO WORK certified itself. The empty-string case above
+# fails closed for an unrelated reason and never covered this.
+nok "l1: all-zero (no work planned or done) fails closed"  l1_ops_ok 0 0 0 0 0 0 0 0
+nok "l1: plan present but nothing submitted fails closed"  l1_ops_ok 0 15 0 15 0 0 0 0
+ok  "l1: single-direction plan (L2 legs disabled) passes"  l1_ops_ok 15 15 0 0 0 0 15 15
 
 echo "──────────────────────────────────────────────"
 if [[ "$FAILS" == "0" ]]; then

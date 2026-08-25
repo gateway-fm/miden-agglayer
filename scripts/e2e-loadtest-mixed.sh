@@ -281,12 +281,32 @@ l2l2_fwd_fire() {
     forward_bridge "$FWD_OP_WEI" && mix "fwd#$1 fired (L2B->Miden $FWD_OP_WEI wei)" || mix "fwd#$1 submit FAILED"
 }
 # back FIRE: bridge-out wrapped MOP Miden->L2B ADMIN (creates the B2AGG note).
+# Exit-code contract with bridge-out-tool (2026-08-18): rc=3 = failed BEFORE
+# any on-chain acceptance (whole-op retry is SAFE); rc=4 = the B2AGG note IS
+# on chain but unconsumed at the tool's deadline (a re-run would mint a SECOND
+# note = double-bridge — NEVER retry; the drain waits on the deposit and fails
+# there if consumption truly never happens). Anything else = unknown, no retry.
 l2l2_back_fire() {
     bump back_sub
-    if iso_tool --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$MOP_FAUCET_ID" \
-        --amount "$BACK_OP_UNITS" --dest-address "$BACK_DEST" --dest-network "$L2B_NETWORK_ID" >>"$MIX_LOG" 2>&1; then
-        mix "back#$1 bridged out ($BACK_OP_UNITS units -> L2B $BACK_DEST)"
-    else mix "back#$1 bridge-out FAILED"; fi
+    local tries="${BACK_FIRE_TRIES:-5}" attempt rc delay
+    for attempt in $(seq 1 "$tries"); do
+        iso_tool --wallet-id "$WALLET_ID" --bridge-id "$BRIDGE_ID" --faucet-id "$MOP_FAUCET_ID" \
+            --amount "$BACK_OP_UNITS" --dest-address "$BACK_DEST" --dest-network "$L2B_NETWORK_ID" >>"$MIX_LOG" 2>&1
+        rc=$?
+        case "$rc" in
+            0) mix "back#$1 bridged out ($BACK_OP_UNITS units -> L2B $BACK_DEST)"; return 0 ;;
+            4) mix "back#$1 PENDING consumption (note on chain, tool deadline hit) — drain will settle or fail it"; return 0 ;;
+            3) if (( attempt < tries )); then
+                   delay=$(( 10 << (attempt - 1) )); (( delay > 120 )) && delay=120
+                   mix "back#$1 pre-submission failure (rc=3, attempt $attempt/$tries) — retrying in ${delay}s"
+                   sleep "$delay"
+               else
+                   mix "back#$1 bridge-out FAILED after $tries pre-submission attempts (rc=3)"
+               fi ;;
+            *) mix "back#$1 bridge-out FAILED (rc=$rc, not retryable)"; return 1 ;;
+        esac
+    done
+    return 1
 }
 
 # Build a MIXED schedule of every L2<->L2 op + the clash, then Fisher-Yates shuffle it
@@ -472,7 +492,8 @@ log "    address clash               = $CLASH (want: distinct)"
 log "    event-completeness rc       = $VC_RC (0 = PASS; 'skip' = caller verifies)"
 log "    proxy store-locks           = $LOCKS"
 if mixed_ops_ok "$FWD_OK" "$FWD_SUB" "$BACK_OK" "$BACK_SUB" "$CLASH" \
-        "$LT_RC" "${SKIP_L1_LOAD:-0}" "$VC_RC" "${LOCKS:-1}"; then
+        "$LT_RC" "${SKIP_L1_LOAD:-0}" "$VC_RC" "${LOCKS:-1}" \
+        "${L2L2_FWD:-5}" "${L2L2_BACK:-5}"; then
     log "  >>> MIXED LOADTEST PASS — all 4 directions landed + clash distinct <<<"
     log "======================================================================"
     exit 0

@@ -7,8 +7,9 @@
 use crate::faucet_ops;
 use crate::service_state::ServiceState;
 use crate::store::FaucetEntry;
-use miden_base_agglayer::{EthAddress, MetadataHash};
+use miden_base_agglayer::MetadataHash;
 use miden_protocol::account::AccountId;
+use miden_standards::interop::eth::EthAddress;
 use serde::Deserialize;
 use std::sync::{Arc, OnceLock};
 
@@ -90,7 +91,7 @@ pub async fn admin_register_faucet(
     // to 8. Routability then reduces to a single check on the origin token: the
     // downscaling factor `scale = origin_decimals - min(origin_decimals, 8)` must
     // fit MAX_SCALING_FACTOR (18, enforced at runtime by
-    // `EthAmount::scale_to_token_amount`), i.e. `origin_decimals <= 26`. Reject
+    // `EthAmount::scale_to_asset_amount`), i.e. `origin_decimals <= 26`. Reject
     // unclaimable routes up-front so a poisoned entry is never persisted.
     let miden_decimals = params.origin_decimals.min(faucet_ops::MIDEN_DECIMALS);
     // `miden_decimals <= origin_decimals` by construction — this never underflows;
@@ -1347,7 +1348,7 @@ mod tests {
 /// free by construction (distinct AccountIds embed to distinct addresses) and
 /// deterministic, which is what makes registration idempotent.
 pub fn derive_native_origin_address(faucet_id: AccountId) -> [u8; 20] {
-    miden_base_agglayer::EthEmbeddedAccountId::from(faucet_id).into()
+    miden_standards::interop::eth::EthEmbeddedAccountId::from(faucet_id).into()
 }
 
 /// Params for the PERMISSIONLESS registration: the faucet id and nothing else.

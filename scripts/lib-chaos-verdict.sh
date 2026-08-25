@@ -66,6 +66,14 @@ chaos_verdict() {
 l1_ops_ok() {
     local sub_l1="$1" plan_l1="$2" sub_l2="$3" plan_l2="$4" \
           fail_l1="$5" fail_l2="$6" g_clm="$7" g_sub="$8"
+    # AN ALL-ZERO RUN IS NOT A PASS. Every equality below holds trivially when
+    # nothing was planned, submitted, failed or claimed, so `l1_ops_ok 0 0 0 0
+    # 0 0 0 0` returned success — a run that did NO WORK certified itself, and
+    # every completeness check downstream is vacuous over its empty feed. The
+    # existing tests covered empty STRINGS, which fail closed for a different
+    # reason, and so never caught the numeric-zero shape.
+    [[ "${plan_l1:-0}" -gt 0 || "${plan_l2:-0}" -gt 0 ]] || return 1
+    [[ "${g_sub:-0}" -gt 0 ]] || return 1
     [[ "${sub_l1:-0}" == "${plan_l1:--1}" ]] || return 1
     [[ "${sub_l2:-0}" == "${plan_l2:--1}" ]] || return 1
     [[ "${fail_l1:-1}" == "0" && "${fail_l2:-1}" == "0" ]] || return 1
@@ -73,17 +81,24 @@ l1_ops_ok() {
     return 0
 }
 
-# mixed_ops_ok FWD_OK FWD_SUB BACK_OK BACK_SUB CLASH LT_RC SKIP_L1 VC_RC LOCKS
+# mixed_ops_ok FWD_OK FWD_SUB BACK_OK BACK_SUB CLASH LT_RC SKIP_L1 VC_RC LOCKS REQ_FWD REQ_BACK
 #   The mixed loadtest's operational verdict. VC_RC may be the literal string
 #   "skip" (MIX_VERIFY=0: the caller runs the ONE authoritative verifier
 #   post-heal) — that skips ONLY the verifier requirement; every operational
 #   requirement (all forwards claimed, all backs released, clash distinct, L1
 #   loadtest green unless explicitly skipped, zero store locks) still gates.
+#   REQ_FWD/REQ_BACK are the counts the CALLER requested (default 5 each, the
+#   full-run shape): every requested op must have been submitted AND landed,
+#   and the old unconditional ">0" guard applies only when the request is >0 —
+#   the chaos fresh-op runs L2L2_FWD=0 L2L2_BACK=0 by design and was
+#   impossible to pass before (2026-08-18 verdict-d artifact: every leg green,
+#   still NOT-GREEN).
 mixed_ops_ok() {
     local fwd_ok="$1" fwd_sub="$2" back_ok="$3" back_sub="$4" clash="$5" \
-          lt_rc="$6" skip_l1="$7" vc_rc="$8" locks="$9"
-    [[ "$fwd_ok" == "$fwd_sub" && "${fwd_sub:-0}" -gt 0 ]] || return 1
-    [[ "$back_ok" == "$back_sub" && "${back_sub:-0}" -gt 0 ]] || return 1
+          lt_rc="$6" skip_l1="$7" vc_rc="$8" locks="$9" \
+          req_fwd="${10:-5}" req_back="${11:-5}"
+    [[ "${fwd_sub:-0}" == "$req_fwd" && "$fwd_ok" == "$fwd_sub" ]] || return 1
+    [[ "${back_sub:-0}" == "$req_back" && "$back_ok" == "$back_sub" ]] || return 1
     [[ "$clash" == "distinct" ]] || return 1
     [[ "$lt_rc" == "0" || "$skip_l1" == "1" ]] || return 1
     [[ "$vc_rc" == "skip" || "$vc_rc" == "0" ]] || return 1

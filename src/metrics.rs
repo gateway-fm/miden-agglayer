@@ -38,7 +38,18 @@ use metrics::{describe_counter, describe_gauge, describe_histogram};
 /// either name changes.
 pub fn install_prometheus_recorder() -> anyhow::Result<metrics_exporter_prometheus::PrometheusHandle>
 {
-    let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+    let handle = prometheus_builder()?
+        .install_recorder()
+        .context("failed to install metrics recorder")?;
+    init_metrics();
+    Ok(handle)
+}
+
+/// The exporter configuration (bucket sets) shared by the real installer and
+/// the rendering test, so a histogram that loses its buckets fails a test
+/// instead of silently degrading to summary quantiles in production.
+fn prometheus_builder() -> anyhow::Result<metrics_exporter_prometheus::PrometheusBuilder> {
+    metrics_exporter_prometheus::PrometheusBuilder::new()
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Full("miden_proof_duration_seconds".to_string()),
             &[
@@ -53,10 +64,28 @@ pub fn install_prometheus_recorder() -> anyhow::Result<metrics_exporter_promethe
             ],
         )
         .context("set_buckets_for_metric (rpc_request_duration_seconds) failed")?
-        .install_recorder()
-        .context("failed to install metrics recorder")?;
-    init_metrics();
-    Ok(handle)
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(
+                "miden_sync_state_duration_seconds".to_string(),
+            ),
+            // #106: per-call sync_state cost is what grows with client-store
+            // size. The interesting region spans 50ms (small store) → 2s (the
+            // WARN threshold) → 30s (big enough to stall the commit-wait loop),
+            // so the buckets straddle all three.
+            &[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0],
+        )
+        .context("set_buckets_for_metric (miden_sync_state_duration_seconds) failed")?
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(
+                "agglayer_writer_job_duration_seconds".to_string(),
+            ),
+            // RD-940 alerts on p99 > 60s against aggkit's 2m WaitTxToBeMined,
+            // so the buckets must resolve on either side of both thresholds.
+            &[
+                0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 60.0, 90.0, 120.0, 300.0,
+            ],
+        )
+        .context("set_buckets_for_metric (agglayer_writer_job_duration_seconds) failed")
 }
 
 pub fn init_metrics() {
@@ -78,6 +107,16 @@ pub fn init_metrics() {
          AlreadyClaimed. Nonzero means a sponsor/user cross-claimed the same gi and the sponsor's \
          nonce sequence was kept in lockstep (autoclaim NOT wedged). A steady climb means heavy \
          claim front-running, not a bug."
+    );
+    describe_counter!(
+        "claim_inflight_dedup_total",
+        "#55 third dedup window: a claimAsset arrived for a globalIndex whose winning claim was \
+         SUBMITTED but had not LANDED yet (claim lock held, no ClaimEvent, within TTL) — the \
+         duplicate was accepted at RPC and failed in the writer with a status-0 receipt, \
+         consuming the submitter's nonce. Distinct from claim_landed_dedup_reverted_total \
+         (duplicate arriving after the ClaimEvent exists). Nonzero means a sponsor/user \
+         cross-claim raced inside the proving window; a steady climb means heavy \
+         front-running, not a bug."
     );
     describe_counter!(
         "rpc_nonce_repaired_after_commit_gap_total",
@@ -208,6 +247,17 @@ pub fn init_metrics() {
     describe_counter!("bridge_outs_total", "Total bridge-out operations");
     describe_counter!("store_errors_total", "Total store operation errors");
     describe_histogram!("rpc_request_duration_seconds", "JSON-RPC request duration");
+    describe_histogram!(
+        "miden_sync_state_duration_seconds",
+        "#106 — duration of a single miden-client sync_state() call on the \
+         commit-wait hot path. This is the growth term behind claim latency: \
+         the client store accumulates with history, each sync gets more \
+         expensive, every publish waits on several of them, and because claims \
+         are nonce-serialized the per-claim cost becomes the delivery-throughput \
+         ceiling. Measured 13.5s vs 57.6s writer-job time for the same job kind \
+         at 29 MB vs 71 MB of client store. A steady climb here predicts the \
+         'deposits stop being claimed fast enough' symptom before users see it."
+    );
     describe_counter!(
         "miden_client_build_errors_total",
         "Failed attempts to build Miden client connection"
@@ -987,5 +1037,47 @@ mod tests {
             record_fallback_attempt(ProofKind::Claim, res2, 0.3),
             Err("nope")
         );
+    }
+
+    /// Every histogram we alert or capacity-plan on must render as real
+    /// `_bucket{le="…"}` series. Without an explicit bucket set the Prometheus
+    /// exporter falls back to rolling-summary quantiles, which cannot be
+    /// aggregated across replicas — a fleet-wide p95 computed from them is
+    /// simply wrong, and the degradation is silent.
+    #[test]
+    fn every_histogram_renders_prometheus_buckets() {
+        let recorder = super::prometheus_builder()
+            .expect("builder config must be valid")
+            .build_recorder();
+        let handle = recorder.handle();
+
+        // Record one observation per histogram through a LOCAL recorder, so
+        // this test neither depends on nor disturbs the process-wide one.
+        metrics::with_local_recorder(&recorder, || {
+            metrics::histogram!("miden_proof_duration_seconds", "kind" => "ger", "op" => "submit")
+                .record(1.5);
+            metrics::histogram!("rpc_request_duration_seconds", "method" => "eth_getLogs")
+                .record(0.02);
+            metrics::histogram!("miden_sync_state_duration_seconds").record(0.15);
+            metrics::histogram!(
+                "agglayer_writer_job_duration_seconds",
+                "kind" => "ger_insert",
+                "outcome" => "committed"
+            )
+            .record(12.0);
+        });
+
+        let rendered = handle.render();
+        for metric in [
+            "miden_proof_duration_seconds",
+            "rpc_request_duration_seconds",
+            "miden_sync_state_duration_seconds",
+            "agglayer_writer_job_duration_seconds",
+        ] {
+            assert!(
+                rendered.contains(&format!("{metric}_bucket")),
+                "{metric} rendered without buckets (exporter fell back to summary quantiles);                  add a set_buckets_for_metric entry in prometheus_builder(). Rendered:\n{rendered}"
+            );
+        }
     }
 }

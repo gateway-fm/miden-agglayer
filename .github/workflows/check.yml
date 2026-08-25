@@ -8,6 +8,14 @@ on:
       - opened
       - synchronize
 
+# CodeQL (actions/missing-workflow-permissions): without this, jobs inherit the
+# repository default GITHUB_TOKEN scope, which is far wider than anything here
+# needs. Every job in this workflow only reads the checked-out source — it builds,
+# lints, tests and inspects Cargo.toml — so read-only contents is sufficient.
+# Matches release.yml and e2e-l2l2.yml, which already declare exactly this.
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -22,3 +30,56 @@ jobs:
       - run: cargo check --workspace --features postgres --profile=release
       - run: make test-unit
       - run: make test-scripts
+
+      # SCA scanners report the LGPL arm of SPDX "A OR B" expressions as if it
+      # were the only option, and do not exclude target-gated crates that never
+      # compile. deny.toml records the actual elections (and why each reported
+      # crate is not a problem) so the policy is machine-checked here instead of
+      # re-derived by hand every time a scan runs.
+      - name: license policy (cargo-deny)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check licenses
+
+  # Blocks on an UNRESOLVED upstream API gap. It does NOT block on every vendor
+  # patch: the miden-agglayer one it was written for is RESOLVED (rc.6 restored
+  # read_let_num_leaves/is_ger_registered as public API and vendor/ is gone), so
+  # a blanket "any [patch.crates-io] fails" rule now only reports a stale fact.
+  #
+  # EXCEPTION (explicit, reviewed): the miden-client rc.1 vendor patch is
+  # permitted. It is a correctness fix, not an API un-gate — rc.1's foreign
+  # account fetch omits an "unchanged" vault, which the reconstruction path
+  # rebuilds as EMPTY, wedging every bridge-targeted transaction once the bridge
+  # vault holds its first locked native asset. It is forced to VaultFetch::Always
+  # and is byte-identical to the release otherwise. Remove the patch and the
+  # vendor copy when upstream fixes that, and drop it from the allow-list here.
+  upstream-api-gate:
+    name: "upstream API gate (miden-client vendor exception active)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: fail on an unresolved upstream API gap
+        run: |
+          rc=0
+          if ls -d vendor/miden-agglayer-* >/dev/null 2>&1; then
+            echo "::error::miden-agglayer is vendored again — that patch exists only to un-gate"
+            echo "::error::read_let_num_leaves/is_ger_registered. Upstream restored them in rc.6;"
+            echo "::error::re-vendoring means the API regressed and this must not merge."
+            rc=1
+          fi
+          # Every patched crate must be on the allow-list below.
+          patched="$(awk '/^\[patch\.crates-io\]/{f=1;next} /^\[/{f=0} f' Cargo.toml \
+                     | sed -e 's/#.*//' -e '/^[[:space:]]*$/d' \
+                     | cut -d= -f1 | tr -d '[:space:]')"
+          for crate in $patched; do
+            case "$crate" in
+              miden-client)
+                echo "::notice::allowed vendor exception: $crate (rc.1 unchanged-vault reconstruction fix)"
+                ;;
+              *)
+                echo "::error::unreviewed [patch.crates-io] entry: $crate — add it to the allow-list in this gate, with justification, or remove the patch."
+                rc=1
+                ;;
+            esac
+          done
+          exit $rc

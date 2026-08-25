@@ -84,6 +84,43 @@ BASE_PRIV_SKIP=$(counter synthetic_reconciler_private_skipped_total)
 BASE_FOREIGN_SKIP=$(counter claim_event_foreign_skipped_total)
 say "garbo baselines: private_skipped=$BASE_PRIV_SKIP foreign_skipped=$BASE_FOREIGN_SKIP"
 
+# ── cancellation safety net ──────────────────────────────────────────────────
+# Injected faults are real: a paused postgres, a disconnected node, a stopped
+# prover/proxy. The injectors restore their own faults on a clean exit, but a
+# SIGKILL to them — or a Ctrl-C / runner timeout on THIS script — leaves the
+# stack faulted and every later test on this machine runs against a crippled
+# system, which is how a chaos run contaminates the runs after it.
+#
+# Idempotent, best-effort, and installed BEFORE the first injector starts so
+# there is no window where a fault exists without a way back.
+CHAOS_CLEANUP_DONE=0
+chaos_cleanup() {
+    [ "$CHAOS_CLEANUP_DONE" = "1" ] && return 0
+    CHAOS_CLEANUP_DONE=1
+    say "cleanup: stopping injectors and reversing any live faults"
+    for pid in "${SEEDER_PID:-}" "${GARBO_PID:-}" "${WATCHDOG_PID:-}"; do
+        [ -n "$pid" ] || continue
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    done
+    docker unpause "${PROJECT}-agglayer-postgres-1" >/dev/null 2>&1 || true
+    docker unpause "${PROJECT}-postgres-1" >/dev/null 2>&1 || true
+    local net
+    net="$(docker inspect "$AGGLAYER_CONTAINER" \
+        --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null \
+        | awk '{print $1}')"
+    # Reconnect WITH the compose alias — a plain connect drops 'miden-node'
+    # name resolution and the stack stays functionally partitioned.
+    [ -n "$net" ] && docker network connect --alias miden-node "$net" \
+        "${PROJECT}-miden-node-1" >/dev/null 2>&1 || true
+    for c in tx-prover-1 miden-agglayer-1 miden-node-1 ntx-builder-1; do
+        docker start "${PROJECT}-$c" >/dev/null 2>&1 || true
+    done
+    say "cleanup: done (unpaused pg, reconnected node, ensured core services up)"
+}
+trap chaos_cleanup EXIT
+trap 'chaos_cleanup; exit 130' INT TERM
+
 # ── 2. STORM: chaos-seeder + chaos-garbo + mixed loadtest, concurrent ────────
 say "=== STORM: chaos-seeder (${CHAOS_DURATION}s) + chaos-garbo (${GARBO_DURATION}s) + mixed loadtest (N=$N) ==="
 PROJECT="$PROJECT" CHAOS_DURATION="$CHAOS_DURATION" CHAOS_LOG="$CHAOS_LOG" \
@@ -109,7 +146,19 @@ WATCHDOG_HEALS_FILE=/tmp/chaos-watchdog-heals; : > "$WATCHDOG_HEALS_FILE"
   declare -A seen
   while true; do
     sleep 30
-    for AK in "${PROJECT}-aggkit-1" "${PROJECT}-aggkit-l2b-1"; do
+    # ONLY the base aggkit is watched here. aggkit-l2b submits its GER
+    # injections to anvil-l2b (fixtures/aggkit-l2b-config.toml), NOT to this
+    # proxy — so the "unknown to the proxy" probe below is trivially true for
+    # every healthy L2B transaction, and the preserve-healer it would call
+    # likewise reads the BASE proxy database. Watching aggkit-l2b through the
+    # base proxy's transactions table therefore produced a heal decision from
+    # evidence about a different chain entirely, and let unrelated base GER
+    # activity satisfy an L2B "recovery" proof.
+    #
+    # Wiring an L2B-aware watchdog needs an L2B-side admission probe; until
+    # then, not watching it is the honest option — a silent wrong answer is
+    # worse than a missing one. Tracked as the L2B watchdog follow-up.
+    for AK in "${PROJECT}-aggkit-1"; do
       docker inspect "$AK" >/dev/null 2>&1 || continue
       loops=$(docker logs "$AK" --since 60s 2>&1 | grep -c 'already exists in monitoring DB' || true)
       [ "${loops:-0}" -ge 10 ] || continue
@@ -168,7 +217,7 @@ WATCHDOG_PID=$!
 say "=== mixed loadtest under storm (L1 ${N} split $((N / 2))/$((N - N / 2)), L2<->L2 $L2L2_FWD/$L2L2_BACK) ==="
 N_L1_FWD=$((N / 2)) N_L1_BACK=$((N - N / 2)) L2L2_FWD="$L2L2_FWD" L2L2_BACK="$L2L2_BACK" \
     MIX_VERIFY=0 ALLOW_LATE="$ALLOW_LATE" COMPOSE_PROJECT_NAME="$PROJECT" \
-    timeout 4800 "$SCRIPT_DIR/e2e-loadtest-mixed.sh" >/tmp/chaos-lt.out 2>&1
+    timeout "${CHAOS_LT_TIMEOUT:-9000}" "$SCRIPT_DIR/e2e-loadtest-mixed.sh" >/tmp/chaos-lt.out 2>&1
 LT_RC=$?
 say "mixed loadtest exited rc=$LT_RC"
 grep -aE "MIXED LOADTEST RESULT|forward ops|back ops|address clash|L1<->Miden rc" /tmp/chaos-lt.out | tail -6 || true
@@ -178,6 +227,11 @@ say "=== stopping injectors + restoring all faults ==="
 kill "$SEEDER_PID" 2>/dev/null || true; wait "$SEEDER_PID" 2>/dev/null || true
 kill "$GARBO_PID" 2>/dev/null || true;  wait "$GARBO_PID" 2>/dev/null || true
 kill "$WATCHDOG_PID" 2>/dev/null || true; wait "$WATCHDOG_PID" 2>/dev/null || true
+# CLEAR the PID variables now that these children are reaped. The EXIT trap
+# runs on the SUCCESS path too, and a reaped PID can already have been reused
+# by an unrelated process on this shared host — signalling it would be someone
+# else's outage caused by our cleanup.
+SEEDER_PID=""; GARBO_PID=""; WATCHDOG_PID=""
 WATCHDOG_HEALS=$(grep -c 'WATCHDOG:' "$WATCHDOG_HEALS_FILE" 2>/dev/null | head -1); WATCHDOG_HEALS=${WATCHDOG_HEALS:-0}
 # belt-and-suspenders restore in case a trap raced (correct container names)
 docker unpause "${PROJECT}-agglayer-postgres-1" >/dev/null 2>&1 || true
@@ -214,10 +268,74 @@ sleep "$POST_CHAOS_SETTLE"
 # verifier reads state that can predate the recovery — neither proves the stack
 # works AFTER the faults. Require one fresh deposit + one fresh withdrawal to
 # complete post-chaos before the soak may PASS.
-say "=== (pre-verdict) fresh two-way post-chaos operation (1 L1->Miden + 1 Miden->L1) ==="
+# Snapshot service state BEFORE the post-op: the loadtest calls
+# l2l2_ensure_stack, which brings missing services back UP. Checking
+# services-running only after that would credit the harness's own repair to the
+# system under test.
+POST_STORM_DOWN=""
+_L2B_OVERLAY=0
+[[ -f "$REPO/docker-compose.l2l2.yml" ]] && _L2B_OVERLAY=1
+# One snapshot rule for every service. The core loop used to be status-only
+# with a second inspect call (so a race rendered `svc=` instead of typed
+# evidence) and ignored the proxy's own healthcheck.
+_snapshot_service() {   # <service>  -> appends to POST_STORM_DOWN when not OK
+    local svc="$1" insp err st health
+    # ONE inspect. Two calls meant the first failure was labelled MISSING
+    # whatever the cause — absence, a daemon hiccup, permissions — so a
+    # transient docker error read as "the storm destroyed this container".
+    # Distinguish by the error text docker itself uses for absence.
+    insp=$(docker inspect \
+        -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+        "${PROJECT}-${svc}-1" 2>&1)
+    if [[ $? -ne 0 ]]; then
+        err="$insp"
+        if [[ "$err" == *"No such object"* || "$err" == *"no such container"* ]]; then
+            [[ "$2" == "required" ]] && POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=MISSING"
+        else
+            POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=INSPECT-FAILED"
+        fi
+        return
+    fi
+    read -r st health <<<"$insp"
+    case "$st:$health" in
+        running:healthy|running:none) ;;
+        running:starting) POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=health-starting" ;;
+        running:*)        POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=running-but-${health}" ;;
+        *)                POST_STORM_DOWN="$POST_STORM_DOWN ${svc}=${st}" ;;
+    esac
+}
+for svc in miden-agglayer aggkit bridge-service miden-node ntx-builder; do
+    _snapshot_service "$svc" required
+done
+# EVERY service l2l2_ensure_stack can bring back must be in this snapshot,
+# not just the ones checked in the final verdict: anything it repairs while
+# unobserved is a fault the storm caused and the harness silently undid.
+# (lib-l2l2.sh brings up anvil-l2b, aggkit-l2b, agglayer, bridge-service,
+# postgres-l2b and bridge-service-l2b.)
+# `l2l2_ensure_stack` runs `docker compose up` WITHOUT --no-deps, so it can
+# also restart anything those services depend on (anvil, postgres, tx-prover,
+# agglayer-postgres). Any of those repaired while unobserved is a storm-caused
+# fault the harness silently undid, so they belong in the snapshot too.
+for svc in aggkit-l2b bridge-service-l2b anvil-l2b postgres-l2b agglayer \
+           anvil postgres tx-prover agglayer-postgres validator; do
+    # Required only when the l2l2 overlay is in play; otherwise absence is
+    # simply "this stack does not run it".
+    if [[ "$_L2B_OVERLAY" == "1" ]]; then _snapshot_service "$svc" required
+    else _snapshot_service "$svc" optional; fi
+done
+say "=== (pre-verdict) fresh post-chaos operation (L1<->Miden + BOTH L2<->L2 directions) ==="
+say "    post-storm service state before any harness repair: ${POST_STORM_DOWN:-all running}"
+# BOTH L2<->L2 directions run after the last fault. Naming here is a trap worth
+# spelling out, because getting it wrong silently tests the wrong thing:
+# e2e-loadtest-mixed defines L2L2_FWD as L2B->Miden and L2L2_BACK as
+# Miden->L2B. The probe used to disable both, so an aggkit-l2b aggoracle left
+# frozen by the storm passed every gate; a first attempt then set FWD=1 while
+# describing it as Miden->L2B, which exercised the direction that was already
+# covered. Running both removes the ambiguity entirely — the L2B path is what
+# chaos breaks most often (#41/#87), and neither direction proves the other.
 POSTOP_RC=1
-if N_L1_FWD=1 N_L1_BACK=1 L2L2_FWD=0 L2L2_BACK=0 MIX_VERIFY=0 ALLOW_LATE="$ALLOW_LATE" \
-    COMPOSE_PROJECT_NAME="$PROJECT" timeout 1800 "$SCRIPT_DIR/e2e-loadtest-mixed.sh" \
+if N_L1_FWD=1 N_L1_BACK=1 L2L2_FWD=1 L2L2_BACK=1 MIX_VERIFY=0 ALLOW_LATE="$ALLOW_LATE" \
+    COMPOSE_PROJECT_NAME="$PROJECT" timeout "${CHAOS_POSTOP_TIMEOUT:-3600}" "$SCRIPT_DIR/e2e-loadtest-mixed.sh" \
     >/tmp/chaos-postop.out 2>&1; then
     POSTOP_RC=0
 fi
@@ -361,18 +479,55 @@ GARBO_VERDICT_OK=0
 # enabled garbo class fired (private always; foreign only when GARBO_FOREIGN=1).
 CHAOS_OK=0
 chaos_fired_ok "${FAULTS_DONE:-0}" "${GARBO_PRIVATE_FIRED:-0}" "${GARBO_FOREIGN:-1}" "${GARBO_FOREIGN_FIRED:-0}" && CHAOS_OK=1
-# (d) POST-CHAOS liveness (review 0814): a heal that failed, an exhausted heal
-# budget, a proxy that never regained health, or a fresh post-chaos op that did
-# not land — each independently vetoes PASS. All are persisted signals, so a
-# fault landing after the storm-phase load completed can no longer false-green.
+# (d) POST-CHAOS liveness (redesigned 2026-08-18, chaos-green): mid-storm heal
+# churn is EXPECTED — faults re-form the aggoracle wedge while injection runs,
+# and post-cf78a0e a "failed" heal is a soft-fail that leaves the service
+# RUNNING (2026-08-18 12:17 run: heal_fails=11 + budget exhausted, yet every
+# service up and the fresh op operationally green). Counting storm-phase heal
+# attempts as liveness failures made (d) structurally red. The truthful gate:
+#   - every stack service is RUNNING after the storm (a heal that failed HARD
+#     leaves one down — still caught),
+#   - the proxy is healthy,
+#   - the fresh two-way op lands (the positive end-to-end proof).
+# WATCHDOG_FAILED / BUDGET_EXHAUSTED stay in the summary as telemetry.
 WATCHDOG_FAILED=$(grep -c 'WATCHDOG-FAILED' "$WATCHDOG_HEALS_FILE" 2>/dev/null | head -1); WATCHDOG_FAILED=${WATCHDOG_FAILED:-0}
 BUDGET_EXHAUSTED=$(grep -c 'WATCHDOG-BUDGET-EXHAUSTED' "$WATCHDOG_HEALS_FILE" 2>/dev/null | head -1); BUDGET_EXHAUSTED=${BUDGET_EXHAUSTED:-0}
+SERVICES_DOWN=""
+for svc in miden-agglayer aggkit bridge-service miden-node ntx-builder; do
+    st=$(docker inspect -f '{{.State.Status}}' "${PROJECT}-${svc}-1" 2>/dev/null || echo missing)
+    [[ "$st" == "running" ]] || SERVICES_DOWN="$SERVICES_DOWN ${svc}=${st}"
+done
+# The L2B services are REQUIRED, not optional, whenever this stack runs the
+# l2l2 overlay — `docker inspect` failing means the container is GONE, which
+# the old `if` treated as "not applicable" and skipped. A destroyed aggkit-l2b
+# is the loudest possible failure, not an absent one.
+L2B_STACK=0
+[[ -f "$REPO/docker-compose.l2l2.yml" ]] && L2B_STACK=1
+for svc in aggkit-l2b bridge-service-l2b; do
+    if docker inspect "${PROJECT}-${svc}-1" >/dev/null 2>&1; then
+        st=$(docker inspect -f '{{.State.Status}}' "${PROJECT}-${svc}-1" 2>/dev/null)
+        [[ "$st" == "running" ]] || SERVICES_DOWN="$SERVICES_DOWN ${svc}=${st}"
+    elif [[ "$L2B_STACK" == "1" ]]; then
+        SERVICES_DOWN="$SERVICES_DOWN ${svc}=MISSING"
+    fi
+done
+# The post-storm snapshot is a VERDICT CONDITION, not commentary. The post-op
+# runs l2l2_ensure_stack, which brings missing services back up — so checking
+# only the post-op state credits the harness's own repair to the system under
+# test. A service still down after the storm's own heal window means chaos left
+# it down; that is a chaos failure regardless of what the repair achieved.
+# CHAOS_ALLOW_HARNESS_REPAIR=1 exists for deliberate teardown experiments and
+# must never be set in a release gate.
 POSTLIVE_OK=0
-[[ "$WATCHDOG_FAILED" == "0" && "$BUDGET_EXHAUSTED" == "0" && "${PROXY_HEALTHY:-0}" == "1" && "${POSTOP_RC:-1}" == "0" ]] && POSTLIVE_OK=1
+SELF_RECOVERED=1
+if [[ -n "$POST_STORM_DOWN" && "${CHAOS_ALLOW_HARNESS_REPAIR:-0}" != "1" ]]; then
+    SELF_RECOVERED=0
+fi
+[[ -z "$SERVICES_DOWN" && "$SELF_RECOVERED" == "1" && "${PROXY_HEALTHY:-0}" == "1" && "${POSTOP_RC:-1}" == "0" ]] && POSTLIVE_OK=1
 say "    (a) LEGIT completeness: $([[ $LEGIT_OK == 1 ]] && echo PASS || echo FAIL)  (verify_rc=$VC_RC store=$([[ ${STORE_OK:-0} == 1 ]] && echo CLEAN || echo DROP) locks=$LOCKS loadtest_rc=$LT_RC allow_late=$ALLOW_LATE)"
 say "    (b) GARBO containment:  $([[ $GARBO_VERDICT_OK == 1 ]] && echo PASS || echo FAIL)  (foreign_leak=$FOREIGN_LEAK private_leak=$PRIVATE_LEAK)"
 say "    (c) CHAOS actually fired: $([[ $CHAOS_OK == 1 ]] && echo PASS || echo FAIL)  (faults=${FAULTS_DONE:-0} private=${GARBO_PRIVATE_FIRED:-0} foreign=${GARBO_FOREIGN_FIRED:-0})"
-say "    (d) POST-CHAOS liveness: $([[ $POSTLIVE_OK == 1 ]] && echo PASS || echo FAIL)  (heal_fails=$WATCHDOG_FAILED budget_exhausted=$BUDGET_EXHAUSTED proxy_healthy=${PROXY_HEALTHY:-0} fresh_op_rc=${POSTOP_RC:-1})"
+say "    (d) POST-CHAOS liveness: $([[ $POSTLIVE_OK == 1 ]] && echo PASS || echo FAIL)  (services_down='${SERVICES_DOWN:-none}' proxy_healthy=${PROXY_HEALTHY:-0} fresh_op_rc=${POSTOP_RC:-1} [L1 both ways + L2B both ways]; self_recovered=$SELF_RECOVERED post-storm_before_repair='${POST_STORM_DOWN:-all running}'; telemetry: heal_softfails=$WATCHDOG_FAILED budget_exhausted=$BUDGET_EXHAUSTED)"
 if [[ "$LEGIT_OK" == "1" && "$GARBO_VERDICT_OK" == "1" && "$CHAOS_OK" == "1" && "$POSTLIVE_OK" == "1" ]]; then
     if [[ "$ALLOW_LATE" == "0" ]]; then
         say "  >>> CHAOS SOAK PASS — every legit event survived exact-block; every garbo input contained <<<"

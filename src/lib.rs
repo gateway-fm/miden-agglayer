@@ -14,6 +14,7 @@ pub mod expected_mint_tracker;
 pub mod faucet_ops;
 pub mod faucet_ownership_monitor;
 pub mod faucet_registry_reconciler;
+pub mod fee_policy;
 pub mod forged_mint_detector;
 pub mod ger;
 pub mod hex;

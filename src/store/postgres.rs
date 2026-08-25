@@ -162,6 +162,17 @@ impl Store for PgStore {
             // in `last_processed`. Preserve that progress on upgrade so events
             // emitted during the restart are not skipped. Safe/finalized must
             // never inherit a latest frontier.
+            //
+            //
+            // KNOWN GAP, filed as a follow-up (see docs): under strict H6 this
+            // inheritance hands the database a NON-ZERO evidence cursor for
+            // rows scanned before the policy existed, which satisfies
+            // `check_h6_backfill_invariant` and skips the backfill those rows
+            // need. Fixing it correctly needs durable cursor PROVENANCE (was
+            // this position inherited, or actually scanned?) plus a retirement
+            // transition once a real backfill has covered the prefix — a state
+            // machine with its own upgrade tests, not a flag. Deliberately not
+            // attempted inside this rc-migration PR.
             tx.execute(
                 "UPDATE l1_indexer_state \
                  SET evidence_tag = $1, finalized_scan_cursor = $2, updated_at = now() \

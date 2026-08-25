@@ -250,8 +250,27 @@ submit_back_claim() {
     local target_rpc="${9:-$L2B_RPC}"
     local tries="${BACK_CLAIM_TRIES:-30}" interval="${BACK_CLAIM_INTERVAL:-15}"
     local attempt pj mer rer smtL smtR out txh
+    local l1ger_500s=0 body api_code
     for attempt in $(seq 1 "$tries"); do
-        pj=$(curl -sf "$BRIDGE_SERVICE_URL/merkle-proof?deposit_cnt=$cnt&net_id=$MIDEN_NETWORK_ID" 2>/dev/null || true)
+        # FINDING #111: `curl -sf` collapsed the service's HTTP-500 code=2
+        # ("l1GER not found in the Storage" — the L1-GER index is behind the
+        # L2-GER view, the claimtxman-starvation signature) into "proof not
+        # ready yet", so the whole 450s retry budget silently masked a wedged
+        # bridge-service as slow certs (cycles 1-2). Classify by the API's
+        # NUMERIC code field (no error-string matching) and fail FAST after 4
+        # consecutive occurrences with the real cause.
+        body=$(curl -s "$BRIDGE_SERVICE_URL/merkle-proof?deposit_cnt=$cnt&net_id=$MIDEN_NETWORK_ID" 2>/dev/null || true)
+        api_code=$(echo "$body" | python3 -c "import json,sys; print(json.load(sys.stdin).get('code',''))" 2>/dev/null || true)
+        if [[ "$api_code" == "2" ]]; then
+            l1ger_500s=$((l1ger_500s + 1))
+            if (( l1ger_500s >= 4 )); then
+                echo "FATAL-CAUSE: bridge-service /merkle-proof deposit_cnt=$cnt returned API code=2 (l1GER missing from its storage) ${l1ger_500s}x consecutively — L1-GER index is behind its own L2-GER view (claimtxman nonce-divergence starvation, FINDING #111). This is a bridge-service wedge, NOT slow certs. Heal: scripts/bridge-claimtxman-heal.sh" >&2
+                return 2
+            fi
+            sleep "$interval"; continue
+        fi
+        l1ger_500s=0
+        pj=$(echo "$body" | python3 -c "import json,sys; d=json.load(sys.stdin); import sys as s; s.exit(1) if 'proof' not in d else print(json.dumps(d))" 2>/dev/null || true)
         if [[ -n "$pj" ]]; then
             mer=$(echo "$pj" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['main_exit_root'])" 2>/dev/null || true)
             rer=$(echo "$pj" | python3 -c "import json,sys; print(json.load(sys.stdin)['proof']['rollup_exit_root'])" 2>/dev/null || true)
@@ -670,6 +689,72 @@ _pf_sync_lag() {
     fi
 }
 
+# FINDING #111 — the sync.status 'synced' flag is the synchronizer's own
+# self-report, refreshed only when its (possibly starved) iteration runs, so it
+# reads synced=true THROUGH the claimtxman-starvation wedge (_pf_sync_lag
+# false-PASSed at cycle-1's chaos preflight while the L1-GER index was 2700
+# blocks behind). This probe checks the harmful state DIRECTLY: an L2-observed
+# GER (network_id=1 row) older than the 2 newest with NO matching L1 row means
+# /merkle-proof is already 500ing for every net-1 deposit — Miden->L2B claims
+# are impossible regardless of what sync.status claims.
+# L1-GER consistency: READABILITY ONLY. The consistency VERDICT is retired.
+#
+# This check tried to answer "can bridge-service serve /merkle-proof for net-1
+# deposits?" (the #111 starvation shape). Three successive attempts modelled the
+# wrong thing:
+#   1. a join over all rows with a newest-N rank grace — rank is not age, small
+#      populations were swallowed whole, and growth short-circuited to PASS;
+#   2. an id-based identity rule across probes — defeated by reorg
+#      delete-and-replay, since the pinned service's Reset cascade-deletes
+#      exit_root rows and ids are sequence-backed;
+#   3. the synchronizer's ROOT-HYDRATION predicate (`allowed AND block_id > 0`,
+#      empty exit_roots) — which is the background work queue, NOT the request
+#      selector. With FinalizedGEREnabled the endpoint serves from the single
+#      LATEST TRUSTED row (GetLatestTrustedExitRoot, ordered by id DESC), so a
+#      historical orphan beneath a newer hydrated row makes this check red a
+#      stack the endpoint serves perfectly well.
+#
+# Each attempt replaced one false verdict with another, in both directions. The
+# property is real and worth checking, but it can only be checked by evaluating
+# the row `GetClaimProof` would actually SELECT under the deployment's own
+# config — that is a piece of work with its own upstream-pinning, not something
+# to keep guessing at inside an unrelated PR. Filed:
+# docs/development/followups-h6-evidence-provenance.md.
+#
+# What remains is the part that is unambiguously true and strictly better than
+# leaving it out: the tables must be READABLE. An unreadable bridge_db is a
+# broken stack, and reporting that is a fact rather than a model. It does NOT
+# claim proof-serving consistency, and says so.
+_pf_l1ger_readable() {
+    local pg="${1:-${COMPOSE_PROJECT_NAME}-postgres-1}"
+    local out rc=0
+    # `|| rc=$?` so a failure cannot escape the real entrypoints' `set -e`
+    # before the typed verdict line is printed.
+    out=$(timeout 30 docker exec "$pg" psql -U bridge_user -d bridge_db \
+        -v ON_ERROR_STOP=1 -tAX -c \
+        "SELECT count(*) FILTER (WHERE network_id = 0) || '|' ||
+                count(*) FILTER (WHERE network_id = 1) FROM sync.exit_root" 2>&1) || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        _pf_fail "bridge-service exit_root table is NOT READABLE in $pg (rc=$rc) — psql: ${out//$'\n'/ }"
+        return
+    fi
+    out=$(printf '%s' "$out" | tr -d '[:space:]')
+    local n_l1="${out%%|*}" n_l2="${out##*|}"
+    if [[ ! "$n_l1" =~ ^[0-9]+$ || ! "$n_l2" =~ ^[0-9]+$ ]]; then
+        _pf_fail "bridge-service exit_root count returned '$out', not a pair of numbers"
+    elif [[ "$n_l1" -eq 0 && "$n_l2" -eq 0 ]]; then
+        # NOT a failure. sync.exit_root only gains rows when GER events occur,
+        # and the pinned synchronizer walks eventless ranges perfectly happily —
+        # a caught-up quiet stack legitimately has zero rows. The old "dead
+        # indexer" reading was a population veto this check has no basis to
+        # make; whether the synchronizer is alive is asserted separately by the
+        # freshness and sync-lag checks.
+        _pf_pass "bridge-service exit_root readable and empty on both networks (zero indexed rows; this check does not establish WHY — the synchronizer's liveness is asserted by the freshness/lag checks)"
+    else
+        _pf_pass "bridge-service exit_root readable (L1 $n_l1 / L2 $n_l2 rows). NOTE: proof-serving consistency is NOT asserted here — see docs/development/followups-h6-evidence-provenance.md"
+    fi
+}
+
 l2l2_validate_stack() {
     _PF_FAILS=0
     step "PREFLIGHT: validating l2l2 stack (project=$COMPOSE_PROJECT_NAME)"
@@ -743,7 +828,12 @@ l2l2_validate_stack() {
     _pf_bridge_fresh "${COMPOSE_PROJECT_NAME}-bridge-service-l2b-1" "L2B bridge-service"
     # net 0/1 on the base bridge_db (postgres); net 2 on the isolated L2B bridge_db (postgres-l2b)
     _pf_sync_lag 0 "$L1_RPC"  "L1 (Miden svc)"  "${COMPOSE_PROJECT_NAME}-postgres-1"
+    # Network 1 (Miden, via the proxy's synthetic RPC) was the one network never
+    # checked: a stalled net-1 synchronizer leaves Miden->anywhere deposits
+    # never reaching ready_for_claim while nets 0 and 2 look perfectly healthy.
+    _pf_sync_lag 1 "$L2_RPC"  "Miden (Miden svc)" "${COMPOSE_PROJECT_NAME}-postgres-1"
     _pf_sync_lag 2 "$L2B_RPC" "L2B (L2B svc)"   "${COMPOSE_PROJECT_NAME}-postgres-l2b-1"
+    _pf_l1ger_readable "${COMPOSE_PROJECT_NAME}-postgres-1"
 
     # (e) aggkit-l2b aggoracle alive — GER injection into L2B GER. A quiet stack
     # legitimately has no RECENT inject (aggoracle only fires on a new L1 GER), so

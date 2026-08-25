@@ -191,6 +191,14 @@ pub struct InMemoryStore {
     // the legacy `finalized_scan_cursor` column for upgrade-safe provenance.
     l1_evidence_cursor: RwLock<u64>,
 
+    // Test-only fault injection for cursor READS. Exists because "the read
+    // failed" and "the cursor is 0" must lead to different behaviour: the
+    // latter is a fresh database, the former is an unknown state, and treating
+    // one as the other restarts the L1 evidence scan at the head and abandons
+    // every block of evidence below it.
+    #[cfg(test)]
+    fail_l1_evidence_cursor_reads: RwLock<bool>,
+
     // Canonical EvidenceTag that produced the persisted selected-scan state.
     l1_evidence_policy: RwLock<Option<String>>,
 
@@ -272,10 +280,20 @@ impl InMemoryStore {
             reconcile_cursor: RwLock::new(0),
             nonce_ledger_rebuilt: RwLock::new(false),
             l1_evidence_cursor: RwLock::new(0),
+            #[cfg(test)]
+            fail_l1_evidence_cursor_reads: RwLock::new(false),
             l1_evidence_policy: RwLock::new(None),
             tx_note_links: RwLock::new(HashMap::new()),
             note_tx_links: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Test-only: make every `get_l1_evidence_cursor` call fail, so callers can
+    /// be asserted to distinguish "the cursor read failed" from "the cursor is
+    /// 0" (see `fail_l1_evidence_cursor_reads`).
+    #[cfg(test)]
+    pub fn fail_l1_evidence_cursor_reads(&self, fail: bool) {
+        *self.fail_l1_evidence_cursor_reads.write() = fail;
     }
 
     /// The claim-lock clock: `Instant::now()`, plus the test-only forward skew.
@@ -531,6 +549,10 @@ impl Store for InMemoryStore {
     // ── Selected L1 evidence scan ────────────────────────────────
 
     async fn get_l1_evidence_cursor(&self) -> anyhow::Result<u64> {
+        #[cfg(test)]
+        if *self.fail_l1_evidence_cursor_reads.read() {
+            anyhow::bail!("injected failure: cannot read the L1 evidence cursor");
+        }
         Ok(*self.l1_evidence_cursor.read())
     }
 

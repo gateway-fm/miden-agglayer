@@ -1,7 +1,7 @@
 use crate::accounts_config::AccountsConfig;
 use alloy::primitives::Address;
-use miden_base_agglayer::{EthAddress, EthEmbeddedAccountId};
 use miden_protocol::account::AccountId;
+use miden_standards::interop::eth::{EthAddress, EthEmbeddedAccountId};
 
 pub fn is_miden_compatible_address(address: Address) -> bool {
     // The canonical EthEmbeddedAccountId encoding embeds AccountId as:

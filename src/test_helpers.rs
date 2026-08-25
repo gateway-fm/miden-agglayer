@@ -110,3 +110,57 @@ pub async fn offline_miden_client_lib() -> crate::miden_client::MidenClientLib {
         .await
         .expect("offline MidenClientLib must build without a node")
 }
+
+/// Build an rpc `TransactionRecord` fixture via the proto conversion path —
+/// the ONLY public constructor in miden-client 0.16.0-rc.1
+/// (`consumed_note_refs` is `pub(crate)` upstream). Mirrors production wire
+/// shape exactly: input notes are HEADERLESS (the rc.1 decoder drops headers)
+/// and public input-note identities arrive as explicit
+/// `(nullifier, note_id)` refs.
+///
+/// Only compiled for the crate's own test harness: the proto module is public
+/// only under miden-client's `testing` feature, which our dev-dependencies
+/// enable.
+#[cfg(test)]
+pub fn test_tx_record(
+    block: u32,
+    account: AccountId,
+    initial: miden_protocol::Word,
+    final_state: miden_protocol::Word,
+    nullifiers: Vec<miden_protocol::note::Nullifier>,
+    consumed_note_refs: Vec<(
+        miden_protocol::note::Nullifier,
+        miden_protocol::note::NoteId,
+    )>,
+) -> miden_client::rpc::domain::transaction::TransactionRecord {
+    use miden_client::rpc::generated as proto;
+    let header = proto::transaction::TransactionHeader {
+        transaction_id: None,
+        account_id: Some(account.into()),
+        initial_state_commitment: Some(initial.into()),
+        final_state_commitment: Some(final_state.into()),
+        input_notes: nullifiers
+            .into_iter()
+            .map(|n| proto::transaction::InputNoteCommitment {
+                nullifier: Some(n.as_word().into()),
+                header: None,
+            })
+            .collect(),
+        output_notes: vec![],
+    };
+    let record = proto::rpc::TransactionRecord {
+        block_num: block,
+        header: Some(header),
+        output_note_proofs: vec![],
+        consumed_note_refs: consumed_note_refs
+            .into_iter()
+            .map(|(n, id)| proto::rpc::ConsumedNoteRef {
+                nullifier: Some(n.as_word().into()),
+                note_id: Some(id.into()),
+            })
+            .collect(),
+    };
+    record
+        .try_into()
+        .expect("proto test transaction record converts to the domain type")
+}

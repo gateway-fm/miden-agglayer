@@ -81,6 +81,11 @@ test-scripts: ## Syntax-check + run the shell guard test harnesses (no docker ne
 	bash -n scripts/test-verify-completeness-substitution.sh
 	python3 -m py_compile scripts/lib-verify-completeness.py
 	TOOL_BIN=target/release/bridge-out-tool bash scripts/test-verify-completeness-substitution.sh
+	# Verdict predicates that decide whether a gate passes. This one returned
+	# OK for an all-zero operational tuple — a run that did no work certifying
+	# itself — so it runs here rather than only inside a docker-bound e2e.
+	bash -n scripts/test-chaos-verdict.sh
+	bash scripts/test-chaos-verdict.sh
 
 .PHONY: test-e2e
 test-e2e: ## Spin up docker stack, run E2E tests, tear down (fully self-contained)
@@ -205,13 +210,18 @@ MIDEN_NODE_GIT_URL := https://github.com/0xMiden/node.git
 # node/client boundary with no Cargo.lock-alignment hack. fixtures/patches/0001
 # is not applied (the node-store callback-vault-key bug is fixed upstream), and
 # the AggLayer network id is a runtime storage slot again, so no vendor patch.
-MIDEN_NODE_GIT_REF := v0.16.0-alpha.2
+MIDEN_NODE_GIT_REF := v0.16.0-rc.1
 
 E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
 
 # L2<->L2 overlay (task #25): base stack + the second-rollup overlay. The
 # generated configs it mounts must be produced by `make gen-l2b-configs` first.
-L2L2_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml --env-file fixtures/.env
+# WITH_WEB3SIGNER=1 adds the remote-custody overlay to every l2l2 compose
+# invocation (up/registration/down all inherit it). The caller must provision
+# keys (scripts/gen-web3signer-keys.sh) and export fixtures/web3signer-keys.env
+# BEFORE `make e2e-l2l2-up` — the overlay interpolates AGGLAYER_SIGNER_KEYS.
+WEB3SIGNER_COMPOSE_EXTRA := $(if $(WITH_WEB3SIGNER),-f docker-compose.web3signer.yml,)
+L2L2_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml $(WEB3SIGNER_COMPOSE_EXTRA) --env-file fixtures/.env
 
 .PHONY: miden-node-image-coords
 miden-node-image-coords: ## Print the git URL + ref the miden-node image is built from

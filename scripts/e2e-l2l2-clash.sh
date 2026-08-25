@@ -188,15 +188,22 @@ pass "ClaimEvent pinned: net0 gi=$COL_GI_NET0 (rows=$CR0), net2 gi=$COL_GI_NET2 
 evidence_record "leg3" clash Miden claim "" "" "$COL" "isolated+minted" \
     "net0 faucet=$COL_FID_NET0 bal=$CB0 gi=$COL_GI_NET0 ; net2 faucet=$COL_FID_NET2 bal=$CB2 gi=$COL_GI_NET2"
 
-# Negative control: OPT0 (from the forward leg) exists ONLY as an origin-network-2
-# asset — a lookup under origin_network=0 must yield NOTHING, and exactly one row.
-OPT0_NET0_ROWS=$(pgq "SELECT COUNT(*) FROM faucet_registry WHERE encode(origin_address,'hex') = '${OPT0_HEX}' AND origin_network = 0;")
-[[ "$OPT0_NET0_ROWS" == "0" ]] \
-    || fail "(OPT0, net 0) unexpectedly resolves to a faucet ($OPT0_NET0_ROWS rows) — keying broken"
-OPT0_ALL_ROWS=$(pgq "SELECT COUNT(*) FROM faucet_registry WHERE encode(origin_address,'hex') = '${OPT0_HEX}';")
-[[ "$OPT0_ALL_ROWS" == "1" ]] \
-    || fail "expected exactly 1 faucet row for OPT0's address, got $OPT0_ALL_ROWS"
-pass "negative control: (OPT0, net 0) -> no faucet; OPT0 address has exactly 1 row (net 2)"
+# Negative control: OPT0 (from the forward leg) is an origin-network-2 asset, so
+# its faucet must not be reachable under origin_network=0.
+#
+# NOT "the address has exactly one row": both anvils share dev keys, so equal
+# deployer nonces produce the SAME address on L1 and L2B and an unrelated L1 token
+# can legitimately hold it (observed: TT on net 0 vs OPT0 on net 2). The real
+# invariant is per-(address,network) uniqueness plus distinct faucet identities.
+OPT0_NET2_FID=$(pgq "SELECT lower(faucet_id) FROM faucet_registry WHERE encode(origin_address,'hex') = '${OPT0_HEX}' AND origin_network = ${L2B_NETWORK_ID};")
+[[ -n "$OPT0_NET2_FID" ]] || fail "no faucet_registry row for (OPT0, net $L2B_NETWORK_ID)"
+OPT0_NET0_FID=$(pgq "SELECT lower(faucet_id) FROM faucet_registry WHERE encode(origin_address,'hex') = '${OPT0_HEX}' AND origin_network = 0;")
+[[ "$OPT0_NET0_FID" != "$OPT0_NET2_FID" ]] \
+    || fail "(OPT0, net 0) resolves to the SAME faucet as net $L2B_NETWORK_ID ($OPT0_NET2_FID) — network is not part of the registry key"
+OPT0_DUPES=$(pgq "SELECT COUNT(*) FROM (SELECT origin_network FROM faucet_registry WHERE encode(origin_address,'hex') = '${OPT0_HEX}' GROUP BY origin_network HAVING COUNT(*) > 1) d;")
+[[ "$OPT0_DUPES" == "0" ]] \
+    || fail "faucet_registry holds duplicate rows for OPT0's address within a single origin_network ($OPT0_DUPES network(s))"
+pass "negative control: (OPT0, net 0) is not this faucet; one row per (address, network) for OPT0's address"
 
 log "======================================================================"
 log "  L2<->L2 CLASH PASS — one address, two origins, two isolated faucets"

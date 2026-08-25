@@ -1,3 +1,5 @@
 # Exclude generated TOML from `taplo fmt --check` (make lint): miden-protocol
-# 0.16's build.rs emits miden-project.toml files under target/.
-exclude = ["target/**"]
+# 0.16's build.rs emits miden-project.toml files under target/. vendor/ is the
+# temporary byte-faithful miden-agglayer patch — upstream formatting stays as
+# released.
+exclude = ["target/**", "vendor/**"]

@@ -512,6 +512,23 @@ fn check_h6_evidence_source(command: &Command) -> Result<(), String> {
 /// evaluated only after the store exists (well past the point where non-Copy
 /// command fields such as `miden_store_dir` have already been moved out), so the
 /// whole struct can no longer be borrowed.
+/// Wall-clock ceiling for the synchronous L1 evidence catch-up that the
+/// strict-H6 startup readiness barrier performs.
+///
+/// Default 300s covers a normal boot (cursor already current: a couple of RPCs). A production backfill over millions of
+/// L1 blocks needs a larger value — it is deliberately an explicit operator
+/// decision rather than an unbounded wait, because on a startup path an
+/// unbounded wait is indistinguishable from a hung process.
+fn l1_evidence_catch_up_budget() -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 300;
+    let secs = std::env::var("L1_EVIDENCE_CATCHUP_BUDGET_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
 fn check_h6_backfill_invariant(
     reject_unverified_ger: bool,
     require_hardening: bool,
@@ -1095,6 +1112,32 @@ async fn main() -> anyhow::Result<()> {
             result.logs_created,
         );
 
+        // FINDING #113 is enforced on the SERVING path, not here.
+        //
+        // An earlier version of this fix ran the L1 evidence catch-up at the end
+        // of the restore one-shot so the proxy would boot already-ready. That is
+        // a latency optimisation, and it came at a cost base does not pay: the
+        // catch-up WRITES evidence (set_ger_exit_roots marks rows verified) and
+        // advances the shared cursor. Base's restore never touches the evidence
+        // index, so a restore accidentally pointed at the wrong L1 leaves the
+        // index correctable; with the writer here it does not — B-evidence is
+        // already durable and strict-H6-authorizing before the operator can fix
+        // the configuration.
+        //
+        // Binding evidence to its source would make the writer safe, but that
+        // needs a provenance state machine of its own (see
+        // docs/development/followups-h6-evidence-provenance.md). Until then the
+        // honest trade is to keep restore out of the evidence business
+        // entirely: the strict-H6 readiness barrier on the serving path already
+        // runs the same bounded catch-up BEFORE binding the listener, so the
+        // window #113 identified (serving while blind to L1) stays closed. The
+        // only difference is that the catch-up happens on the next boot instead
+        // of at the end of this one.
+        tracing::info!(
+            "restore: complete. L1 evidence catch-up runs on the next boot — under strict H6 the \
+             serving path blocks on it before accepting traffic (#113)."
+        );
+
         client.shutdown()?;
         return Ok(());
     }
@@ -1204,7 +1247,69 @@ async fn main() -> anyhow::Result<()> {
                 }
                 // Use the one startup-validated frontier for the entire scan.
                 indexer = indexer.with_evidence_tag(state.l1_evidence_tag);
-                match indexer.spawn() {
+
+                // READINESS BARRIER (#113). Under strict H6 the indexer is the
+                // sole evidence source, and a GER injection that arrives while
+                // it is still catching up is refused — which aggkit's
+                // ethtxmanager turns into a PERMANENT freeze, because its
+                // deterministic-ID dedup never re-sends. Spawning the ticker
+                // and binding the listener in the same breath is therefore
+                // fail-OPEN for as long as the backlog takes to drain.
+                //
+                // Catch up synchronously BEFORE serving, and refuse to serve if
+                // we cannot. Cost on a healthy boot is a couple of RPCs (the
+                // cursor is already current); the expensive case is exactly the
+                // one where serving early would be wrong. This is the ONLY
+                // place the catch-up runs: `--restore` deliberately defers it
+                // to the next boot rather than writing L1-derived evidence
+                // itself (see the restore path and
+                // docs/development/followups-h6-evidence-provenance.md).
+                let mut barrier_reached: Option<u64> = None;
+                if strict_h6 {
+                    let budget = l1_evidence_catch_up_budget();
+                    match indexer.catch_up_to_head(budget).await {
+                        Ok(outcome) if outcome.converged => {
+                            // Hand the barrier's position to the ticker below:
+                            // `spawn()` would otherwise re-resolve the start
+                            // block, and --l1-indexer-from-block outranks the
+                            // stored cursor, rewinding the scan we just
+                            // completed and replaying the whole range in front
+                            // of every new GER.
+                            barrier_reached = Some(outcome.last_processed);
+                            tracing::info!(
+                                l1_evidence_block = outcome.last_processed,
+                                passes = outcome.passes,
+                                "L1 evidence index is current — strict-H6 readiness barrier passed"
+                            );
+                        }
+                        Ok(outcome) => anyhow::bail!(
+                            "strict H6 GER corroboration is enabled, but the L1 evidence index did \
+                             not catch up within {}s: indexed to block {}, L1 head {} ({} blocks \
+                             behind{}). Serving now would refuse GER injections for every root \
+                             above block {} and aggkit would freeze permanently on the first \
+                             refusal. Raise L1_EVIDENCE_CATCHUP_BUDGET_SECS for a large backfill, \
+                             or fix the L1 endpoint.",
+                            budget.as_secs(),
+                            outcome.last_processed,
+                            outcome.head,
+                            outcome.lag(),
+                            if outcome.skipped_no_frontier {
+                                "; no evidence frontier configured — set --l1-indexer-from-block"
+                            } else {
+                                ""
+                            },
+                            outcome.last_processed,
+                        ),
+                        Err(e) => anyhow::bail!(
+                            "strict H6 GER corroboration is enabled, but the L1 evidence catch-up \
+                             failed: {e}. Refusing to serve with an incomplete evidence index — \
+                             every GER above the indexed cursor would be rejected, and aggkit \
+                             turns the first refusal into a permanent freeze."
+                        ),
+                    }
+                }
+
+                match indexer.spawn_resuming_at(barrier_reached) {
                     Ok(shutdown_tx) => {
                         // The indexer runs for the lifetime of the tokio
                         // runtime; when `main` returns, the runtime tears

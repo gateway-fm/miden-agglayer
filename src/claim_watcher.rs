@@ -273,10 +273,10 @@ mod tests {
     use super::*;
     use crate::store::memory::InMemoryStore;
     use miden_base_agglayer::{
-        ClaimNoteStorage, EthAddress, EthAmount, ExitRoot, GlobalIndex, LeafData, MetadataHash,
-        ProofData, SmtNode,
+        ClaimNoteStorage, ExitRoot, GlobalIndex, LeafData, MetadataHash, ProofData, SmtNode,
     };
     use miden_protocol::Felt;
+    use miden_standards::interop::eth::{EthAddress, EthAmount};
     use std::sync::Arc as StdArc;
 
     fn known_storage() -> NoteStorage {

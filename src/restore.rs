@@ -52,6 +52,7 @@ use crate::store::Store;
 use miden_base_agglayer::UpdateGerNote;
 use miden_client::store::{InputNoteRecord, NoteFilter};
 use miden_protocol::account::AccountId;
+use miden_protocol::block::BlockNumber;
 use miden_protocol::note::{NoteAttachments, NoteDetails, NoteId, NoteMetadata, Nullifier};
 use sha3::{Digest, Keccak256};
 use std::sync::Arc;
@@ -764,7 +765,6 @@ async fn scan_bridge_out_bodies(
     to_block: u32,
 ) -> anyhow::Result<RecoveredBridgeOuts> {
     use miden_client::rpc::domain::note::FetchedNote;
-    use miden_protocol::block::BlockNumber;
     let claim_root = miden_base_agglayer::ClaimNote::script().root();
     let ger_root = UpdateGerNote::script_root();
     let mut by_id = std::collections::HashMap::new();
@@ -932,8 +932,6 @@ async fn restore_bridge_replay(
     mut recovered: RecoveredBridgeOuts,
     to_block: u32,
 ) -> anyhow::Result<(Vec<ReplayBridgeOut>, Vec<ReplayClaim>)> {
-    use miden_protocol::block::BlockNumber;
-
     let txs = rpc
         .sync_transactions(
             BlockNumber::from(0u32),
@@ -1001,12 +999,21 @@ async fn recover_erased_bridge_inputs(
     let mut missing: Vec<NoteId> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for (_, _, tx) in ordered_account_transactions(txs, bridge_id)? {
+        // rc.1: the wire decoder DROPS input-note headers; the node instead
+        // returns explicit (nullifier, note_id) refs for every public input —
+        // including erased notes. Headers are still honoured when present
+        // (older fixtures), refs are the production path.
         for input in tx.transaction_header.input_notes().iter() {
             if let Some(header) = input.header() {
                 let id = header.id();
                 if !by_id.contains_key(&id) && !claims_by_id.contains_key(&id) && seen.insert(id) {
                     missing.push(id);
                 }
+            }
+        }
+        for (_nullifier, id) in tx.trusted_consumed_note_refs() {
+            if !by_id.contains_key(&id) && !claims_by_id.contains_key(&id) && seen.insert(id) {
+                missing.push(id);
             }
         }
     }
@@ -1102,11 +1109,17 @@ fn build_bridge_replay(
     } = recovered;
     let mut replay = Vec::new();
     for (block, order, tx) in ordered_account_transactions(txs, bridge_id)? {
+        // rc.1: headers are absent on wire-decoded inputs; the tx's explicit
+        // (nullifier -> note_id) refs are the production identity source, with
+        // the scan-recovered nullifier map as the final fallback.
+        let tx_refs: std::collections::HashMap<Nullifier, NoteId> =
+            tx.trusted_consumed_note_refs().collect();
         for (within_tx_pos, input) in tx.transaction_header.input_notes().iter().enumerate() {
             let within_tx_pos = within_tx_pos as u32;
             let id = input
                 .header()
                 .map(|header| header.id())
+                .or_else(|| tx_refs.get(&input.nullifier()).copied())
                 .or_else(|| id_by_nullifier.get(&input.nullifier()).copied());
             let Some(id) = id else { continue };
             let Some(body) = by_id.remove(&id) else {
@@ -1116,6 +1129,45 @@ fn build_bridge_replay(
                 && header.details_commitment() != body.details.commitment()
             {
                 anyhow::bail!("restore: NoteId {id} body/transaction commitment mismatch");
+            }
+            // BIND the resolved id back to the input it was resolved FOR.
+            // Upstream's `trusted_consumed_note_refs` only checks that each
+            // ref's NULLIFIER is one this transaction consumed; it never checks
+            // that the paired note id is the note that nullifier belongs to.
+            // Two refs whose ids are SWAPPED therefore both survive that
+            // filter, and since the id decides which body lands at which
+            // `within_tx_pos`, a swap silently REORDERS bridge-outs — deposit
+            // counts and global indexes shift while every cardinality check
+            // stays green.
+            //
+            // `id_by_nullifier` is an independent pairing: the block walk built
+            // it from each fetched note's OWN id and OWN derived nullifier
+            // (`Note::nullifier()`), not from the transaction's refs. Where the
+            // two sources overlap they must agree.
+            // The scan inserts `by_id[id]` and `id_by_nullifier[nullifier]` in
+            // the SAME step, from the same fetched note — so a body resolved
+            // here implies the scan holds that note's true nullifier binding.
+            // Both a mismatch and an ABSENCE therefore prove the id we resolved
+            // belongs to a different nullifier than this input: the `if let
+            // Some` form let the absence case through, which is exactly how a
+            // B2AGG ref swapped with a CLAIM ref would slip past (its nullifier
+            // is in the CLAIM map, not this one).
+            match id_by_nullifier.get(&input.nullifier()) {
+                Some(scanned_id) if *scanned_id == id => {}
+                Some(scanned_id) => anyhow::bail!(
+                    "restore: input nullifier {} resolves to NoteId {id} via the transaction's \
+                     consumed-note refs but to NoteId {scanned_id} via the node block scan. \
+                     Refusing to replay: a mismatched reference reorders bridge-outs and shifts \
+                     deposit counts.",
+                    input.nullifier(),
+                ),
+                None => anyhow::bail!(
+                    "restore: a B2AGG body was resolved for NoteId {id}, but the node block scan \
+                     holds no B2AGG note for input nullifier {} — the scan records id and \
+                     nullifier together, so this proves the resolved reference belongs to a \
+                     different note. Refusing to replay.",
+                    input.nullifier(),
+                ),
             }
             replay.push(ReplayBridgeOut {
                 id,
@@ -1147,10 +1199,13 @@ fn build_claim_replay(
 ) -> anyhow::Result<Vec<ReplayClaim>> {
     let mut replay = Vec::new();
     for (block, _order, tx) in ordered_account_transactions(txs, bridge_id)? {
+        let tx_refs: std::collections::HashMap<Nullifier, NoteId> =
+            tx.trusted_consumed_note_refs().collect();
         for input in tx.transaction_header.input_notes().iter() {
             let id = input
                 .header()
                 .map(|header| header.id())
+                .or_else(|| tx_refs.get(&input.nullifier()).copied())
                 .or_else(|| claim_id_by_nullifier.get(&input.nullifier()).copied());
             let Some(id) = id else { continue };
             let Some(body) = claims_by_id.remove(&id) else {
@@ -1160,6 +1215,28 @@ fn build_claim_replay(
                 && header.details_commitment() != body.details.commitment()
             {
                 anyhow::bail!("restore: CLAIM NoteId {id} body/transaction commitment mismatch");
+            }
+            // Same binding check as `build_bridge_replay`: where the node block
+            // scan independently knows which note id owns this nullifier, the
+            // transaction's ref must agree, so a mismatched reference cannot
+            // attach the wrong CLAIM body to this consumption.
+            // Same reasoning as build_bridge_replay: the CLAIM scan inserts
+            // body and nullifier binding together, so absence is as conclusive
+            // as a mismatch.
+            match claim_id_by_nullifier.get(&input.nullifier()) {
+                Some(scanned_id) if *scanned_id == id => {}
+                Some(scanned_id) => anyhow::bail!(
+                    "restore: CLAIM input nullifier {} resolves to NoteId {id} via the \
+                     transaction's consumed-note refs but to NoteId {scanned_id} via the node \
+                     block scan — refusing to replay a mismatched reference",
+                    input.nullifier(),
+                ),
+                None => anyhow::bail!(
+                    "restore: a CLAIM body was resolved for NoteId {id}, but the node block scan \
+                     holds no CLAIM note for input nullifier {} — the resolved reference belongs \
+                     to a different note. Refusing to replay.",
+                    input.nullifier(),
+                ),
             }
             // Only the consumption BLOCK is kept: live claim records carry no
             // tx order (see ReplayClaim's docs / `projection_order`).
@@ -1476,7 +1553,6 @@ impl BlockProjection<'_> {
 fn record_for_bridge_replay(replay: &ReplayBridgeOut, bridge_id: AccountId) -> InputNoteRecord {
     use miden_client::store::InputNoteState;
     use miden_client::store::input_note_states::ConsumedExternalNoteState;
-    use miden_protocol::block::BlockNumber;
     let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
         nullifier_block_height: BlockNumber::from(replay.block as u32),
         // Finding #56: the consumer IS our bridge — these bodies were joined to
@@ -1505,7 +1581,6 @@ fn record_for_bridge_replay(replay: &ReplayBridgeOut, bridge_id: AccountId) -> I
 fn record_for_claim_replay(replay: &ReplayClaim, bridge_id: AccountId) -> InputNoteRecord {
     use miden_client::store::InputNoteState;
     use miden_client::store::input_note_states::ConsumedExternalNoteState;
-    use miden_protocol::block::BlockNumber;
     let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
         nullifier_block_height: BlockNumber::from(replay.block as u32),
         consumer_account: Some(bridge_id),
@@ -2964,7 +3039,6 @@ mod tests {
         use miden_base_agglayer::B2AggNote;
         use miden_client::store::InputNoteState;
         use miden_client::store::input_note_states::ConsumedExternalNoteState;
-        use miden_protocol::block::BlockNumber;
         use miden_protocol::note::{NoteAssets, NoteRecipient, NoteStorage};
         use miden_protocol::{Felt, Word};
 
@@ -3080,10 +3154,18 @@ mod tests {
     /// full-DB-loss content digest caught.
     #[test]
     fn replay_order_uses_input_position_for_same_tx_b2agg_siblings() {
-        // Same block + same tx_order; commitment order is deliberately the INVERSE
-        // of the input-position order, so only `within_tx_pos` can decide.
-        let a = ordered_consumed(50, Some(2), 0xFF); // larger commitment seed
-        let b = ordered_consumed(50, Some(2), 0x01); // smaller commitment seed
+        // Same block + same tx_order; assign the LARGER commitment to the
+        // EARLIER input position, so only `within_tx_pos` can order the pair
+        // (the commitment tiebreak would invert it). Which of two seeds hashes
+        // larger depends on the protocol hash — resolve it at runtime instead
+        // of baking in hash-ordering luck (the VM 0.29 bump flipped it once).
+        let a = ordered_consumed(50, Some(2), 0xFF);
+        let b = ordered_consumed(50, Some(2), 0x01);
+        let (lo, hi) = if a.details_commitment().as_bytes() < b.details_commitment().as_bytes() {
+            (&a, &b)
+        } else {
+            (&b, &a)
+        };
 
         let key = |block, tx, pos: u32, n: &InputNoteRecord| {
             (
@@ -3094,9 +3176,9 @@ mod tests {
                 None::<[u8; 32]>,
             )
         };
-        // `a` is input 0, `b` is input 1 — position must win over commitment.
-        let ka = key(50u64, 2u32, 0, &a);
-        let kb = key(50u64, 2u32, 1, &b);
+        // `hi` is input 0, `lo` is input 1 — position must win over commitment.
+        let ka = key(50u64, 2u32, 0, hi);
+        let kb = key(50u64, 2u32, 1, lo);
         assert!(
             ka < kb,
             "input position must outrank the commitment tiebreak for same-transaction \
@@ -3106,10 +3188,8 @@ mod tests {
 
         // Sanity: with positions EQUAL (the non-B2AGG case, both 0) the commitment
         // tiebreak still applies, so ordering stays deterministic.
-        let ka0 = key(50u64, 2u32, 0, &a);
-        let kb0 = key(50u64, 2u32, 0, &b);
         assert!(
-            kb0 < ka0,
+            key(50u64, 2u32, 0, lo) < key(50u64, 2u32, 0, hi),
             "with no authoritative position, the commitment breaks the tie deterministically"
         );
     }
@@ -3700,7 +3780,6 @@ mod tests {
         use miden_client::store::InputNoteState;
         use miden_client::store::input_note_states::ConsumedExternalNoteState;
         use miden_protocol::asset::{Asset, FungibleAsset};
-        use miden_protocol::block::BlockNumber;
         use miden_protocol::note::{
             NoteAssets, NoteAttachments, NoteDetails, NoteRecipient, NoteStorage,
         };
@@ -3733,10 +3812,7 @@ mod tests {
 
     #[test]
     fn restore_replay_is_complete_and_preserves_same_details_note_ids() {
-        use miden_client::rpc::domain::transaction::TransactionRecord;
-        use miden_protocol::block::BlockNumber;
         use miden_protocol::note::{NoteHeader, Nullifier};
-        use miden_protocol::transaction::{InputNoteCommitment, InputNotes, TransactionHeader};
 
         let (faucet_id, bridge_id, sender_id) = ma3_accounts();
         let details = ma3_b2agg_input_note(faucet_id, None).details().clone();
@@ -3754,27 +3830,28 @@ mod tests {
 
         let nullifier = |value| Nullifier::from_raw(Word::new([Felt::new(value).unwrap(); 4]));
         let second_nullifier = nullifier(2);
-        let inputs = InputNotes::new(vec![
-            InputNoteCommitment::from_parts_unchecked(nullifier(1), Some(first)),
-            InputNoteCommitment::from_parts_unchecked(second_nullifier, None),
-        ])
-        .unwrap();
-        let tx = TransactionRecord {
-            block_num: BlockNumber::from(7u32),
-            transaction_header: TransactionHeader::new(
-                bridge_id,
-                Word::default(),
-                Word::new([Felt::new(1).unwrap(); 4]),
-                inputs,
-                vec![],
-            ),
-            output_notes: vec![],
-            erased_output_notes: vec![],
-        };
+        // rc.1 wire shape: headerless inputs + explicit (nullifier, id) refs
+        // for the resolvable public note. The second input stays unresolved.
+        let tx = crate::test_helpers::test_tx_record(
+            7,
+            bridge_id,
+            Word::default(),
+            Word::new([Felt::new(1).unwrap(); 4]),
+            vec![nullifier(1), second_nullifier],
+            vec![(nullifier(1), first.id())],
+        );
         assert!(ensure_complete_note_response(&ids, &ids[..1]).is_err());
 
+        // The scan inserts a body and its (nullifier -> id) binding in the SAME
+        // step, so a fixture that carries a body WITHOUT its binding describes
+        // a state the scan cannot produce — and, worse, it is exactly the state
+        // the ref-binding check must reject. Bind both notes, as a real scan
+        // would.
         let recovered = RecoveredBridgeOuts {
-            id_by_nullifier: std::collections::HashMap::from([(second_nullifier, second.id())]),
+            id_by_nullifier: std::collections::HashMap::from([
+                (nullifier(1), first.id()),
+                (second_nullifier, second.id()),
+            ]),
             by_id: ids
                 .iter()
                 .copied()
@@ -3796,6 +3873,127 @@ mod tests {
             replay
                 .iter()
                 .all(|item| item.block == 7 && item.tx_order == 0)
+        );
+    }
+
+    /// SAME-TYPE swap: two B2AGG refs whose note ids are exchanged. Both
+    /// nullifiers were genuinely consumed by this transaction, so upstream's
+    /// `trusted_consumed_note_refs` filter passes them both — but each id now
+    /// lands at the other's `within_tx_pos`, which silently reverses
+    /// BridgeEvent order and shifts every downstream deposit count. The node
+    /// block scan is the independent witness that catches it.
+    #[test]
+    fn swapped_same_type_bridge_refs_are_refused() {
+        use miden_protocol::note::{NoteHeader, Nullifier};
+        let (faucet_id, bridge_id, sender_id) = ma3_accounts();
+        let details = ma3_b2agg_input_note(faucet_id, None).details().clone();
+        let attachments = NoteAttachments::default();
+        let metadata = |sender| {
+            NoteMetadata::new(
+                PartialNoteMetadata::new(sender, NoteType::Public),
+                &attachments,
+            )
+        };
+        let first = NoteHeader::new(details.commitment(), metadata(bridge_id));
+        let second = NoteHeader::new(details.commitment(), metadata(sender_id));
+        let ids = [first.id(), second.id()];
+        let nullifier = |value| Nullifier::from_raw(Word::new([Felt::new(value).unwrap(); 4]));
+
+        // SWAPPED: nullifier(1) claims second.id(), nullifier(2) claims first.id().
+        let tx = crate::test_helpers::test_tx_record(
+            7,
+            bridge_id,
+            Word::default(),
+            Word::new([Felt::new(1).unwrap(); 4]),
+            vec![nullifier(1), nullifier(2)],
+            vec![(nullifier(1), second.id()), (nullifier(2), first.id())],
+        );
+        let recovered = RecoveredBridgeOuts {
+            id_by_nullifier: std::collections::HashMap::from([
+                (nullifier(1), first.id()),
+                (nullifier(2), second.id()),
+            ]),
+            by_id: ids
+                .iter()
+                .copied()
+                .map(|id| {
+                    (
+                        id,
+                        RecoveredBridgeBody {
+                            details: details.clone(),
+                            attachments: attachments.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let err = match build_bridge_replay(&[tx], bridge_id, recovered) {
+            Err(e) => e,
+            Ok(replay) => panic!(
+                "swapped same-type refs must fail closed, not reorder the replay (got {} entries)",
+                replay.len()
+            ),
+        };
+        let report = format!("{err:#}");
+        assert!(
+            report.contains("block scan"),
+            "the error must name the independent witness that disagreed: {report}"
+        );
+    }
+
+    /// CROSS-TYPE swap: a B2AGG ref pointing at a CLAIM note id. The nullifier
+    /// is absent from the B2AGG scan map (it belongs to the CLAIM map), which
+    /// the earlier `if let Some(..)` form treated as "nothing to check" and let
+    /// through — the fail-open path. Absence is conclusive here, because the
+    /// scan records body and binding together.
+    #[test]
+    fn cross_type_swapped_ref_is_refused() {
+        use miden_protocol::note::{NoteHeader, Nullifier};
+        let (faucet_id, bridge_id, _sender_id) = ma3_accounts();
+        let details = ma3_b2agg_input_note(faucet_id, None).details().clone();
+        let attachments = NoteAttachments::default();
+        let first = NoteHeader::new(
+            details.commitment(),
+            NoteMetadata::new(
+                PartialNoteMetadata::new(bridge_id, NoteType::Public),
+                &attachments,
+            ),
+        );
+        let nullifier = |value| Nullifier::from_raw(Word::new([Felt::new(value).unwrap(); 4]));
+
+        let tx = crate::test_helpers::test_tx_record(
+            7,
+            bridge_id,
+            Word::default(),
+            Word::new([Felt::new(1).unwrap(); 4]),
+            vec![nullifier(9)],
+            vec![(nullifier(9), first.id())],
+        );
+        let recovered = RecoveredBridgeOuts {
+            // nullifier(9) is NOT a B2AGG nullifier — it belongs to some other
+            // note kind, so the B2AGG scan map has no entry for it.
+            id_by_nullifier: std::collections::HashMap::from([(nullifier(1), first.id())]),
+            by_id: std::collections::HashMap::from([(
+                first.id(),
+                RecoveredBridgeBody {
+                    details: details.clone(),
+                    attachments: attachments.clone(),
+                },
+            )]),
+            ..Default::default()
+        };
+        let err = match build_bridge_replay(&[tx], bridge_id, recovered) {
+            Err(e) => e,
+            Ok(replay) => panic!(
+                "a ref whose nullifier the B2AGG scan never saw must fail closed (got {} entries)",
+                replay.len()
+            ),
+        };
+        let report = format!("{err:#}");
+        assert!(
+            report.contains("no B2AGG note for input nullifier"),
+            "the error must state that the scan holds no such binding: {report}"
         );
     }
 
@@ -4199,7 +4397,6 @@ mod tests {
         use miden_client::store::InputNoteState;
         use miden_client::store::input_note_states::ConsumedExternalNoteState;
         use miden_protocol::Word;
-        use miden_protocol::block::BlockNumber;
         use miden_protocol::note::{
             NoteAssets, NoteAttachments, NoteDetails, NoteRecipient, NoteStorage,
         };
@@ -4390,7 +4587,6 @@ mod tests {
         use miden_base_agglayer::UpdateGerNote;
         use miden_client::store::InputNoteState;
         use miden_client::store::input_note_states::ConsumedExternalNoteState;
-        use miden_protocol::block::BlockNumber;
         use miden_protocol::note::{
             NoteAssets, NoteAttachment, NoteDetails, NoteRecipient, NoteStorage,
         };
@@ -4504,14 +4700,14 @@ mod tests {
         metadata: &[u8],
     ) -> InputNoteRecord {
         use miden_base_agglayer::{
-            ClaimNote, ClaimNoteStorage, EthAddress, EthAmount, ExitRoot, GlobalIndex, LeafData,
-            MetadataHash, ProofData, SmtNode,
+            ClaimNote, ClaimNoteStorage, ExitRoot, GlobalIndex, LeafData, MetadataHash, ProofData,
+            SmtNode,
         };
         use miden_client::store::InputNoteState;
         use miden_client::store::input_note_states::ConsumedExternalNoteState;
-        use miden_protocol::block::BlockNumber;
         use miden_protocol::note::{NoteAssets, NoteDetails, NoteRecipient, NoteStorage};
         use miden_protocol::{Felt, Word};
+        use miden_standards::interop::eth::{EthAddress, EthAmount};
 
         let mut gi_bytes = [0u8; 32];
         gi_bytes[31] = gi_byte;
@@ -4557,10 +4753,7 @@ mod tests {
     /// bridge tx's authoritative `(block, tx_order)`.
     #[test]
     fn finding69_build_claim_replay_joins_by_nullifier_fallback() {
-        use miden_client::rpc::domain::transaction::TransactionRecord;
-        use miden_protocol::block::BlockNumber;
         use miden_protocol::note::Nullifier;
-        use miden_protocol::transaction::{InputNoteCommitment, InputNotes, TransactionHeader};
 
         let (_faucet_id, bridge_id, _sender_id) = ma3_accounts();
         let details = claim_input_note(Some(bridge_id), 0x69).details().clone();
@@ -4568,24 +4761,17 @@ mod tests {
         let note_id = miden_protocol::note::NoteId::new(details.commitment(), &metadata);
 
         let nullifier = Nullifier::from_raw(Word::new([Felt::new(9).unwrap(); 4]));
-        // No header on the input commitment → the join MUST fall back to the
-        // nullifier map (the shape `ConsumedExternal` history produces).
-        let inputs = InputNotes::new(vec![InputNoteCommitment::from_parts_unchecked(
-            nullifier, None,
-        )])
-        .unwrap();
-        let tx = TransactionRecord {
-            block_num: BlockNumber::from(11u32),
-            transaction_header: TransactionHeader::new(
-                bridge_id,
-                Word::default(),
-                Word::new([Felt::new(1).unwrap(); 4]),
-                inputs,
-                vec![],
-            ),
-            output_notes: vec![],
-            erased_output_notes: vec![],
-        };
+        // No header and no tx-level ref for this input → the join MUST fall
+        // back to the scan's nullifier map (the shape `ConsumedExternal`
+        // history produces).
+        let tx = crate::test_helpers::test_tx_record(
+            11,
+            bridge_id,
+            Word::default(),
+            Word::new([Felt::new(1).unwrap(); 4]),
+            vec![nullifier],
+            vec![],
+        );
 
         let claims_by_id = std::collections::HashMap::from([(
             note_id,
@@ -4959,9 +5145,9 @@ mod tests {
     /// calldata rebuild can prove each field lands in the right claimAsset slot.
     fn full_claim_fixture(metadata: &[u8]) -> miden_protocol::note::NoteStorage {
         use miden_base_agglayer::{
-            ClaimNoteStorage, EthAddress, EthAmount, ExitRoot, GlobalIndex, LeafData, MetadataHash,
-            ProofData, SmtNode,
+            ClaimNoteStorage, ExitRoot, GlobalIndex, LeafData, MetadataHash, ProofData, SmtNode,
         };
+        use miden_standards::interop::eth::{EthAddress, EthAmount};
         // Distinct per-node proof values: local node i = [i+1; 32], rollup node i = [0x80+i; 32].
         let local: [SmtNode; 32] = std::array::from_fn(|i| SmtNode::new([(i as u8) + 1; 32]));
         let rollup: [SmtNode; 32] = std::array::from_fn(|i| SmtNode::new([0x80 + (i as u8); 32]));

@@ -537,10 +537,10 @@ mod tests {
         use crate::bridge_out::resolve_faucet_origin;
         use crate::store::memory::InMemoryStore;
         use crate::store::{FaucetEntry, Store};
-        use miden_base_agglayer::EthAddress;
         use miden_protocol::account::{
             AccountId, AccountStorage, StorageMap, StorageMapKey, StorageSlot,
         };
+        use miden_standards::interop::eth::EthAddress;
         use std::sync::Arc as StdArc;
 
         // A valid v1 public account id used as the faucet id under test. The

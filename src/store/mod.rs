@@ -512,6 +512,7 @@ pub trait Store: Send + Sync + 'static {
     async fn set_nonce_ledger_rebuilt(&self, _rebuilt: bool) -> anyhow::Result<()> {
         Ok(())
     }
+
     /// #90 — seed a signer's nonce baseline iff it has NO row yet. Insert-if-absent,
     /// so it is atomic and idempotent across replicas: exactly one caller seeds and
     /// every later call is a no-op. Returns `true` iff this call created the row.

@@ -81,6 +81,14 @@ services:
   # faucets); the bridge is deployed but left UNCONFIGURED — faucet registration
   # happens at runtime via the proxy's CONFIG_AGG_BRIDGE note.
   #
+  # NODE IMAGE PATCH (v0.16.0-rc.1): upstream still hardcodes the ntx-builder's
+  # per-request remote-prover timeout to 10s (bin/ntx-builder/src/lib.rs
+  # DEFAULT_PROVER_TIMEOUT, no CLI flag). Bridge CLAIM-consumption proofs
+  # exceed that on shared e2e hardware, so the miden-ntx-builder image must be
+  # built with the one-line 10s->180s patch (companion checkout, commit
+  # "e2e-local: raise ntx-builder remote-prover timeout 10s->180s") or every
+  # deposit mint retries forever on "Timeout expired".
+  #
   # The ntx-builder authorises network-tx submission to the sequencer with a
   # shared secret that MUST match on both sides (sequencer
   # --rpc.network-tx-auth-header-value == ntx-builder --rpc.auth-header-value),
@@ -88,6 +96,16 @@ services:
   # submitted by users yet". The proxy submits ordinary user txs and needs no
   # such header.
 
+  # v0.16.0-rc.1 split the old one-shot `bootstrap --genesis-config-file` into:
+  #   1. `genesis`   — build the UNSIGNED genesis block (its header commits the
+  #      validator set, so the config must list the validator public keys; we
+  #      compute the pubkey of the insecure dev signing key at runtime with
+  #      `miden-validator pubkey`, exactly like the upstream run-node.sh);
+  #   2. `bootstrap --genesis <block file>` — each service seeds its DB from it.
+  # The validator `start` additionally requires the threshold storage-key
+  # material from the DKG ceremony; for this throwaway devnet we vendor the
+  # node repo's committed INSECURE fixture (fixtures/genesis/insecure-storage-key,
+  # participant 1) — public, deterministic, never for production.
   node-bootstrap-validator:
     image: miden-validator
     volumes:
@@ -100,11 +118,15 @@ services:
         if [ -f /data/validator/.bootstrapped ]; then echo "validator already bootstrapped"; exit 0; fi
         rm -rf /data/genesis /data/validator /data/accounts
         mkdir -p /data/genesis /data/validator /data/accounts
-        miden-validator bootstrap \
-          --data-directory /data/validator \
+        VALIDATOR_PUBKEY=$$(miden-validator pubkey)
+        { printf 'validators = ["%s"]\n' "$$VALIDATOR_PUBKEY"; cat /genesis/02-with-account-files.toml; } > /tmp/genesis-config.toml
+        miden-validator genesis \
           --genesis-block-directory /data/genesis \
           --accounts-directory /data/accounts \
-          --genesis-config-file /genesis/02-with-account-files.toml
+          --config /tmp/genesis-config.toml
+        miden-validator bootstrap \
+          --data-directory /data/validator \
+          --genesis /data/genesis/genesis.dat
         touch /data/validator/.bootstrapped
 
   node-bootstrap-sequencer:
@@ -121,7 +143,7 @@ services:
         if [ -f /data/node/.bootstrapped ]; then echo "node already bootstrapped"; exit 0; fi
         rm -rf /data/node
         mkdir -p /data/node
-        miden-node bootstrap --data-directory /data/node --file /data/genesis/genesis.dat
+        miden-node bootstrap --data-directory /data/node --genesis /data/genesis/genesis.dat
         touch /data/node/.bootstrapped
 
   node-bootstrap-ntx:
@@ -138,7 +160,7 @@ services:
         if [ -f /data/ntx-builder/.bootstrapped ]; then echo "ntx-builder already bootstrapped"; exit 0; fi
         rm -rf /data/ntx-builder
         mkdir -p /data/ntx-builder
-        miden-ntx-builder bootstrap --data-directory /data/ntx-builder --file /data/genesis/genesis.dat
+        miden-ntx-builder bootstrap --data-directory /data/ntx-builder --genesis /data/genesis/genesis.dat
         touch /data/ntx-builder/.bootstrapped
 
   validator:
@@ -146,6 +168,7 @@ services:
     restart: on-failure
     volumes:
       - node_data:/data
+      - ./fixtures/genesis/insecure-storage-key:/storage-key:ro
     depends_on:
       node-bootstrap-validator:
         condition: service_completed_successfully
@@ -154,6 +177,12 @@ services:
       - start
       - --listen=0.0.0.0:50101
       - --data-directory=/data/validator
+      # Threshold-storage material — the vendored INSECURE dev fixture (see the
+      # bootstrap comment above). Epoch mirrors upstream run-node.sh.
+      - --storage-key.epoch=0909090909090909090909090909090909090909090909090909090909090909
+      - --storage-key.setup-context=/storage-key/setup-context.wire
+      - --storage-key.public-key-set=/storage-key/public-key-set.wire
+      - --storage-key.secret-share=/storage-key/secret-share.wire
 
   tx-prover:
     image: miden-remote-prover
@@ -170,6 +199,12 @@ services:
       # injection gets rejected mid-deposit and the deposit never becomes
       # claimable. Allow requests to queue instead of failing.
       - --capacity=16
+      # rc.1 defaults the SERVER-side proof timeout to 1m, which the bridge
+      # CLAIM-consumption proof exceeds on shared e2e hardware — the prover
+      # cancels mid-proof ("Timeout expired") and the ntx-builder retries
+      # forever, so deposits never mint. Match the ntx-builder's own 180s
+      # prover budget.
+      - --timeout=180sec
 
   # The sequencer is the RPC the proxy + aggkit talk to. Named `miden-node` so
   # the existing `--miden-node=http://miden-node:57291` wiring is unchanged.
@@ -226,6 +261,21 @@ services:
     # second build (the Rust auto-claimer ships in the same image).
     image: miden-agglayer-e2e:latest
     restart: on-failure
+    # FINDING #114: Docker's default nofile soft limit is 1024, which this
+    # proxy exhausts after ~18h of continuous operation — it holds a postgres
+    # pool, a node gRPC channel, an L1 HTTP provider, the signer connection,
+    # AND the inbound keep-alives of every component that polls it every 1-2s
+    # (aggoracle, claimtxman, autoclaim, harness). On exhaustion axum logs
+    # "accept error: Too many open files", /metrics stops responding, and the
+    # L1 evidence indexer can no longer open outbound connections — while the
+    # container still reports State.Status=running, so a naive liveness check
+    # misses it entirely. Observed live: 1014 of 1024 FDs were sockets, 1138
+    # ESTABLISHED. Production deployments need the same floor; this is a
+    # mitigation, not the fix (inbound connections should also be reaped).
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     ports:
       - "127.0.0.1:8546:8546"
     env_file:
