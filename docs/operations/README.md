@@ -7,6 +7,7 @@ historical cluster value.
 
 | Document | Purpose |
 |---|---|
+| [Provisioning](provisioning.md) | Standing up a deployment: key custody, remote signer / KMS, roles, and the startup invariants |
 | [Runbook](runbook.md) | Production constraints, startup, safe shutdown, recovery choices, and incident procedures |
 | [Monitoring](monitoring.md) | Health/metrics endpoints, high-signal metrics, alerts, and dashboards |
 | [Diagnostics](diagnostics.md) | Read-only collection and symptom-to-cause investigation |
