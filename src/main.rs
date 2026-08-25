@@ -313,9 +313,22 @@ struct Command {
     /// WILL take longer when paced. That is the intended trade.
     ///
     /// Covers every component's node handle (restore, synthetic projector,
-    /// persistent client) because they share one constructor. The
+    /// persistent client) because they share one constructor AND one governor,
+    /// so this is a process-wide rate rather than a per-handle one. The
     /// `bridge-out-tool` and `note-probe` binaries read `MIDEN_RPC_MAX_RPS` from
     /// the environment directly, since they never see this flag.
+    ///
+    /// IMPORTANT — this bounds CALLS, not wire requests, so PROVISION BELOW the
+    /// limit you are trying to respect. One paced call can become several
+    /// requests inside the client library, which this process cannot see or
+    /// gate:
+    /// - `get_notes_by_id` fetches the node's batch limits and then splits the
+    ///   ids into `note_ids_limit`-sized chunks, one request each;
+    /// - each of those chunks carries its own retry budget, and the retries are
+    ///   issued below this gate.
+    ///
+    /// Treat the number as "roughly this many calls per second", and leave
+    /// headroom rather than setting it exactly at the gateway's ceiling.
     #[arg(long, env = "MIDEN_RPC_MAX_RPS")]
     miden_rpc_max_rps: Option<u32>,
 

@@ -337,9 +337,7 @@ pub fn build_rpc_client(
     // pacing at this point covers restore, the synthetic projector, the
     // persistent client and both CLI tools without touching a call site.
     // Unconfigured means unpaced — the pre-existing behaviour, bit for bit.
-    match crate::rpc_pacer::effective_max_rps()
-        .and_then(|rps| crate::rpc_pacer::PacedRpcClient::new(client.clone(), rps))
-    {
+    match crate::rpc_pacer::PacedRpcClient::new(client.clone()) {
         Some(paced) => Arc::new(paced),
         None => client,
     }

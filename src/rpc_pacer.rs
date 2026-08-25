@@ -157,25 +157,48 @@ impl Pacer {
     }
 }
 
-/// Wraps a node RPC client so every outbound request passes a [`Pacer`] first.
+/// The ONE pacer for this process.
+///
+/// Must be shared, not per-client. `build_rpc_client` is called for the
+/// persistent client, the projector's reconcile handle, restore, and the CLI
+/// tools; giving each its own governor would make `--miden-rpc-max-rps` a
+/// PER-HANDLE rate, so a process with three live handles would present roughly
+/// 3x the configured rate (plus three independent bursts) to a gateway that
+/// enforces one. The flag promises a process-wide ceiling, so there is one
+/// governor behind it.
+static SHARED_PACER: OnceLock<Option<Arc<Pacer>>> = OnceLock::new();
+
+fn shared_pacer() -> Option<Arc<Pacer>> {
+    SHARED_PACER
+        .get_or_init(|| {
+            effective_max_rps().and_then(|rps| Pacer::new(rps, DEFAULT_BURST).map(Arc::new))
+        })
+        .clone()
+}
+
+/// Wraps a node RPC client so every outbound call passes the shared [`Pacer`].
 ///
 /// No `Debug` derive: `dyn NodeRpcClient` is not `Debug`, and a hand-written
 /// impl would only be able to print the pacer anyway.
 pub struct PacedRpcClient {
     inner: Arc<dyn NodeRpcClient>,
-    pacer: Pacer,
+    pacer: Arc<Pacer>,
 }
 
 impl PacedRpcClient {
-    pub fn new(inner: Arc<dyn NodeRpcClient>, rps: u32) -> Option<Self> {
-        Pacer::new(rps, DEFAULT_BURST).map(|pacer| Self { inner, pacer })
+    /// `None` when pacing is not configured, so the caller keeps the bare
+    /// client rather than paying for a wrapper that does nothing.
+    pub fn new(inner: Arc<dyn NodeRpcClient>) -> Option<Self> {
+        shared_pacer().map(|pacer| Self { inner, pacer })
     }
 
     async fn gate(&self) {
         let waited = self.pacer.acquire().await;
-        ::metrics::counter!("miden_rpc_paced_requests_total").increment(1);
+        ::metrics::counter!("miden_rpc_paced_calls_total").increment(1);
         if !waited.is_zero() {
-            ::metrics::counter!("miden_rpc_pace_wait_seconds_total")
+            // Micros, and the NAME says micros. Incrementing a `_seconds_total`
+            // counter by `as_micros()` reported a 100ms wait as 100000 seconds.
+            ::metrics::counter!("miden_rpc_pace_wait_micros_total")
                 .increment(waited.as_micros() as u64);
         }
     }
@@ -420,6 +443,47 @@ mod tests {
             Duration::from_millis(950),
             "a sustained run must not outpace the configured rate"
         );
+    }
+
+    /// Both reviewers flagged that every other test here exercises a standalone
+    /// `Pacer` and would stay green if the decorator were never wired into
+    /// `build_rpc_client` — i.e. they cannot tell a working pacer from an inert
+    /// one. This one pins the WIRING: the same `SHARED_PACER` must back every
+    /// client, or `--miden-rpc-max-rps` is a per-handle rate and a process with
+    /// three handles presents ~3x the configured rate to the gateway.
+    ///
+    /// Deliberately order-independent: other tests in this binary call
+    /// `build_rpc_client`, which memoizes `SHARED_PACER` before this test runs,
+    /// so asserting a specific configured rate here would pass or fail on test
+    /// ordering. What is pinned is the property that matters — whatever this
+    /// process resolved, EVERY handle receives that same governor.
+    ///
+    /// Honest limitation: this proves sharing and memoization, not that the
+    /// wrapper is installed in `build_rpc_client`. A fake `NodeRpcClient`
+    /// counting wire calls through a paced handle would pin that too, and is
+    /// the right next test.
+    #[test]
+    fn every_client_shares_one_governor_so_the_rate_is_process_wide() {
+        match (shared_pacer(), shared_pacer()) {
+            (Some(first), Some(second)) => assert!(
+                Arc::ptr_eq(&first, &second),
+                "each RPC handle must share ONE governor; a per-handle pacer silently \
+                 multiplies the configured ceiling by the number of live clients"
+            ),
+            (None, None) => {}
+            _ => panic!(
+                "shared_pacer() must be memoized — returning different variants across calls \
+                 means handles built at different times would be paced differently"
+            ),
+        }
+    }
+
+    /// The rate itself is pinned here, on a governor built directly, so it does
+    /// not depend on process-global init order.
+    #[test]
+    fn a_configured_rate_becomes_the_expected_interval() {
+        let pacer = Pacer::new(25, DEFAULT_BURST).expect("non-zero rps");
+        assert_eq!(pacer.interval, Duration::from_secs_f64(1.0 / 25.0));
     }
 
     #[tokio::test(start_paused = true)]
