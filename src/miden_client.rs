@@ -332,7 +332,17 @@ pub fn build_rpc_client(
     if let Some(key) = api_key {
         client = client.with_bearer_auth(key.to_string());
     }
-    Arc::new(client)
+    let client: Arc<dyn NodeRpcClient> = Arc::new(client);
+    // Single chokepoint: every component's node handle comes from here, so
+    // pacing at this point covers restore, the synthetic projector, the
+    // persistent client and both CLI tools without touching a call site.
+    // Unconfigured means unpaced — the pre-existing behaviour, bit for bit.
+    match crate::rpc_pacer::effective_max_rps()
+        .and_then(|rps| crate::rpc_pacer::PacedRpcClient::new(client.clone(), rps))
+    {
+        Some(paced) => Arc::new(paced),
+        None => client,
+    }
 }
 
 /// Orders one account's transactions by their on-chain execution chain, not by the RPC

@@ -298,6 +298,27 @@ struct Command {
     #[arg(long, env = "MIDEN_PROVER_TIMEOUT_SECS", default_value_t = 120)]
     miden_prover_timeout_secs: u64,
 
+    /// Ceiling on outbound Miden node RPC, in requests per second. Unset (the
+    /// default) means unpaced — behaviour is unchanged from before this flag.
+    ///
+    /// Set this to what the node or its gateway will actually allow. The proxy
+    /// then spaces its own calls to stay under that, rather than discovering the
+    /// limit by being throttled: the client library treats `ResourceExhausted`
+    /// as retryable and re-sends, so without pacing a bulk scan *survives* the
+    /// rate limit instead of respecting it — thousands of retries, the same work
+    /// done no faster, and a hard error for any burst that outlasts the retry
+    /// budget.
+    ///
+    /// A recovery scan over a deep chain is the case this exists for, and it
+    /// WILL take longer when paced. That is the intended trade.
+    ///
+    /// Covers every component's node handle (restore, synthetic projector,
+    /// persistent client) because they share one constructor. The
+    /// `bridge-out-tool` and `note-probe` binaries read `MIDEN_RPC_MAX_RPS` from
+    /// the environment directly, since they never see this flag.
+    #[arg(long, env = "MIDEN_RPC_MAX_RPS")]
+    miden_rpc_max_rps: Option<u32>,
+
     /// When the remote prover fails (timeout / connection error), retry the proof
     /// against an in-process LocalTransactionProver. Trades OOM safety for availability.
     /// Default OFF — preserves the bali OOM fix as the default behaviour.
@@ -669,6 +690,18 @@ async fn main() -> anyhow::Result<()> {
     // emissions never reached the served registry).
     let metrics_handle = miden_agglayer_service::metrics::install_prometheus_recorder()?;
     miden_agglayer_service::bridge_address::init_bridge_address(command.bridge_address.clone());
+    // Install the RPC pace BEFORE anything can build a node handle. `restore`
+    // and the projector both construct their own clients early, and an unpaced
+    // handle created before this line would stay unpaced for its whole life.
+    miden_agglayer_service::rpc_pacer::install_max_rps(command.miden_rpc_max_rps);
+    if let Some(rps) = command.miden_rpc_max_rps.filter(|rps| *rps > 0) {
+        tracing::info!(
+            max_rps = rps,
+            "pacing outbound Miden RPC — bulk scans (recovery in particular) will take longer \
+             by design, in exchange for staying under the node's rate limit instead of \
+             absorbing it as retries"
+        );
+    }
     // Install the read-only switch BEFORE any client / submit path exists so
     // the guarantee holds from the very first instruction that could mutate
     // chain state (including the init phase's deploy transactions).
@@ -1748,6 +1781,9 @@ mod hardening_tests {
             miden_prover_url: prover_url,
             miden_prover_timeout_secs: 120,
             miden_prover_fallback_to_local: false,
+            // Unpaced: these fixtures exercise the hardening invariants, and
+            // pacing is deliberately orthogonal to them.
+            miden_rpc_max_rps: None,
             read_only: false,
         }
     }
