@@ -297,18 +297,39 @@ impl Store for PgStore {
     }
 
     async fn nonce_bootstrap_if_absent(&self, addr: &str, nonce: u64) -> anyhow::Result<bool> {
-        let client = self.pool.get().await?;
+        let mut client = self.pool.get().await?;
         let key = addr.to_lowercase();
+        // PR#155 review (codex, blocking #3): bound this SERVER-side rather than
+        // by cancelling the caller.
+        //
+        // The sweep runs bootstrap serially and deliberately OUTSIDE its
+        // per-signer timeout, because cancelling this insert mid-flight is
+        // unsafe: the client future goes away, PostgreSQL keeps the statement,
+        // and the abandoned insert can still commit a baseline AFTER a lower
+        // nonce has parked and been acknowledged — stranding it below the
+        // frontier forever. That non-cancellability is correct, but it left a
+        // single signer blocked on a row lock able to stall every LATER signer's
+        // drain, since nothing bounded it at all.
+        //
+        // `statement_timeout` dissolves the tension: the SERVER gives up and
+        // returns an error, so the work is bounded WITHOUT a client-side cancel
+        // and without a statement that can outlive its caller. SET LOCAL scopes
+        // it to this transaction, so the pooled connection is not mutated for
+        // whoever gets it next.
+        let tx = client.transaction().await?;
+        tx.batch_execute("SET LOCAL statement_timeout = '10s'")
+            .await?;
         // Insert-if-absent: atomic and idempotent across replicas — exactly one
         // caller seeds the baseline, everyone else sees 0 rows affected and falls
         // through to the ordinary R4 path against the now-existing row.
-        let affected = client
+        let affected = tx
             .execute(
                 "INSERT INTO nonces (address, nonce) VALUES ($1, $2)
                  ON CONFLICT (address) DO NOTHING",
                 &[&key, &(nonce as i64)],
             )
             .await?;
+        tx.commit().await?;
         Ok(affected > 0)
     }
 
