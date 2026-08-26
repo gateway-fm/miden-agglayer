@@ -116,15 +116,57 @@ _pred_deposit_indexed() {                                                       
     [[ -n "$dep" ]]
 }
 
+# How long to keep watching AFTER the nominal window expires, purely to classify
+# the failure. Does NOT make a slow run pass — it decides which failure is being
+# reported. Set WAIT_GRACE_SECS=0 to disable.
+WAIT_GRACE_SECS="${WAIT_GRACE_SECS:-300}"
+
 # wait_for <desc> <timeout> <interval> <predicate-fn> [args...]
 # Polls the NAMED predicate function until it succeeds or <timeout>s elapse.
+#
+# On expiry it does NOT fail immediately. A settle/readiness wait that expires
+# has two completely different causes and the old message conflated them:
+#
+#   LATE  — the window was too short; the thing completes shortly after. This is
+#           the #41/#99/#106 family (L2<->L2 settle, claim latency vs chain
+#           depth), a harness-window problem.
+#   LOST  — it never completes; a real wedge or a lost event.
+#
+# Both used to print "Timed out: <desc>" and exit, so every triage started by
+# hand-querying the stack hours later to find out which one it was — and that
+# query is easy to get wrong (asking a bridge-service about a deposit it does
+# not index by construction reads exactly like loss). So on expiry we keep
+# polling for a bounded grace period and report WHICH failure occurred, with the
+# observed latency when it is LATE.
+#
+# Still a failure either way. The point is a triagable verdict, not a pass.
 wait_for() {
     local desc="$1" timeout="$2" interval="${3:-5}"; shift 3
     local elapsed=0
     log "Waiting: $desc (timeout: ${timeout}s)..."
     while ! ( set +o pipefail; "$@" ) 2>/dev/null; do
         elapsed=$((elapsed + interval))
-        [[ $elapsed -ge $timeout ]] && fail "Timed out: $desc"
+        if [[ $elapsed -ge $timeout ]]; then
+            echo ""
+            if [[ "${WAIT_GRACE_SECS:-0}" -le 0 ]]; then
+                fail "Timed out: $desc (no grace configured — LATE vs LOST not distinguished)"
+            fi
+            log "Window expired for: $desc — watching ${WAIT_GRACE_SECS}s more to classify LATE vs LOST"
+            local grace=0
+            while [[ $grace -lt $WAIT_GRACE_SECS ]]; do
+                sleep "$interval"; grace=$((grace + interval))
+                if ( set +o pipefail; "$@" ) 2>/dev/null; then
+                    fail "LATE (not lost): $desc settled after $((timeout + grace))s, \
+past its ${timeout}s window. Delivery is INTACT — this is a settle-window/latency \
+failure (#41/#99/#106), not a lost event. Raise the window or fix the latency; do \
+NOT go hunting for a missing transaction."
+                fi
+            done
+            fail "LOST (still not satisfied): $desc did not complete within \
+$((timeout + WAIT_GRACE_SECS))s (${timeout}s window + ${WAIT_GRACE_SECS}s grace). \
+Nothing arrived late either, so treat this as a genuine wedge/loss and preserve \
+the stack for forensics."
+        fi
         echo -n "."; sleep "$interval"
     done
     echo ""
