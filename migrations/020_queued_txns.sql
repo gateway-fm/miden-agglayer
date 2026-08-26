@@ -35,6 +35,15 @@ CREATE TABLE IF NOT EXISTS queued_txns (
     tx_hash     TEXT NOT NULL,
     envelope    BYTEA NOT NULL,
     expires_at  BIGINT NOT NULL,
+    -- Proof that this row was parked while the post-rebuild recovery window
+    -- (#90) was OPEN. Eligibility to adopt a baseline must be proof-carrying:
+    -- inferring it from "signer has parked rows and reads nonce 0" is wrong,
+    -- because an ABSENT ledger row also reads 0, so a brand-new wallet
+    -- submitting nonce 42 would be seeded to 42 and skip 0..41. This marker
+    -- distinguishes a continuing wallet's tx from a new wallet's out-of-order
+    -- one, and is durable because its job is to outlive the window and survive
+    -- a restart.
+    parked_during_recovery BOOLEAN NOT NULL DEFAULT FALSE,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (signer, nonce)
 );

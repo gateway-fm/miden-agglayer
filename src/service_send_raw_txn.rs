@@ -367,8 +367,32 @@ async fn recovery_bootstrap_active(service: &ServiceState) -> anyhow::Result<boo
 /// seeded afterwards. Closing that hole needs proof that a row was parked while
 /// the window was open — a durable per-row "parked during recovery" marker — not
 /// a predicate that cannot tell a continuing wallet from a new one.
-async fn signer_may_bootstrap(_service: &ServiceState, _signer: &str, global: bool) -> bool {
-    global
+async fn signer_may_bootstrap(service: &ServiceState, signer: &str, global: bool) -> bool {
+    if global {
+        return true;
+    }
+    // The global window has closed. A row PARKED WHILE IT WAS OPEN stays
+    // eligible, because that marker is proof — not inference — that this is a
+    // continuing wallet from the rebuild era. Without it, a tx parked inside the
+    // final settle margin (the sweep waits BOOTSTRAP_SETTLE_BLOCKS before
+    // seeding, so it cannot be adopted on that sweep) is stranded forever behind
+    // nonces that will never arrive, having already been ACKNOWLEDGED.
+    //
+    // This is NOT the reverted round-4 grandfathering. That inferred eligibility
+    // from `nonce_get() == 0` plus the presence of parked rows, which an ABSENT
+    // ledger row also satisfies — so a brand-new wallet submitting nonce 42
+    // would have been seeded to 42, skipping 0..41. The marker is written at
+    // park time and only when recovery mode was genuinely active, so a new
+    // wallet's out-of-order tx can never carry it.
+    // Read the LOWEST parked nonce's row: that is the one a baseline adoption
+    // would seed from, so its provenance is the one that governs eligibility.
+    let Ok(Some(min)) = service.store.peek_queued_min_nonce(signer).await else {
+        return false;
+    };
+    match service.store.get_queued_txn(signer, min).await {
+        Ok(Some(parked)) => parked.parked_during_recovery,
+        _ => false,
+    }
 }
 
 /// #55 BLOCKER C/D — idempotent crash-gap nonce repair via store-level CAS.
@@ -1618,6 +1642,12 @@ async fn service_send_raw_txn_inner(
             // conflicting same-nonce hash and bound breaches are refused.
             let latest_block = service.store.get_latest_block_number().await?;
             let expires_at = latest_block.saturating_add(QUEUE_TTL_BLOCKS);
+            // Stamp the row iff the #90 post-rebuild recovery window is open
+            // RIGHT NOW. Captured at park time and stored durably, so a tx
+            // parked inside the final settle margin stays eligible for baseline
+            // adoption after the global window closes — without granting a new
+            // wallet the same amnesty, since it can never earn the stamp.
+            let parked_during_recovery = recovery_bootstrap_active(&service).await.unwrap_or(false);
             let outcome = service
                 .store
                 .queue_txn(
@@ -1626,6 +1656,7 @@ async fn service_send_raw_txn_inner(
                     txn_hash,
                     &txn_envelope,
                     expires_at,
+                    parked_during_recovery,
                     crate::store::QueueBounds {
                         per_signer: QUEUE_MAX_PER_SIGNER,
                         global: QUEUE_MAX_GLOBAL,

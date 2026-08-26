@@ -1949,6 +1949,7 @@ impl Store for PgStore {
         tx_hash: TxHash,
         envelope: &TxEnvelope,
         expires_at: u64,
+        parked_during_recovery: bool,
         bounds: QueueBounds,
     ) -> anyhow::Result<QueueOutcome> {
         use alloy::eips::Encodable2718;
@@ -1997,14 +1998,16 @@ impl Store for PgStore {
         let mut envelope_bytes = Vec::new();
         envelope.encode_2718(&mut envelope_bytes);
         tx.execute(
-            "INSERT INTO queued_txns (signer, nonce, tx_hash, envelope, expires_at)
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO queued_txns \
+             (signer, nonce, tx_hash, envelope, expires_at, parked_during_recovery)
+             VALUES ($1, $2, $3, $4, $5, $6)",
             &[
                 &key,
                 &(nonce as i64),
                 &hash_str,
                 &envelope_bytes,
                 &(expires_at as i64),
+                &parked_during_recovery,
             ],
         )
         .await?;
@@ -2017,8 +2020,8 @@ impl Store for PgStore {
         let key = signer.to_lowercase();
         let Some(row) = client
             .query_opt(
-                "SELECT tx_hash, envelope, expires_at FROM queued_txns
-                 WHERE signer = $1 AND nonce = $2",
+                "SELECT tx_hash, envelope, expires_at, parked_during_recovery \
+                 FROM queued_txns WHERE signer = $1 AND nonce = $2",
                 &[&key, &(nonce as i64)],
             )
             .await?
@@ -2073,7 +2076,8 @@ impl Store for PgStore {
         let client = self.pool.get().await?;
         let Some(row) = client
             .query_opt(
-                "SELECT signer, nonce, tx_hash, envelope, expires_at
+                "SELECT signer, nonce, tx_hash, envelope, expires_at, \
+                 parked_during_recovery
                  FROM queued_txns WHERE tx_hash = $1 LIMIT 1",
                 &[&format!("{tx_hash:#x}")],
             )
@@ -2089,6 +2093,7 @@ impl Store for PgStore {
             tx_hash: parse_queued_hash(row.get(2))?,
             envelope: decode_queued_envelope(row.get(3))?,
             expires_at: row.get::<_, i64>(4) as u64,
+            parked_during_recovery: row.get(5),
         }))
     }
 
@@ -3650,5 +3655,6 @@ fn row_to_queued_txn(
         tx_hash: parse_queued_hash(row.get(0))?,
         envelope: decode_queued_envelope(row.get(1))?,
         expires_at: row.get::<_, i64>(2) as u64,
+        parked_during_recovery: row.get(3),
     })
 }

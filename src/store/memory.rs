@@ -1487,6 +1487,7 @@ impl Store for InMemoryStore {
         tx_hash: TxHash,
         envelope: &TxEnvelope,
         expires_at: u64,
+        parked_during_recovery: bool,
         bounds: QueueBounds,
     ) -> anyhow::Result<QueueOutcome> {
         let key = signer.to_lowercase();
@@ -1514,6 +1515,7 @@ impl Store for InMemoryStore {
                 tx_hash,
                 envelope: envelope.clone(),
                 expires_at,
+                parked_during_recovery,
             },
         );
         Ok(QueueOutcome::Parked)
@@ -4256,7 +4258,7 @@ mod tests {
         for (n, h) in [(7u64, 0x77u8), (8, 0x88), (10, 0xAA)] {
             let (hash, env) = mk(h);
             store
-                .queue_txn(signer, n, hash, &env, 10, bounds)
+                .queue_txn(signer, n, hash, &env, 10, false, bounds)
                 .await
                 .unwrap();
         }
@@ -4272,6 +4274,64 @@ mod tests {
                  whether it is executable, contiguous-executable, or gap-blocked (#119)"
             );
         }
+    }
+
+    /// #146 finding 1: the marker must round-trip durably, because eligibility
+    /// to adopt a post-rebuild baseline is read from it AFTER the global window
+    /// has closed. A row parked outside recovery must never carry it — that is
+    /// the direction both reverted attempts got wrong (a new wallet at nonce 42
+    /// being seeded to 42, skipping 0..41).
+    #[tokio::test]
+    async fn parked_during_recovery_marker_round_trips_and_defaults_false() {
+        use alloy::consensus::{Signed, TxLegacy};
+        use alloy::primitives::Signature;
+        let store = InMemoryStore::new();
+        let bounds = crate::store::QueueBounds {
+            per_signer: 8,
+            global: 8,
+        };
+        let mk = |nonce: u64| {
+            let tx = TxLegacy {
+                nonce,
+                ..Default::default()
+            };
+            let sig = Signature::test_signature();
+            TxEnvelope::Legacy(Signed::new_unchecked(tx, sig, Default::default()))
+        };
+
+        // Parked DURING recovery -> carries the proof.
+        let during = mk(7);
+        store
+            .queue_txn("0xaa", 7, *during.tx_hash(), &during, 999, true, bounds)
+            .await
+            .expect("park");
+        let got = store
+            .get_queued_txn("0xaa", 7)
+            .await
+            .expect("read")
+            .expect("row");
+        assert!(
+            got.parked_during_recovery,
+            "a tx parked while the recovery window was open must carry the proof, or it \
+             is stranded forever once the global window closes"
+        );
+
+        // Parked OUTSIDE recovery -> must NOT carry it.
+        let outside = mk(42);
+        store
+            .queue_txn("0xbb", 42, *outside.tx_hash(), &outside, 999, false, bounds)
+            .await
+            .expect("park");
+        let got = store
+            .get_queued_txn("0xbb", 42)
+            .await
+            .expect("read")
+            .expect("row");
+        assert!(
+            !got.parked_during_recovery,
+            "a NEW wallet's out-of-order tx must never earn the marker — granting it \
+             would seed the signer to 42 and skip nonces 0..41"
+        );
     }
 
     /// #146 — the future-nonce queue's park/idempotency/conflict/bounds/expiry
@@ -4302,6 +4362,7 @@ mod tests {
                     h5,
                     &e5,
                     100,
+                    false,
                     QueueBounds {
                         per_signer: 8,
                         global: 8
@@ -4320,6 +4381,7 @@ mod tests {
                     h5,
                     &e5,
                     100,
+                    false,
                     QueueBounds {
                         per_signer: 8,
                         global: 8
@@ -4339,6 +4401,7 @@ mod tests {
                     h5b,
                     &e5b,
                     100,
+                    false,
                     QueueBounds {
                         per_signer: 8,
                         global: 8
@@ -4367,6 +4430,7 @@ mod tests {
                     h6,
                     &e6,
                     100,
+                    false,
                     QueueBounds {
                         per_signer: 2,
                         global: 8
@@ -4385,6 +4449,7 @@ mod tests {
                     h7,
                     &e7,
                     100,
+                    false,
                     QueueBounds {
                         per_signer: 2,
                         global: 8
@@ -4404,6 +4469,7 @@ mod tests {
                     h8,
                     &e8,
                     100,
+                    false,
                     QueueBounds {
                         per_signer: 8,
                         global: 2

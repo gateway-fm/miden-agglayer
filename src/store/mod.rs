@@ -375,6 +375,10 @@ pub struct QueuedTxn {
     pub envelope: TxEnvelope,
     /// Block number after which the expiry sweep drops this parked tx.
     pub expires_at: u64,
+    /// True iff this row was parked while the #90 post-rebuild recovery window
+    /// was open. Carried durably so a tx parked inside the final settle margin
+    /// stays eligible for baseline adoption after the global window closes.
+    pub parked_during_recovery: bool,
 }
 
 /// Capacity bounds for the future-nonce queue, passed to [`Store::queue_txn`]
@@ -821,6 +825,9 @@ pub trait Store: Send + Sync + 'static {
     /// refuses (never overwrites) a DIFFERENT hash at the same `(signer, nonce)`;
     /// refuses when either bound is already met. The returned [`QueueOutcome`]
     /// tells the caller whether to accept (return the hash) or reject.
+    #[allow(clippy::too_many_arguments)] // one flag past the lint's 7; splitting
+    // the park into a struct would obscure that `parked_during_recovery` is
+    // captured at THIS instant, which is the whole point of the marker.
     async fn queue_txn(
         &self,
         signer: &str,
@@ -828,6 +835,7 @@ pub trait Store: Send + Sync + 'static {
         tx_hash: TxHash,
         envelope: &TxEnvelope,
         expires_at: u64,
+        parked_during_recovery: bool,
         bounds: QueueBounds,
     ) -> anyhow::Result<QueueOutcome>;
 
