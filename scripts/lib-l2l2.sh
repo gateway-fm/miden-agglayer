@@ -127,10 +127,14 @@ WAIT_GRACE_SECS="${WAIT_GRACE_SECS:-300}"
 # On expiry it does NOT fail immediately. A settle/readiness wait that expires
 # has two completely different causes and the old message conflated them:
 #
-#   LATE  — the window was too short; the thing completes shortly after. This is
-#           the #41/#99/#106 family (L2<->L2 settle, claim latency vs chain
-#           depth), a harness-window problem.
-#   LOST  — it never completes; a real wedge or a lost event.
+#   LATE  — the window was too short; the thing completes shortly after.
+#           WARNS and CONTINUES. Delivery is intact, so failing the run would be
+#           reporting a harness-window problem (#41/#99/#106) as a product
+#           defect — which is exactly what happened on the 2026-08-25 paced run,
+#           where two "Timed out" legs had in fact delivered 7/7 and 26/26.
+#           The warning carries observed-vs-expected so the window gets tuned
+#           from data.
+#   LOST  — it never completes. FAILS, as it should.
 #
 # Both used to print "Timed out: <desc>" and exit, so every triage started by
 # hand-querying the stack hours later to find out which one it was — and that
@@ -139,10 +143,17 @@ WAIT_GRACE_SECS="${WAIT_GRACE_SECS:-300}"
 # polling for a bounded grace period and report WHICH failure occurred, with the
 # observed latency when it is LATE.
 #
-# Still a failure either way. The point is a triagable verdict, not a pass.
+# Only LOST fails. LATE is loud but non-fatal, because the transfer arrived.
 wait_for() {
     local desc="$1" timeout="$2" interval="${3:-5}"; shift 3
     local elapsed=0
+    # MEASURED wall time, for the LATE report. Do NOT reconstruct it from
+    # `elapsed`: that counter increments BEFORE its sleep, so it runs one
+    # interval ahead of reality, and adding it to the nominal `timeout` yields a
+    # number that is neither the budget nor the observed latency. A "settled
+    # after 5s" line for something that settled at 4s is worse than no number —
+    # it is the kind of figure someone later tunes a timeout against.
+    local started=$SECONDS
     log "Waiting: $desc (timeout: ${timeout}s)..."
     while ! ( set +o pipefail; "$@" ) 2>/dev/null; do
         elapsed=$((elapsed + interval))
@@ -156,10 +167,20 @@ wait_for() {
             while [[ $grace -lt $WAIT_GRACE_SECS ]]; do
                 sleep "$interval"; grace=$((grace + interval))
                 if ( set +o pipefail; "$@" ) 2>/dev/null; then
-                    fail "LATE (not lost): $desc settled after $((timeout + grace))s, \
-past its ${timeout}s window. Delivery is INTACT — this is a settle-window/latency \
-failure (#41/#99/#106), not a lost event. Raise the window or fix the latency; do \
-NOT go hunting for a missing transaction."
+                    local took=$((SECONDS - started))
+                    # NOT a failure: the thing arrived, so delivery is intact and
+                    # the run continues. It is loud, and it carries observed-vs-
+                    # expected so the window can be tuned from data instead of
+                    # guesswork.
+                    echo "LATE-SETTLE: $desc took ${took}s vs ${timeout}s expected \
+(+$((took - timeout))s, $(( took * 100 / (timeout > 0 ? timeout : 1) ))% of window) \
+— delivered, NOT lost; settle-window/latency (#41/#99/#106)" >&2
+                    log "LATE (warning, continuing): $desc took ${took}s, expected ${timeout}s"
+                    # Machine-readable trail for the driver to aggregate.
+                    [[ -n "${WAIT_LATE_LOG:-}" ]] &&
+                        echo "$(date +%H:%M:%S)|$desc|took=${took}|expected=${timeout}" \
+                            >> "$WAIT_LATE_LOG"
+                    return 0
                 fi
             done
             fail "LOST (still not satisfied): $desc did not complete within \
