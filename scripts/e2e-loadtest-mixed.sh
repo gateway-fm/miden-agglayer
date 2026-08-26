@@ -423,6 +423,13 @@ fi
 # require the L2B holder balance to have risen by the full bridged-out total.
 BACK_N=$(cat "$CNT_DIR/back_sub")
 if [[ "$BACK_N" -gt 0 ]]; then
+    # Readiness here depends on a SETTLED certificate, so gate on aggkit being
+    # able to produce one before starting the clock. Measured 2026-08-25: aggkit
+    # was recreated at 17:02 and settled its first cert at 17:21, and THIS 900s
+    # wait — opened at 17:01 — expired at 17:15, entirely inside that cold start.
+    # Timing the system before it can answer measures the cold start, not the
+    # system, and fails deterministically (the real shape of #41).
+    wait_for_aggkit_ready
     # Wait for all back deposits (to BACK_DEST) to be indexed + ready on the Miden service.
     wait_for "all $BACK_N Miden->L2B deposits ready_for_claim" 900 10 \
         _mixed_back_ready "$BACK_DEST" "$MOP_LOWER" "$BACK_N"
