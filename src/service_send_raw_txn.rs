@@ -3501,6 +3501,86 @@ mod tests {
         );
     }
 
+    /// Review finding 1 (round 2) — the durable-lower refusal must be one hop
+    /// of a CONVERGING protocol, not a dead end. The test above only pins that
+    /// the refusal string is claimtxman-classifiable; this one drives the real
+    /// flow end to end:
+    ///
+    ///   pre-restart: A@5 admitted durably, never reaches the Miden handoff
+    ///   (the first service has NO writer — that is the crash window itself);
+    ///   restart: fresh service + writer over the SAME store;
+    ///   B@6 -> REFUSED on the real path with the real message;
+    ///   the sender does exactly what the refusal instructs — re-submits the
+    ///   EXACT signed A@5 -> accepted via durable resume, nonce 5 live again;
+    ///   B@6 resubmitted -> accepted; ledger sequenced through 7.
+    #[tokio::test]
+    async fn durable_lower_refusal_recovers_once_the_lower_tx_is_resubmitted() {
+        // Pre-restart service: durable admission, NO writer — A@5 will be
+        // admitted and then never handed off, which is precisely the state the
+        // refusal exists for.
+        let service1 = create_test_service();
+        let store = service1.store.clone();
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
+
+        // An established wallet whose ledger sits at 5.
+        store
+            .nonce_bootstrap_if_absent(&signer_str, 5)
+            .await
+            .unwrap();
+
+        let (raw_a, hash_a) = ger_tx_at(&key, 5, 0xD5);
+        service_send_raw_txn(service1.clone(), raw_a.clone())
+            .await
+            .expect("A@5 at the expected nonce is admitted durably");
+        assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 6);
+
+        // Restart: fresh service AND writer over the SAME store. The durable
+        // A@5 row survives; the writer's in-flight set does not, so nothing
+        // considers nonce 5 live.
+        let mut service2 = create_test_service();
+        service2.store = store.clone();
+        let (handle, _sd2) = crate::writer_worker::WriterWorker::spawn(
+            service2.clone(),
+            64,
+            std::time::Duration::from_secs(60),
+        );
+        service2.writer_handle = Some(std::sync::Arc::new(handle));
+
+        // B@6 must be refused on the REAL path, with the message the sender is
+        // expected to act on.
+        let (raw_b, _) = ger_tx_at(&key, 6, 0xD6);
+        let err = service_send_raw_txn(service2.clone(), raw_b.clone())
+            .await
+            .expect_err("B@6 must be refused while durable A@5 is unlinked and not live");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid nonce 6") && msg.contains("lower nonce 5"),
+            "the refusal must name both nonces and stay claimtxman-classifiable: {msg}"
+        );
+
+        // The sender follows the instruction: re-submit the EXACT signed A@5.
+        let resumed = service_send_raw_txn(service2.clone(), raw_a)
+            .await
+            .expect("re-submitting the durable lower tx must be accepted (durable resume)");
+        assert_eq!(resumed, hash_a, "resume returns the original hash");
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            6,
+            "a durable resume re-enqueues; it must not advance the ledger again"
+        );
+
+        // With nonce 5 live (or already completed) the successor now lands.
+        service_send_raw_txn(service2.clone(), raw_b)
+            .await
+            .expect("the successor must be accepted once the lower nonce is live again");
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            7,
+            "refusal -> resume -> successor: the pair is fully sequenced"
+        );
+    }
+
     /// #90 (round-5) — a genuinely NEW wallet must never be bootstrapped.
     ///
     /// An earlier revision grandfathered any signer with parked rows and
