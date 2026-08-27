@@ -3518,7 +3518,13 @@ mod tests {
             buggy_be[i * 4..(i + 1) * 4].copy_from_slice(&v.to_be_bytes());
         }
         let mut expected_swap = [0u8; 32];
-        for (i, chunk) in ger.chunks_exact(4).enumerate() {
+        // `as_chunks`, not `chunks_exact(4)`: clippy 1.98 added
+        // `chunks_exact_to_as_chunks`, which fires on a CONSTANT chunk size and
+        // is denied in CI (`-D warnings`). Local clippy is 1.97 and does not
+        // have the lint, so `make lint` passed here and failed there — the fix
+        // has to compile on both, and `as_chunks` has been stable since well
+        // before 1.97.
+        for (i, chunk) in ger.as_chunks::<4>().0.iter().enumerate() {
             expected_swap[i * 4..(i + 1) * 4]
                 .copy_from_slice(&[chunk[3], chunk[2], chunk[1], chunk[0]]);
         }
