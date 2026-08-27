@@ -1573,16 +1573,26 @@ impl Store for InMemoryStore {
             .cloned())
     }
 
-    async fn count_stale_queued_txns(&self, now: u64) -> anyhow::Result<usize> {
-        // Deletes NOTHING. See the trait doc: a parked tx is already
-        // acknowledged, so a TTL may report it but must never destroy it.
-        Ok(self
-            .queued_txns
-            .read()
-            .values()
-            .flat_map(|m| m.values())
-            .filter(|q| q.expires_at <= now)
-            .count())
+    async fn evict_expired_queued_txns(
+        &self,
+        now: u64,
+    ) -> anyhow::Result<Vec<(String, u64, TxHash)>> {
+        // Ephemeral txpool: TTL expiry DELETES (see the trait doc for the
+        // design decision and the re-broadcast contract that makes it safe).
+        let mut evicted = Vec::new();
+        let mut map = self.queued_txns.write();
+        for (signer, txs) in map.iter_mut() {
+            txs.retain(|nonce, q| {
+                if q.expires_at <= now {
+                    evicted.push((signer.clone(), *nonce, q.tx_hash));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        map.retain(|_, txs| !txs.is_empty());
+        Ok(evicted)
     }
 
     // ── Nonces ───────────────────────────────────────────────────
@@ -4219,19 +4229,20 @@ mod tests {
         assert_eq!(store.list_faucets().await.unwrap().len(), 1);
     }
 
-    /// #146/#119 — a parked tx has already been ACKNOWLEDGED to its sender, so a
-    /// TTL may REPORT it but must never destroy it. Deleting one silently orphans
-    /// an accepted transaction: the sender never resubmits (it was told "accepted")
-    /// and the downstream consumer cannot classify the rejection it eventually
-    /// sees. That is exactly the permanent claim-stream wedge of #119.
-    ///
-    /// Covers the case a "gap-blocked only" predicate gets wrong: with frontier N
-    /// and expired rows at N AND N+1 there is no gap at all — both form an
-    /// executable contiguous prefix — yet such a predicate would delete N+1
-    /// merely because N+1 > frontier. Here NOTHING is deleted, and the count is
-    /// reported for operator visibility.
+    /// #146 ephemeral-txpool (maintainer decision, 2026-08-27): TTL expiry
+    /// EVICTS. The queue is a geth-like mempool — persistence is best-effort
+    /// crash convenience, not a delivery guarantee — so a gap that never fills
+    /// within the TTL forfeits its slot. This test pins the three properties
+    /// that make eviction safe and useful:
+    ///   1. expired rows are DELETED and returned (so each drop is logged),
+    ///   2. the evicted hash stops resolving — the exact signal that makes the
+    ///      sender's monitoring re-broadcast, and
+    ///   3. the capacity the dead rows were pinning is RECLAIMED, so unrelated
+    ///      future-nonce submissions are no longer locked out (the reviewer's
+    ///      blocker: enough permanently-impossible rows starved the bounds
+    ///      forever with no operator remedy).
     #[tokio::test]
-    async fn stale_parked_txns_are_reported_never_deleted() {
+    async fn expired_parked_txns_are_evicted_and_capacity_reclaimed() {
         use alloy::consensus::{Signed, TxLegacy};
         use alloy::primitives::Signature;
         let store = InMemoryStore::new();
@@ -4263,17 +4274,69 @@ mod tests {
                 .unwrap();
         }
 
-        // All three are long past their TTL block.
-        let stale = store.count_stale_queued_txns(100).await.unwrap();
-        assert_eq!(stale, 3, "all three must be REPORTED as stale");
+        // All three are long past their TTL block: evict them.
+        let evicted = store.evict_expired_queued_txns(100).await.unwrap();
+        assert_eq!(evicted.len(), 3, "all three expired rows must be evicted");
 
         for n in [7u64, 8, 10] {
             assert!(
-                store.get_queued_txn(signer, n).await.unwrap().is_some(),
-                "parked nonce {n} was DELETED — an acknowledged tx must never be dropped, \
-                 whether it is executable, contiguous-executable, or gap-blocked (#119)"
+                store.get_queued_txn(signer, n).await.unwrap().is_none(),
+                "evicted nonce {n} must be gone"
             );
         }
+        // The evicted hashes must stop resolving: a vanished hash is the signal
+        // an EVM sender's monitoring understands as "dropped, re-broadcast".
+        assert!(
+            store
+                .queued_txn_by_hash(TxHash::from([0x77u8; 32]))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store.queued_signers().await.unwrap().is_empty(),
+            "an evicted-out signer must leave the resume set"
+        );
+        // Idempotent: a second sweep finds nothing.
+        assert!(
+            store
+                .evict_expired_queued_txns(100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Capacity reuse — the reviewer's actual blocker. Fill a tiny bound with
+        // rows that expire, evict, and the SAME signer must be able to park
+        // again where a retained dead row would still consume the slot.
+        let tight = QueueBounds {
+            per_signer: 1,
+            global: 1,
+        };
+        let (h1, e1) = mk(0x01);
+        store
+            .queue_txn(signer, 20, h1, &e1, 200, false, tight)
+            .await
+            .unwrap();
+        let (h2, e2) = mk(0x02);
+        assert!(matches!(
+            store
+                .queue_txn(signer, 21, h2, &e2, 300, false, tight)
+                .await
+                .unwrap(),
+            crate::store::QueueOutcome::PerSignerBoundExceeded
+        ));
+        store.evict_expired_queued_txns(250).await.unwrap();
+        assert!(
+            matches!(
+                store
+                    .queue_txn(signer, 21, h2, &e2, 300, false, tight)
+                    .await
+                    .unwrap(),
+                crate::store::QueueOutcome::Parked
+            ),
+            "eviction must return the dead row's slot to the pool"
+        );
     }
 
     /// #146 finding 1: the marker must round-trip durably, because eligibility
@@ -4485,16 +4548,20 @@ mod tests {
         assert!(store.delete_queued_txn(a, 5, h5).await.unwrap());
         assert_eq!(store.peek_queued_min_nonce(a).await.unwrap(), Some(6));
 
-        // #146/#119 — expiry REPORTS, it does not delete. This assertion used to
-        // require the stale row to be dropped; an acknowledged parked tx must
-        // survive its TTL, so the row (nonce 6, expires_at 100) is still here and
-        // is merely counted.
-        assert_eq!(store.count_stale_queued_txns(100).await.unwrap(), 1);
+        // #146 ephemeral-txpool — expiry EVICTS. The row (nonce 6, expires_at
+        // 100) is deleted, its hash stops resolving, and the signer leaves the
+        // resume set; the sender re-broadcasts on the vanished hash.
+        let evicted = store.evict_expired_queued_txns(100).await.unwrap();
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(
+            evicted[0].1, 6,
+            "the expired nonce-6 row is what got evicted"
+        );
         assert_eq!(
             store.peek_queued_min_nonce(a).await.unwrap(),
-            Some(6),
-            "a stale parked tx is RETAINED, never dropped"
+            None,
+            "the evicted row must not linger"
         );
-        assert_eq!(store.queued_signers().await.unwrap(), vec![a.to_string()]);
+        assert!(store.queued_signers().await.unwrap().is_empty());
     }
 }

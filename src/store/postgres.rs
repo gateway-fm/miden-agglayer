@@ -1953,6 +1953,17 @@ impl Store for PgStore {
         bounds: QueueBounds,
     ) -> anyhow::Result<QueueOutcome> {
         use alloy::eips::Encodable2718;
+        // Review finding 5: the nonce is EXTERNAL input (it rides in a signed
+        // transaction), and `as i64` silently wraps anything above i64::MAX
+        // negative — corrupting MIN(nonce) ordering and inviting arithmetic
+        // overflow downstream. Reject it here with a checked conversion; a
+        // legitimate sequential nonce can never approach this bound, so the
+        // only thing lost is a garbage submission. `expires_at` gets the same
+        // treatment for symmetry, though it is derived from block numbers.
+        let nonce_db = i64::try_from(nonce)
+            .map_err(|_| anyhow::anyhow!("nonce {nonce} exceeds the supported range (i64)"))?;
+        let expires_db = i64::try_from(expires_at)
+            .map_err(|_| anyhow::anyhow!("expires_at {expires_at} exceeds the supported range"))?;
         let mut client = self.pool.get().await?;
         let key = signer.to_lowercase();
         let hash_str = format!("{tx_hash:#x}");
@@ -1964,7 +1975,7 @@ impl Store for PgStore {
         if let Some(row) = tx
             .query_opt(
                 "SELECT tx_hash FROM queued_txns WHERE signer = $1 AND nonce = $2",
-                &[&key, &(nonce as i64)],
+                &[&key, &nonce_db],
             )
             .await?
         {
@@ -2003,10 +2014,10 @@ impl Store for PgStore {
              VALUES ($1, $2, $3, $4, $5, $6)",
             &[
                 &key,
-                &(nonce as i64),
+                &nonce_db,
                 &hash_str,
                 &envelope_bytes,
-                &(expires_at as i64),
+                &expires_db,
                 &parked_during_recovery,
             ],
         )
@@ -2097,17 +2108,29 @@ impl Store for PgStore {
         }))
     }
 
-    async fn count_stale_queued_txns(&self, now: u64) -> anyhow::Result<usize> {
-        // Deletes NOTHING. See the trait doc: a parked tx is already
-        // acknowledged, so a TTL may report it but must never destroy it.
+    async fn evict_expired_queued_txns(
+        &self,
+        now: u64,
+    ) -> anyhow::Result<Vec<(String, u64, TxHash)>> {
+        // Ephemeral txpool: TTL expiry DELETES (see the trait doc for the
+        // design decision and the re-broadcast contract that makes it safe).
         let client = self.pool.get().await?;
-        let row = client
-            .query_one(
-                "SELECT count(*) FROM queued_txns WHERE expires_at <= $1",
+        let rows = client
+            .query(
+                "DELETE FROM queued_txns WHERE expires_at <= $1
+                 RETURNING signer, nonce, tx_hash",
                 &[&(now as i64)],
             )
             .await?;
-        Ok(row.get::<_, i64>(0).max(0) as usize)
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    row.get::<_, String>(0),
+                    row.get::<_, i64>(1) as u64,
+                    parse_queued_hash(row.get(2))?,
+                ))
+            })
+            .collect()
     }
 
     // ── Nonces ───────────────────────────────────────────────────

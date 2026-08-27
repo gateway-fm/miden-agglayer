@@ -863,19 +863,28 @@ pub trait Store: Send + Sync + 'static {
     /// Look up a parked tx by its hash (for `eth_getTransactionByHash`).
     async fn queued_txn_by_hash(&self, tx_hash: TxHash) -> anyhow::Result<Option<QueuedTxn>>;
 
-    /// Count parked txs whose `expires_at` block is `<= now`. OBSERVABILITY
-    /// ONLY — it deletes nothing.
+    /// Delete every parked tx whose `expires_at` block is `<= now`, returning
+    /// `(signer, nonce, tx_hash)` for each evicted row so the sweep can log the
+    /// drops individually.
     ///
-    /// #146/#119: a parked tx has already been ACKNOWLEDGED to its sender, which
-    /// will therefore never resubmit it, and the downstream consumer cannot
-    /// classify the rejection it would eventually see. Deleting one silently
-    /// orphans it — precisely the permanent claim-stream wedge this queue exists
-    /// to prevent. A TTL cannot distinguish "the gap will never fill" from "the
-    /// gap is slow", so it must not be allowed to destroy durable, acknowledged
-    /// work. Memory is bounded instead by the per-signer and global queue caps,
-    /// which reject at SUBMISSION time (an immediate, visible error to a caller
-    /// that still holds the tx) rather than dropping an accepted one later.
-    async fn count_stale_queued_txns(&self, now: u64) -> anyhow::Result<usize>;
+    /// #146 design decision (maintainer, 2026-08-27): the queue is EPHEMERAL,
+    /// like geth's txpool. Persistence is best-effort crash convenience, NOT a
+    /// delivery guarantee. A gap that has not filled within the TTL forfeits its
+    /// slot: the row is deleted, capacity returns to the per-signer/global
+    /// bounds, and the tx hash stops resolving — which is precisely the signal
+    /// an EVM sender understands. claimtxman re-broadcasts a monitored tx whose
+    /// hash no longer resolves, and the resubmission is then judged against the
+    /// CURRENT nonce state (parks again, executes, or hits a nonce error it
+    /// already self-heals from via the #111 wording contract).
+    ///
+    /// This supersedes the earlier surface-never-reap stance: retaining
+    /// permanently-impossible work pinned the bounds forever, so enough dead
+    /// rows could lock every unrelated future-nonce submission out of the
+    /// queue with no operator remedy short of hand-editing the table.
+    async fn evict_expired_queued_txns(
+        &self,
+        now: u64,
+    ) -> anyhow::Result<Vec<(String, u64, TxHash)>>;
 
     // === Nonces ===
     /// Does ANY signer hold a nonce ledger row?
@@ -1420,21 +1429,23 @@ impl SyncListener for StoreSyncListener {
             self.store
                 .txn_expire_pending(data.block_num, block_hash)
                 .await?;
-            // #146 — SURFACE (never reap) parked future-nonce txns whose gap has
-            // outlived its TTL. These are acknowledged transactions: dropping one
-            // orphans it permanently (#119). Report them so an operator can act;
-            // the queue's per-signer/global bounds cap memory.
-            let stale = self.store.count_stale_queued_txns(data.block_num).await?;
-            ::metrics::gauge!("rpc_future_nonce_stale_parked").set(stale as f64);
-            if stale > 0 {
-                tracing::warn!(
-                    target: "rpc::mempool",
-                    stale,
-                    block = data.block_num,
-                    "parked future-nonce txns have outlived their TTL and are STILL RETAINED \
-                     (an acknowledged tx is never dropped); their predecessor nonce has not \
-                     arrived — investigate the sender or fill the gap"
-                );
+            // #146 — EVICT parked future-nonce txns whose gap outlived the TTL
+            // (ephemeral-txpool design; see `evict_expired_queued_txns`). The
+            // hash stops resolving, the sender re-broadcasts, and the queue
+            // capacity the dead row was pinning returns to the pool.
+            let evicted = self.store.evict_expired_queued_txns(data.block_num).await?;
+            if !evicted.is_empty() {
+                ::metrics::counter!("rpc_future_nonce_evicted_total")
+                    .increment(evicted.len() as u64);
+                for (signer, nonce, tx_hash) in &evicted {
+                    tracing::warn!(
+                        target: "rpc::mempool",
+                        %signer, nonce, %tx_hash, block = data.block_num,
+                        "evicted expired parked tx (gap never filled within its TTL); \
+                         the hash no longer resolves, so the sender's monitoring \
+                         re-broadcasts it to be re-judged at the current nonce state"
+                    );
+                }
             }
         }
         Ok(())

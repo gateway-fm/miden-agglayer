@@ -17,18 +17,19 @@
 -- mined" pending shape so aggkit treats it as accepted rather than dropped.
 -- `envelope` is the raw EIP-2718-encoded signed transaction, replayed verbatim
 -- when the gap fills. `expires_at` is a BLOCK NUMBER (same denomination as
--- `transactions.expires_at`), but note what it does and does NOT do: it marks a
--- parked tx as STALE for reporting. NOTHING ever deletes that row.
+-- `transactions.expires_at`): a row whose block has passed is EVICTED by the
+-- expiry sweep, exactly like geth dropping a stale queued tx from its mempool.
 --
--- A parked tx has already been ACKNOWLEDGED to its sender, which will therefore
--- never resubmit it. Dropping one silently orphans it — exactly the permanent
--- claim-stream wedge (#119) this queue exists to prevent — and a TTL cannot
--- distinguish "the gap will never fill" from "the gap is slow". So the sweep
--- SURFACES these rows (gauge `rpc_future_nonce_stale_parked` plus a warning) and
--- leaves them in place for an operator to act on. Memory is bounded by the
--- per-signer and global caps, which reject at SUBMISSION time — an immediate,
--- visible error to a caller that still holds the transaction — rather than by
--- discarding work already accepted.
+-- Design decision (maintainer, 2026-08-27): this queue is EPHEMERAL.
+-- Persistence is best-effort crash convenience, NOT a delivery guarantee. What
+-- makes eviction safe is the re-broadcast contract: after eviction the tx hash
+-- stops resolving via eth_getTransactionByHash, which is the standard EVM
+-- signal for "dropped" — the sender's monitoring (claimtxman) re-broadcasts,
+-- and the resubmission is judged against the CURRENT nonce state (parks again,
+-- executes, or hits a nonce error it already self-heals from via the #111
+-- wording contract). Without eviction, a gap that never fills pinned its
+-- per-signer/global capacity forever, and enough dead rows could lock every
+-- unrelated future-nonce submission out of the queue.
 CREATE TABLE IF NOT EXISTS queued_txns (
     signer      TEXT NOT NULL,
     nonce       BIGINT NOT NULL,

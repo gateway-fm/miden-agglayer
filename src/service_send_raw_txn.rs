@@ -1647,7 +1647,19 @@ async fn service_send_raw_txn_inner(
             // parked inside the final settle margin stays eligible for baseline
             // adoption after the global window closes — without granting a new
             // wallet the same amnesty, since it can never earn the stamp.
-            let parked_during_recovery = recovery_bootstrap_active(&service).await.unwrap_or(false);
+            //
+            // Review finding 2: this read must FAIL CLOSED, not default. The
+            // previous `unwrap_or(false)` turned a transient store error into
+            // "not recovery", after which the tx was parked UNSTAMPED and
+            // ACKNOWLEDGED — near the window boundary that acknowledgment could
+            // never be made eligible again. Erroring here rejects the
+            // submission instead: the sender still holds the transaction and
+            // retries, which is recoverable; a wrongly-unstamped acknowledged
+            // row is not.
+            let parked_during_recovery = anyhow::Context::context(
+                recovery_bootstrap_active(&service).await,
+                "reading recovery state before parking (rejecting rather than parking unstamped)",
+            )?;
             let outcome = service
                 .store
                 .queue_txn(
@@ -1960,19 +1972,30 @@ pub async fn resume_queued_drain(service: &ServiceState) -> anyhow::Result<()> {
         // observation for many minutes (Miden-client calls have no outer
         // deadline). Bounding only the drain left the other steps unbounded, so
         // one stuck signer still starved every later one. Bound the WHOLE slice.
-        // (round-4) The BOOTSTRAP runs OUTSIDE the timeout, deliberately.
-        // Cancelling it is unsafe: dropping an in-flight tokio-postgres execute
-        // future does not cancel the statement — the driver has already queued it
-        // and keeps processing after the response receiver is gone. A timeout
-        // there would release the per-signer lock while the baseline INSERT was
-        // still pending; a LOWER nonce could then park and be acknowledged, and
-        // the abandoned insert would afterwards commit the HIGHER baseline,
-        // stranding the lower one below the frontier permanently. It is a single
-        // bounded insert, so it does not need a budget.
-        bootstrap_one_signer(service, &signer, bootstrap).await;
+        // (review finding 3, supersedes round-4) The bootstrap is INSIDE the
+        // per-signer budget again, and this time it is safe. Round-4 kept it
+        // outside because cancelling a bare tokio-postgres `execute` abandons a
+        // statement the server may still commit — releasing the per-signer lock
+        // while the baseline INSERT was pending let a LOWER nonce park and then
+        // be stranded under an abandoned HIGHER baseline. Two later changes
+        // dissolved that hazard:
+        //   1. the insert now runs in an EXPLICIT TRANSACTION with a server-side
+        //      statement_timeout — a cancelled future DROPS the transaction,
+        //      which rolls back; nothing half-done can commit later — and
+        //   2. the queue is now ephemeral (TTL eviction + sender re-broadcast),
+        //      so even the one residual race (cancellation landing exactly
+        //      inside COMMIT) self-heals: a wrongly-seeded baseline turns the lower
+        //      nonce's re-broadcast into "nonce too low", which claimtxman
+        //      already recovers from by re-deriving off the chain (#111).
+        // Leaving it OUTSIDE was itself the reviewer's finding: the lock wait,
+        // pool checkout and reads had no bound at all, so one hung signer
+        // silently starved every later signer's recovery forever.
         if tokio::time::timeout(
             std::time::Duration::from_secs(SWEEP_PER_SIGNER_BUDGET_SECS),
-            sweep_one_signer(service, &signer),
+            async {
+                bootstrap_one_signer(service, &signer, bootstrap).await;
+                sweep_one_signer(service, &signer).await
+            },
         )
         .await
         .is_err()
@@ -1993,8 +2016,11 @@ pub async fn resume_queued_drain(service: &ServiceState) -> anyhow::Result<()> {
 /// prefix reconciliation, then the contiguous drain. Bounded by the caller.
 /// Adopt a post-rebuild baseline for one signer, if eligible.
 ///
-/// Kept OUT of the sweep's cancellable region: see the call site for why
-/// cancelling a PostgreSQL insert mid-flight is unsafe here.
+/// Runs INSIDE the sweep's per-signer budget (review finding 3). Cancellation
+/// became safe when the baseline insert moved into an explicit transaction —
+/// dropping the future rolls the transaction back — and the ephemeral-queue
+/// re-broadcast contract absorbs the residual commit-instant race; see the
+/// call site for the full argument.
 async fn bootstrap_one_signer(service: &ServiceState, signer: &str, bootstrap: bool) {
     // #90 x #146 — on a REBUILT store a continuing wallet has NO nonce ledger
     // row, so `nonce_get` reports 0 and everything it submits parks behind
