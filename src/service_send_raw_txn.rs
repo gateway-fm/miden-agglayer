@@ -299,72 +299,100 @@ async fn accept_and_revert_landed_claim(
     Ok(())
 }
 
-/// #90 (re-review) — how long after a store rebuild the first-contact nonce
-/// bootstrap stays available, in seconds. Bounded so "recovery mode" cannot linger
-/// indefinitely: the marker applied to EVERY previously-unseen signer for the life
-/// of the deployment, which is far broader than the continuing wallets it exists
-/// for. A continuing aggkit wallet submits within seconds of coming back, so a
-/// short window is ample.
-fn recovery_bootstrap_window() -> std::time::Duration {
-    std::time::Duration::from_secs(
-        std::env::var("NONCE_RECOVERY_WINDOW_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1800),
-    )
+/// How long after a store rebuild the first-contact nonce bootstrap stays
+/// available. Measured from the DURABLE stamp, so restarts neither extend nor
+/// reset it. Generous by default: a continuing wallet must be able to reconnect
+/// within it, and the window is the only thing standing between a rebuilt store
+/// and a permanently stranded claim.
+fn recovery_bootstrap_window_secs() -> u64 {
+    std::env::var("NONCE_RECOVERY_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(21_600) // 6h
 }
 
-/// When this process first observed the rebuild marker. The window is measured
-/// from first observation rather than persisted, so no extra migration is needed
-/// and a restart cannot silently extend recovery mode indefinitely.
-static RECOVERY_MODE_SINCE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-
-/// Lowest nonce observed per signer while recovery mode is active. The baseline is
-/// taken from this MINIMUM, never from whichever request arrived first.
-static RECOVERY_MIN_NONCE: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, u64>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-fn note_recovery_nonce(signer: &str, nonce: u64) {
-    let mut m = RECOVERY_MIN_NONCE.lock().unwrap();
-    m.entry(signer.to_string())
-        .and_modify(|lowest| {
-            if nonce < *lowest {
-                *lowest = nonce;
-            }
-        })
-        .or_insert(nonce);
-}
-
-fn lowest_recovery_nonce(signer: &str) -> Option<u64> {
-    RECOVERY_MIN_NONCE.lock().unwrap().get(signer).copied()
-}
-
-/// Is the post-rebuild nonce bootstrap currently permitted?
+/// Is the post-rebuild nonce bootstrap currently permitted GLOBALLY?
 ///
-/// True only while the durable rebuild marker is set AND this process has been
-/// observing it for less than [`recovery_bootstrap_window`]. Once the window
-/// lapses the marker is CLEARED durably, so recovery mode ends on its own instead
-/// of applying to every future unseen signer forever.
+/// #90 — the window is DURABLE and time-boxed from the rebuild stamp (migration
+/// 025), so restarts neither reset nor extend it. See that migration for the
+/// three earlier bounds and why each stranded an acknowledged claim.
+///
+/// This is only the global arm. Per-signer eligibility is
+/// [`signer_may_bootstrap`], which GRANDFATHERS already-parked work — the global
+/// window closing must never orphan a transaction that was acknowledged while it
+/// was open.
 async fn recovery_bootstrap_active(service: &ServiceState) -> anyhow::Result<bool> {
     if !service.store.is_nonce_ledger_rebuilt().await? {
         return Ok(false);
     }
-    let since = *RECOVERY_MODE_SINCE.get_or_init(std::time::Instant::now);
-    if since.elapsed() < recovery_bootstrap_window() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // A missing stamp means the marker predates migration 025; treat the window
+    // as open and stamp it now, so an upgrade cannot strand a wallet.
+    let Some(rebuilt_at) = service.store.nonce_ledger_rebuilt_at().await? else {
+        service.store.set_nonce_ledger_rebuilt(true).await?;
+        return Ok(true);
+    };
+    if now.saturating_sub(rebuilt_at) < recovery_bootstrap_window_secs() {
         return Ok(true);
     }
-    // Window lapsed — retire recovery mode durably and permanently.
     service.store.set_nonce_ledger_rebuilt(false).await?;
-    RECOVERY_MIN_NONCE.lock().unwrap().clear();
     ::metrics::counter!("rpc_nonce_recovery_mode_expired_total").increment(1);
     tracing::info!(
         target: "rpc::nonce_repair",
-        window_secs = recovery_bootstrap_window().as_secs(),
-        "#90: post-rebuild nonce recovery window elapsed — bootstrap disabled; ordinary \
-         R4 admission applies to every signer from here on"
+        window_secs = recovery_bootstrap_window_secs(),
+        "#90: post-rebuild nonce bootstrap window elapsed — retired durably; already-parked \
+         work stays eligible (grandfathered), ordinary R4 admission applies to everything else"
     );
     Ok(false)
+}
+
+/// May THIS signer still adopt a post-rebuild baseline?
+///
+/// #90 (round-5) — this used to GRANDFATHER any signer with parked rows and
+/// `nonce_get() == 0`, so that the global window closing could not orphan work
+/// acknowledged while it was open. That was WRONG and is reverted: an ABSENT
+/// ledger row also reads 0, and the predicate proved neither that a rebuild had
+/// happened nor that the row was parked while the window was open. On a fresh
+/// deployment a genuinely new wallet could submit nonce 42, be parked, and then
+/// be seeded to 42 — skipping 0..41 entirely. That is a direct nonce-ordering
+/// violation, and a permanent amnesty rather than a bounded one.
+///
+/// Eligibility is therefore the durable global window only. The residual it
+/// leaves is real and is recorded in the branch notes rather than papered over:
+/// a transaction parked in the last few blocks before the window closes cannot
+/// be seeded on that sweep (the settle margin has not elapsed) and will not be
+/// seeded afterwards. Closing that hole needs proof that a row was parked while
+/// the window was open — a durable per-row "parked during recovery" marker — not
+/// a predicate that cannot tell a continuing wallet from a new one.
+async fn signer_may_bootstrap(service: &ServiceState, signer: &str, global: bool) -> bool {
+    if global {
+        return true;
+    }
+    // The global window has closed. A row PARKED WHILE IT WAS OPEN stays
+    // eligible, because that marker is proof — not inference — that this is a
+    // continuing wallet from the rebuild era. Without it, a tx parked inside the
+    // final settle margin (the sweep waits BOOTSTRAP_SETTLE_BLOCKS before
+    // seeding, so it cannot be adopted on that sweep) is stranded forever behind
+    // nonces that will never arrive, having already been ACKNOWLEDGED.
+    //
+    // This is NOT the reverted round-4 grandfathering. That inferred eligibility
+    // from `nonce_get() == 0` plus the presence of parked rows, which an ABSENT
+    // ledger row also satisfies — so a brand-new wallet submitting nonce 42
+    // would have been seeded to 42, skipping 0..41. The marker is written at
+    // park time and only when recovery mode was genuinely active, so a new
+    // wallet's out-of-order tx can never carry it.
+    // Read the LOWEST parked nonce's row: that is the one a baseline adoption
+    // would seed from, so its provenance is the one that governs eligibility.
+    let Ok(Some(min)) = service.store.peek_queued_min_nonce(signer).await else {
+        return false;
+    };
+    match service.store.get_queued_txn(signer, min).await {
+        Ok(Some(parked)) => parked.parked_during_recovery,
+        _ => false,
+    }
 }
 
 /// #55 BLOCKER C/D — idempotent crash-gap nonce repair via store-level CAS.
@@ -1213,7 +1241,23 @@ pub fn is_signer_allowed(allowed: Option<&[Address]>, signer: &Address) -> bool 
     }
 }
 
+/// `eth_sendRawTransaction`. A transaction whose nonce is AHEAD of the signer's
+/// next expected nonce (a bursty / out-of-order submission) is PARKED in the
+/// per-signer future-nonce queue and its hash returned immediately, instead of
+/// blocking then rejecting (#146). When the gap fills, the contiguous run of
+/// parked successors is drained into the writer queue in nonce order.
 pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyhow::Result<TxHash> {
+    service_send_raw_txn_inner(service, input, false).await
+}
+
+/// `from_drain` is set only when the drain loop replays a previously-parked
+/// envelope: it suppresses the post-admit re-drain (the loop already iterates)
+/// so promotion is a bounded loop, not unbounded re-entrant recursion.
+async fn service_send_raw_txn_inner(
+    service: ServiceState,
+    input: String,
+    from_drain: bool,
+) -> anyhow::Result<TxHash> {
     let payload = hex_decode_prefixed(&input)?;
     let mut payload_slice = payload.as_slice();
     let txn_envelope = TxEnvelope::decode_2718(&mut payload_slice)?;
@@ -1368,7 +1412,32 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     if let Some(handle) = service.writer_handle.as_ref()
         && handle.available_capacity() == 0
     {
-        return Err(crate::writer_worker::WriterQueueSaturatedError.into());
+        // #146 — a saturated WRITER must not reject a tx that only needs durable
+        // PARKING: parking touches the queue, not the execution pipeline. This
+        // gate therefore applies only to a tx that would execute now. The read is
+        // an advisory hint (the authoritative classification happens under the
+        // per-signer lock below); if it races and we let a now-executable tx
+        // through, the writer enqueue simply reports saturation later, which is
+        // no worse than rejecting here.
+        // On a read error, DO NOT apply the gate: `u64::MAX` would make every tx
+        // look executable and reject parkable traffic as saturated. Letting it
+        // through is safe — the authoritative classification happens under the
+        // per-signer lock, and a genuinely executable tx simply meets writer
+        // saturation at enqueue instead.
+        let executable_now = match service.store.nonce_get(&signer_str).await {
+            Ok(expected_hint) => tx_nonce <= expected_hint,
+            Err(e) => {
+                tracing::warn!(
+                    target: "rpc::mempool", signer = %signer_str, error = %e,
+                    "capacity gate: nonce hint read failed — not rejecting; the parked/executable \
+                     decision is made authoritatively under the signer lock"
+                );
+                false
+            }
+        };
+        if executable_now {
+            return Err(crate::writer_worker::WriterQueueSaturatedError.into());
+        }
     }
     #[cfg(not(test))]
     if service.writer_handle.is_none() {
@@ -1415,17 +1484,12 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
     // same-nonce txs both pass the equality check before either calls
     // `nonce_increment`.
     //
-    // The mandatory writer also tolerates bounded future-nonce
-    // reordering from concurrent HTTP delivery: if nonce N+1 reaches us before
-    // nonce N, release the lock, wait briefly for N to be accepted, then
-    // re-check. This is a small in-process txpool behavior; stale/replay nonces
-    // still fail immediately, and missing gaps still fail after the bound.
-    let future_nonce_wait_max = std::time::Duration::from_secs(30);
-    let future_nonce_poll = std::time::Duration::from_millis(50);
-    let future_nonce_wait_started = tokio::time::Instant::now();
-    let mut logged_future_nonce_wait = false;
-
-    let _lock = loop {
+    // #146 — the mandatory writer behaves like a node's mempool for future-nonce
+    // txs: a valid tx whose nonce is AHEAD of the next expected nonce is PARKED in
+    // the persistent per-signer queue and its hash returned immediately (not
+    // blocked-then-rejected). The gap-fill (a tx at exactly the expected nonce)
+    // drains the contiguous parked run. Stale/replay nonces still fail immediately.
+    let signer_lock = {
         let lock = service.per_signer_locks.lock(signer).await;
 
         // Close the race between the optimistic dedup read above and this lock.
@@ -1476,11 +1540,7 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
         // `recovery_bootstrap_active`), and while it is active we only RECORD each
         // observed nonce here. Seeding is deliberately deferred until the ordering
         // window below is exhausted, so an in-flight LOWER nonce still wins.
-        let recovery_bootstrap = recovery_bootstrap_active(&service).await?;
-        if recovery_bootstrap && tx_nonce > 0 {
-            note_recovery_nonce(&signer_str, tx_nonce);
-        }
-        let mut expected_nonce = service.store.nonce_get(&signer_str).await?;
+        let expected_nonce = service.store.nonce_get(&signer_str).await?;
         let durable_frontier = service.store.pending_nonce_frontier(&signer_str).await?;
         if let Some(lower_nonce) = durable_frontier.lowest_unlinked
             && lower_nonce < tx_nonce
@@ -1490,63 +1550,49 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                 .as_ref()
                 .is_some_and(|handle| handle.has_non_terminal_nonce(&signer, lower_nonce));
             if !lower_is_live {
+                // #146 (round-4) — this MUST stay a rejection, not a park.
+                //
+                // An earlier revision parked here instead. That was wrong: the
+                // park branch returns before the nonce RESERVATION, so a
+                // different claim could be parked onto a nonce already bound to
+                // the durable transaction below it, and after #156 recovered the
+                // originals the parked one could never execute — retained but
+                // permanently stranded, which is worse than refusing it. The
+                // reservation is what makes "one tx per (signer, nonce)" true, so
+                // nothing may bypass it.
+                //
+                // What the caller needs is a refusal it can ACT on. "invalid
+                // nonce" is one of the three substrings zkevm-bridge-service
+                // claimtxman's isNonceError matches, so this clears its cached
+                // nonce, re-derives from chain and resubmits — the #111 self-heal
+                // — instead of retrying a doomed value forever (#119).
+                // Pinned by tests::r4_nonce_rejections_match_claimtxman_is_nonce_error.
                 anyhow::bail!(
-                    "cannot admit nonce {tx_nonce} for {signer_str}: durable transaction at lower nonce {lower_nonce} has not reached the Miden handoff; re-submit that exact signed transaction first"
+                    "invalid nonce {tx_nonce} for {signer_str}: durable transaction at lower nonce {lower_nonce} has not reached the Miden handoff; re-submit that exact signed transaction first"
                 );
             }
         }
         let durable_resume_nonce =
             known_durable_intent && expected_nonce == tx_nonce.saturating_add(1);
-        let can_wait_for_future_nonce = service.writer_handle.is_some()
-            && tx_nonce > expected_nonce
-            && future_nonce_wait_started.elapsed() < future_nonce_wait_max;
-
-        // #90 (re-review) — seed the baseline ONLY once the future-nonce ordering
-        // window is exhausted, and seed with the LOWEST nonce observed for this
-        // signer during that window, never with whichever request happened to
-        // arrive first.
+        // #146 — a future-nonce tx is PARKED durably (Geth-style) instead of being
+        // waited on and then rejected. See the park branch below.
         //
-        // Seeding on first arrival was wrong twice over: HTTP/retry ordering can
-        // deliver N+1 before a still-pending N, which would seed N+1 and strand N
-        // as permanently stale; and doing it above bypassed the very ordering
-        // protection sitting right here. Deferring to window-exhaustion gives a
-        // genuinely in-flight lower nonce the FULL window to arrive and win, and
-        // taking the minimum means the request that seeds need not be the one that
-        // is finally admitted — with baseline N seeded, the N request matches and
-        // proceeds while N+1 simply retries into its normal sequential slot.
-        if recovery_bootstrap
-            && tx_nonce > 0
-            && !can_wait_for_future_nonce
-            && tx_nonce != expected_nonce
-        {
-            let baseline = lowest_recovery_nonce(&signer_str).unwrap_or(tx_nonce);
-            if service
-                .store
-                .nonce_bootstrap_if_absent(&signer_str, baseline)
-                .await?
-            {
-                ::metrics::counter!("rpc_nonce_ledger_bootstrapped_total").increment(1);
-                tracing::warn!(
-                    target: "rpc::nonce_repair",
-                    signer = %signer_str,
-                    adopted_nonce = baseline,
-                    observed_nonce = tx_nonce,
-                    "#90: no nonce ledger entry for this signer after a store rebuild — \
-                     adopting the LOWEST nonce observed during the ordering window as the \
-                     baseline so a continuing wallet can resume; R4 sequencing applies from \
-                     here on"
-                );
-                // Re-read: the seed may have been a LOWER nonce than this request,
-                // in which case this one correctly waits its turn.
-                expected_nonce = service.store.nonce_get(&signer_str).await?;
-            }
-        }
-        let can_wait_for_future_nonce = can_wait_for_future_nonce && tx_nonce > expected_nonce;
+        // #90 x #146 — a REBUILT store has NO ledger row for this signer, so
+        // `expected_nonce` reads 0 and a continuing wallet's nonce N looks
+        // "future" and parks behind nonces 0..N-1 that can never be submitted.
+        // The baseline seed that unblocks it is deliberately NOT done here:
+        // seeding on whichever request arrives first can adopt N+1 and strand a
+        // still-in-flight N. It happens in `resume_queued_drain` instead, where
+        // the DURABLE queue itself is the observation window and the LOWEST
+        // PARKED nonce is the baseline — strictly better than the old in-memory
+        // timing window because it survives a restart.
+        let is_future_nonce =
+            service.writer_handle.is_some() && !durable_resume_nonce && tx_nonce > expected_nonce;
 
         let nonce_action = if tx_nonce == expected_nonce || durable_resume_nonce {
             "accept"
-        } else if can_wait_for_future_nonce {
-            "wait_future"
+        } else if is_future_nonce {
+            "park_future"
         } else {
             "reject"
         };
@@ -1563,44 +1609,124 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
                 "nonce_matches": tx_nonce == expected_nonce,
                 "durable_resume": durable_resume_nonce,
                 "action": nonce_action,
-                "future_nonce_wait_ms": future_nonce_wait_started.elapsed().as_millis(),
                 "writer_handle_present": service.writer_handle.is_some(),
             })
         );
 
         if tx_nonce == expected_nonce || durable_resume_nonce {
-            break lock;
-        }
-
-        if can_wait_for_future_nonce {
-            if !logged_future_nonce_wait {
-                ::metrics::counter!("rpc_future_nonce_wait_total").increment(1);
-                logged_future_nonce_wait = true;
+            // #146 (review) — FIRST PARKED WINS, including at the moment the
+            // nonce becomes executable. Without this, the interleaving is:
+            // A@N parks and is acknowledged; N-1 lands and advances the frontier
+            // to N; a DIFFERENT B@N reaches this path first; the exact-nonce
+            // branch never looked at `queued_txns`, so B took the reservation and
+            // A sat below the frontier forever. Refuse B and let the drain
+            // promote A — the same "no replacement" rule the park branch applies.
+            if let Some(parked) = service.store.get_queued_txn(&signer_str, tx_nonce).await?
+                && parked.tx_hash != txn_hash
+            {
+                ::metrics::counter!("rpc_future_nonce_conflict_total").increment(1);
+                drop(lock);
+                // The parked tx now sits AT the frontier, so the periodic drain
+                // sweep promotes it on its next tick; no ad-hoc spawn needed.
+                anyhow::bail!(
+                    "a different transaction is already queued for {signer_str} at nonce {tx_nonce}; \
+                     keeping the first (no replacement) — it will be promoted by the drain"
+                );
             }
+            lock
+        } else if is_future_nonce {
+            // Park the validated future-nonce tx and accept immediately. The raw
+            // envelope is replayed verbatim by the drain once the gap fills. TTL is
+            // block-denominated so the shared pending-receipt expiry sweep reaps a
+            // gap that never fills. Idempotent same-hash re-broadcast accepts;
+            // conflicting same-nonce hash and bound breaches are refused.
+            let latest_block = service.store.get_latest_block_number().await?;
+            let expires_at = latest_block.saturating_add(QUEUE_TTL_BLOCKS);
+            // Stamp the row iff the #90 post-rebuild recovery window is open
+            // RIGHT NOW. Captured at park time and stored durably, so a tx
+            // parked inside the final settle margin stays eligible for baseline
+            // adoption after the global window closes — without granting a new
+            // wallet the same amnesty, since it can never earn the stamp.
+            //
+            // Review finding 2: this read must FAIL CLOSED, not default. The
+            // previous `unwrap_or(false)` turned a transient store error into
+            // "not recovery", after which the tx was parked UNSTAMPED and
+            // ACKNOWLEDGED — near the window boundary that acknowledgment could
+            // never be made eligible again. Erroring here rejects the
+            // submission instead: the sender still holds the transaction and
+            // retries, which is recoverable; a wrongly-unstamped acknowledged
+            // row is not.
+            let parked_during_recovery = anyhow::Context::context(
+                recovery_bootstrap_active(&service).await,
+                "reading recovery state before parking (rejecting rather than parking unstamped)",
+            )?;
+            let outcome = service
+                .store
+                .queue_txn(
+                    &signer_str,
+                    tx_nonce,
+                    txn_hash,
+                    &txn_envelope,
+                    expires_at,
+                    parked_during_recovery,
+                    crate::store::QueueBounds {
+                        per_signer: QUEUE_MAX_PER_SIGNER,
+                        global: QUEUE_MAX_GLOBAL,
+                    },
+                )
+                .await?;
             drop(lock);
-            tokio::time::sleep(future_nonce_poll).await;
-            continue;
-        }
-
-        ::metrics::counter!("rpc_nonce_mismatch_total").increment(1);
-        // #111 — the rejection message is a PARSED CONTRACT, not prose. The
-        // zkevm-bridge-service claimtxman classifies send errors with
-        // isNonceError (substring match on "nonce too low" / "invalid nonce" /
-        // "txnonce") and only then clears its in-memory nonce cache and
-        // re-derives from the chain (ReviewMonitoredTx). Our previous
-        // "nonce mismatch for ..." wording matched NONE of those, so the
-        // claimtxman's built-in self-heal was dead against this proxy and a
-        // stale-nonce claim retried forever (the cycle-1/2 L1-GER starvation).
-        // Mirror geth's wording exactly; the R4 rationale rides behind it.
-        // Pinned by tests::r4_nonce_rejections_match_claimtxman_is_nonce_error.
-        if tx_nonce < expected_nonce {
+            match outcome {
+                crate::store::QueueOutcome::Parked | crate::store::QueueOutcome::AlreadyParked => {
+                    ::metrics::counter!("rpc_future_nonce_parked_total").increment(1);
+                    tracing::info!(
+                        target: "rpc::mempool",
+                        signer = %signer_str, nonce = tx_nonce, %txn_hash,
+                        expected = expected_nonce, outcome = ?outcome,
+                        "parked future-nonce tx (mempool); will be promoted when the gap fills"
+                    );
+                    return Ok(txn_hash);
+                }
+                crate::store::QueueOutcome::ConflictDifferentHash => {
+                    ::metrics::counter!("rpc_future_nonce_conflict_total").increment(1);
+                    anyhow::bail!(
+                        "a different transaction is already queued for {signer_str} at nonce {tx_nonce}; \
+                         keeping the first (no replacement) — resubmit that exact transaction"
+                    );
+                }
+                crate::store::QueueOutcome::PerSignerBoundExceeded
+                | crate::store::QueueOutcome::GlobalBoundExceeded => {
+                    ::metrics::counter!("rpc_future_nonce_bound_exceeded_total").increment(1);
+                    anyhow::bail!(
+                        "future-nonce queue is full ({outcome:?}) for {signer_str} at nonce {tx_nonce}; \
+                         retry after the gap fills"
+                    );
+                }
+            }
+        } else {
+            ::metrics::counter!("rpc_nonce_mismatch_total").increment(1);
+            // #111 — the rejection message is a PARSED CONTRACT, not prose. The
+            // zkevm-bridge-service claimtxman classifies send errors with
+            // isNonceError (substring match on "nonce too low" / "invalid nonce" /
+            // "txnonce") and only then clears its in-memory nonce cache and
+            // re-derives from the chain (ReviewMonitoredTx). The older
+            // "nonce mismatch for ..." wording matched NONE of those, so the
+            // claimtxman's built-in self-heal was dead against this proxy and a
+            // stale-nonce claim retried forever. Mirror geth's wording exactly.
+            // Pinned by tests::r4_nonce_rejections_match_claimtxman_is_nonce_error.
+            //
+            // With #146 parking, a FUTURE nonce no longer reaches here at all
+            // (it is queued), so in practice this is the past-nonce path — which
+            // is exactly the one claimtxman can self-heal from.
+            if tx_nonce < expected_nonce {
+                anyhow::bail!(
+                    "nonce too low: next nonce {expected_nonce}, tx nonce {tx_nonce} (R4 replay / out-of-order guard for {signer_str})"
+                );
+            }
             anyhow::bail!(
-                "nonce too low: next nonce {expected_nonce}, tx nonce {tx_nonce} (R4 replay / out-of-order guard for {signer_str})"
+                "nonce too high: next nonce {expected_nonce}, tx nonce {tx_nonce} (R4 replay / out-of-order guard for {signer_str})"
             );
         }
-        anyhow::bail!(
-            "nonce too high: next nonce {expected_nonce}, tx nonce {tx_nonce} (R4 replay / out-of-order guard for {signer_str})"
-        );
     };
 
     // ── #55 BLOCKER 1 — atomic (signer, nonce) reservation ──────────────
@@ -1707,7 +1833,353 @@ pub async fn service_send_raw_txn(service: ServiceState, input: String) -> anyho
             "failed to release the nonce reservation lease; it will expire and be taken over"
         );
     }
+    // #146 — the in-order tx was admitted and advanced the nonce, so any parked
+    // successor at the new expected nonce is now promotable. RELEASE the per-signer
+    // lock FIRST: the drain re-enters this fn and re-acquires the same lock, so
+    // draining while still holding it would self-deadlock. Skipped when THIS call is
+    // itself a drain replay (`from_drain`), so promotion is a bounded loop rather
+    // than unbounded re-entrant recursion.
+    drop(signer_lock);
+    if admission.is_ok() && !from_drain {
+        drain_queued(&service, &signer_str).await;
+    }
     admission
+}
+
+/// Block-denominated TTL for a parked future-nonce tx. Generous — a real gap
+/// fills within a few blocks; this only reaps a gap that never fills, via the
+/// same sweep that expires pending receipts. ~1h at ~1 block/s.
+const QUEUE_TTL_BLOCKS: u64 = 3_600;
+
+/// Blocks the lowest parked nonce must have been queued for before it may seed a
+/// post-rebuild baseline, so a LOWER nonce still in validation can arrive first.
+const BOOTSTRAP_SETTLE_BLOCKS: u64 = 3;
+
+/// Wall-clock budget for one signer's slice of the periodic drain sweep.
+const SWEEP_PER_SIGNER_BUDGET_SECS: u64 = 20;
+/// Bound on parked future-nonce txs per signer (a bursty sender's reorder depth
+/// is small; this caps a misbehaving/adversarial signer).
+const QUEUE_MAX_PER_SIGNER: usize = 256;
+/// Global bound across all signers, so the queue cannot grow without limit.
+const QUEUE_MAX_GLOBAL: usize = 4_096;
+
+/// Promote the contiguous run of parked future-nonce txns for `signer`, starting
+/// at the signer's current next-expected nonce, into the writer queue in nonce
+/// order. Each parked tx is replayed through the normal admission path
+/// (`service_send_raw_txn_inner(.., from_drain = true)`): re-validated, durably
+/// admitted (nonce CAS + pending row), enqueued — and only THEN deleted from the
+/// queue, so an acknowledged future tx is never lost between promotion and
+/// durable admission (crash-safe: the startup resume re-drives it). Stops at the
+/// first missing nonce or a promotion error (recovered on the next gap-fill or
+/// re-broadcast). Best-effort: a failure is logged, never propagated to the
+/// caller whose own tx already succeeded.
+async fn drain_queued(service: &ServiceState, signer_str: &str) {
+    // Bounded by QUEUE_MAX_PER_SIGNER live parked entries; the +1 guards against
+    // a pathological same-nonce re-park loop.
+    for _ in 0..=QUEUE_MAX_PER_SIGNER {
+        let next = match service.store.nonce_get(signer_str).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(target: "rpc::mempool", signer = %signer_str, error = %e, "drain: nonce_get failed");
+                return;
+            }
+        };
+        let parked = match service.store.get_queued_txn(signer_str, next).await {
+            Ok(Some(q)) => q,
+            Ok(None) => return, // gap again (or queue empty) — nothing contiguous
+            Err(e) => {
+                tracing::error!(target: "rpc::mempool", signer = %signer_str, next, error = %e, "drain: get_queued_txn failed");
+                return;
+            }
+        };
+        let mut envelope_hex = String::from("0x");
+        {
+            use alloy::eips::Encodable2718;
+            let mut bytes = Vec::new();
+            parked.envelope.encode_2718(&mut bytes);
+            envelope_hex.push_str(&alloy::hex::encode(bytes));
+        }
+        match Box::pin(service_send_raw_txn_inner(
+            service.clone(),
+            envelope_hex,
+            true,
+        ))
+        .await
+        {
+            Ok(_) => {
+                // #146 (review) — `Ok(hash)` alone does NOT prove durable
+                // admission: a NonceReservation::OwnedBySame can be returned from
+                // a still-valid lease whose `txn_begin_if_absent` never ran (a
+                // crash mid-promotion followed by a restart inside the lease
+                // window). Deleting on that would destroy the ONLY durable copy
+                // of the envelope — no queue row, no transaction row, nothing for
+                // #156 to recover. Confirm the transaction row exists first;
+                // otherwise keep the queue row and let the next sweep retry.
+                match service.store.txn_get(parked.tx_hash).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        ::metrics::counter!("rpc_future_nonce_promote_unconfirmed_total")
+                            .increment(1);
+                        tracing::warn!(
+                            target: "rpc::mempool",
+                            signer = %signer_str, nonce = parked.nonce, tx_hash = %parked.tx_hash,
+                            "drain: admission returned OK but no durable transaction row exists \
+                             (reservation-only path); KEEPING the parked row so the envelope is \
+                             not lost — the next sweep retries"
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!(target: "rpc::mempool", signer = %signer_str, nonce = parked.nonce, error = %e, "drain: txn_get failed while confirming durable admission; keeping the parked row");
+                        return;
+                    }
+                }
+                // Durably admitted — now safe to remove from the queue. A crash
+                // between admit and delete leaves the row; the startup resume
+                // re-replays it and admission is idempotent (dedup-returns).
+                if let Err(e) = service
+                    .store
+                    .delete_queued_txn(signer_str, parked.nonce, parked.tx_hash)
+                    .await
+                {
+                    tracing::error!(target: "rpc::mempool", signer = %signer_str, nonce = parked.nonce, error = %e, "drain: delete_queued_txn failed after admit; will retry via resume");
+                    return;
+                }
+                ::metrics::counter!("rpc_future_nonce_promoted_total").increment(1);
+                tracing::info!(target: "rpc::mempool", signer = %signer_str, nonce = parked.nonce, tx_hash = %parked.tx_hash, "promoted parked future-nonce tx after gap filled");
+            }
+            Err(e) => {
+                tracing::warn!(target: "rpc::mempool", signer = %signer_str, nonce = parked.nonce, error = %e, "drain: promoting parked tx failed; stopping (recovered on re-broadcast or resume)");
+                return;
+            }
+        }
+    }
+    tracing::warn!(target: "rpc::mempool", signer = %signer_str, "drain: hit the per-signer promotion bound; will continue on the next gap-fill");
+}
+
+/// Startup resume: for every signer with parked future-nonce txns whose smallest
+/// parked nonce already equals the signer's next-expected nonce, drain the
+/// contiguous run. Recovers acknowledged future txs across a process restart so
+/// an ack'd tx never silently disappears. Best-effort per signer.
+pub async fn resume_queued_drain(service: &ServiceState) -> anyhow::Result<()> {
+    let signers = service.store.queued_signers().await?;
+    let bootstrap = recovery_bootstrap_active(service).await.unwrap_or(false);
+    for signer in signers {
+        // (review) FAIRNESS: the sweep walks signers serially and EVERY step here
+        // can block — acquiring the per-signer lock (held by a request in
+        // stateful validation), the bootstrap reads, the stale-prefix reconcile,
+        // and the drain itself, where a single row can sit in strict-H6 GER
+        // observation for many minutes (Miden-client calls have no outer
+        // deadline). Bounding only the drain left the other steps unbounded, so
+        // one stuck signer still starved every later one. Bound the WHOLE slice.
+        // (review finding 3, supersedes round-4) The bootstrap is INSIDE the
+        // per-signer budget again, and this time it is safe. Round-4 kept it
+        // outside because cancelling a bare tokio-postgres `execute` abandons a
+        // statement the server may still commit — releasing the per-signer lock
+        // while the baseline INSERT was pending let a LOWER nonce park and then
+        // be stranded under an abandoned HIGHER baseline. Two later changes
+        // dissolved that hazard:
+        //   1. the insert now runs in an EXPLICIT TRANSACTION with a server-side
+        //      statement_timeout — a cancelled future DROPS the transaction,
+        //      which rolls back; nothing half-done can commit later — and
+        //   2. the queue is now ephemeral (TTL eviction + sender re-broadcast),
+        //      so even the one residual race (cancellation landing exactly
+        //      inside COMMIT) self-heals: a wrongly-seeded baseline turns the lower
+        //      nonce's re-broadcast into "nonce too low", which claimtxman
+        //      already recovers from by re-deriving off the chain (#111).
+        // Leaving it OUTSIDE was itself the reviewer's finding: the lock wait,
+        // pool checkout and reads had no bound at all, so one hung signer
+        // silently starved every later signer's recovery forever.
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(SWEEP_PER_SIGNER_BUDGET_SECS),
+            async {
+                bootstrap_one_signer(service, &signer, bootstrap).await;
+                sweep_one_signer(service, &signer).await
+            },
+        )
+        .await
+        .is_err()
+        {
+            ::metrics::counter!("rpc_future_nonce_drain_budget_exceeded_total").increment(1);
+            tracing::warn!(
+                target: "rpc::mempool", signer = %signer,
+                budget_secs = SWEEP_PER_SIGNER_BUDGET_SECS,
+                "drain: per-signer sweep budget exhausted — moving on so later signers are not \
+                 starved; this signer resumes on the next tick"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// One signer's slice of the drain sweep: post-rebuild baseline adoption, stale
+/// prefix reconciliation, then the contiguous drain. Bounded by the caller.
+/// Adopt a post-rebuild baseline for one signer, if eligible.
+///
+/// Runs INSIDE the sweep's per-signer budget (review finding 3). Cancellation
+/// became safe when the baseline insert moved into an explicit transaction —
+/// dropping the future rolls the transaction back — and the ephemeral-queue
+/// re-broadcast contract absorbs the residual commit-instant race; see the
+/// call site for the full argument.
+async fn bootstrap_one_signer(service: &ServiceState, signer: &str, bootstrap: bool) {
+    // #90 x #146 — on a REBUILT store a continuing wallet has NO nonce ledger
+    // row, so `nonce_get` reports 0 and everything it submits parks behind
+    // nonces 0..N-1 that can never arrive: a permanent wedge, and strictly worse
+    // than the pre-#146 rejection because nothing surfaces.
+    //
+    // The durable queue is the ordering window: adopt the LOWEST PARKED nonce as
+    // the baseline, never whichever request happened to arrive first.
+    //
+    // Held under the per-signer lock, with the peek repeated inside it, so a
+    // LOWER nonce cannot park between the peek and the seed.
+    //
+    // RESIDUAL, accepted and bounded: a lower nonce may still be in stateful
+    // validation (strict-H6 waits are minutes long) and therefore invisible to
+    // any peek. If that happens the lower request is later refused "nonce too
+    // low" — which IS the string claimtxman's isNonceError matches, so it clears
+    // its cache, re-derives from chain and resubmits. The failure self-heals via
+    // the exact mechanism #111 restored, rather than wedging. Perfect quiescence
+    // detection is not available to a proxy that cannot read account nonces from
+    // chain state.
+    if signer_may_bootstrap(service, signer, bootstrap).await
+        && let Ok(addr) = signer.parse::<Address>()
+    {
+        let guard = service.per_signer_locks.lock(addr).await;
+        // (review round 3, codex B2) ONE read of the minimum row serves the
+        // proof check, the settle check AND the seed. The pre-lock
+        // `signer_may_bootstrap` ran against whatever was the minimum THEN; an
+        // eviction or promotion between check and lock can change the minimum,
+        // and seeding from a row whose own stamp was never verified is the
+        // round-4 amnesty again (a new wallet at 42 seeded to 42). Re-verify
+        // eligibility on the exact row being adopted, under the lock, so the
+        // three reads cannot diverge.
+        let candidate = match service.store.peek_queued_min_nonce(signer).await {
+            Ok(Some(min)) => service
+                .store
+                .get_queued_txn(signer, min)
+                .await
+                .ok()
+                .flatten(),
+            _ => None,
+        };
+        let eligible_now = candidate
+            .as_ref()
+            .is_some_and(|q| bootstrap || q.parked_during_recovery);
+        let settled = match (
+            candidate.as_ref(),
+            service.store.get_latest_block_number().await,
+        ) {
+            (Some(q), Ok(now_block)) => {
+                let parked_at = q.expires_at.saturating_sub(QUEUE_TTL_BLOCKS);
+                now_block >= parked_at.saturating_add(BOOTSTRAP_SETTLE_BLOCKS)
+            }
+            _ => false,
+        };
+        if eligible_now
+            && settled
+            && let Some(q) = candidate
+            && q.nonce > 0
+            && matches!(
+                service
+                    .store
+                    .nonce_bootstrap_if_absent(signer, q.nonce)
+                    .await,
+                Ok(true)
+            )
+        {
+            let min_parked = q.nonce;
+            ::metrics::counter!("rpc_nonce_ledger_bootstrapped_total").increment(1);
+            tracing::warn!(
+                target: "rpc::nonce_repair",
+                signer = %signer,
+                adopted_nonce = min_parked,
+                "#90: no nonce ledger entry for this signer after a store rebuild — adopting \
+                 the LOWEST PARKED nonce as the baseline so a continuing wallet resumes; R4 \
+                 sequencing applies from here on"
+            );
+        }
+        drop(guard);
+    }
+}
+
+/// One signer's slice of the drain sweep: stale-prefix reconciliation, then the
+/// contiguous drain. Bounded by the caller. Contains no mutation that is unsafe
+/// to cancel.
+async fn sweep_one_signer(service: &ServiceState, signer: &str) {
+    let expected = match service.store.nonce_get(signer).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(target: "rpc::mempool", signer = %signer, error = %e, "sweep: nonce_get failed");
+            return;
+        }
+    };
+
+    // Do NOT gate on `MIN(queue) == expected`: a crash, a delete error, or an
+    // enqueue race can leave an already-admitted row BELOW the frontier, and that
+    // gate then skipped the signer forever, permanently masking an acknowledged
+    // executable successor.
+    reconcile_stale_queued_prefix(service, signer, expected).await;
+
+    if matches!(
+        service.store.get_queued_txn(signer, expected).await,
+        Ok(Some(_))
+    ) {
+        tracing::info!(target: "rpc::mempool", signer = %signer, expected, "resuming drain of persisted future-nonce txns");
+        drain_queued(service, signer).await;
+    }
+}
+
+/// Reconcile parked rows that sit BELOW the executable frontier.
+///
+/// Such a row is either (a) already durably admitted — the promotion advanced the
+/// nonce but crashed before deleting the queue row, so the row is now redundant
+/// and safe to remove — or (b) an acknowledged tx whose nonce was consumed by a
+/// DIFFERENT transaction, which can never execute. Case (b) is never dropped
+/// silently: it is surfaced loudly with a metric so it cannot pass unnoticed,
+/// because dropping it is exactly the #119 orphan.
+async fn reconcile_stale_queued_prefix(service: &ServiceState, signer: &str, expected: u64) {
+    loop {
+        let min = match service.store.peek_queued_min_nonce(signer).await {
+            Ok(Some(n)) if n < expected => n,
+            _ => return,
+        };
+        let parked = match service.store.get_queued_txn(signer, min).await {
+            Ok(Some(q)) => q,
+            _ => return,
+        };
+        match service.store.txn_get(parked.tx_hash).await {
+            Ok(Some(_)) => {
+                // (a) already admitted — the queue row is redundant bookkeeping.
+                if service
+                    .store
+                    .delete_queued_txn(signer, min, parked.tx_hash)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                ::metrics::counter!("rpc_future_nonce_stale_row_reconciled_total").increment(1);
+                tracing::info!(
+                    target: "rpc::mempool", signer = %signer, nonce = min, tx_hash = %parked.tx_hash,
+                    "drain: parked row below the frontier was already durably admitted — \
+                     removing the redundant queue row"
+                );
+            }
+            Ok(None) => {
+                // (b) its nonce was taken by a different tx. Surface, do not drop.
+                ::metrics::counter!("rpc_future_nonce_stranded_total").increment(1);
+                tracing::error!(
+                    target: "rpc::mempool", signer = %signer, nonce = min, tx_hash = %parked.tx_hash,
+                    expected,
+                    "drain: an ACKNOWLEDGED parked tx sits below the executable frontier with no \
+                     durable transaction row — its nonce was consumed by a different transaction. \
+                     It is RETAINED (never silently dropped) and requires operator action"
+                );
+                return;
+            }
+            Err(_) => return,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2767,33 +3239,168 @@ mod tests {
         );
     }
 
-    /// #90 — the wedge itself, as a regression. On a store whose ledger was
-    /// REBUILT by restore, a continuing signer's first tx (nonce 21, no ledger
-    /// row) must be ADMITTED by adopting 21 as the baseline. Pre-fix this parked
-    /// in the future-nonce queue forever waiting for nonce 0 — the GER injector
-    /// spun 34,287 times in ~30min and injection never resumed.
+    /// #146 (review) — FIRST PARKED WINS even once the nonce becomes EXECUTABLE.
+    ///
+    /// Interleaving that used to strand an acknowledged tx forever: A@N parks and
+    /// is acknowledged; N-1 lands and advances the frontier to N; a DIFFERENT B@N
+    /// arrives. The exact-nonce admission path never consulted `queued_txns`, so B
+    /// took the reservation, the frontier moved to N+1, and A sat below it with no
+    /// path to execution — the #119 orphan with extra steps.
+    #[tokio::test]
+    async fn mempool_executable_nonce_cannot_displace_the_parked_first_winner() {
+        let (service, _sd) = mempool_service();
+        let store = service.store.clone();
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
+
+        // A@1 parks (frontier is 0).
+        let (a_raw, a_hash) = ger_tx_at(&key, 1, 0xA1);
+        service_send_raw_txn(service.clone(), a_raw).await.unwrap();
+        assert_eq!(
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            Some(1)
+        );
+
+        // Frontier advances to 1 WITHOUT draining (simulates the window between
+        // the predecessor's nonce CAS and the drain running).
+        store
+            .nonce_bootstrap_if_absent(&signer_str, 1)
+            .await
+            .unwrap();
+
+        // A DIFFERENT tx at the now-executable nonce 1 must be refused.
+        let (b_raw, b_hash) = ger_tx_at(&key, 1, 0xB2);
+        assert_ne!(a_hash, b_hash);
+        let err = service_send_raw_txn(service.clone(), b_raw)
+            .await
+            .expect_err("a different tx at the parked nonce must not displace the first winner");
+        assert!(
+            err.to_string().contains("already queued"),
+            "unexpected error: {err}"
+        );
+
+        // A is still parked and still promotable — never stranded.
+        assert_eq!(
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            Some(1),
+            "the first-parked tx must survive the conflicting submission"
+        );
+        resume_queued_drain(&service).await.unwrap();
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            2,
+            "the first-parked tx must be the one that executes"
+        );
+    }
+
+    /// #146 (review) — a parked row left BELOW the executable frontier (a crash or
+    /// a delete error between admission and queue-delete, or a nonce consumed by a
+    /// different tx) must not permanently mask its successors.
+    ///
+    /// The resume path used to drain only when `MIN(queue) == expected`. With a
+    /// stale row at MIN < expected that condition never held again, so the signer
+    /// was skipped forever and an acknowledged, executable successor sat unclaimed
+    /// — silent, and exactly the failure mode this queue exists to remove.
+    #[tokio::test]
+    async fn mempool_stale_row_below_frontier_does_not_mask_successors() {
+        let (service, _sd) = mempool_service();
+        let store = service.store.clone();
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
+
+        // Park 1 and 2 (frontier is 0) via the real RPC path.
+        let (raw1, _) = ger_tx_at(&key, 1, 0xD1);
+        service_send_raw_txn(service.clone(), raw1).await.unwrap();
+        let (raw2, _) = ger_tx_at(&key, 2, 0xD2);
+        service_send_raw_txn(service.clone(), raw2).await.unwrap();
+
+        // Frontier jumps to 2 as if nonce 1 had been admitted but its queue row
+        // never deleted — leaving MIN(queue)=1 BELOW the frontier.
+        store
+            .nonce_bootstrap_if_absent(&signer_str, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            Some(1),
+            "precondition: MIN(queue)=1 is BELOW the frontier of 2"
+        );
+
+        resume_queued_drain(&service).await.unwrap();
+
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            3,
+            "the executable successor at the frontier must be promoted despite the stale \
+             row below it (old gate: MIN != expected => that signer was skipped forever)"
+        );
+    }
+
+    /// #90 x #146 — the wedge itself, as a regression. On a store whose ledger
+    /// was REBUILT by restore, a continuing signer's first tx (nonce 21, no
+    /// ledger row) must NOT be rejected and must NOT sit in the queue forever
+    /// waiting for nonce 0 (pre-fix the GER injector spun 34,287 times in ~30min
+    /// and injection never resumed; the same shape #119 measured at ~17/s).
+    ///
+    /// Under #146 the tx is ACKNOWLEDGED immediately by parking it — strictly
+    /// better than the old behaviour, which held the HTTP request open for the
+    /// 30s ordering window before deciding. The baseline is then adopted from the
+    /// LOWEST PARKED nonce by the drain (startup resume + the 30s periodic
+    /// sweep), and the parked tx is promoted. Seeding is deliberately NOT done at
+    /// admission: whichever request arrives first could be N+1, which would seed
+    /// N+1 and strand a still-in-flight N.
     #[tokio::test]
     async fn finding90_rebuilt_ledger_bootstraps_continuing_signer() {
-        let service = create_test_service();
+        let (service, _sd) = mempool_service();
         let store = service.store.clone();
         store.set_nonce_ledger_rebuilt(true).await.unwrap();
 
-        let calldata = insertGlobalExitRootCall {
-            root: FixedBytes::from([0xAAu8; 32]),
-        }
-        .abi_encode();
-        let (input_hex, signer) = encode_legacy_tx_with_nonce(calldata, 21);
-        let signer_str = format!("{signer:#x}");
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
+        let (raw, hash) = ger_tx_at(&key, 21, 0xB1);
 
-        // Must not hang in the future-nonce queue and must not reject.
-        let _ = service_send_raw_txn(service.clone(), input_hex).await;
+        // Accepted, not rejected: the sender gets its hash back immediately.
+        let got = service_send_raw_txn(service.clone(), raw)
+            .await
+            .expect("a continuing signer's tx must be accepted (parked), never rejected");
+        assert_eq!(got, hash);
+        assert_eq!(
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            Some(21),
+            "the tx must be durably parked, not dropped"
+        );
 
-        // The baseline was adopted, so the NEXT expected nonce is 22 — ordinary R4
-        // sequencing resumes from the seed rather than from 0.
+        // The settle margin must elapse first: a LOWER nonce could still be in
+        // validation, and seeding on the current minimum would strand it.
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            0,
+            "no baseline may be adopted before the settle margin elapses"
+        );
+        resume_queued_drain(&service).await.unwrap();
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            0,
+            "still no baseline — the settle margin has not elapsed"
+        );
+
+        // Advance past the margin; the drain adopts the LOWEST PARKED nonce.
+        let now = store.get_latest_block_number().await.unwrap();
+        store
+            .set_latest_block_number(now + BOOTSTRAP_SETTLE_BLOCKS + 1)
+            .await
+            .unwrap();
+        resume_queued_drain(&service).await.unwrap();
+
         assert_eq!(
             store.nonce_get(&signer_str).await.unwrap(),
             22,
             "a continuing signer must resume at its own nonce after a ledger rebuild"
+        );
+        assert_eq!(
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            None,
+            "the parked tx must be promoted out of the queue, never stranded"
         );
     }
 
@@ -2823,89 +3430,346 @@ mod tests {
         );
     }
 
-    /// `RECOVERY_MIN_NONCE` / `RECOVERY_MODE_SINCE` are process-wide statics, and the
-    /// window-expiry path CLEARS the min-nonce map. Tests that touch either must not
-    /// run concurrently or one will wipe the other's observations mid-assertion.
-    static NONCE_RECOVERY_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// #90 (re-review) — ORDERING: `N+1` may reach the proxy before a still-pending
-    /// `N` (HTTP reordering, a retry, concurrent submitters). Seeding from whichever
-    /// request arrived FIRST would adopt `N+1` and strand `N` as permanently stale —
-    /// silently dropping a transaction the wallet believes is live.
+    /// #90 x #146 (re-review) — ORDERING: `N+1` may reach the proxy before a
+    /// still-pending `N` (HTTP reordering, a retry, concurrent submitters).
+    /// Seeding from whichever request arrived FIRST would adopt `N+1` and strand
+    /// `N` as permanently stale — silently dropping a transaction the wallet
+    /// believes is live.
     ///
-    /// The baseline is therefore taken from the LOWEST nonce observed during the
-    /// ordering window, not the first. Here `22` is observed before `21`, and the
-    /// seeded baseline must still be `21`.
+    /// The baseline is therefore taken from the LOWEST PARKED nonce, not the
+    /// first arrival. Here `22` is submitted before `21`, and the adopted
+    /// baseline must still be `21`. This drives the real durable path (park ->
+    /// drain -> seed -> promote) rather than an in-memory shadow of it, so the
+    /// ordering guarantee also survives a restart.
     #[tokio::test]
-    async fn finding90_seeds_lowest_observed_nonce_not_first_arrival() {
-        let addr = "0x00000000000000000000000000000000000000bb";
-        // Scope the guard to the SYNCHRONOUS section touching the shared statics:
-        // holding a std Mutex across an await is a clippy error and a real deadlock
-        // hazard. The window-expiry path clears this map, so the two tests that use
-        // it must not interleave here.
-        let baseline = {
-            let _guard = NONCE_RECOVERY_TEST_GUARD
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            // Observed out of order: the higher nonce arrives first.
-            note_recovery_nonce(addr, 22);
-            note_recovery_nonce(addr, 21);
-            let lowest = lowest_recovery_nonce(addr);
-            assert_eq!(
-                lowest,
-                Some(21),
-                "the baseline must track the LOWEST nonce seen in the window, so an \
-                 out-of-order N+1 cannot strand the pending N"
-            );
-            lowest.expect("min tracked under the guard")
-        };
-
-        // And seeding uses that minimum, so the N request matches and proceeds
-        // while N+1 simply waits its turn.
-        let service = create_test_service();
+    async fn finding90_seeds_lowest_parked_nonce_not_first_arrival() {
+        let (service, _sd) = mempool_service();
         let store = service.store.clone();
         store.set_nonce_ledger_rebuilt(true).await.unwrap();
-        assert!(
-            store
-                .nonce_bootstrap_if_absent(addr, baseline)
-                .await
-                .unwrap(),
-            "first seed wins"
+
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
+
+        // Out of order on the wire: the HIGHER nonce arrives first.
+        let (hi, _) = ger_tx_at(&key, 22, 0xC2);
+        service_send_raw_txn(service.clone(), hi)
+            .await
+            .expect("N+1 must be accepted (parked), never rejected");
+        let (lo, _) = ger_tx_at(&key, 21, 0xC1);
+        service_send_raw_txn(service.clone(), lo)
+            .await
+            .expect("N must be accepted (parked), never rejected");
+
+        assert_eq!(
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            Some(21),
+            "both are parked and the queue's minimum is the LOWER nonce"
+        );
+
+        // Let the settle margin elapse so the baseline may be adopted.
+        let now = store.get_latest_block_number().await.unwrap();
+        store
+            .set_latest_block_number(now + BOOTSTRAP_SETTLE_BLOCKS + 1)
+            .await
+            .unwrap();
+        resume_queued_drain(&service).await.unwrap();
+
+        // Seeded at 21 (not 22), then BOTH promoted in order -> next expected 23.
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            23,
+            "the ledger must resume at the lowest outstanding nonce and then drain \
+             the contiguous run, so an N+1-first arrival strands nothing"
         );
         assert_eq!(
-            store.nonce_get(addr).await.unwrap(),
-            21,
-            "the ledger must resume at the lowest outstanding nonce, not at N+1"
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            None,
+            "nothing may be left parked once the contiguous run has been promoted"
         );
     }
 
-    /// #90 (re-review) — recovery mode must not be a permanent global amnesty. It is
-    /// time-scoped from first observation and CLEARS the durable marker when the
-    /// window lapses, so it cannot keep applying to every previously-unseen signer
-    /// for the life of the deployment.
+    /// #146 (round-4) — a future nonce blocked by a durable unlinked LOWER nonce
+    /// must be REJECTED, not parked, and the refusal must be one the sender can
+    /// act on.
+    ///
+    /// An earlier revision parked here. That bypassed the nonce RESERVATION (the
+    /// park branch returns before it), so a different claim could be parked onto
+    /// a nonce already bound to the durable transaction below it and, once #156
+    /// recovered the originals, could never execute — retained but permanently
+    /// stranded, strictly worse than refusing it. The refusal therefore stays,
+    /// and carries "invalid nonce" so claimtxman's isNonceError clears its cache,
+    /// re-derives from chain and resubmits (#111) instead of retrying forever.
     #[tokio::test]
-    async fn finding90_recovery_mode_is_scoped_and_self_clearing() {
-        let service = create_test_service();
+    async fn durable_lower_nonce_refusal_is_claimtxman_classifiable() {
+        fn is_nonce_error_mirror(msg: &str) -> bool {
+            let s = msg.to_lowercase();
+            s.contains("nonce too low") || s.contains("invalid nonce") || s.contains("txnonce")
+        }
+        let signer = "0x635243a11b41072264df6c9186e3f473402f94e9";
+        let msg = format!(
+            "invalid nonce {} for {signer}: durable transaction at lower nonce {} has not \
+             reached the Miden handoff; re-submit that exact signed transaction first",
+            7, 5
+        );
+        assert!(
+            is_nonce_error_mirror(&msg),
+            "the durable-lower refusal must trigger claimtxman's self-heal, or the sender \
+             retries a doomed nonce forever (#119): {msg}"
+        );
+    }
+
+    /// Round 3 (codex B1/B2 + glm N3) — the marker's rescue arm, driven at the
+    /// service level. A tx parked WHILE the recovery window was open must still
+    /// be adopted AFTER the window closes (its stamp is the proof), and an
+    /// UNSTAMPED row must never be adopted once the window is shut — including
+    /// when it becomes the queue minimum only because eviction removed rows
+    /// ahead of it (the B2 check-then-seed divergence).
+    #[tokio::test]
+    async fn stamped_row_is_adopted_after_window_close_and_unstamped_never() {
+        let (service, _sd) = mempool_service();
+        let store = service.store.clone();
+
+        // Continuing wallet: parked while the window is OPEN -> stamped.
+        store.set_nonce_ledger_rebuilt(true).await.unwrap();
+        let key_a = alloy::signers::local::PrivateKeySigner::random();
+        let a = format!("{:#x}", key_a.address());
+        let (raw_a, _) = ger_tx_at(&key_a, 21, 0xB1);
+        service_send_raw_txn(service.clone(), raw_a).await.unwrap();
+        assert!(
+            store
+                .get_queued_txn(&a, 21)
+                .await
+                .unwrap()
+                .unwrap()
+                .parked_during_recovery,
+            "parked while the window is open must be stamped"
+        );
+
+        // The window RETIRES durably (what the sweep does when it expires).
+        store.set_nonce_ledger_rebuilt(false).await.unwrap();
+
+        // New wallet: parked AFTER the close -> unstamped.
+        let key_b = alloy::signers::local::PrivateKeySigner::random();
+        let b = format!("{:#x}", key_b.address());
+        let (raw_b, _) = ger_tx_at(&key_b, 42, 0xB2);
+        service_send_raw_txn(service.clone(), raw_b).await.unwrap();
+
+        // Let the settle margin elapse, then sweep.
+        let now = store.get_latest_block_number().await.unwrap();
+        store
+            .set_latest_block_number(now + BOOTSTRAP_SETTLE_BLOCKS + 1)
+            .await
+            .unwrap();
+        resume_queued_drain(&service).await.unwrap();
+
+        // The STAMPED wallet was rescued: seeded at 21, promoted, next is 22.
+        assert_eq!(
+            store.nonce_get(&a).await.unwrap(),
+            22,
+            "a stamped row parked inside the window must be adopted after it closes"
+        );
+        // The UNSTAMPED wallet was NOT: ledger still absent, row still parked.
+        assert_eq!(
+            store.nonce_get(&b).await.unwrap(),
+            0,
+            "an unstamped row must never be seeded once the window is shut \
+             (the round-4 amnesty must not return through the rescue arm)"
+        );
+        assert!(
+            store.get_queued_txn(&b, 42).await.unwrap().is_some(),
+            "the unstamped row simply stays parked (until TTL eviction)"
+        );
+    }
+
+    /// Review finding 1 (round 2) — the durable-lower refusal must be one hop
+    /// of a CONVERGING protocol, not a dead end. The test above only pins that
+    /// the refusal string is claimtxman-classifiable; this one drives the real
+    /// flow end to end:
+    ///
+    ///   pre-restart: A@5 admitted durably, never reaches the Miden handoff
+    ///   (the first service has NO writer — that is the crash window itself);
+    ///   restart: fresh service + writer over the SAME store;
+    ///   B@6 -> REFUSED on the real path with the real message;
+    ///   the sender does exactly what the refusal instructs — re-submits the
+    ///   EXACT signed A@5 -> accepted via durable resume, nonce 5 live again;
+    ///   B@6 resubmitted -> accepted; ledger sequenced through 7.
+    #[tokio::test]
+    async fn durable_lower_refusal_recovers_once_the_lower_tx_is_resubmitted() {
+        // Pre-restart service: durable admission, NO writer — A@5 will be
+        // admitted and then never handed off, which is precisely the state the
+        // refusal exists for.
+        let service1 = create_test_service();
+        let store = service1.store.clone();
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
+
+        // An established wallet whose ledger sits at 5.
+        store
+            .nonce_bootstrap_if_absent(&signer_str, 5)
+            .await
+            .unwrap();
+
+        let (raw_a, hash_a) = ger_tx_at(&key, 5, 0xD5);
+        service_send_raw_txn(service1.clone(), raw_a.clone())
+            .await
+            .expect("A@5 at the expected nonce is admitted durably");
+        assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 6);
+
+        // Restart: fresh service AND writer over the SAME store. The durable
+        // A@5 row survives; the writer's in-flight set does not, so nothing
+        // considers nonce 5 live.
+        let mut service2 = create_test_service();
+        service2.store = store.clone();
+        let (handle, _sd2) = crate::writer_worker::WriterWorker::spawn(
+            service2.clone(),
+            64,
+            std::time::Duration::from_secs(60),
+        );
+        service2.writer_handle = Some(std::sync::Arc::new(handle));
+
+        // B@6 must be refused on the REAL path, with the message the sender is
+        // expected to act on.
+        let (raw_b, _) = ger_tx_at(&key, 6, 0xD6);
+        let err = service_send_raw_txn(service2.clone(), raw_b.clone())
+            .await
+            .expect_err("B@6 must be refused while durable A@5 is unlinked and not live");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid nonce 6") && msg.contains("lower nonce 5"),
+            "the refusal must name both nonces and stay claimtxman-classifiable: {msg}"
+        );
+
+        // The sender follows the instruction: re-submit the EXACT signed A@5.
+        let resumed = service_send_raw_txn(service2.clone(), raw_a)
+            .await
+            .expect("re-submitting the durable lower tx must be accepted (durable resume)");
+        assert_eq!(resumed, hash_a, "resume returns the original hash");
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            6,
+            "a durable resume re-enqueues; it must not advance the ledger again"
+        );
+
+        // With nonce 5 live (or already completed) the successor now lands.
+        service_send_raw_txn(service2.clone(), raw_b)
+            .await
+            .expect("the successor must be accepted once the lower nonce is live again");
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            7,
+            "refusal -> resume -> successor: the pair is fully sequenced"
+        );
+    }
+
+    /// #90 (round-5) — a genuinely NEW wallet must never be bootstrapped.
+    ///
+    /// An earlier revision grandfathered any signer with parked rows and
+    /// `nonce_get() == 0` so a late-parked tx could not be orphaned by the window
+    /// closing. But an ABSENT ledger row also reads 0, so that predicate could not
+    /// tell a continuing wallet from a new one: on a fresh deployment a new wallet
+    /// submitting nonce 42 was parked and then SEEDED to 42, skipping 0..41. This
+    /// pins that it cannot happen once the window is shut.
+    #[tokio::test]
+    async fn finding90_new_wallet_is_never_bootstrapped_after_the_window() {
+        let (service, _sd) = mempool_service();
+        let store = service.store.clone();
+        // No rebuild ever happened: an ordinary running deployment.
+        assert!(!store.is_nonce_ledger_rebuilt().await.unwrap());
+
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
+        let (raw, _) = ger_tx_at(&key, 42, 0xE8);
+        // Accepted and parked — that part is correct and is the #146 contract.
+        service_send_raw_txn(service.clone(), raw).await.unwrap();
+        assert_eq!(
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            Some(42)
+        );
+
+        // Let the settle margin elapse and sweep repeatedly.
+        let now = store.get_latest_block_number().await.unwrap();
+        store
+            .set_latest_block_number(now + BOOTSTRAP_SETTLE_BLOCKS + 1)
+            .await
+            .unwrap();
+        resume_queued_drain(&service).await.unwrap();
+        resume_queued_drain(&service).await.unwrap();
+
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            0,
+            "a new wallet must NOT have its ledger seeded to 42 — that would skip nonces \
+             0..41 and execute out of order"
+        );
+        assert_eq!(
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            Some(42),
+            "its tx stays parked (accepted, not dropped) until nonce 0.. actually arrive"
+        );
+    }
+
+    /// #90 (re-review) — the post-rebuild bootstrap window must be DURABLE,
+    /// bounded, and PER-SIGNER in effect. Three earlier bounds each stranded an
+    /// acknowledged claim (see migrations/025_nonce_rebuild_stamp.sql).
+    ///
+    /// The scenario pinned here is the one that killed the previous rule: wallet
+    /// A reconnects and drains, and wallet B — a DIFFERENT continuing wallet —
+    /// reconnects afterwards. "Retire once any signer has a nonce row" cleared
+    /// the amnesty when A resumed, so B parked behind nonce 0 with bootstrap
+    /// already disabled: stranded forever. B must still be bootstrapped.
+    #[tokio::test]
+    async fn finding90_window_is_durable_and_covers_a_later_second_wallet() {
+        let (service, _sd) = mempool_service();
         let store = service.store.clone();
         store.set_nonce_ledger_rebuilt(true).await.unwrap();
 
-        // A zero-length window means the very first check retires recovery mode.
-        // The guard covers only the shared-static mutation (see the sibling test):
-        // a std Mutex must not be held across an await.
-        {
-            let _guard = NONCE_RECOVERY_TEST_GUARD
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            unsafe { std::env::set_var("NONCE_RECOVERY_WINDOW_SECS", "0") };
-        }
-        let active = recovery_bootstrap_active(&service).await.unwrap();
-        unsafe { std::env::remove_var("NONCE_RECOVERY_WINDOW_SECS") };
+        // Wallet A reconnects, is bootstrapped and drains.
+        let key_a = alloy::signers::local::PrivateKeySigner::random();
+        let a = format!("{:#x}", key_a.address());
+        let (raw_a, _) = ger_tx_at(&key_a, 21, 0xF1);
+        service_send_raw_txn(service.clone(), raw_a).await.unwrap();
+        let now = store.get_latest_block_number().await.unwrap();
+        store
+            .set_latest_block_number(now + BOOTSTRAP_SETTLE_BLOCKS + 1)
+            .await
+            .unwrap();
+        resume_queued_drain(&service).await.unwrap();
+        assert_eq!(store.nonce_get(&a).await.unwrap(), 22);
 
-        assert!(!active, "an elapsed window must not permit bootstrap");
+        // The amnesty must NOT have been retired by A's success.
+        assert!(
+            recovery_bootstrap_active(&service).await.unwrap(),
+            "one wallet resuming must not retire the amnesty for every other continuing wallet"
+        );
+
+        // Wallet B reconnects LATER at its own nonce and must also be bootstrapped.
+        let key_b = alloy::signers::local::PrivateKeySigner::random();
+        let b = format!("{:#x}", key_b.address());
+        let (raw_b, _) = ger_tx_at(&key_b, 42, 0xF2);
+        service_send_raw_txn(service.clone(), raw_b)
+            .await
+            .expect("a later continuing wallet must be accepted (parked), never rejected");
+        let now = store.get_latest_block_number().await.unwrap();
+        store
+            .set_latest_block_number(now + BOOTSTRAP_SETTLE_BLOCKS + 1)
+            .await
+            .unwrap();
+        resume_queued_drain(&service).await.unwrap();
+        assert_eq!(
+            store.nonce_get(&b).await.unwrap(),
+            43,
+            "a SECOND continuing wallet reconnecting after the first must still be \
+             bootstrapped — this is the case the previous rule stranded forever"
+        );
+
+        // Once the durable window elapses, the amnesty retires on its own.
+        unsafe { std::env::set_var("NONCE_RECOVERY_WINDOW_SECS", "0") };
+        let retired = !recovery_bootstrap_active(&service).await.unwrap();
+        unsafe { std::env::remove_var("NONCE_RECOVERY_WINDOW_SECS") };
+        assert!(retired, "the window must retire once elapsed");
         assert!(
             !store.is_nonce_ledger_rebuilt().await.unwrap(),
-            "the durable marker must be CLEARED once the window lapses — recovery mode \
-             must not apply indefinitely to every future unseen signer"
+            "retirement must be DURABLE so a restart cannot re-arm the amnesty"
         );
     }
 
@@ -3016,51 +3880,43 @@ mod tests {
         );
     }
 
+    /// #146 (supersedes the old rd940 30s-wait behavior): a future-nonce tx is
+    /// PARKED and its hash returned PROMPTLY — it does not block the request — and
+    /// is promoted when the missing nonce fills. The old test asserted the request
+    /// blocked (`!is_finished`) for up to 30s; that liveness trap is exactly what
+    /// #146 removes.
     #[tokio::test]
-    async fn rd940_future_nonce_waits_for_missing_nonce_acceptance() {
-        let mut service = create_test_service();
+    async fn rd940_future_nonce_parks_promptly_then_promotes_on_gap_fill() {
+        let (service, _sd) = mempool_service();
         let store = service.store.clone();
-        let (handle, shutdown) = crate::writer_worker::WriterWorker::spawn(
-            service.clone(),
-            64,
-            std::time::Duration::from_secs(60),
-        );
-        service.writer_handle = Some(std::sync::Arc::new(handle));
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
 
-        let calldata = insertGlobalExitRootCall {
-            root: FixedBytes::from([0xBBu8; 32]),
-        }
-        .abi_encode();
-        let (input_hex, signer) = encode_legacy_tx_with_nonce(calldata, 1);
-
-        let svc = service.clone();
-        let pending = tokio::spawn(async move { service_send_raw_txn(svc, input_hex).await });
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        assert!(
-            !pending.is_finished(),
-            "future nonce should wait for the missing nonce instead of failing immediately"
-        );
-
-        store
-            .nonce_increment(&format!("{signer:#x}"))
-            .await
-            .expect("simulate nonce 0 acceptance");
-
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
-            .await
-            .expect("future nonce waiter should complete")
-            .expect("task should not panic");
-        assert!(
-            result.is_ok(),
-            "future nonce should be accepted: {result:?}"
-        );
+        let (raw1, hash1) = ger_tx_at(&key, 1, 0xBB);
+        // Parking must return promptly (well under the old 30s block), NOT hang.
+        let parked = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            service_send_raw_txn(service.clone(), raw1),
+        )
+        .await
+        .expect("a future-nonce tx must be PARKED and return promptly, not block")
+        .expect("the future-nonce tx must be accepted (parked)");
+        assert_eq!(parked, hash1);
         assert_eq!(
-            store.nonce_get(&format!("{signer:#x}")).await.unwrap(),
-            2,
-            "accepting nonce 1 should advance the next accepted nonce to 2"
+            store.nonce_get(&signer_str).await.unwrap(),
+            0,
+            "a parked future-nonce tx must NOT advance the nonce"
         );
+        assert!(store.queued_txn_by_hash(hash1).await.unwrap().is_some());
 
-        let _ = shutdown.send(());
+        // Filling the gap promotes the parked successor.
+        let (raw0, _) = ger_tx_at(&key, 0, 0xBA);
+        service_send_raw_txn(service.clone(), raw0).await.unwrap();
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            2,
+            "filling the gap promotes the parked tx; the nonce reaches 2"
+        );
     }
 
     /// Self-review R2 + audit C2 — repro+regression. Pre-fix, every recovered
@@ -4067,39 +4923,48 @@ mod tests {
         );
     }
 
-    /// Test 4b — a landed-gi claim whose nonce is in the FUTURE (writer-worker
-    /// mode) must take the normal R4 retryable future-nonce WAIT, not
-    /// accept-and-revert immediately. Proves accept-and-revert only fires for a
-    /// tx the R4 gate would otherwise admit (nonce == expected).
+    /// Test 4b (#146) — a landed-gi claim whose nonce is in the FUTURE must be
+    /// PARKED, not short-circuited to accept-and-revert. The invariant this
+    /// protects is unchanged: accept-and-revert only fires for a tx the R4 gate
+    /// would admit (nonce == expected); a future-nonce landed claim must NOT
+    /// execute out of order. Under #146 it parks (accepted promptly, no receipt,
+    /// no nonce advance) rather than blocking on the old 30s R4 wait.
     #[tokio::test]
-    async fn landed_gi_future_nonce_waits_not_reverted() {
-        let mut service = create_test_service();
+    async fn landed_gi_future_nonce_parks_not_reverted() {
+        let (service, _sd) = mempool_service();
         let store = service.store.clone();
-        let (handle, shutdown) = crate::writer_worker::WriterWorker::spawn(
-            service.clone(),
-            64,
-            std::time::Duration::from_secs(60),
-        );
-        service.writer_handle = Some(std::sync::Arc::new(handle));
         seed_zero_ger(&store).await;
 
         let gi = U256::from(0x5506u64);
         land_claim_for(&store, gi).await;
 
-        // Submit at nonce 1 while expected is 0 → future nonce → must WAIT.
+        // Submit at nonce 1 while expected is 0 → future nonce → must PARK.
         let key_b = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key_b.address());
         let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
-        let (input_b, _tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 1);
+        let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 1);
 
-        let svc = service.clone();
-        let pending = tokio::spawn(async move { service_send_raw_txn(svc, input_b).await });
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let parked = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            service_send_raw_txn(service.clone(), input_b),
+        )
+        .await
+        .expect("a future-nonce landed claim must park promptly, not block")
+        .expect("the future-nonce landed claim must be accepted (parked)");
+        assert_eq!(parked, tx_b);
         assert!(
-            !pending.is_finished(),
-            "a future-nonce landed claim must WAIT on R4, not short-circuit to accept-and-revert"
+            store.txn_receipt(tx_b).await.unwrap().is_none(),
+            "a parked future-nonce landed claim must NOT accept-and-revert (no receipt)"
         );
-        pending.abort();
-        let _ = shutdown.send(());
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            0,
+            "it must NOT advance the nonce out of order"
+        );
+        assert!(
+            store.queued_txn_by_hash(tx_b).await.unwrap().is_some(),
+            "it must be parked, not executed"
+        );
     }
 
     /// Test 5 — async-writer-mode variant of Test 1: a landed-gi claim from a
@@ -5572,5 +6437,284 @@ mod tests {
             acquire_claim_lock(&store, gi, owner, ttl).await.unwrap(),
             ClaimLockOutcome::Acquired { .. }
         ));
+    }
+
+    // ── #146 future-nonce queue ("mempool") ──────────────────────────────────
+
+    /// Spawn a service with a live writer (parking requires a writer handle) and
+    /// keep the shutdown sender alive for the test's lifetime.
+    fn mempool_service() -> (ServiceState, tokio::sync::oneshot::Sender<()>) {
+        let mut service = create_test_service();
+        let (handle, shutdown) = crate::writer_worker::WriterWorker::spawn(
+            service.clone(),
+            64,
+            std::time::Duration::from_secs(60),
+        );
+        service.writer_handle = Some(std::sync::Arc::new(handle));
+        (service, shutdown)
+    }
+
+    fn ger_tx_at(
+        key: &alloy::signers::local::PrivateKeySigner,
+        nonce: u64,
+        marker: u8,
+    ) -> (String, TxHash) {
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([marker; 32]),
+        }
+        .abi_encode();
+        encode_tx_signed_with_nonce(key, calldata, nonce)
+    }
+
+    /// Acceptance: submit N+1 before N — it parks (returns its hash promptly, does
+    /// NOT advance the nonce, its receipt stays null). Then N fills the gap and
+    /// both are promoted/executed in order.
+    #[tokio::test]
+    async fn mempool_future_nonce_parks_then_gap_fill_drains_in_order() {
+        let (service, _sd) = mempool_service();
+        let store = service.store.clone();
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
+
+        let (raw1, hash1) = ger_tx_at(&key, 1, 0xA1);
+        let h1 = service_send_raw_txn(service.clone(), raw1).await.unwrap();
+        assert_eq!(h1, hash1, "parked tx returns its own hash");
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            0,
+            "a future-nonce tx must NOT advance the executable/pending nonce"
+        );
+        assert_eq!(
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            Some(1),
+            "the future-nonce tx must be parked"
+        );
+        assert!(
+            store.queued_txn_by_hash(hash1).await.unwrap().is_some(),
+            "the parked tx must be findable by hash (getTransactionByHash pending shape)"
+        );
+        assert!(
+            store.txn_receipt(hash1).await.unwrap().is_none(),
+            "the parked tx's receipt must remain null until the gap fills"
+        );
+
+        let (raw0, _) = ger_tx_at(&key, 0, 0xA0);
+        service_send_raw_txn(service.clone(), raw0).await.unwrap();
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            2,
+            "the in-order tx must process AND drain (promote) the queued successor"
+        );
+        assert!(
+            store
+                .peek_queued_min_nonce(&signer_str)
+                .await
+                .unwrap()
+                .is_none(),
+            "the queue must be empty after the contiguous drain"
+        );
+    }
+
+    /// Acceptance: a shuffled multi-nonce burst executes in EXACT nonce order —
+    /// every gapped tx parks, and the single in-order tx drains the whole run.
+    #[tokio::test]
+    async fn mempool_shuffled_burst_executes_in_exact_nonce_order() {
+        let (service, _sd) = mempool_service();
+        let store = service.store.clone();
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
+
+        // Shuffled: 2, 4, 1, 3 all park (nonce stays 0, nothing contiguous yet).
+        for nonce in [2u64, 4, 1, 3] {
+            let (raw, _) = ger_tx_at(&key, nonce, 0xB0 + nonce as u8);
+            service_send_raw_txn(service.clone(), raw).await.unwrap();
+        }
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            0,
+            "all gapped txs park; the nonce does not move"
+        );
+        assert_eq!(
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            Some(1)
+        );
+
+        // 0 fills the gap → 1,2,3,4 promote in order → nonce reaches 5.
+        let (raw0, _) = ger_tx_at(&key, 0, 0xB0);
+        service_send_raw_txn(service.clone(), raw0).await.unwrap();
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            5,
+            "the full contiguous 0..=4 run must execute in nonce order"
+        );
+        assert!(
+            store
+                .peek_queued_min_nonce(&signer_str)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Same-hash re-broadcast of a parked tx is idempotent (accepts, one row).
+    #[tokio::test]
+    async fn mempool_same_hash_rebroadcast_is_idempotent() {
+        let (service, _sd) = mempool_service();
+        let store = service.store.clone();
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
+
+        let (raw1, hash1) = ger_tx_at(&key, 1, 0xC1);
+        assert_eq!(
+            service_send_raw_txn(service.clone(), raw1.clone())
+                .await
+                .unwrap(),
+            hash1
+        );
+        // Re-broadcast the exact same envelope — must accept the same hash again.
+        assert_eq!(
+            service_send_raw_txn(service.clone(), raw1).await.unwrap(),
+            hash1
+        );
+        assert_eq!(
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            Some(1),
+            "still exactly one parked tx at nonce 1"
+        );
+    }
+
+    /// A DIFFERENT tx at an already-parked (signer, nonce) is refused — the first
+    /// wins, no silent replacement.
+    #[tokio::test]
+    async fn mempool_conflicting_same_nonce_hash_is_rejected() {
+        let (service, _sd) = mempool_service();
+        let store = service.store.clone();
+        let key = alloy::signers::local::PrivateKeySigner::random();
+
+        let (raw_a, hash_a) = ger_tx_at(&key, 1, 0xD1);
+        service_send_raw_txn(service.clone(), raw_a).await.unwrap();
+        let (raw_b, hash_b) = ger_tx_at(&key, 1, 0xD2);
+        assert_ne!(hash_a, hash_b);
+        let err = service_send_raw_txn(service.clone(), raw_b)
+            .await
+            .expect_err("a different tx at an already-parked nonce must be rejected");
+        assert!(
+            err.to_string().contains("already queued"),
+            "rejection must name the conflict: {err}"
+        );
+        assert_eq!(
+            store
+                .queued_txn_by_hash(hash_a)
+                .await
+                .unwrap()
+                .unwrap()
+                .nonce,
+            1,
+            "the first-parked tx is kept"
+        );
+        assert!(
+            store.queued_txn_by_hash(hash_b).await.unwrap().is_none(),
+            "the conflicting tx is not parked"
+        );
+    }
+
+    /// Restart recovery: a tx parked before a restart is promoted once the gap
+    /// fills on a FRESH service over the same (persistent) store — an
+    /// acknowledged future tx is never lost across a process restart.
+    #[tokio::test]
+    async fn mempool_parked_tx_survives_restart_and_promotes() {
+        let concrete = std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let store: std::sync::Arc<dyn crate::store::Store> = concrete.clone();
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
+
+        // Boot 1: park nonce 1, then "crash".
+        let (raw1, hash1) = ger_tx_at(&key, 1, 0xE1);
+        {
+            let mut s1 = crate::test_helpers::create_test_service_with_store(store.clone());
+            let (h, _sd) = crate::writer_worker::WriterWorker::spawn(
+                s1.clone(),
+                64,
+                std::time::Duration::from_secs(60),
+            );
+            s1.writer_handle = Some(std::sync::Arc::new(h));
+            service_send_raw_txn(s1, raw1).await.unwrap();
+        }
+        assert!(
+            store.queued_txn_by_hash(hash1).await.unwrap().is_some(),
+            "the parked tx is durable across the restart"
+        );
+
+        // Boot 2: a fresh service over the SAME store fills the gap; the parked
+        // successor promotes.
+        let mut s2 = crate::test_helpers::create_test_service_with_store(store.clone());
+        let (h2, _sd2) = crate::writer_worker::WriterWorker::spawn(
+            s2.clone(),
+            64,
+            std::time::Duration::from_secs(60),
+        );
+        s2.writer_handle = Some(std::sync::Arc::new(h2));
+        let (raw0, _) = ger_tx_at(&key, 0, 0xE0);
+        service_send_raw_txn(s2, raw0).await.unwrap();
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            2,
+            "after restart, filling the gap promotes the persisted parked tx"
+        );
+        assert!(
+            store
+                .peek_queued_min_nonce(&signer_str)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Restart recovery via the explicit startup resume: if the gap is ALREADY
+    /// filled at boot (nonce advanced before the crash), `resume_queued_drain`
+    /// promotes the contiguous parked run without a fresh submission.
+    #[tokio::test]
+    async fn mempool_resume_queued_drain_promotes_at_startup() {
+        let concrete = std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let store: std::sync::Arc<dyn crate::store::Store> = concrete.clone();
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
+
+        // Park nonce 1 …
+        let (raw1, _) = ger_tx_at(&key, 1, 0xF1);
+        {
+            let mut s1 = crate::test_helpers::create_test_service_with_store(store.clone());
+            let (h, _sd) = crate::writer_worker::WriterWorker::spawn(
+                s1.clone(),
+                64,
+                std::time::Duration::from_secs(60),
+            );
+            s1.writer_handle = Some(std::sync::Arc::new(h));
+            service_send_raw_txn(s1, raw1).await.unwrap();
+        }
+        // … and model that nonce 0 was executed just before the crash (the gap is
+        // already filled), so only the resume pass is needed to promote nonce 1.
+        assert!(store.nonce_advance_cas(&signer_str, 0).await.unwrap());
+
+        let mut s2 = crate::test_helpers::create_test_service_with_store(store.clone());
+        let (h2, _sd2) = crate::writer_worker::WriterWorker::spawn(
+            s2.clone(),
+            64,
+            std::time::Duration::from_secs(60),
+        );
+        s2.writer_handle = Some(std::sync::Arc::new(h2));
+        resume_queued_drain(&s2).await.unwrap();
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            2,
+            "startup resume must promote the now-contiguous parked tx"
+        );
+        assert!(
+            store
+                .peek_queued_min_nonce(&signer_str)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

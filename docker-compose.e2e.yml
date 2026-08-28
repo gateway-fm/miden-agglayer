@@ -293,6 +293,17 @@ services:
       # external prover is actually exercised (assert
       # miden_proof_generations_total{outcome="ok"} > 0, no local fallback).
       MIDEN_PROVER_URL: "${MIDEN_PROVER_URL:-http://tx-prover:50051}"
+      # Outbound node-RPC ceiling (requests/sec). Empty by default = unpaced,
+      # the historical behaviour. This service's `environment` is an explicit
+      # allow-list, so a variable exported in the caller's shell does NOT reach
+      # the container unless it is named here — without this line a run that set
+      # MIDEN_RPC_MAX_RPS would look paced while being anything but.
+      # NOTE the bare key: this is Compose's pass-through form, which omits the
+      # variable entirely when the host has not set it. The tempting
+      # "${MIDEN_RPC_MAX_RPS:-}" would instead export an EMPTY STRING, and clap
+      # parses a present-but-empty env var as a value — failing `Option<u32>` at
+      # startup and breaking every unpaced run.
+      MIDEN_RPC_MAX_RPS:
       # Finding #85/#99: the default 500/s per-IP limit 429s the stack's OWN
       # infrastructure under N=30 bursts (measured 879/392/949 rate-limit hits
       # across three runs). claimtxman pre-assigns nonces to its monitored claim

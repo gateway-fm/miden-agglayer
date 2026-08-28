@@ -33,6 +33,7 @@ pub mod proxy_keystore;
 pub mod recovery;
 pub mod remote_signer;
 pub mod restore;
+pub mod rpc_pacer;
 pub mod service;
 pub(crate) mod service_admin;
 pub(crate) mod service_debug;

@@ -122,9 +122,12 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "019_claim_calldata_repair_pending.sql",
         include_str!("../../migrations/019_claim_calldata_repair_pending.sql"),
     ),
-    // 020 is reserved for #146's `queued_txns`; #156 takes 021 so the two land
-    // without a migration-number collision. Migrations apply in this array's
-    // order, so a gap is harmless.
+    // 020 is #146's `queued_txns` (main reserved this slot for it); #156 takes
+    // 021. Migrations apply in this array's order.
+    (
+        "020_queued_txns.sql",
+        include_str!("../../migrations/020_queued_txns.sql"),
+    ),
     (
         "021_orphan_recovery_backoff.sql",
         include_str!("../../migrations/021_orphan_recovery_backoff.sql"),
@@ -132,6 +135,12 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "022_nonce_ledger_rebuilt.sql",
         include_str!("../../migrations/022_nonce_ledger_rebuilt.sql"),
+    ),
+    // 023 and 024 are BURNED: intermediate commits of the rc.1 branch applied
+    // files under both names and those databases still carry the rows.
+    (
+        "025_nonce_rebuild_stamp.sql",
+        include_str!("../../migrations/025_nonce_rebuild_stamp.sql"),
     ),
 ];
 
