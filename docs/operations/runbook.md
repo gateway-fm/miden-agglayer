@@ -192,7 +192,7 @@ The flags below are not interchangeable.
 | `--unlock-miden-accounts` | Clears `locked` in known miden-client sqlite account-header tables | Yes | The service is stopped and evidence proves a stale local lock only |
 | `--resweep-from-genesis` | Resets the Postgres note-reconciler cursor to zero, then runs normally | No | Deliberate full-history visibility audit with an otherwise valid Miden store |
 | `--l1-indexer-from-block N` | Overrides L1 InfoTree start for that boot | No | Deliberate GER decomposition backfill from a verified L1 block |
-| `--restore` | Replays Miden history into the selected synthetic store, resets reconciler cursor, then exits | Yes | Reconstructing a lost/clean synthetic store from authoritative history |
+| `--restore` | Reconstructs the synthetic store by driving the canonical projector catch-up to a captured Miden tip (cursors reset to genesis, then parked at the tip), then exits | Yes | Reconstructing a lost/clean synthetic store from authoritative history |
 | `--reset-miden-store` | Deletes only miden-client `store.sqlite3`, WAL, and SHM before startup | No by itself | Local Miden sqlite is irrecoverably divergent; keystore/config are intact |
 | `--read-only` | Refuses all Miden transaction submission at the chokepoint | No | Passive recovery rehearsal/audit against a production network |
 

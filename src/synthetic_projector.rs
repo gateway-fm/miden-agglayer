@@ -1025,6 +1025,7 @@ impl SyntheticProjector {
         fetcher: &dyn PublicNoteFetcher,
         consumed_refs: HashMap<Nullifier, ConsumedRef>,
         within_tx_pos: &mut HashMap<NoteId, u32>,
+        resolved_nullifiers: &mut HashSet<Nullifier>,
     ) -> anyhow::Result<Vec<(NoteId, InputNoteRecord)>> {
         let build = |details: NoteDetails, attachments: NoteAttachments, cref: &ConsumedRef| {
             let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
@@ -1110,6 +1111,7 @@ impl SyntheticProjector {
                     );
                 }
                 within_tx_pos.insert(*note_id, cref.within_tx_pos);
+                resolved_nullifiers.insert(*nullifier);
                 recs.push((
                     *note_id,
                     build(body.details.clone(), body.attachments.clone(), cref),
@@ -1514,7 +1516,7 @@ impl SyntheticProjector {
             .await
             .map_err(|e| anyhow::anyhow!("failed to get sync height: {e}"))?
             .as_u64();
-        self.tick_pass(client, tip, ReconcilePatience::LiveTick)
+        self.tick_pass(client, tip, ReconcilePatience::LiveTick, true)
             .await
     }
 
@@ -1532,6 +1534,7 @@ impl SyntheticProjector {
         client: &mut MidenClientLib,
         tip: u64,
         reconcile_patience: ReconcilePatience,
+        enforce_let_cardinality: bool,
     ) -> anyhow::Result<u64> {
         let mut cursor = self.cursor.load(Ordering::Acquire);
         // Reconcile even when projection is already at the tip so note imports do not stall
@@ -1658,9 +1661,28 @@ impl SyntheticProjector {
             .map_err(|e| anyhow::anyhow!("sync_transactions({}..{}): {e}", cursor + 1, tip))?;
         let consumed_refs = bridge_consumed_nullifiers(&txs, self.bridge_id)?;
         let fetcher = RpcNoteFetcher(&*self.node_rpc);
+        let mut resolved_nullifiers: HashSet<Nullifier> = HashSet::new();
         let mut auth_b2agg = self
-            .resolve_b2agg_consumptions(&fetcher, consumed_refs.clone(), &mut within_tx_pos)
+            .resolve_b2agg_consumptions(
+                &fetcher,
+                consumed_refs.clone(),
+                &mut within_tx_pos,
+                &mut resolved_nullifiers,
+            )
             .await?;
+        // #167 (review blocker) — AUTHORITATIVE COVERAGE GUARD (restore mode):
+        // every bridge-consumed input in the window must be accounted for —
+        // present in the client consumed feed OR resolved as an authoritative
+        // bridge-out — or the restore halts before anything seals.
+        if self.require_full_coverage.load(Ordering::Acquire) {
+            ensure_authoritative_coverage(
+                consumed.as_slice(),
+                &consumed_refs,
+                &resolved_nullifiers,
+                cursor,
+                tip,
+            )?;
+        }
         // Same canonical comparator as every other projection sort (see
         // `projection_order`); the id here is always known (authoritative feed).
         auth_b2agg.sort_by_key(|(id, note)| {
@@ -1679,51 +1701,6 @@ impl SyntheticProjector {
             if let Some(h) = rec.state().consumed_block_height().map(|h| h.as_u64()) {
                 by_block.entry(h).or_default().push((Some(*id), rec));
             }
-            // #167 (review blocker) — AUTHORITATIVE COVERAGE GUARD (restore mode):
-            // the deleted node-scan engine could recover CLAIM/GER consumptions the
-            // client store lost (same-block created-and-consumed "erased" notes,
-            // headerless inputs after a full store wipe). The canonical path sources
-            // CLAIM/GER from the local consumed feed; a bridge-consumed input that is
-            // neither in that feed nor authoritatively resolved as a B2AGG here would
-            // silently vanish from restored history. Fail closed BEFORE sealing with
-            // an actionable error (the issue's stated hard boundary for ERASED notes)
-            // instead of emitting a divergent log stream and reporting success.
-            if self.require_full_coverage.load(Ordering::Acquire) {
-                let local_nullifiers: HashSet<Nullifier> =
-                    consumed.iter().filter_map(|n| n.nullifier()).collect();
-                let resolved: HashSet<Nullifier> = consumed_refs
-                    .keys()
-                    .filter(|nul| {
-                        auth_b2agg
-                            .iter()
-                            .any(|(_, rec)| rec.nullifier().is_some_and(|n| n == **nul))
-                    })
-                    .copied()
-                    .collect();
-                let mut uncovered: Vec<(&Nullifier, &ConsumedRef)> = consumed_refs
-                    .iter()
-                    .filter(|(nul, _)| !local_nullifiers.contains(*nul) && !resolved.contains(*nul))
-                    .collect();
-                uncovered.sort_by_key(|(_, r)| (r.block, r.order, r.within_tx_pos));
-                if let Some((nul, first)) = uncovered.first() {
-                    metrics::counter!("restore_authoritative_coverage_gaps_total").increment(1);
-                    anyhow::bail!(
-                        "restore: bridge-consumed input at block {} (tx order {}, input {}) has no \
-                     recoverable identity — its nullifier {} is absent from the client store's \
-                     consumed feed and it does not resolve as a bridge-out (issue #167 ERASED-note \
-                     boundary). {} input(s) affected in window {}..{}. The node/protocol cannot \
-                     reconstruct this body, so restore refuses to seal a divergent history; \
-                     re-run against a node/archive that can serve the note.",
-                        first.block,
-                        first.order,
-                        first.within_tx_pos,
-                        nul.to_hex(),
-                        uncovered.len(),
-                        cursor + 1,
-                        tip
-                    );
-                }
-            }
         }
         // A crash after an old commitment-keyed event but before cursor advance must replay
         // under its NoteId. The exact legacy log block prevents a future same-details note
@@ -1740,6 +1717,12 @@ impl SyntheticProjector {
         }
         // Before sealing, every on-chain LET leaf must be represented by either the audited
         // legacy offset, a durable reservation, or an unreserved B2AGG in this tip window.
+        // #167 (review): the on-chain leaf count is read from the FROZEN synced account
+        // (the session tip). In windowed restore catch-up an intermediate pass's window
+        // covers only cursor..pass_tip, so leaves consumed after pass_tip are EXPECTED to
+        // be invisible here — the equality gate runs only on the FINAL pass (tip == the
+        // captured restore target). Live ticks always enforce it. The reservation-prefix
+        // checks below are window-local and always run.
         let bridge_account = client
             .get_account(self.bridge_id)
             .await
@@ -1773,22 +1756,24 @@ impl SyntheticProjector {
                 );
             }
         }
-        let unreserved = u64::try_from(note_keys.len() - existing.len())?;
-        let expected = accounted
-            .checked_add(unreserved)
-            .ok_or_else(|| anyhow::anyhow!("LET gate accounting overflow"))?;
-        if on_chain != expected {
-            let (kind, gap) = if on_chain > expected {
-                ("invisible_gap", on_chain - expected)
-            } else {
-                ("local_ahead", expected - on_chain)
-            };
-            ::metrics::counter!("bridge_let_assignment_gate_halted_total", "kind" => kind)
-                .increment(1);
-            anyhow::bail!(
-                "LET cardinality gate blocked ({kind}, gap {gap}): on-chain={on_chain}, \
-                 expected={expected}; see docs/operations/let-cardinality-gate.md"
-            );
+        if enforce_let_cardinality {
+            let unreserved = u64::try_from(note_keys.len() - existing.len())?;
+            let expected = accounted
+                .checked_add(unreserved)
+                .ok_or_else(|| anyhow::anyhow!("LET gate accounting overflow"))?;
+            if on_chain != expected {
+                let (kind, gap) = if on_chain > expected {
+                    ("invisible_gap", on_chain - expected)
+                } else {
+                    ("local_ahead", expected - on_chain)
+                };
+                ::metrics::counter!("bridge_let_assignment_gate_halted_total", "kind" => kind)
+                    .increment(1);
+                anyhow::bail!(
+                    "LET cardinality gate blocked ({kind}, gap {gap}): on-chain={on_chain}, \
+                     expected={expected}; see docs/operations/let-cardinality-gate.md"
+                );
+            }
         }
         // EMITTED-FRONTIER GATE (complements the LET cardinality gate above).
         // The cardinality gate enforces `accounted == on_chain let_num_leaves` — but a
@@ -1900,7 +1885,7 @@ impl SyntheticProjector {
     ) -> anyhow::Result<u64> {
         match mode {
             CatchUpMode::Live => {
-                self.tick_pass(client, target_tip, ReconcilePatience::LiveTick)
+                self.tick_pass(client, target_tip, ReconcilePatience::LiveTick, true)
                     .await?;
                 Ok(self.cursor.load(Ordering::Acquire))
             }
@@ -1954,8 +1939,13 @@ impl SyntheticProjector {
             // client-store queries — bounded by store content, not history.)
             let pass_tip =
                 target_tip.min(self.cursor.load(Ordering::Acquire) + Self::RESTORE_PASS_WINDOW);
-            self.tick_pass(client, pass_tip, ReconcilePatience::Recovery)
-                .await?;
+            self.tick_pass(
+                client,
+                pass_tip,
+                ReconcilePatience::Recovery,
+                pass_tip == target_tip,
+            )
+            .await?;
             let now = cursor_pair();
             match progress.observe(now, target_tip, Self::RESTORE_STALL_PATIENCE) {
                 CatchUpStep::Complete => {
@@ -2149,6 +2139,75 @@ impl PublicNoteFetcher for RpcNoteFetcher<'_> {
 /// (`consumer == bridge`). The account-id re-check is fail-closed defense in
 /// depth against a node that ignores the server-side filter. Pure (no I/O) so
 /// it is unit-testable directly.
+/// #167 (review blocker) — AUTHORITATIVE COVERAGE GUARD (pure, restore mode).
+///
+/// Every bridge-consumed input in the window must be accounted for before
+/// anything seals:
+///   * present in the client store's consumed feed (the normal CLAIM/GER
+///     source — the store was not wiped, or the sweep re-imported it), OR
+///   * authoritatively resolved as a bridge-out by exact body fetch
+///     (`resolved_nullifiers` — the ERASED-B2AGG recovery path).
+///
+/// Anything else is an unrecoverable input (same-block created-and-consumed
+/// on a wiped store, headerless, no durable identity) that would SILENTLY
+/// vanish from restored history. The issue's hard boundary for such notes:
+/// reconstruct exactly or fail before sealing — this fails, with the window
+/// and the first offender named so an operator knows where history diverges.
+fn ensure_authoritative_coverage(
+    consumed: &[InputNoteRecord],
+    consumed_refs: &HashMap<Nullifier, ConsumedRef>,
+    resolved_nullifiers: &HashSet<Nullifier>,
+    window_from: u64,
+    window_to: u64,
+) -> anyhow::Result<()> {
+    // Required bridge consumptions per block: every consumed ref in the window
+    // that was NOT authoritatively resolved as a bridge-out body.
+    let mut required: HashMap<u64, usize> = HashMap::new();
+    for (nul, r) in consumed_refs {
+        if resolved_nullifiers.contains(nul) {
+            continue;
+        }
+        *required.entry(r.block).or_default() += 1;
+    }
+    if required.is_empty() {
+        return Ok(());
+    }
+    // Local coverage per block: consumed-feed records at that block. Intentionally
+    // block-granular (not tx-order/nullifier): consumed records may carry neither
+    // metadata nor tx order, and this guard must not false-positive on metadata-less
+    // records — it is a safety net ON TOP of the LET cardinality gate.
+    let mut local: HashMap<u64, usize> = HashMap::new();
+    for n in consumed {
+        if let Some(h) = n.state().consumed_block_height() {
+            *local.entry(h.as_u64()).or_default() += 1;
+        }
+    }
+    let mut gaps: Vec<(u64, usize, usize)> = required
+        .iter()
+        .filter_map(|(block, need)| {
+            let have = local.get(block).copied().unwrap_or(0);
+            (have < *need).then_some((*block, *need, have))
+        })
+        .collect();
+    if gaps.is_empty() {
+        return Ok(());
+    }
+    gaps.sort_unstable();
+    let (block, need, have) = gaps[0];
+    let total_missing: usize = gaps.iter().map(|(_, need, have)| need - have).sum();
+    ::metrics::counter!("restore_authoritative_coverage_gaps_total").increment(1);
+    anyhow::bail!(
+        "restore: bridge consumption(s) at block {block} have no recoverable identity — \
+         {need} bridge-consumed input(s) in that block, but the client store's consumed \
+         feed accounts for only {have}, and none resolves as an authoritative bridge-out \
+         (issue #167 ERASED-note boundary). {total_missing} input(s) unrecoverable across \
+         window {}..{} ({gaps:?}). Restore refuses to seal a divergent history; re-run \
+         against a node/archive that can serve the missing note(s).",
+        window_from + 1,
+        window_to
+    );
+}
+
 pub(crate) fn bridge_consumed_nullifiers(
     txs: &[TransactionRecord],
     bridge_id: AccountId,
@@ -2714,6 +2773,74 @@ mod tests {
             store.get_reconcile_cursor().await.unwrap(),
             2_000,
             "multiple windows must advance the persisted cursor to the tip in ONE tick"
+        );
+    }
+
+    /// ISSUE #167 (review blocker) — the AUTHORITATIVE COVERAGE GUARD, pinned
+    /// as a pure decision: every bridge-consumed input in a window must be
+    /// either in the local consumed feed or authoritatively resolved as a
+    /// bridge-out. An unrecoverable (ERASED) input halts the restore instead
+    /// of silently vanishing from restored history; fully covered windows
+    /// pass in both coverage shapes.
+    #[test]
+    fn coverage_guard_erased_input_halts_and_covered_windows_pass() {
+        let refs_at = |blocks: &[u64]| {
+            let mut m: HashMap<Nullifier, ConsumedRef> = HashMap::new();
+            for (i, b) in blocks.iter().enumerate() {
+                m.insert(
+                    nullifier(0x10 + i as u64),
+                    ConsumedRef {
+                        block: *b,
+                        order: 0,
+                        note_id: None,
+                        within_tx_pos: i as u32,
+                    },
+                );
+            }
+            m
+        };
+        let empty: HashSet<Nullifier> = HashSet::new();
+
+        // ERASED gap: two bridge-consumed inputs at block 5, nothing covers
+        // them — the restore must refuse, naming the block.
+        let refs = refs_at(&[5, 5]);
+        let err = ensure_authoritative_coverage(&[], &refs, &empty, 0, 10)
+            .expect_err("an unrecoverable input must halt the restore");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("at block 5") && rendered.contains("no recoverable identity"),
+            "error must name the first uncovered block: {rendered}"
+        );
+
+        // LOCAL coverage: the client store's consumed feed has records at the
+        // block — covered, no error.
+        let local = vec![claim_note(5, Some(0)), claim_note(5, Some(1))];
+        ensure_authoritative_coverage(&local, &refs, &empty, 0, 10)
+            .expect("a locally-covered window must pass");
+
+        // AUTHORITATIVE coverage: one input resolved as a bridge-out, the
+        // other covered locally — covered.
+        let mut half_resolved: HashSet<Nullifier> = HashSet::new();
+        half_resolved.insert(nullifier(0x10));
+        let local_one = vec![claim_note(5, Some(0))];
+        ensure_authoritative_coverage(&local_one, &refs, &half_resolved, 0, 10)
+            .expect("resolved-as-B2AGG plus local coverage must pass");
+        // BOTH resolved (the erased-B2AGG path): covered with an empty feed.
+        let mut all_resolved: HashSet<Nullifier> = HashSet::new();
+        for k in refs.keys() {
+            all_resolved.insert(*k);
+        }
+        ensure_authoritative_coverage(&[], &refs, &all_resolved, 0, 10)
+            .expect("authoritative-only coverage must pass");
+
+        // MIXED: blocks 3 (covered locally) and 7 (gap) — the guard names 7.
+        let refs = refs_at(&[3, 7]);
+        let local = vec![claim_note(3, Some(0))];
+        let err = ensure_authoritative_coverage(&local, &refs, &empty, 0, 10)
+            .expect_err("the uncovered block must halt the restore");
+        assert!(
+            format!("{err:#}").contains("at block 7"),
+            "error must name the uncovered block, not the covered one: {err:#}"
         );
     }
 
@@ -3790,7 +3917,7 @@ mod tests {
         };
         let mut positions = HashMap::new();
         let recovered = restarted
-            .resolve_b2agg_consumptions(&fetcher, refs, &mut positions)
+            .resolve_b2agg_consumptions(&fetcher, refs, &mut positions, &mut Default::default())
             .await
             .unwrap();
         assert_eq!(recovered.len(), 2);
@@ -3892,7 +4019,12 @@ mod tests {
         };
 
         let err = projector
-            .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut HashMap::new())
+            .resolve_b2agg_consumptions(
+                &fetcher,
+                consumed_refs,
+                &mut HashMap::new(),
+                &mut Default::default(),
+            )
             .await
             .expect_err("a body whose nullifier is not the consumed one must fail closed");
         let report = format!("{err:#}");
@@ -3943,7 +4075,12 @@ mod tests {
             ..Default::default()
         };
         let recs = projector
-            .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut HashMap::new())
+            .resolve_b2agg_consumptions(
+                &fetcher,
+                consumed_refs,
+                &mut HashMap::new(),
+                &mut Default::default(),
+            )
             .await
             .expect("uncached consumption with a NoteId must resolve, not error");
 
@@ -3993,7 +4130,12 @@ mod tests {
         )]);
         let fetcher = MockFetcher::default();
         let recs = projector
-            .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut HashMap::new())
+            .resolve_b2agg_consumptions(
+                &fetcher,
+                consumed_refs,
+                &mut HashMap::new(),
+                &mut Default::default(),
+            )
             .await
             .expect("headerless unmapped consumption must be a safe skip");
         assert!(
@@ -4031,7 +4173,12 @@ mod tests {
             .unwrap();
         let fetcher = MockFetcher::default();
         let err = projector
-            .resolve_b2agg_consumptions(&fetcher, HashMap::from([(nf, cref)]), &mut HashMap::new())
+            .resolve_b2agg_consumptions(
+                &fetcher,
+                HashMap::from([(nf, cref)]),
+                &mut HashMap::new(),
+                &mut Default::default(),
+            )
             .await
             .expect_err("an identified body omission must fail before sealing");
         assert!(format!("{err:#}").contains("omitted identified bridge consumption"));
@@ -4072,7 +4219,12 @@ mod tests {
             also_returned: vec![note_id],
         };
         let recs = projector
-            .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut HashMap::new())
+            .resolve_b2agg_consumptions(
+                &fetcher,
+                consumed_refs,
+                &mut HashMap::new(),
+                &mut Default::default(),
+            )
             .await
             .expect("a returned non-b2agg note must be a safe skip, not an error");
         assert!(

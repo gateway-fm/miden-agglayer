@@ -104,11 +104,13 @@ node-versus-log verifier and isolated-wallet load test provide independent check
 
 The ORDER stage is implemented ONCE, in `src/projection_order.rs`
 (`ProjectionOrder::key`), and the per-block EMIT dispatch ONCE, in
-`restore::BlockProjection::project_block`. The live tick
-(`SyntheticProjector::project_block_notes`) and the `--restore` replay are thin
-wrappers over the same two units — the live wrapper adds block-metadata lookup,
-the emitted-frontier gate and the seal; the replay wrapper adds the conversion
-of node-recovered bodies into client-store record shape and per-block grouping.
+`projection::BlockProjection::project_block`. The live tick
+(`SyntheticProjector::project_block_notes`) and `--restore` (issue #167) are
+thin wrappers over the same units — the live wrapper adds block-metadata lookup,
+the emitted-frontier gate and the seal; `--restore` is reset-to-genesis +
+`catch_up_to(CatchUpMode::Restore)`, the same path under a blocking,
+fail-closed schedule. The former node-recovery conversion/replay wrapper was
+deleted.
 
 Do not add a second comparator or a second dispatch loop. The comparator copies
 drifted three times before this extraction (kind-major replay #100; a

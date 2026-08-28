@@ -250,10 +250,12 @@ before restoring write traffic, per the standard procedure above.
 
 ### Behavior changes to know about
 
-- **`--restore` now rebuilds historical claims** (Phase 2.6, node scan): after
-  a full store recovery, aggkit's aggsender can resolve pre-recovery bridge
-  exits and certificate settlement resumes. GER/hash-chain history still
-  restarts by design (the chain rebuilds through live operation).
+- **`--restore` now rebuilds historical claims**: after a full store recovery,
+  aggkit's aggsender can resolve pre-recovery bridge exits and certificate
+  settlement resumes. GER/hash-chain history still restarts by design (the
+  chain rebuilds through live operation). Since issue #167, `--restore` runs
+  the canonical projector catch-up to a captured tip (the parallel replay
+  engine was deleted) and parks the reconcile cursor at the tip it reached.
 - **Duplicate landed claims are accepted-and-reverted** (geth-faithful,
   status-0x0, no ClaimEvent) instead of rejected at admission, so an external
   claim sponsor's transaction manager can never wedge on a user front-run.

@@ -161,10 +161,10 @@ Two cursors are stored independently:
 - reconcile cursor: last completed tag-0 note-body sweep window.
 
 Normal restarts resume both. `--resweep-from-genesis` deliberately resets the
-body-sweep cursor. `--restore` replays B2AGG, CLAIM, and GER history through the
-same derivation functions, advances the projector cursor to the Miden tip, and
-resets the body-sweep cursor so the next normal boot performs the healing
-history sweep.
+body-sweep cursor. `--restore` resets BOTH cursors to genesis and re-drives the
+same projector catch-up to a captured tip (issue #167), advancing the projector
+cursor to the tip and parking the body-sweep cursor where the catch-up reached —
+the canonical path IS the healing history sweep.
 
 ## Deployment constraint
 
