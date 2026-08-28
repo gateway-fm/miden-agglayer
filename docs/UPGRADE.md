@@ -285,8 +285,7 @@ through blocks mined during the swap window.
 
 ### Operational follow-ups shipped with this release
 
-The operations runbook gained incident procedures for the two known
-silent-freeze modes — "Stuck GER injection (interrupted `ger_insert`)" and
-"ntx-builder silent death" (`docs/operations/runbook.md` §4) — including their
-monitoring signals and watchdog allowances. Review alerting against those
+The operations runbook documents automatic recovery and escalation signals for
+interrupted GER/claim writer jobs, plus the separate "ntx-builder silent death"
+procedure (`docs/operations/runbook.md` §4). Review alerting against those
 sections when rolling this release out.

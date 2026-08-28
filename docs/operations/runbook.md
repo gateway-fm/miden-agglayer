@@ -33,9 +33,11 @@ the service then enforces containment after symlink resolution.
 
 ### Durable synthetic store
 
-Set `DATABASE_URL` in production. Without it the service uses `InMemoryStore`,
-which loses synthetic logs, receipts, cursors, faucet routes, and admission
-state at restart.
+Set `DATABASE_URL` in production. A serving start without it is now refused.
+`ALLOW_EPHEMERAL_STORE=1` is an explicit development/test escape hatch that
+selects `InMemoryStore` and loses synthetic logs, receipts, cursors, faucet
+routes, admission state, and acknowledged future-nonce transactions at
+restart. Never set it in production.
 
 Postgres migrations are embedded into the binary and run automatically under
 an advisory lock before the pool opens. A previously applied file whose
@@ -45,17 +47,20 @@ container, edit an applied migration, or mark one applied manually.
 ### Rate-limit sizing vs the claim pipeline
 
 The per-IP rate limit (`RATE_LIMIT_PER_SECOND` / `RATE_LIMIT_BURST`, default
-500/500) MUST be sized above your claimtxman/aggkit burst rate. Measured on the
-N=30 loadtest: the stack's own infrastructure generates 400-1000 rate-limited
-requests per run at the default. The failure mode is not throttling — it is a
-PERMANENT wedge: claimtxman pre-assigns nonces to monitored claim txs and never
-re-nonces one it drops, so a 429-exhausted tx leaves a nonce gap that the R4
-anti-replay ledger then rejects everything behind (observed: `tx.nonce = 86-89,
-expected 11`, L1→L2 autoclaims stalled indefinitely). If autoclaims stall and
-the proxy log shows rate-limit hits alongside `nonce mismatch` errors from the
-claimtxman address, raise the limit for the infra network — the wedged
-claimtxman txs themselves need their sqlite state cleared (recreate the
-container) to re-nonce.
+500/500) must be sized above the claimtxman/aggkit burst rate. Measured on the
+N=30 loadtest, the stack's own infrastructure generates 400–1000 rate-limited
+requests per run at the default.
+
+Current nonce admission persists a valid future nonce in the Postgres-backed
+ephemeral txpool instead of rejecting everything behind a missing nonce. That
+removes the old immediate `nonce mismatch` wedge, but it does not make a
+rejected lower transaction optional: later transactions wait in the bounded
+future-nonce queue until promotion is possible, and non-recovery rows may
+eventually be evicted. If rate-limit hits correlate with
+`rpc_future_nonce_parked_total` or bound-exceeded events, raise the rate limit
+for the infrastructure boundary and have the sender retry the exact missing
+signed transaction. Diagnose its state before changing sender storage; do not
+clear proxy admission rows or invent a replacement transaction.
 
 ### Private listener and authentication
 
@@ -70,8 +75,10 @@ Current state-changing protections:
   `--require-hardening`;
 - no `ADMIN_API_KEY` means every `admin_*` call is disabled;
 - no CORS configuration means browsers receive no allow-origin header;
-- `--require-hardening` additionally requires admin key, signer allow-list,
-  non-wildcard CORS, and a configured/reachable remote prover.
+- `--require-hardening` additionally requires remote-only loopback signer
+  custody, an admin key, a signer allow-list, non-wildcard CORS, a
+  configured/reachable remote prover, and the strict-H6 L1 evidence contract
+  below.
 
 ### Remote prover
 
@@ -84,15 +91,23 @@ at startup and refuses local-only mode.
 ### L1 GER indexer
 
 Configure both `L1_RPC_URL` and `GER_L1_ADDRESS`. If either is missing, the
-InfoTree indexer is disabled; newly projected GER rows can remain unresolved
-and `zkevm_getExitRootsByGER` returns `null` for them. There is no safe
-latest-root fallback because a combined GER cannot be decomposed after the
-fact. Monitor `l1_indexer_state` and the indexer error metrics.
+InfoTree indexer is disabled in non-strict mode; strict H6 instead aborts
+startup. Newly projected GER rows can remain unresolved and
+`zkevm_getExitRootsByGER` returns `null` for them. There is no safe latest-root
+fallback because a combined GER cannot be decomposed after the fact. Monitor
+`l1_indexer_state` and the indexer error metrics.
 
 `L1_EVIDENCE_TAG=latest|safe|finalized` selects the indexer's only L1 frontier;
 the default is `latest`. `REJECT_UNVERIFIED_GER_INJECTION=true` makes GER
 admission wait for roots written by that scan. `REQUIRE_HARDENING=true` implies
 strict admission and requires `safe` or `finalized`.
+
+Strict startup also validates an HTTP(S) L1 URL and EVM GER address. On a fresh
+database it requires `L1_INDEXER_FROM_BLOCK` at or before rollup deployment; an
+existing database may use its non-zero, policy-matched cursor. Before serving,
+the indexer synchronously catches up to the selected frontier. The default
+budget is 300 seconds (`L1_EVIDENCE_CATCHUP_BUDGET_SECS`); size it for an
+initial historical backfill or startup aborts without binding the listener.
 
 The database binds its evidence marker and cursor to the exact selected tag.
 Changing it requires stopping the service, clearing the policy-derived marker,
@@ -320,6 +335,32 @@ than** `transaction_hash` differs. It also refuses to run against a store that i
 itself restore output (`service_state.nonce_ledger_rebuilt = true`), because such a
 run would only measure idempotence, not fidelity.
 
+### Nonce admission after full PostgreSQL loss
+
+The submitter nonce ledger is proxy-local and cannot be reconstructed from
+Miden. A restore into a fresh PostgreSQL database therefore records a durable
+rebuild marker. On the next serving boot, a signer with no nonce row may park
+its first observed transaction; after a three-projected-block settle margin,
+the lowest eligible parked nonce becomes that signer's baseline and the
+contiguous run is promoted. Ordinary nonce ordering applies after that
+first-contact seed.
+
+The global first-contact window defaults to six hours from the restore stamp
+and is configured with `NONCE_RECOVERY_WINDOW_SECS`. Restarts do not extend it.
+A transaction parked while the window is open carries
+`parked_during_recovery=true`; it remains eligible and is exempt from the normal
+3600-block txpool TTL even if the global window closes first. It remains until
+admission/reconciliation, or until an operator handles a surfaced stranded row.
+
+This policy intentionally treats **any signer first seen while the recovery
+window is open as continuing**, including a genuinely new signer. That is an
+accepted operational trade-off of recovering a nonce ledger with no chain
+source. Freeze signer onboarding and changes to `ALLOWED_SIGNERS` during the
+window, admit only the expected pre-loss identities, and verify
+`rpc_nonce_ledger_bootstrapped_total` against that inventory. The
+`rpc_nonce_recovery_mode_expired_total` counter records retirement of the
+global window; already stamped rows remain grandfathered until handled.
+
 ### Full Miden sqlite reset plus restore
 
 Use only when sqlite divergence cannot be repaired surgically and the managed
@@ -452,10 +493,11 @@ leaf). To detect it:
 
 ### Pending transaction or writer restart
 
-Look up the hash in `transactions`, `tx_note_links`, and
-`nonce_reservations` as shown in diagnostics.
+Look up the hash in `queued_txns`, `transactions`, `tx_note_links`, and
+`nonce_reservations` as shown in diagnostics. A parked future transaction has a
+`queued_txns` row but no `transactions` row until promotion.
 
-- Queue saturation returns JSON-RPC `-32005`; callers should back off and
+- Writer-queue saturation returns JSON-RPC `-32005`; callers should back off and
   rebroadcast the exact signed envelope.
 - Queue-wait TTL can fail a job only before dispatch when no durable handoff
   exists. The maintenance sweeper also evicts old terminal in-memory entries;
@@ -464,114 +506,80 @@ Look up the hash in `transactions`, `tx_note_links`, and
   pending. Only exact note observation/commit or authoritative expiration
   classification may resolve it.
 - A different transaction cannot replace the durable `(signer, nonce)` owner.
+- A valid nonce above the executable frontier is accepted into the bounded
+  Postgres-backed but ephemeral `queued_txns` pool. Filling the gap triggers an
+  ordered promotion attempt, with retained failures retried periodically;
+  same-hash rebroadcast is idempotent and a different same-nonce hash is
+  rejected.
+- A non-recovery parked row still resident at its 3600-projected-block TTL may
+  be evicted, including after a failed promotion attempt. Its hash then stops
+  resolving and its capacity is reclaimed; the sender must retain and
+  rebroadcast the signed envelope if it still needs it. Recovery-stamped rows
+  follow the exemption described above.
 - A lower nonce admitted without reaching handoff blocks higher nonces until
   the exact lower signed transaction is resubmitted.
 
 Recovery:
 
 1. Obtain the original raw signed transaction from the caller/transaction
-   manager or the durable `envelope_bytes` through an approved forensic path.
+   manager, `queued_txns.envelope`, or `transactions.envelope_bytes` through an
+   approved forensic path.
 2. Submit those exact bytes again; verify the returned EVM hash is unchanged.
 3. Observe handoff/receipt reconciliation and nonce progression.
 4. Never construct a new random Miden note or a new EVM transaction at the same
    nonce to "unstick" it.
 5. Never delete admission/handoff rows manually.
 
-### Stuck GER injection (interrupted `ger_insert`) — aggoracle deadlock
+### Interrupted GER or claim job: automatic orphan recovery
 
-Known failure mode (tracked as finding #70; recurred repeatedly under fault
-testing). If the proxy is restarted/paused while a `ger_insert` writer job is
-in flight, the aggoracle's `insertGlobalExitRoot` transaction can be left
-`status='pending', block_number=0` permanently: nothing resumes the job after
-restart. Two deadlocks then stack:
+The service automatically recovers acknowledged `pending` transactions after an
+interrupted writer job. A bounded background pass starts at boot and repeats
+every 30 seconds. It works from the stored signed envelope and authoritative
+Miden state, in nonce order per signer:
 
-- the aggoracle's ethtxmanager polls that hash forever ("waiting signedTx to
-  be mined"); and
-- its monitored-transaction ID is deterministic (hash of from/to/calldata, no
-  nonce), so even a recreated aggkit re-derives the same ID, logs
-  `inject GER transaction already exists in monitoring DB`, and never sends a
-  new injection.
+- an intent with no durable note handoff is re-enqueued with persistent,
+  exponential backoff;
+- a submitted handoff or recorded Miden transaction is polled and is never
+  blindly resubmitted;
+- a prepared-but-unconfirmed handoff is retained until the reconciliation
+  cursor proves its finite expiration has passed, then a fresh note is driven;
+  and
+- an effect already applied in Miden is reconciled to a terminal receipt for
+  the original proxy transaction hash.
 
-Blast radius: GER injection stops → deposits never turn `ready_for_claim`,
-L2↔L2 settlement stalls, and the store's UpdateHashChain/ClaimEvent counts
-freeze while the chain keeps advancing. There is no error anywhere — only
-silence.
+Do not delete `transactions`, `tx_note_links`, `nonce_reservations`, or `nonces`,
+and do not recreate a transaction at the same nonce. Those changes destroy the
+recovery source of truth and can violate admission ordering.
 
-**Diagnosis (in order):**
+**Diagnosis:** first rule out a silent ntx-builder using the next procedure. If
+note consumption is advancing, inspect the recovery backlog and its handoff
+state:
 
-1. Rule out the ntx-builder first (see the next procedure): if it is silent,
-   restart it and re-check before touching anything else — an unconsumed
-   UpdateGerNote resolves itself once consumption resumes.
-2. Stuck pending injection:
-
-   ```sql
-   SELECT tx_hash, status, block_number, created_at
-   FROM transactions
-   WHERE lower(signer) = '<aggoracle sender, lowercase>'
-     AND status = 'pending'
-     AND created_at < now() - interval '3 minutes';
-   ```
-
-   The aggoracle sender address is logged at aggkit startup
-   (`AggOracle sender address: 0x…`).
-3. Aggoracle deadlock confirmation: aggkit logs repeat
-   `inject GER transaction already exists in monitoring DB with ID 0x…` with
-   no interleaved `submitted`, and the proxy receives no
-   `eth_sendRawTransaction` from that sender.
-4. Corroborate the freeze: `ger_entries.is_injected` stops advancing;
-   `synthetic_logs` UpdateHashChain count is static while the Miden tip moves.
-
-**Recovery.** This is the one documented exception to "never delete
-admission rows / never replace a pending transaction". It is safe if and only
-if ALL of the following hold — verify each before proceeding:
-
-- the pending rows belong to the aggoracle sender only;
-- their GERs show `is_injected = false` in `ger_entries` (the injection never
-  landed — nothing external ever observed a receipt);
-- the only consumer of those hashes is the aggoracle itself, and it is reset
-  in the same procedure (fresh ethtxmanager state);
-- GER injection is content-idempotent: the same root is safely re-injected
-  under a new transaction.
-
-Procedure (order matters — client side must come back AFTER the proxy):
-
-```bash
-# 1. stop the aggoracle so it cannot re-send mid-surgery
-docker stop <aggkit-container>
-
-# 2. proxy store: remove the dead pending injection(s) + realign the nonce
-#    (psql into the proxy's PostgreSQL, agglayer_store)
-DELETE FROM tx_note_links WHERE tx_hash IN
-  (SELECT tx_hash FROM transactions
-   WHERE lower(signer)='<aggoracle>' AND status='pending');
-DELETE FROM transactions
-  WHERE lower(signer)='<aggoracle>' AND status='pending';
--- MINED := count of that signer's success/reverted rows
-DELETE FROM nonce_reservations
-  WHERE lower(signer)='<aggoracle>' AND nonce >= MINED;
-UPDATE nonces SET nonce = MINED WHERE lower(address)='<aggoracle>';
-
-# 3. restart the proxy; wait for healthy
-docker restart <proxy-container>
-
-# 4. recreate aggkit WITH A FRESH CONTAINER (its ethtxmanager sqlite lives in
-#    the container /tmp — a plain restart resumes the deadlocked state)
-docker rm -f <aggkit-container>
-docker compose up -d --no-deps aggkit
+```sql
+SELECT t.tx_hash, t.signer, t.miden_tx_id, t.status,
+       t.recovery_attempts, t.next_recovery_at,
+       l.handoff_state, l.note_id, l.prepared_expiration_block,
+       t.created_at, t.updated_at
+FROM transactions AS t
+LEFT JOIN tx_note_links AS l ON l.tx_hash = t.tx_hash
+WHERE t.status = 'pending'
+ORDER BY t.created_at;
 ```
 
-**Verify:** within ~1 minute the aggoracle logs `inject GER transaction
-submitted`, the proxy mines it (`transactions.status='success'`,
-`ger_entries.is_injected` flips true, UpdateHashChain count increments), and
-new deposits turn `ready_for_claim`.
+Watch `pending_unlinked_txns` and
+`pending_unlinked_oldest_age_seconds`; the backlog and oldest age should fall as
+dependencies recover. `orphan_recovery_successes_total`,
+`orphan_recovery_redrives_total`, and
+`orphan_recovery_already_claimed_total` identify forward progress. Page on any
+increase in `orphan_recovery_persistent_failures_total`, or on a persistently
+rising oldest-age gauge while the Miden node and writer are healthy. Correlate
+with `target=recovery` logs and dependency health.
 
-**Prevention / monitoring:** alert when
-`count(pending aggoracle txs older than 3 min) > 0` or when
-`ger_entries.is_injected` is static for >5 min while the Miden tip advances.
-A supervised auto-heal implementing exactly the procedure above is acceptable.
-The product fix — resuming interrupted `ger_insert` jobs on startup via the
-durable note handoff — is tracked as finding #70; until it ships, treat this
-procedure as the standing remediation.
+If recovery remains stuck, preserve the database, exact envelope, handoff row,
+and logs and escalate for code-level diagnosis. A legacy prepared handoff with
+`prepared_expiration_block = 4294967295` predates finite note expiry and cannot
+self-heal through expiration; resolve that bounded upgrade edge case out of
+band. It is not authorization for ad-hoc row deletion or nonce rewinding.
 
 ### ntx-builder silent death (network-note consumption halts)
 
@@ -580,8 +588,9 @@ Upstream Miden issue (finding #68). After all account actors log
 following the chain entirely — no further `apply_committed_block` lines, no
 error, process alive — while the tip advances. Because the bridge is a network
 account, ALL bridge note consumption (CLAIM, UpdateGerNote) halts with it:
-claims stop landing, GER injections stall (see the previous procedure — check
-this FIRST), and store event counts freeze silently.
+claims stop landing, GER injections stall, and store event counts freeze
+silently. Check this condition before treating an old pending transaction as an
+orphan-recovery failure.
 
 **Diagnosis:** compare the ntx-builder's last log timestamp against the Miden
 tip. Healthy operation logs `apply_committed_block` every few seconds; more

@@ -59,6 +59,15 @@ The writer queue capacity defaults to 64 and is configured by
 and applies to time waiting in the queue before dispatch; it also controls how
 long terminal entries remain in the process-local status cache.
 
+The future-nonce parking queue is a separate, Postgres-backed but intentionally
+ephemeral txpool. Persistence prevents a process restart from silently erasing
+accepted rows; it is not a delivery guarantee. The pool is bounded at 256 rows
+per signer and 4096 globally. Any non-recovery row still resident when its
+3600-projected-block TTL is reached may be evicted and its capacity reclaimed,
+including after a failed promotion attempt. A row stamped during the accepted
+full-loss recovery window is TTL-exempt; it remains until
+admission/reconciliation, or until an operator handles a surfaced stranded row.
+
 | Metric | Labels/meaning |
 |---|---|
 | `agglayer_writer_queue_depth` | Jobs currently waiting in the bounded channel |
@@ -68,8 +77,18 @@ long terminal entries remain in the process-local status cache.
 | `agglayer_writer_job_failures_total{kind,reason}` | Terminal failures; reasons emitted by current paths include `ttl`, `miden`, and `panic` |
 | `agglayer_writer_drain_outcome_total{outcome}` | Graceful shutdowns labelled `clean` or `partial` |
 | `agglayer_writer_dropped_on_restart_total` | Residual in-memory jobs reported from the prior graceful-shutdown snapshot |
-| `rpc_future_nonce_wait_total` | Future nonces that entered the bounded ordering wait |
-| `rpc_nonce_mismatch_total` | Nonce requests rejected after the wait/check |
+| `rpc_future_nonce_parked_total` | Valid future-nonce envelopes accepted into the Postgres-backed ephemeral txpool, including idempotent same-hash rebroadcasts |
+| `rpc_future_nonce_promoted_total` | Parked envelopes durably admitted after their nonce gap filled |
+| `rpc_future_nonce_evicted_total` | Non-recovery rows evicted after their block TTL; hash visibility and capacity were removed |
+| `rpc_future_nonce_conflict_total` | Different envelopes attempted the same `(signer, nonce)`; first parked transaction remains authoritative |
+| `rpc_future_nonce_bound_exceeded_total` | Per-signer or global parking bound rejected a future-nonce envelope |
+| `rpc_future_nonce_promote_unconfirmed_total` | Promotion returned success without a durable transaction row; queue row was retained for retry |
+| `rpc_future_nonce_drain_budget_exceeded_total` | One signer's mempool sweep slice exceeded its 20-second budget and was deferred |
+| `rpc_future_nonce_stale_row_reconciled_total` | Redundant parked row below the frontier was removed after durable admission was confirmed |
+| `rpc_future_nonce_stranded_total` | Acknowledged parked transaction fell below the frontier without a durable transaction row; operator action required |
+| `rpc_nonce_ledger_bootstrapped_total` | A signer with no nonce row after full database loss adopted its lowest eligible parked nonce as the recovered baseline |
+| `rpc_nonce_recovery_mode_expired_total` | The durable full-loss first-contact window reached its configured wall-clock limit |
+| `rpc_nonce_mismatch_total` | Past or otherwise invalid nonce requests rejected by the ordering check |
 | `rpc_nonce_reservation_lost_total` | A different transaction won the durable `(signer, nonce)` slot |
 | `rpc_nonce_repaired_after_commit_gap_total` | Same-hash replay repaired a receipt-to-nonce crash gap |
 
@@ -80,6 +99,12 @@ Recommended alerts from the code's metric contract:
 - p99 writer duration above 60 seconds for 10 minutes: page;
 - queue-full rejection rate above 0.1/second for 5 minutes: page;
 - writer failure rate above 0.5/second for 5 minutes: page;
+- any increase in `rpc_future_nonce_stranded_total`: page immediately;
+- any increase in `rpc_future_nonce_promote_unconfirmed_total`: investigate;
+- sustained `rpc_future_nonce_bound_exceeded_total`: page and locate the
+  missing lower nonce before raising bounds;
+- sustained eviction or drain-budget exhaustion: warn and verify sender
+  rebroadcast plus nonce progression; and
 - any increase in `agglayer_writer_dropped_on_restart_total`: page and arrange
   rebroadcast of the original signed transactions.
 
@@ -178,16 +203,27 @@ to a plain-fungible view when the AggLayer decode fails, so trusting it would le
 a drifted bridge-owned faucet be silently reclassified as a benign native one —
 the blindness this monitor exists to prevent.
 
-## Remote signer (KMS custody)
+## Remote signer custody
 
-When `--signer-url` is set, every account signature leaves this host. The proxy
-never falls back to a local key, so losing the signer stalls claims and GER
-injection outright — and the fail-closed startup check only covers boot.
+When `--signer-url` is set, every account signing request is delegated out of
+the proxy process. The proxy never falls back to a local key, so losing the
+signer stalls claims and GER injection outright — and the fail-closed startup
+check only covers boot. Whether the private-key operation also leaves the host
+depends on the signer's backend; `file-raw`, `azure-secret`, and `hashicorp` do
+not prove off-host, non-export custody.
 
 | Metric | Meaning |
 |---|---|
+| `remote_signer_verified_accounts` | Startup-only count of persisted/imported account records whose auth keys matched their configured bindings and the signer's initial key directory; expect `2` on a new deployment, or potentially `1` for a supported legacy config without `ger_manager`. |
 | `remote_signer_signatures_total` | Signatures the signer produced. |
 | `remote_signer_signature_failures_total` | Signatures it failed to produce (unreachable, refused, or no key for the requested commitment). |
+
+A binding failure prevents the service and metrics listener from coming up; it
+does not necessarily appear as a low gauge. Alert on target/process absence and
+require `remote_signer_verified_accounts` to equal the account-role inventory
+in `bridge_accounts.toml` after every successful start (`2` for a new
+deployment; potentially `1` for a supported legacy config without
+`ger_manager`).
 
 Alert on the RATE, not the absolute value. A counter never returns to zero, so
 "sustained non-zero" would page forever after a single transient failure:
@@ -213,8 +249,12 @@ authenticates the *server* to us and encrypts the channel, but this client sends
 no certificate, token or other identity, so any caller that can reach the signing
 API still has a signing oracle — and a KMS only prevents key *extraction*, not
 key *use*. Until caller authentication is implemented, run Web3Signer (or an
-authenticated relay in front of it) on the same host/pod and point
-`--signer-url` at `127.0.0.1`.
+authenticated relay in front of it) in the proxy's same network namespace and
+point `--signer-url` at `http://127.0.0.1:<port>`. Separate containers on the
+same host normally do not share loopback. The signer or relay must itself bind
+the signing API only to loopback and must not publish it through a host port,
+Service, or Ingress; the proxy's loopback URL does not constrain the signer's
+listener.
 
 ## Bridge integrity: page on increase
 

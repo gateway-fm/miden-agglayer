@@ -39,7 +39,11 @@ including `eth_sendRawTransaction`, transaction/receipt lookups, block lookups,
   migration container.
 - The production write path is a bounded single writer. Accepted signed
   envelopes, nonce reservations, and exact note handoffs are persisted in the
-  store. If a submission remains pending after a restart, rebroadcast the
+  store. Valid future-nonce envelopes are parked in a persisted but
+  intentionally ephemeral txpool until promotion or reconciliation; ordinary
+  rows still resident at their block TTL may be evicted, while rows stamped
+  during accepted full-loss recovery are TTL-exempt. If a submission remains
+  pending after a restart, rebroadcast the
   **same signed transaction**; do not construct a replacement with the same
   nonce.
 
@@ -73,16 +77,20 @@ settings include:
 | `--bind`, `--port` | `BIND_ADDR`, none | HTTP listen address and port; defaults are `0.0.0.0:8546` |
 | `--miden-node` | none | Miden gRPC URL, or `devnet`/`testnet`; defaults to local port `57291` |
 | `--miden-store-dir` | none | Persistent miden-client sqlite, keystore, and account config directory |
-| `--database-url` | `DATABASE_URL` | Enables the production Postgres store; omission selects the in-memory store |
+| `--database-url` | `DATABASE_URL` | Selects the durable Postgres store. A serving start without it is refused unless `ALLOW_EPHEMERAL_STORE=1` explicitly accepts dev/test data loss |
 | `--chain-id` | `CHAIN_ID` | Value returned by `eth_chainId` |
 | `--network-id` | `NETWORK_ID` | AggLayer rollup network ID stored in the bridge account |
 | `--bridge-address` | `BRIDGE_ADDRESS` | Address stamped on synthetic bridge logs |
 | `--l1-rpc-url` | `L1_RPC_URL` | L1 reads, metadata recovery, and GER decomposition |
 | `--ger-l1-address` | `GER_L1_ADDRESS` | L1 GER contract used by the InfoTree indexer |
+| `--l1-indexer-from-block` | `L1_INDEXER_FROM_BLOCK` | Required on a fresh database under strict H6; start at or before rollup deployment |
+| `--l1-evidence-tag` | `L1_EVIDENCE_TAG` | L1 evidence frontier; hardening requires `safe` or `finalized` |
 | `--miden-prover-url` | `MIDEN_PROVER_URL` | Remote Miden transaction prover |
+| `--signer-url` | `AGGLAYER_SIGNER_URL` | Web3Signer-compatible custody endpoint; hardening accepts only loopback HTTP |
+| `--signer-key` | `AGGLAYER_SIGNER_KEYS` | Required distinct `service` and `ger-manager` public-key bindings |
 | `--admin-api-key` | `ADMIN_API_KEY` | Bearer token for `admin_*`; without it all admin calls are disabled |
 | `--allowed-signers` | `ALLOWED_SIGNERS` | Comma-separated EVM submitter allow-list; without it all signed submissions are rejected |
-| `--require-hardening` | `REQUIRE_HARDENING` | Refuses startup unless admin auth, signer allow-list, non-wildcard CORS, and a reachable remote prover are configured |
+| `--require-hardening` | `REQUIRE_HARDENING` | Also requires remote-only loopback custody, admin auth, signer allow-list, non-wildcard CORS, reachable remote prover, and complete strict-H6 L1 evidence configuration |
 | `--read-only` | `AGGLAYER_READ_ONLY` | Allows reads/reindexing while refusing every Miden transaction submission |
 
 The writer queue is configured with `AGGLAYER_WRITER_QUEUE_DEPTH` (default
@@ -91,6 +99,15 @@ can fail work only before dispatch when no durable handoff exists; the same TTL
 also controls eviction of old terminal entries from the in-memory status map.
 It never expires queued/submitting work from the maintenance sweeper or turns
 an ambiguous post-handoff submission into a failure.
+
+The future-nonce parking queue is separate from the writer channel. Production
+persists it in Postgres so a process restart does not silently erase accepted
+rows, but it is intentionally an ephemeral txpool rather than a delivery
+guarantee: it is bounded at 256 entries per signer and 4096 globally, and any
+non-recovery row still resident after 3600 projected Miden blocks may be
+evicted. The persistence requirement is why the serving process refuses the
+in-memory store by default. Senders must retain and rebroadcast signed
+envelopes whose hashes stop resolving.
 
 ### Store-directory containment
 
@@ -107,17 +124,19 @@ do not pass it to an existing deployment unless creating new account identities
 is intentional.
 
 ```bash
-./target/debug/miden-agglayer-service \
+ALLOW_EPHEMERAL_STORE=1 ./target/debug/miden-agglayer-service \
   --miden-node http://127.0.0.1:57291 \
   --miden-store-dir ./.miden-dev \
+  --insecure-local-keystore \
   --bind 127.0.0.1 \
   --port 8546
 ```
 
-This is a read-capable development configuration. Because the signer allow-list
-is fail-closed, `eth_sendRawTransaction` is rejected until `--allowed-signers`
-is configured. `--insecure-allow-any-signer` exists only for a loopback/private
-development boundary and is incompatible with `--require-hardening`.
+This explicitly accepts local-key and in-memory-store data loss for development.
+Because the signer allow-list is fail-closed, `eth_sendRawTransaction` is
+rejected until `--allowed-signers` is configured.
+`--insecure-allow-any-signer` exists only for a loopback/private development
+boundary and is incompatible with `--require-hardening`.
 
 A production-shaped invocation should use Postgres, a persistent store,
 explicit signer/admin policy, L1 GER settings, and a remote prover:
@@ -127,6 +146,10 @@ DATABASE_URL="$DATABASE_URL" \
 ADMIN_API_KEY="$ADMIN_API_KEY" \
 ALLOWED_SIGNERS="$ALLOWED_SIGNERS" \
 MIDEN_PROVER_URL="$MIDEN_PROVER_URL" \
+AGGLAYER_SIGNER_URL="http://127.0.0.1:9000" \
+AGGLAYER_SIGNER_KEYS="$AGGLAYER_SIGNER_KEYS" \
+L1_EVIDENCE_TAG="finalized" \
+L1_INDEXER_FROM_BLOCK="$ROLLUP_DEPLOYMENT_BLOCK" \
 miden-agglayer-service \
   --miden-node "$MIDEN_NODE_URL" \
   --miden-store-dir /var/lib/miden-agglayer-service \
@@ -140,7 +163,16 @@ miden-agglayer-service \
 ```
 
 Supply secrets through the deployment secret mechanism, not literal shell
-history. If a reverse proxy or sidecar is the network boundary, adapt `--bind`
+history. The example is a first boot on a fresh database; an existing database
+with a non-zero, policy-matched L1 evidence cursor does not need
+`L1_INDEXER_FROM_BLOCK`. Treat it as a one-boot initial-backfill override and
+remove it after catch-up succeeds; it outranks the stored cursor and otherwise
+rewinds the scan on every restart. The signer must share the proxy's network
+namespace (or sit behind a loopback relay), bind its signing listener only to
+loopback, and not publish that listener through a host port, Service, or
+Ingress. The binary must include the `postgres` feature. See the
+[provisioning guide](docs/operations/provisioning.md) before initializing
+accounts. If a reverse proxy or sidecar is the network boundary, adapt `--bind`
 to that topology while keeping port `8546` private.
 
 ## Health and metrics

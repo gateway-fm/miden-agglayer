@@ -139,6 +139,12 @@ FROM nonce_reservations
 ORDER BY created_at DESC
 LIMIT 200;
 
+-- Valid future-nonce envelopes retained while awaiting promotion.
+SELECT signer, nonce, tx_hash, expires_at, parked_during_recovery, created_at
+FROM queued_txns
+ORDER BY created_at DESC
+LIMIT 200;
+
 -- GER state and unresolved decomposition.
 SELECT encode(ger_hash, 'hex') AS ger,
        encode(mainnet_exit_root, 'hex') AS mainnet_exit_root,
