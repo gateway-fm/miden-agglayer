@@ -30,11 +30,17 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 /// #173 — request-mailbox depth for the single-actor Miden thread.
 ///
-/// Capacity 1 meant `MidenClient::with` senders blocked until the actor
-/// *picked up* the previous request, so writers queued on `send` (outside
-/// the mailbox) with no visibility and no FIFO between them. A bounded-deep
-/// mailbox lets concurrent writers queue in order instead; backpressure now
-/// kicks in only at this depth, far past any real writer concurrency.
+/// Capacity 1 meant `MidenClient::with` senders blocked on `send` until the
+/// actor *picked up* the previous request, so concurrent writers contended at
+/// the sender instead of queueing observably inside the mailbox. A bounded
+/// queue admits writers in sender order (tokio mpsc is FIFO and fair — that
+/// part is unchanged), moves backpressure to this depth, and lets
+/// `miden_client_mailbox_depth` make the queue visible. Execution stays fully
+/// serialized: the actor still runs one request closure at a time. Note that
+/// admission is not cancellation: once `send` accepts a request it will
+/// execute even if the caller's future is dropped awaiting the response —
+/// this was already true of the capacity-1 buffer, only the accepted-window
+/// depth changes.
 const REQUEST_MAILBOX_CAPACITY: usize = 64;
 
 /// #173 — after this many consecutive write requests the actor forces a
@@ -51,6 +57,52 @@ const REQUESTS_PER_FORCED_SYNC: usize = 8;
 /// 354 MB (queue waits up to 91s); the #106 note measured a 4x penalty
 /// between 29 MB and 71 MB. 256 MB is well past both.
 const STORE_SIZE_WARN_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The actor's periodic sync ticker: a 5s interval with `Delay` missed-tick
+/// behaviour and the immediate first tick pre-consumed. #173 (review) — the
+/// default `Burst` policy would replay every tick that elapsed while long
+/// write requests were being serviced as a back-to-back sync burst once the
+/// mailbox briefly emptied, each tick a full store-size-dependent
+/// `sync_state` — quietly recreating the very queue stall this fix removes.
+/// `Delay` collapses any elapsed span into a single catch-up sync, and the
+/// forced-sync arm realigns via a fresh interval (see the actor loop).
+fn new_sync_interval() -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Consume the immediate first tick synchronously (a fresh interval's
+    // first tick is always ready) so the loop's first real deadline is a
+    // full period out.
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    let _ = interval.poll_tick(&mut cx);
+    interval
+}
+
+/// #173 — write-vs-sync arbitration state for the actor loop. Forces a sync
+/// on the [`REQUESTS_PER_FORCED_SYNC`]-th consecutive request and resets on
+/// any completed (ticker or forced) sync.
+#[derive(Default)]
+struct SyncCadence {
+    requests_since_sync: usize,
+}
+
+impl SyncCadence {
+    /// Records a serviced write request; returns `true` exactly when a forced
+    /// sync is due (and resets the counter as a side effect).
+    fn on_request(&mut self) -> bool {
+        self.requests_since_sync += 1;
+        if self.requests_since_sync >= REQUESTS_PER_FORCED_SYNC {
+            self.requests_since_sync = 0;
+            return true;
+        }
+        false
+    }
+
+    /// Records a completed sync (ticker or forced).
+    fn on_sync(&mut self) {
+        self.requests_since_sync = 0;
+    }
+}
 
 /// Process-wide guard enforcing that at most ONE production `MidenClient` is
 /// live at a time — the single owner of the miden `store.sqlite3`.
@@ -1016,10 +1068,11 @@ impl MidenClient {
         }
 
         alive.store(true, Ordering::Release);
-        let mut sync_interval = tokio::time::interval(Duration::from_secs(5));
-        // #173 — writes serviced since the last sync, and whether the
-        // store-size warning has already fired for the current growth regime.
-        let mut requests_since_sync: usize = 0;
+        let mut sync_interval = new_sync_interval();
+        let mut cadence = SyncCadence::default();
+        // Whether the store-size warning has fired for the current growth
+        // regime (re-armed when a compaction shrinks the store back below
+        // the threshold — see [`sample_store_size`]).
         let mut store_size_warned = false;
 
         loop {
@@ -1027,8 +1080,10 @@ impl MidenClient {
             // random coin flip: a queued write can no longer lose the
             // iteration to the 5s sync ticker (measured 0.5s-91s queue waits
             // that quantise to the sync cadence). Order is shutdown, then
-            // writes, then sync; the `requests_since_sync` counter below
-            // stops a deep write backlog from starving sync indefinitely.
+            // writes, then sync; `SyncCadence` below stops a deep write
+            // backlog from starving sync indefinitely.
+            ::metrics::gauge!("miden_client_mailbox_depth")
+                .set((REQUEST_MAILBOX_CAPACITY - receiver.capacity()) as f64);
             tokio::select! {
                 biased;
 
@@ -1037,9 +1092,7 @@ impl MidenClient {
                     let Some(request) = receiver_result else { break };
                     let result = (request.closure)(&mut client).await;
                     request.response_sender.send(result).unwrap_or(());
-                    requests_since_sync += 1;
-                    if requests_since_sync >= REQUESTS_PER_FORCED_SYNC {
-                        requests_since_sync = 0;
+                    if cadence.on_request() {
                         sample_store_size(&store_dir, &mut store_size_warned);
                         tokio::select! {
                             result = Self::sync(&mut client) => {
@@ -1049,10 +1102,16 @@ impl MidenClient {
                             },
                             _ = &mut *done_receiver => break,
                         }
+                        // The forced sync substitutes for the ticker: realign
+                        // the deadline to a full period from now. Without this,
+                        // any tick that elapsed while the backlog was serviced
+                        // would fire a redundant sync the moment the mailbox
+                        // briefly empties (review finding on #173).
+                        sync_interval = new_sync_interval();
                     }
                 },
                 _ = sync_interval.tick() => {
-                    requests_since_sync = 0;
+                    cadence.on_sync();
                     sample_store_size(&store_dir, &mut store_size_warned);
                     tokio::select! {
                         result = Self::sync(&mut client) => {
@@ -1128,10 +1187,15 @@ pub async fn wait_for_transaction_commit(
     poll_interval: Duration,
 ) -> anyhow::Result<bool> {
     // #173 — probe the local store BEFORE the first sleep+sync round-trip.
-    // The commit is frequently already visible: submit paths sync right
-    // before submitting (ger.rs), or the commit lands while the proof is
-    // still finishing. Each skipped round saves a full `sync_state()`
-    // (~5-6s on a grown store) spent holding the serialized actor.
+    // Scope: the probe fires when the commit is already locally visible —
+    // a repeat/retry wait, a wait re-entered after a caller-level retry, or
+    // an out-of-actor caller (the bridge_out_tool bins) whose background
+    // sync observed the commit between polls. It does NOT normally fire for
+    // a fresh submission inside the actor: `apply_transaction` records the
+    // txn as Pending and no sync can run while the closure holds the actor,
+    // so the first sync is still required there. A false positive is
+    // impossible — an exact-ID record only ever reads back Committed if a
+    // sync has observed it (Pending/Discarded never match).
     if txn_committed_locally(client, txn_id).await? {
         return Ok(true);
     }
@@ -1242,8 +1306,9 @@ mod tests {
     /// `miden_client_store_bytes` gauge, and the large-store warning latches
     /// exactly once per growth regime: armed at/above the threshold, latched
     /// while it persists, re-armed once a compaction shrinks the store back
-    /// below it. The file length is set sparsely (`set_len`) so the test
-    /// never materialises 256 MB on disk.
+    /// below it — and a SECOND overshoot warns again (a fresh regime, not a
+    /// once-per-process latch). The file length is set sparsely (`set_len`)
+    /// so the test never materialises 256 MB on disk.
     #[test]
     fn store_size_sampling_gauge_and_warn_rearm() {
         let dir = tempfile::tempdir().unwrap();
@@ -1256,22 +1321,30 @@ mod tests {
         let sample = |warned: &mut bool, path: &std::path::Path| {
             metrics::with_local_recorder(&recorder, || sample_store_size(path, warned));
         };
+        let rendered_gauge = |name: &str| {
+            handle
+                .render()
+                .lines()
+                .find_map(|l| l.strip_prefix(name)?.trim().parse::<f64>().ok())
+                .unwrap_or_else(|| panic!("gauge {name} must render"))
+        };
 
-        // Small store: gauge published, no warning.
+        // Small store: exact gauge value, no warning.
         sample(&mut warned, dir.path());
         assert!(!warned, "a fresh store must not arm the warning");
-        assert!(
-            handle.render().contains("miden_client_store_bytes"),
-            "the gauge must be published for every sample"
-        );
+        assert_eq!(rendered_gauge("miden_client_store_bytes"), 1.0);
 
-        // Grow past the threshold (sparse): warning arms.
+        // Grow past the threshold (sparse): warning arms, gauge tracks size.
         std::fs::File::create(&store)
             .unwrap()
             .set_len(STORE_SIZE_WARN_BYTES + 1)
             .unwrap();
         sample(&mut warned, dir.path());
         assert!(warned, "crossing the threshold must arm the warning");
+        assert_eq!(
+            rendered_gauge("miden_client_store_bytes"),
+            (STORE_SIZE_WARN_BYTES + 1) as f64
+        );
 
         // Still above the threshold: latched — no re-warn.
         sample(&mut warned, dir.path());
@@ -1281,6 +1354,86 @@ mod tests {
         std::fs::write(&store, b"x").unwrap();
         sample(&mut warned, dir.path());
         assert!(!warned, "shrinking below the threshold must re-arm");
+
+        // Regrow past the threshold: a SECOND regime warns again.
+        std::fs::File::create(&store)
+            .unwrap()
+            .set_len(STORE_SIZE_WARN_BYTES + 2)
+            .unwrap();
+        sample(&mut warned, dir.path());
+        assert!(warned, "a second growth regime must warn again");
+        assert_eq!(
+            rendered_gauge("miden_client_store_bytes"),
+            (STORE_SIZE_WARN_BYTES + 2) as f64
+        );
+    }
+
+    /// #173 (review) — pins the forced-sync cadence: a forced sync fires
+    /// exactly on the `REQUESTS_PER_FORCED_SYNC`-th consecutive request and
+    /// resets the counter, and any completed sync (ticker or forced) resets
+    /// a partially-accumulated run.
+    #[test]
+    fn sync_cadence_forces_on_nth_request_and_resets() {
+        let mut cadence = SyncCadence::default();
+        for i in 1..REQUESTS_PER_FORCED_SYNC {
+            assert!(!cadence.on_request(), "request {i} must not force a sync");
+        }
+        assert!(
+            cadence.on_request(),
+            "the nth consecutive request must force a sync"
+        );
+        // The forced sync consumed the counter: the next run starts at zero.
+        assert!(
+            !cadence.on_request(),
+            "counter must reset after a forced sync"
+        );
+        // A completed sync (ticker or forced) resets mid-run.
+        cadence.on_request();
+        cadence.on_sync();
+        for _ in 0..REQUESTS_PER_FORCED_SYNC - 1 {
+            assert!(!cadence.on_request());
+        }
+        assert!(cadence.on_request());
+    }
+
+    /// #173 (review) — pins the sync ticker construction: the first real
+    /// deadline is a FULL period out (the immediate first tick is consumed
+    /// at construction, not inside the loop), and the missed-tick policy is
+    /// `Delay` — a long elapsed span collapses into ONE catch-up tick whose
+    /// next deadline is again a full period out, never a Burst replay.
+    #[tokio::test(start_paused = true)]
+    async fn sync_interval_first_deadline_is_a_full_period_out_and_misses_delay() {
+        let mut interval = new_sync_interval();
+        tokio::time::advance(Duration::from_secs(4)).await;
+        // Not ready before a full period (first tick pre-consumed).
+        assert!(
+            tokio::time::timeout(Duration::ZERO, interval.tick())
+                .await
+                .is_err()
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        // Fires exactly at the 5s deadline.
+        assert!(
+            tokio::time::timeout(Duration::ZERO, interval.tick())
+                .await
+                .is_ok()
+        );
+        // Three periods elapse while the actor is busy with writes...
+        tokio::time::advance(Duration::from_secs(15)).await;
+        let _ = interval.tick().await; // exactly ONE catch-up tick (Delay)
+        // ...and the next deadline is a full period out. Under the default
+        // Burst policy this tick would already be ready (and the next one,
+        // and the next) — a redundant sync burst right after write activity.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(4), interval.tick())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), interval.tick())
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

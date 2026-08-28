@@ -297,9 +297,10 @@ struct Faucet {
 /// routing by faucet B, so later bridge-outs of B-minted assets could not be
 /// resolved and emitted no synthetic BridgeEvent.
 ///
-/// `MidenClient::with(...)` queues each request on a size-1 channel and the
-/// single client task awaits the WHOLE closure before taking the next, so today
-/// this entire check→deploy→register→persist sequence already runs serialised
+/// `MidenClient::with(...)` queues each request on the actor's bounded
+/// mailbox and the single client task awaits the WHOLE closure before taking
+/// the next, so today this entire check→deploy→register→persist sequence
+/// already runs serialised
 /// against every other claim on that task — in the current call graph two
 /// first-claims cannot actually interleave here. The single-flight coordinator
 /// ([`coordinate_faucet_provision`]) is therefore defense-in-depth: it does NOT
@@ -1123,8 +1124,9 @@ async fn publish_claim_internal(
 ///     conflicts with current mempool state"`). The bali production incident
 ///     fired this 189 times over 2026-05-11 → 2026-05-14 because the previous
 ///     fresh-per-call code path raced aggoracle's `insert_ger` against
-///     claim publishes on the same `bridge`/`service` account. The channel-of-1
-///     makes that race structurally impossible.
+///     claim publishes on the same `bridge`/`service` account. The actor's
+///     single-request-at-a-time mailbox makes that race structurally
+///     impossible.
 ///
 ///   - **Single in-memory account cache.** Building a fresh `Client` against
 ///     the same `store.sqlite3` produced a divergent in-memory commitment

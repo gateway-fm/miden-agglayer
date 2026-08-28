@@ -267,6 +267,13 @@ pub fn init_metrics() {
          waits. Alert on sustained growth; remediate with a restore-driven \
          compaction window."
     );
+    describe_gauge!(
+        "miden_client_mailbox_depth",
+        "#173 — write requests admitted into the actor's mailbox but not yet \
+         picked up (0 = idle; sustained growth means writers are outpacing the \
+         serialized actor, e.g. during long proofs or slow syncs). Backpressure \
+         (send awaiting) begins at the mailbox capacity."
+    );
     describe_counter!(
         "miden_client_build_errors_total",
         "Failed attempts to build Miden client connection"
