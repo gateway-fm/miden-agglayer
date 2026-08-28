@@ -1112,8 +1112,9 @@ async fn publish_claim_internal(
 ///
 /// All Miden submissions — claim publishes and aggoracle `insert_ger` pushes
 /// alike — funnel through `MidenClient::with(...)`, which serialises every
-/// request through a `mpsc::channel::<Request>(1)` (see `miden_client.rs:126`).
-/// That FIFO serialisation is what makes this design correct on bali:
+/// request through the actor's request mailbox (see `REQUEST_MAILBOX_CAPACITY`
+/// in `miden_client.rs`). That FIFO serialisation is what makes this design
+/// correct on bali:
 ///
 ///   - **No concurrent submissions for the same account.** The Miden node
 ///     rejects a second tx that builds atop the same `init_commitment` as a

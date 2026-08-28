@@ -12,7 +12,7 @@ use miden_protocol::note::NoteId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(test)]
@@ -27,6 +27,30 @@ use tokio::sync::oneshot;
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 /// Maximum backoff delay for retries.
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// #173 — request-mailbox depth for the single-actor Miden thread.
+///
+/// Capacity 1 meant `MidenClient::with` senders blocked until the actor
+/// *picked up* the previous request, so writers queued on `send` (outside
+/// the mailbox) with no visibility and no FIFO between them. A bounded-deep
+/// mailbox lets concurrent writers queue in order instead; backpressure now
+/// kicks in only at this depth, far past any real writer concurrency.
+const REQUEST_MAILBOX_CAPACITY: usize = 64;
+
+/// #173 — after this many consecutive write requests the actor forces a
+/// sync even if the 5s ticker hasn't been reached. With `biased;` recv-first
+/// arbitration below, a sustained write backlog would otherwise starve the
+/// sync tick (and the projector listeners that fire on it) indefinitely;
+/// this bounds that staleness while still giving writes strict priority.
+const REQUESTS_PER_FORCED_SYNC: usize = 8;
+
+/// #173 — warn threshold for the client store's on-disk size. The store is
+/// the amplifier behind every serialized-actor latency: `sync_state` cost
+/// scales with it (see `miden_sync_state_duration_seconds`), and through the
+/// sync cadence so does every queued write. The measured-bad deployment ran
+/// 354 MB (queue waits up to 91s); the #106 note measured a 4x penalty
+/// between 29 MB and 71 MB. 256 MB is well past both.
+const STORE_SIZE_WARN_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Process-wide guard enforcing that at most ONE production `MidenClient` is
 /// live at a time — the single owner of the miden `store.sqlite3`.
@@ -507,7 +531,7 @@ impl MidenClient {
                 None
             };
 
-        let (sender, receiver) = mpsc::channel::<Request>(1);
+        let (sender, receiver) = mpsc::channel::<Request>(REQUEST_MAILBOX_CAPACITY);
         let (done_sender, done_receiver) = oneshot::channel::<()>();
         let alive = Arc::new(AtomicBool::new(false));
         let alive_for_run = alive.clone();
@@ -993,15 +1017,43 @@ impl MidenClient {
 
         alive.store(true, Ordering::Release);
         let mut sync_interval = tokio::time::interval(Duration::from_secs(5));
+        // #173 — writes serviced since the last sync, and whether the
+        // store-size warning has already fired for the current growth regime.
+        let mut requests_since_sync: usize = 0;
+        let mut store_size_warned = false;
 
         loop {
+            // #173 — `biased` gives the arms strict priority instead of a
+            // random coin flip: a queued write can no longer lose the
+            // iteration to the 5s sync ticker (measured 0.5s-91s queue waits
+            // that quantise to the sync cadence). Order is shutdown, then
+            // writes, then sync; the `requests_since_sync` counter below
+            // stops a deep write backlog from starving sync indefinitely.
             tokio::select! {
+                biased;
+
+                _ = &mut *done_receiver => break,
                 receiver_result = receiver.recv() => {
                     let Some(request) = receiver_result else { break };
                     let result = (request.closure)(&mut client).await;
                     request.response_sender.send(result).unwrap_or(());
+                    requests_since_sync += 1;
+                    if requests_since_sync >= REQUESTS_PER_FORCED_SYNC {
+                        requests_since_sync = 0;
+                        sample_store_size(&store_dir, &mut store_size_warned);
+                        tokio::select! {
+                            result = Self::sync(&mut client) => {
+                                if let Err(err) = Self::on_sync(result, &mut client, sync_listeners, listeners_paused).await {
+                                    tracing::error!("MidenClient sync listener error: {err:#}");
+                                }
+                            },
+                            _ = &mut *done_receiver => break,
+                        }
+                    }
                 },
                 _ = sync_interval.tick() => {
+                    requests_since_sync = 0;
+                    sample_store_size(&store_dir, &mut store_size_warned);
                     tokio::select! {
                         result = Self::sync(&mut client) => {
                             if let Err(err) = Self::on_sync(result, &mut client, sync_listeners, listeners_paused).await {
@@ -1011,7 +1063,6 @@ impl MidenClient {
                         _ = &mut *done_receiver => break,
                     }
                 },
-                _ = &mut *done_receiver => break,
             }
         }
 
@@ -1044,6 +1095,28 @@ impl MidenClient {
     }
 }
 
+/// Cantina MA#22 — local-store commit probe: no sleep, no `sync_state`, just
+/// the scoped sqlite read. Previously the commit poll used
+/// `TransactionFilter::All`, which forces the underlying sqlite query to
+/// return EVERY known transaction (committed, uncommitted, expired, foreign)
+/// on every 1s poll, per call — the `Ids(...)` filter pushes the equality
+/// check into the SQL query.
+async fn txn_committed_locally(
+    client: &mut MidenClientLib,
+    txn_id: miden_protocol::transaction::TransactionId,
+) -> anyhow::Result<bool> {
+    let txns = client
+        .get_transactions(miden_client::store::TransactionFilter::Ids(vec![txn_id]))
+        .await?;
+    Ok(txns.iter().any(|t| {
+        t.id == txn_id
+            && matches!(
+                t.status,
+                miden_client::transaction::TransactionStatus::Committed { .. }
+            )
+    }))
+}
+
 /// Poll until a transaction is committed on the Miden node.
 ///
 /// Returns `true` if committed within the given number of attempts.
@@ -1054,6 +1127,14 @@ pub async fn wait_for_transaction_commit(
     max_attempts: usize,
     poll_interval: Duration,
 ) -> anyhow::Result<bool> {
+    // #173 — probe the local store BEFORE the first sleep+sync round-trip.
+    // The commit is frequently already visible: submit paths sync right
+    // before submitting (ger.rs), or the commit lands while the proof is
+    // still finishing. Each skipped round saves a full `sync_state()`
+    // (~5-6s on a grown store) spent holding the serialized actor.
+    if txn_committed_locally(client, txn_id).await? {
+        return Ok(true);
+    }
     for _ in 0..max_attempts {
         tokio::time::sleep(poll_interval).await;
 
@@ -1103,28 +1184,39 @@ pub async fn wait_for_transaction_commit(
             continue;
         }
 
-        // Cantina MA#22 — scope the store scan to the txn we're actually
-        // waiting on. Previously this used `TransactionFilter::All`, which
-        // forces the underlying sqlite query to return EVERY known
-        // transaction (committed, uncommitted, expired, foreign) on every
-        // 1s poll. On a hot path (claim publish, faucet ops, GER inject,
-        // init) this scales O(transactions_in_store) per poll, per call —
-        // wasted CPU, wasted memory, slower commit observation. The
-        // `Ids(...)` filter pushes the equality check into the SQL query.
-        let txns = client
-            .get_transactions(miden_client::store::TransactionFilter::Ids(vec![txn_id]))
-            .await?;
-        if txns.iter().any(|t| {
-            t.id == txn_id
-                && matches!(
-                    t.status,
-                    miden_client::transaction::TransactionStatus::Committed { .. }
-                )
-        }) {
+        if txn_committed_locally(client, txn_id).await? {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// #173 — sample the client store's on-disk size into
+/// `miden_client_store_bytes` and warn once per growth regime past
+/// [`STORE_SIZE_WARN_BYTES`]. The store is the amplifier behind every
+/// serialized-actor latency: `sync_state` cost scales with it, and through
+/// the sync cadence so does every queued write. The re-arm on dropping back
+/// below the threshold means a restore-driven compaction re-arms the alarm.
+fn sample_store_size(store_dir: &Path, warned: &mut bool) {
+    let Ok(meta) = std::fs::metadata(store_dir.join("store.sqlite3")) else {
+        return;
+    };
+    let bytes = meta.len();
+    ::metrics::gauge!("miden_client_store_bytes").set(bytes as f64);
+    if bytes >= STORE_SIZE_WARN_BYTES {
+        if !*warned {
+            *warned = true;
+            tracing::warn!(
+                store_mb = bytes / (1024 * 1024),
+                warn_mb = STORE_SIZE_WARN_BYTES / (1024 * 1024),
+                "miden-client store is large — sync_state cost (and thus write \
+                 queue latency, #173) scales with it; schedule a restore-driven \
+                 compaction window (docs/UPGRADE.md)"
+            );
+        }
+    } else {
+        *warned = false;
+    }
 }
 
 #[cfg(test)]
@@ -1144,6 +1236,51 @@ mod tests {
         // An explicit URL passes through unchanged.
         let explicit = "http://node.example:57291".to_string();
         assert_eq!(effective_node_url(Some(explicit.clone())), explicit);
+    }
+
+    /// #173 — `sample_store_size` publishes the store's on-disk size as the
+    /// `miden_client_store_bytes` gauge, and the large-store warning latches
+    /// exactly once per growth regime: armed at/above the threshold, latched
+    /// while it persists, re-armed once a compaction shrinks the store back
+    /// below it. The file length is set sparsely (`set_len`) so the test
+    /// never materialises 256 MB on disk.
+    #[test]
+    fn store_size_sampling_gauge_and_warn_rearm() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store.sqlite3");
+        std::fs::write(&store, b"x").unwrap();
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let mut warned = false;
+        let sample = |warned: &mut bool, path: &std::path::Path| {
+            metrics::with_local_recorder(&recorder, || sample_store_size(path, warned));
+        };
+
+        // Small store: gauge published, no warning.
+        sample(&mut warned, dir.path());
+        assert!(!warned, "a fresh store must not arm the warning");
+        assert!(
+            handle.render().contains("miden_client_store_bytes"),
+            "the gauge must be published for every sample"
+        );
+
+        // Grow past the threshold (sparse): warning arms.
+        std::fs::File::create(&store)
+            .unwrap()
+            .set_len(STORE_SIZE_WARN_BYTES + 1)
+            .unwrap();
+        sample(&mut warned, dir.path());
+        assert!(warned, "crossing the threshold must arm the warning");
+
+        // Still above the threshold: latched — no re-warn.
+        sample(&mut warned, dir.path());
+        assert!(warned, "the warning must stay latched while oversized");
+
+        // Shrink back below the threshold (compaction): re-armed.
+        std::fs::write(&store, b"x").unwrap();
+        sample(&mut warned, dir.path());
+        assert!(!warned, "shrinking below the threshold must re-arm");
     }
 
     #[tokio::test]

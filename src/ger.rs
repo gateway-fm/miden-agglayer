@@ -471,6 +471,11 @@ pub async fn insert_ger(
                 .await?;
                 // No durable link exists, so the failure occurred before the
                 // external submission boundary and a fresh local retry is safe.
+                // #173 — the re-run repeats the whole submit flow (sync + note
+                // + prove + commit poll) on the serialized actor; a tight retry
+                // against a persistently failing account is an unbounded queue
+                // amplifier. Give the node (and the actor queue) a beat first.
+                tokio::time::sleep(Duration::from_secs(2)).await;
                 submit_update_ger_note(
                     miden_client,
                     accounts.clone(),

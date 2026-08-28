@@ -258,6 +258,15 @@ pub fn init_metrics() {
          at 29 MB vs 71 MB of client store. A steady climb here predicts the \
          'deposits stop being claimed fast enough' symptom before users see it."
     );
+    describe_gauge!(
+        "miden_client_store_bytes",
+        "#173 — on-disk size of the miden-client store.sqlite3, sampled once per \
+         actor sync. sync_state cost scales with this (see \
+         miden_sync_state_duration_seconds), and through the sync cadence so does \
+         every queued write — the measured-bad deployment ran 354 MB with 91s queue \
+         waits. Alert on sustained growth; remediate with a restore-driven \
+         compaction window."
+    );
     describe_counter!(
         "miden_client_build_errors_total",
         "Failed attempts to build Miden client connection"
