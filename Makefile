@@ -197,20 +197,22 @@ install-tools: ## Install development tools
 # Protocol 0.16: the node repo is `0xMiden/node` (package name stays
 # `miden-node`, so `--bin miden-node` and the `bundled bootstrap/start` CLI are
 # unchanged, and the genesis sample `02-with-account-files.toml` is at the same
-# path). We pin to the alpha tag whose transitive miden-protocol/assembly
-# versions match our Cargo.toml pins, so the BURN/MINT/CLAIM/B2AGG MAST roots
-# agree across the node/client boundary. When a stable v0.16.x tag ships, pin
-# to that instead.
+# path). We pin to the v0.16.0-rc.3 tag, whose transitive miden-protocol
+# 0.16.0-rc.6 / miden-assembly 0.29.x versions match our Cargo.toml pins, so
+# the BURN/MINT/CLAIM/B2AGG MAST roots agree across the node/client boundary.
+# This Makefile is the single source of truth for the node ref: run-all.sh and
+# docs/RUNNING-E2E.md read it via `make miden-node-image-coords`.
 #
 # Bumping: edit MIDEN_NODE_GIT_REF here. The build.args plumb it through
 # docker-compose so the Dockerfile picks it up at build time.
 MIDEN_NODE_GIT_URL := https://github.com/0xMiden/node.git
-# v0.16.0-alpha.2. Builds against the miden-protocol/standards/tx 0.16 alphas
-# our service pins, so BURN/MINT/CLAIM/B2AGG MAST roots agree across the
-# node/client boundary with no Cargo.lock-alignment hack. fixtures/patches/0001
-# is not applied (the node-store callback-vault-key bug is fixed upstream), and
-# the AggLayer network id is a runtime storage slot again, so no vendor patch.
-MIDEN_NODE_GIT_REF := v0.16.0-rc.1
+# v0.16.0-rc.3. Builds against the miden-protocol/standards/tx 0.16.0-rc.6 and
+# miden-assembly/core 0.29.x crates our service pins, so BURN/MINT/CLAIM/B2AGG
+# MAST roots agree across the node/client boundary with no Cargo.lock-alignment
+# hack. fixtures/patches/0001 is not applied (the node-store callback-vault-key
+# bug is fixed upstream), and the AggLayer network id is a runtime storage
+# slot, so no vendor patch.
+MIDEN_NODE_GIT_REF := v0.16.0-rc.3
 
 E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
 

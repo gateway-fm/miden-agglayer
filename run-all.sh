@@ -37,11 +37,9 @@ OUT="$PROJECT_DIR/out"; mkdir -p "$OUT"
 REPORT="$OUT/RUN-ALL-REPORT.txt"
 : > "$REPORT"
 
-# Pin coords (kept in sync with the Makefile / setup-fixtures expectations).
-export MIDEN_NODE_GIT_URL="https://github.com/0xMiden/node.git"
-# Must track the Makefile pin: this branch is protocol 0.16 and a 0.15 node
-# produces an incompatible account/genesis format (PR #159 review).
-export MIDEN_NODE_GIT_REF="v0.16.0-alpha.2"
+# Node pin coords are read from the Makefile (miden-node-image-coords) inside
+# provision() — the Makefile is the single source of truth, so the ref cannot
+# drift between the two again. See MIDEN_NODE_GIT_REF in the Makefile.
 export PATH="/usr/local/bin:$HOME/.cargo/bin:$PATH"
 [ -s "$HOME/.cargo/env" ] && . "$HOME/.cargo/env" 2>/dev/null || true
 
@@ -99,6 +97,16 @@ provision() {
     . "$NVM_DIR/nvm.sh"; nvm install --lts; nb="$(dirname "$(nvm which default)")"; sudo ln -sf "$nb/node" /usr/local/bin/node; sudo ln -sf "$nb/npm" /usr/local/bin/npm
   fi
   ok "tools: $(cargo --version | cut -d' ' -f1-2), cast $(cast --version | head -1 | awk '{print $2}'), kurtosis $(kurtosis version 2>/dev/null | awk '/CLI/{print $3}'), node $(node --version)"
+
+  section "0a' · node pin (read from the Makefile — single source of truth)"
+  MIDEN_NODE_GIT_URL="$(make -s miden-node-image-coords | sed -n 's/^url: //p')"
+  MIDEN_NODE_GIT_REF="$(make -s miden-node-image-coords | sed -n 's/^ref: //p')"
+  export MIDEN_NODE_GIT_URL MIDEN_NODE_GIT_REF
+  [ -n "$MIDEN_NODE_GIT_URL" ] && [ -n "$MIDEN_NODE_GIT_REF" ] || \
+    die "could not read node coords via 'make miden-node-image-coords'"
+  # Must be a 0.16 node: a 0.15 node produces an incompatible account/genesis
+  # format (PR #159 review).
+  ok "node pin: $MIDEN_NODE_GIT_REF ($MIDEN_NODE_GIT_URL)"
 
   section "0b · companion repos (siblings of this checkout)"
   [ -d "$WORK/aggkit-proxy" ]   || git clone https://github.com/mandrigin/aggkit-proxy.git "$WORK/aggkit-proxy"

@@ -112,9 +112,11 @@ pub async fn offline_miden_client_lib() -> crate::miden_client::MidenClientLib {
 }
 
 /// Build an rpc `TransactionRecord` fixture via the proto conversion path —
-/// the ONLY public constructor in miden-client 0.16.0-rc.1
+/// the ONLY public constructor in miden-client 0.16.0-rc.2 (vendored)
 /// (`consumed_note_refs` is `pub(crate)` upstream). Mirrors production wire
-/// shape exactly: input notes are HEADERLESS (the rc.1 decoder drops headers)
+/// shape exactly: input notes are HEADERLESS (the rc.2 decoder still reads
+/// `consumed_note_refs` from the flat proto list, not from the header's
+/// input notes)
 /// and public input-note identities arrive as explicit
 /// `(nullifier, note_id)` refs.
 ///

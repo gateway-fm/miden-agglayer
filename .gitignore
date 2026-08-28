@@ -54,3 +54,8 @@ fixtures/web3signer-keys/
 fixtures/web3signer-keys.env
 __pycache__/
 *.pyc
+
+# local live-test fixtures (operator-side; may contain credentials)
+fixtures/live-test.env
+fixtures/live-miden-home/
+demo/state/
