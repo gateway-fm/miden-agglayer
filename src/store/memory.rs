@@ -1,12 +1,14 @@
 //! In-memory Store implementation — wraps HashMap/RwLock data structures.
 
 use super::{
-    ClaimFence, FaucetEntry, NoteHandoff, NoteHandoffState, PendingNonceFrontier,
-    RecoverablePendingTxn, Store, TxnData, TxnEntry, UnbridgeableBridgeOut, UnclaimableClaim,
+    ClaimFence, FaucetEntry, NoteHandoff, NoteHandoffState, PendingNonceFrontier, QueueBounds,
+    QueueOutcome, QueuedTxn, RecoverablePendingTxn, Store, TxnData, TxnEntry,
+    UnbridgeableBridgeOut, UnclaimableClaim,
 };
 use crate::log_synthesis::{
     GerEntry, L2_GLOBAL_EXIT_ROOT_ADDRESS, LogFilter, SyntheticLog, UPDATE_HASH_CHAIN_VALUE_TOPIC,
 };
+use alloy::consensus::TxEnvelope;
 use alloy::primitives::{Address, LogData, TxHash, U256};
 use lru::LruCache;
 use miden_protocol::account::AccountId;
@@ -186,6 +188,7 @@ pub struct InMemoryStore {
     reconcile_cursor: RwLock<u64>,
     /// #90 — set by restore when it rebuilt the store and left `nonces` empty.
     nonce_ledger_rebuilt: RwLock<bool>,
+    nonce_ledger_rebuilt_at: RwLock<Option<u64>>,
 
     // Cursor of the one configured L1 evidence scan. PostgreSQL stores this in
     // the legacy `finalized_scan_cursor` column for upgrade-safe provenance.
@@ -216,6 +219,11 @@ pub struct InMemoryStore {
     // treat an evicted (repaired) claim as "still awaiting" and pin readiness at a
     // permanent 503 (review blocker 3). A standalone set is immune to eviction.
     claim_calldata_pending: RwLock<HashSet<String>>,
+
+    // #146 future-nonce queue ("mempool"): signer -> (nonce -> parked tx). A
+    // BTreeMap keeps nonces ordered so `peek_queued_min_nonce` is the first key.
+    // Field-backed mirror of the PgStore `queued_txns` table (migration 020).
+    queued_txns: RwLock<HashMap<String, std::collections::BTreeMap<u64, QueuedTxn>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -241,6 +249,7 @@ impl InMemoryStore {
     pub fn new() -> Self {
         Self {
             latest_block_number: RwLock::new(0),
+            queued_txns: RwLock::new(HashMap::new()),
             logs_by_block: RwLock::new(HashMap::new()),
             logs_by_tx: RwLock::new(HashMap::new()),
             log_counter: RwLock::new(0),
@@ -279,6 +288,7 @@ impl InMemoryStore {
             projector_cursor: RwLock::new(0),
             reconcile_cursor: RwLock::new(0),
             nonce_ledger_rebuilt: RwLock::new(false),
+            nonce_ledger_rebuilt_at: RwLock::new(None),
             l1_evidence_cursor: RwLock::new(0),
             #[cfg(test)]
             fail_l1_evidence_cursor_reads: RwLock::new(false),
@@ -487,7 +497,17 @@ impl Store for InMemoryStore {
 
     async fn set_nonce_ledger_rebuilt(&self, rebuilt: bool) -> anyhow::Result<()> {
         *self.nonce_ledger_rebuilt.write() = rebuilt;
+        *self.nonce_ledger_rebuilt_at.write() = rebuilt.then(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        });
         Ok(())
+    }
+
+    async fn nonce_ledger_rebuilt_at(&self) -> anyhow::Result<Option<u64>> {
+        Ok(*self.nonce_ledger_rebuilt_at.read())
     }
 
     async fn nonce_bootstrap_if_absent(&self, addr: &str, nonce: u64) -> anyhow::Result<bool> {
@@ -1458,7 +1478,129 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
+    // ── Future-nonce queue ("mempool") — #146 ────────────────────
+
+    async fn queue_txn(
+        &self,
+        signer: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+        envelope: &TxEnvelope,
+        expires_at: u64,
+        parked_during_recovery: bool,
+        bounds: QueueBounds,
+    ) -> anyhow::Result<QueueOutcome> {
+        let key = signer.to_lowercase();
+        let mut map = self.queued_txns.write();
+        // Idempotency / conflict at (signer, nonce) BEFORE the bound checks — an
+        // already-parked same-hash re-broadcast must accept even at the bound.
+        if let Some(existing) = map.get(&key).and_then(|m| m.get(&nonce)) {
+            return Ok(if existing.tx_hash == tx_hash {
+                QueueOutcome::AlreadyParked
+            } else {
+                QueueOutcome::ConflictDifferentHash
+            });
+        }
+        if map.get(&key).map(|m| m.len()).unwrap_or(0) >= bounds.per_signer {
+            return Ok(QueueOutcome::PerSignerBoundExceeded);
+        }
+        if map.values().map(|m| m.len()).sum::<usize>() >= bounds.global {
+            return Ok(QueueOutcome::GlobalBoundExceeded);
+        }
+        map.entry(key.clone()).or_default().insert(
+            nonce,
+            QueuedTxn {
+                signer: key,
+                nonce,
+                tx_hash,
+                envelope: envelope.clone(),
+                expires_at,
+                parked_during_recovery,
+            },
+        );
+        Ok(QueueOutcome::Parked)
+    }
+
+    async fn get_queued_txn(&self, signer: &str, nonce: u64) -> anyhow::Result<Option<QueuedTxn>> {
+        Ok(self
+            .queued_txns
+            .read()
+            .get(&signer.to_lowercase())
+            .and_then(|m| m.get(&nonce))
+            .cloned())
+    }
+
+    async fn delete_queued_txn(
+        &self,
+        signer: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+    ) -> anyhow::Result<bool> {
+        let key = signer.to_lowercase();
+        let mut map = self.queued_txns.write();
+        let Some(inner) = map.get_mut(&key) else {
+            return Ok(false);
+        };
+        if inner.get(&nonce).map(|q| q.tx_hash) != Some(tx_hash) {
+            return Ok(false);
+        }
+        inner.remove(&nonce);
+        if inner.is_empty() {
+            map.remove(&key);
+        }
+        Ok(true)
+    }
+
+    async fn peek_queued_min_nonce(&self, signer: &str) -> anyhow::Result<Option<u64>> {
+        Ok(self
+            .queued_txns
+            .read()
+            .get(&signer.to_lowercase())
+            .and_then(|m| m.keys().next().copied()))
+    }
+
+    async fn queued_signers(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self.queued_txns.read().keys().cloned().collect())
+    }
+
+    async fn queued_txn_by_hash(&self, tx_hash: TxHash) -> anyhow::Result<Option<QueuedTxn>> {
+        Ok(self
+            .queued_txns
+            .read()
+            .values()
+            .flat_map(|m| m.values())
+            .find(|q| q.tx_hash == tx_hash)
+            .cloned())
+    }
+
+    async fn evict_expired_queued_txns(
+        &self,
+        now: u64,
+    ) -> anyhow::Result<Vec<(String, u64, TxHash)>> {
+        // Ephemeral txpool: TTL expiry DELETES (see the trait doc for the
+        // design decision and the re-broadcast contract that makes it safe).
+        let mut evicted = Vec::new();
+        let mut map = self.queued_txns.write();
+        for (signer, txs) in map.iter_mut() {
+            txs.retain(|nonce, q| {
+                // Stamped rows are exempt — see the postgres impl / trait doc.
+                if q.expires_at <= now && !q.parked_during_recovery {
+                    evicted.push((signer.clone(), *nonce, q.tx_hash));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        map.retain(|_, txs| !txs.is_empty());
+        Ok(evicted)
+    }
+
     // ── Nonces ───────────────────────────────────────────────────
+
+    async fn nonce_ledger_is_populated(&self) -> anyhow::Result<bool> {
+        Ok(!self.nonces.read().is_empty())
+    }
 
     async fn nonce_get(&self, addr: &str) -> anyhow::Result<u64> {
         Ok(*self.nonces.read().get(&addr.to_lowercase()).unwrap_or(&0))
@@ -4086,5 +4228,361 @@ mod tests {
 
         // Nothing leaked a second row.
         assert_eq!(store.list_faucets().await.unwrap().len(), 1);
+    }
+
+    /// #146 ephemeral-txpool (maintainer decision, 2026-08-27): TTL expiry
+    /// EVICTS. The queue is a geth-like mempool — persistence is best-effort
+    /// crash convenience, not a delivery guarantee — so a gap that never fills
+    /// within the TTL forfeits its slot. This test pins the three properties
+    /// that make eviction safe and useful:
+    ///   1. expired rows are DELETED and returned (so each drop is logged),
+    ///   2. the evicted hash stops resolving — the exact signal that makes the
+    ///      sender's monitoring re-broadcast, and
+    ///   3. the capacity the dead rows were pinning is RECLAIMED, so unrelated
+    ///      future-nonce submissions are no longer locked out (the reviewer's
+    ///      blocker: enough permanently-impossible rows starved the bounds
+    ///      forever with no operator remedy).
+    #[tokio::test]
+    async fn expired_parked_txns_are_evicted_and_capacity_reclaimed() {
+        use alloy::consensus::{Signed, TxLegacy};
+        use alloy::primitives::Signature;
+        let store = InMemoryStore::new();
+        let signer = "0x00000000000000000000000000000000000000ee";
+        let mk = |h: u8| -> (TxHash, TxEnvelope) {
+            let hash = TxHash::from([h; 32]);
+            let env = TxEnvelope::Legacy(Signed::new_unchecked(
+                TxLegacy::default(),
+                Signature::test_signature(),
+                hash,
+            ));
+            (hash, env)
+        };
+        let bounds = QueueBounds {
+            per_signer: 16,
+            global: 16,
+        };
+
+        // Executable frontier is nonce 7.
+        store.nonce_bootstrap_if_absent(signer, 7).await.unwrap();
+
+        // 7 == frontier and 8 == frontier+1: a CONTIGUOUS executable prefix.
+        // 10 is genuinely gap-blocked (9 is missing).
+        for (n, h) in [(7u64, 0x77u8), (8, 0x88), (10, 0xAA)] {
+            let (hash, env) = mk(h);
+            store
+                .queue_txn(signer, n, hash, &env, 10, false, bounds)
+                .await
+                .unwrap();
+        }
+
+        // A STAMPED row, equally expired, parked alongside them. It must
+        // SURVIVE eviction: the stamp is the only post-restore eligibility
+        // proof, and evicting it re-creates the park-unstamped-forever wedge
+        // (review round 3, codex B1).
+        let (hs, es) = mk(0x5A);
+        store
+            .queue_txn(signer, 30, hs, &es, 10, true, bounds)
+            .await
+            .unwrap();
+
+        // All four are long past their TTL block: evict.
+        let evicted = store.evict_expired_queued_txns(100).await.unwrap();
+        assert_eq!(
+            evicted.len(),
+            3,
+            "the three UNSTAMPED expired rows are evicted"
+        );
+        assert!(
+            store.get_queued_txn(signer, 30).await.unwrap().is_some(),
+            "the stamped row is EXEMPT from TTL eviction — it is the continuing \
+             wallet's eligibility proof and leaves via adoption, not expiry"
+        );
+        store.delete_queued_txn(signer, 30, hs).await.unwrap();
+
+        for n in [7u64, 8, 10] {
+            assert!(
+                store.get_queued_txn(signer, n).await.unwrap().is_none(),
+                "evicted nonce {n} must be gone"
+            );
+        }
+        // The evicted hashes must stop resolving: a vanished hash is the signal
+        // an EVM sender's monitoring understands as "dropped, re-broadcast".
+        assert!(
+            store
+                .queued_txn_by_hash(TxHash::from([0x77u8; 32]))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store.queued_signers().await.unwrap().is_empty(),
+            "an evicted-out signer must leave the resume set"
+        );
+        // Idempotent: a second sweep finds nothing.
+        assert!(
+            store
+                .evict_expired_queued_txns(100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Capacity reuse — the reviewer's actual blocker. Fill a tiny bound with
+        // rows that expire, evict, and the SAME signer must be able to park
+        // again where a retained dead row would still consume the slot.
+        let tight = QueueBounds {
+            per_signer: 1,
+            global: 1,
+        };
+        let (h1, e1) = mk(0x01);
+        store
+            .queue_txn(signer, 20, h1, &e1, 200, false, tight)
+            .await
+            .unwrap();
+        let (h2, e2) = mk(0x02);
+        assert!(matches!(
+            store
+                .queue_txn(signer, 21, h2, &e2, 300, false, tight)
+                .await
+                .unwrap(),
+            crate::store::QueueOutcome::PerSignerBoundExceeded
+        ));
+        store.evict_expired_queued_txns(250).await.unwrap();
+        assert!(
+            matches!(
+                store
+                    .queue_txn(signer, 21, h2, &e2, 300, false, tight)
+                    .await
+                    .unwrap(),
+                crate::store::QueueOutcome::Parked
+            ),
+            "eviction must return the dead row's slot to the pool"
+        );
+    }
+
+    /// #146 finding 1: the marker must round-trip durably, because eligibility
+    /// to adopt a post-rebuild baseline is read from it AFTER the global window
+    /// has closed. A row parked outside recovery must never carry it — that is
+    /// the direction both reverted attempts got wrong (a new wallet at nonce 42
+    /// being seeded to 42, skipping 0..41).
+    #[tokio::test]
+    async fn parked_during_recovery_marker_round_trips_and_defaults_false() {
+        use alloy::consensus::{Signed, TxLegacy};
+        use alloy::primitives::Signature;
+        let store = InMemoryStore::new();
+        let bounds = crate::store::QueueBounds {
+            per_signer: 8,
+            global: 8,
+        };
+        let mk = |nonce: u64| {
+            let tx = TxLegacy {
+                nonce,
+                ..Default::default()
+            };
+            let sig = Signature::test_signature();
+            TxEnvelope::Legacy(Signed::new_unchecked(tx, sig, Default::default()))
+        };
+
+        // Parked DURING recovery -> carries the proof.
+        let during = mk(7);
+        store
+            .queue_txn("0xaa", 7, *during.tx_hash(), &during, 999, true, bounds)
+            .await
+            .expect("park");
+        let got = store
+            .get_queued_txn("0xaa", 7)
+            .await
+            .expect("read")
+            .expect("row");
+        assert!(
+            got.parked_during_recovery,
+            "a tx parked while the recovery window was open must carry the proof, or it \
+             is stranded forever once the global window closes"
+        );
+
+        // Parked OUTSIDE recovery -> must NOT carry it.
+        let outside = mk(42);
+        store
+            .queue_txn("0xbb", 42, *outside.tx_hash(), &outside, 999, false, bounds)
+            .await
+            .expect("park");
+        let got = store
+            .get_queued_txn("0xbb", 42)
+            .await
+            .expect("read")
+            .expect("row");
+        assert!(
+            !got.parked_during_recovery,
+            "a NEW wallet's out-of-order tx must never earn the marker — granting it \
+             would seed the signer to 42 and skip nonces 0..41"
+        );
+    }
+
+    /// #146 — the future-nonce queue's park/idempotency/conflict/bounds/expiry
+    /// contract at the store layer (bounds tested with small explicit limits).
+    #[tokio::test]
+    async fn queue_txn_bounds_idempotency_conflict_and_expiry() {
+        use alloy::consensus::{Signed, TxLegacy};
+        use alloy::primitives::Signature;
+        let store = InMemoryStore::new();
+        let a = "0x00000000000000000000000000000000000000aa";
+        let b = "0x00000000000000000000000000000000000000bb";
+        let mk = |h: u8| -> (TxHash, TxEnvelope) {
+            let hash = TxHash::from([h; 32]);
+            let env = TxEnvelope::Legacy(Signed::new_unchecked(
+                TxLegacy::default(),
+                Signature::test_signature(),
+                hash,
+            ));
+            (hash, env)
+        };
+
+        let (h5, e5) = mk(0x01);
+        assert_eq!(
+            store
+                .queue_txn(
+                    a,
+                    5,
+                    h5,
+                    &e5,
+                    100,
+                    false,
+                    QueueBounds {
+                        per_signer: 8,
+                        global: 8
+                    }
+                )
+                .await
+                .unwrap(),
+            QueueOutcome::Parked
+        );
+        // Idempotent same hash accepts without duplicating.
+        assert_eq!(
+            store
+                .queue_txn(
+                    a,
+                    5,
+                    h5,
+                    &e5,
+                    100,
+                    false,
+                    QueueBounds {
+                        per_signer: 8,
+                        global: 8
+                    }
+                )
+                .await
+                .unwrap(),
+            QueueOutcome::AlreadyParked
+        );
+        // A DIFFERENT hash at the same (signer, nonce) is refused, never overwrites.
+        let (h5b, e5b) = mk(0x02);
+        assert_eq!(
+            store
+                .queue_txn(
+                    a,
+                    5,
+                    h5b,
+                    &e5b,
+                    100,
+                    false,
+                    QueueBounds {
+                        per_signer: 8,
+                        global: 8
+                    }
+                )
+                .await
+                .unwrap(),
+            QueueOutcome::ConflictDifferentHash
+        );
+        assert_eq!(
+            store.get_queued_txn(a, 5).await.unwrap().unwrap().tx_hash,
+            h5,
+            "the first-parked hash is kept"
+        );
+        assert_eq!(store.peek_queued_min_nonce(a).await.unwrap(), Some(5));
+        assert!(store.queued_txn_by_hash(h5).await.unwrap().is_some());
+        assert_eq!(store.queued_signers().await.unwrap(), vec![a.to_string()]);
+
+        // Per-signer bound (max 2): nonce 6 fits (2 total), nonce 7 is refused.
+        let (h6, e6) = mk(0x03);
+        assert_eq!(
+            store
+                .queue_txn(
+                    a,
+                    6,
+                    h6,
+                    &e6,
+                    100,
+                    false,
+                    QueueBounds {
+                        per_signer: 2,
+                        global: 8
+                    }
+                )
+                .await
+                .unwrap(),
+            QueueOutcome::Parked
+        );
+        let (h7, e7) = mk(0x04);
+        assert_eq!(
+            store
+                .queue_txn(
+                    a,
+                    7,
+                    h7,
+                    &e7,
+                    100,
+                    false,
+                    QueueBounds {
+                        per_signer: 2,
+                        global: 8
+                    }
+                )
+                .await
+                .unwrap(),
+            QueueOutcome::PerSignerBoundExceeded
+        );
+        // Global bound (max 2, already 2 total): another signer is refused.
+        let (h8, e8) = mk(0x05);
+        assert_eq!(
+            store
+                .queue_txn(
+                    b,
+                    0,
+                    h8,
+                    &e8,
+                    100,
+                    false,
+                    QueueBounds {
+                        per_signer: 8,
+                        global: 2
+                    }
+                )
+                .await
+                .unwrap(),
+            QueueOutcome::GlobalBoundExceeded
+        );
+
+        // Delete is hash-guarded: wrong hash is a no-op, right hash removes.
+        assert!(!store.delete_queued_txn(a, 5, h5b).await.unwrap());
+        assert!(store.delete_queued_txn(a, 5, h5).await.unwrap());
+        assert_eq!(store.peek_queued_min_nonce(a).await.unwrap(), Some(6));
+
+        // #146 ephemeral-txpool — expiry EVICTS. The row (nonce 6, expires_at
+        // 100) is deleted, its hash stops resolving, and the signer leaves the
+        // resume set; the sender re-broadcasts on the vanished hash.
+        let evicted = store.evict_expired_queued_txns(100).await.unwrap();
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(
+            evicted[0].1, 6,
+            "the expired nonce-6 row is what got evicted"
+        );
+        assert_eq!(
+            store.peek_queued_min_nonce(a).await.unwrap(),
+            None,
+            "the evicted row must not linger"
+        );
+        assert!(store.queued_signers().await.unwrap().is_empty());
     }
 }

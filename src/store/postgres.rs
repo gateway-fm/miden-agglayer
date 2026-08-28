@@ -4,9 +4,9 @@
 //! with the schema from `migrations/001_initial.sql` applied.
 
 use super::{
-    ClaimFence, FaucetEntry, NoteHandoff, NoteHandoffState, PendingNonceFrontier,
-    RecoverablePendingTxn, Store, TxnData, TxnEntry, UnbridgeableBridgeOut,
-    UnbridgeableBridgeOutReason, UnclaimableClaim, UnclaimableReason,
+    ClaimFence, FaucetEntry, NoteHandoff, NoteHandoffState, PendingNonceFrontier, QueueBounds,
+    QueueOutcome, QueuedTxn, RecoverablePendingTxn, Store, TxnData, TxnEntry,
+    UnbridgeableBridgeOut, UnbridgeableBridgeOutReason, UnclaimableClaim, UnclaimableReason,
 };
 use crate::bridge_address::get_bridge_address;
 use crate::log_synthesis::{
@@ -264,28 +264,67 @@ impl Store for PgStore {
 
     async fn set_nonce_ledger_rebuilt(&self, rebuilt: bool) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
+        // Stamp WHEN the rebuild happened so the bootstrap window is durable and
+        // bounded; clear the stamp on retirement so a later rebuild starts fresh.
+        let stamp: Option<i64> = rebuilt.then(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        });
         client
             .execute(
-                "UPDATE service_state SET nonce_ledger_rebuilt = $1, updated_at = now() WHERE id = 1",
-                &[&rebuilt],
+                "UPDATE service_state SET nonce_ledger_rebuilt = $1, \
+                 nonce_ledger_rebuilt_at = $2, updated_at = now() WHERE id = 1",
+                &[&rebuilt, &stamp],
             )
             .await?;
         Ok(())
     }
 
-    async fn nonce_bootstrap_if_absent(&self, addr: &str, nonce: u64) -> anyhow::Result<bool> {
+    async fn nonce_ledger_rebuilt_at(&self) -> anyhow::Result<Option<u64>> {
         let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT nonce_ledger_rebuilt_at FROM service_state WHERE id = 1",
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .first()
+            .and_then(|r| r.get::<_, Option<i64>>(0))
+            .map(|v| v.max(0) as u64))
+    }
+
+    async fn nonce_bootstrap_if_absent(&self, addr: &str, nonce: u64) -> anyhow::Result<bool> {
+        let mut client = self.pool.get().await?;
         let key = addr.to_lowercase();
+        // PR#155 review (codex round-2 #3): bound this SERVER-side.
+        //
+        // A bare `execute` was un-cancellable safely (a dropped future abandons
+        // a statement the server may still commit), which once forced the sweep
+        // to run bootstrap OUTSIDE its per-signer budget — and that left one
+        // hung signer able to starve every later signer's drain. The explicit
+        // transaction changes the cancellation semantics: dropping the future
+        // drops the Transaction, which rolls back, so bootstrap now runs
+        // INSIDE the per-signer budget (see `resume_queued_drain`).
+        // `statement_timeout` additionally bounds each statement on the server,
+        // and SET LOCAL scopes it to this transaction so the pooled connection
+        // is not mutated for whoever gets it next.
+        let tx = client.transaction().await?;
+        tx.batch_execute("SET LOCAL statement_timeout = '10s'")
+            .await?;
         // Insert-if-absent: atomic and idempotent across replicas — exactly one
         // caller seeds the baseline, everyone else sees 0 rows affected and falls
         // through to the ordinary R4 path against the now-existing row.
-        let affected = client
+        let affected = tx
             .execute(
                 "INSERT INTO nonces (address, nonce) VALUES ($1, $2)
                  ON CONFLICT (address) DO NOTHING",
                 &[&key, &(nonce as i64)],
             )
             .await?;
+        tx.commit().await?;
         Ok(affected > 0)
     }
 
@@ -1896,7 +1935,225 @@ impl Store for PgStore {
         Ok(())
     }
 
+    // ── Future-nonce queue ("mempool") — #146 ────────────────────
+
+    async fn queue_txn(
+        &self,
+        signer: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+        envelope: &TxEnvelope,
+        expires_at: u64,
+        parked_during_recovery: bool,
+        bounds: QueueBounds,
+    ) -> anyhow::Result<QueueOutcome> {
+        use alloy::eips::Encodable2718;
+        // Review finding 5: the nonce is EXTERNAL input (it rides in a signed
+        // transaction), and `as i64` silently wraps anything above i64::MAX
+        // negative — corrupting MIN(nonce) ordering and inviting arithmetic
+        // overflow downstream. Reject it here with a checked conversion; a
+        // legitimate sequential nonce can never approach this bound, so the
+        // only thing lost is a garbage submission. `expires_at` gets the same
+        // treatment for symmetry, though it is derived from block numbers.
+        let nonce_db = i64::try_from(nonce)
+            .map_err(|_| anyhow::anyhow!("nonce {nonce} exceeds the supported range (i64)"))?;
+        let expires_db = i64::try_from(expires_at)
+            .map_err(|_| anyhow::anyhow!("expires_at {expires_at} exceeds the supported range"))?;
+        let mut client = self.pool.get().await?;
+        let key = signer.to_lowercase();
+        let hash_str = format!("{tx_hash:#x}");
+        // One transaction so the count checks and the insert are atomic against a
+        // concurrent park for the same signer / global pool.
+        let tx = client.transaction().await?;
+        // (review round 3) The global bound was COUNT-then-INSERT under READ
+        // COMMITTED, so two parks crossing the threshold concurrently could
+        // both pass and overshoot the cap. Parks are rare (future-nonce only),
+        // so serialising them with a transaction-scoped advisory lock is cheap
+        // and makes the bound exact.
+        tx.batch_execute("SELECT pg_advisory_xact_lock(hashtext('queued_txns_bounds'))")
+            .await?;
+        // Idempotency / conflict at (signer, nonce) FIRST — an already-parked
+        // same-hash re-broadcast must accept even when a bound is met.
+        if let Some(row) = tx
+            .query_opt(
+                "SELECT tx_hash FROM queued_txns WHERE signer = $1 AND nonce = $2",
+                &[&key, &nonce_db],
+            )
+            .await?
+        {
+            let existing: String = row.get(0);
+            tx.commit().await?;
+            return Ok(if existing.eq_ignore_ascii_case(&hash_str) {
+                QueueOutcome::AlreadyParked
+            } else {
+                QueueOutcome::ConflictDifferentHash
+            });
+        }
+        let per_signer: i64 = tx
+            .query_one(
+                "SELECT COUNT(*) FROM queued_txns WHERE signer = $1",
+                &[&key],
+            )
+            .await?
+            .get(0);
+        if per_signer as usize >= bounds.per_signer {
+            tx.commit().await?;
+            return Ok(QueueOutcome::PerSignerBoundExceeded);
+        }
+        let global: i64 = tx
+            .query_one("SELECT COUNT(*) FROM queued_txns", &[])
+            .await?
+            .get(0);
+        if global as usize >= bounds.global {
+            tx.commit().await?;
+            return Ok(QueueOutcome::GlobalBoundExceeded);
+        }
+        let mut envelope_bytes = Vec::new();
+        envelope.encode_2718(&mut envelope_bytes);
+        tx.execute(
+            "INSERT INTO queued_txns \
+             (signer, nonce, tx_hash, envelope, expires_at, parked_during_recovery)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            &[
+                &key,
+                &nonce_db,
+                &hash_str,
+                &envelope_bytes,
+                &expires_db,
+                &parked_during_recovery,
+            ],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(QueueOutcome::Parked)
+    }
+
+    async fn get_queued_txn(&self, signer: &str, nonce: u64) -> anyhow::Result<Option<QueuedTxn>> {
+        let client = self.pool.get().await?;
+        let key = signer.to_lowercase();
+        let Some(row) = client
+            .query_opt(
+                "SELECT tx_hash, envelope, expires_at, parked_during_recovery \
+                 FROM queued_txns WHERE signer = $1 AND nonce = $2",
+                &[&key, &(nonce as i64)],
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(row_to_queued_txn(key, nonce, &row)?))
+    }
+
+    async fn delete_queued_txn(
+        &self,
+        signer: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+    ) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let n = client
+            .execute(
+                "DELETE FROM queued_txns WHERE signer = $1 AND nonce = $2 AND tx_hash = $3",
+                &[
+                    &signer.to_lowercase(),
+                    &(nonce as i64),
+                    &format!("{tx_hash:#x}"),
+                ],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    async fn peek_queued_min_nonce(&self, signer: &str) -> anyhow::Result<Option<u64>> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_one(
+                "SELECT MIN(nonce) FROM queued_txns WHERE signer = $1",
+                &[&signer.to_lowercase()],
+            )
+            .await?;
+        // MIN over zero rows yields a single row with a NULL value.
+        let min: Option<i64> = row.get(0);
+        Ok(min.map(|n| n as u64))
+    }
+
+    async fn queued_signers(&self) -> anyhow::Result<Vec<String>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query("SELECT DISTINCT signer FROM queued_txns", &[])
+            .await?;
+        Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
+    }
+
+    async fn queued_txn_by_hash(&self, tx_hash: TxHash) -> anyhow::Result<Option<QueuedTxn>> {
+        let client = self.pool.get().await?;
+        let Some(row) = client
+            .query_opt(
+                "SELECT signer, nonce, tx_hash, envelope, expires_at, \
+                 parked_during_recovery
+                 FROM queued_txns WHERE tx_hash = $1 LIMIT 1",
+                &[&format!("{tx_hash:#x}")],
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let signer: String = row.get(0);
+        let nonce: i64 = row.get(1);
+        Ok(Some(QueuedTxn {
+            signer,
+            nonce: nonce as u64,
+            tx_hash: parse_queued_hash(row.get(2))?,
+            envelope: decode_queued_envelope(row.get(3))?,
+            expires_at: row.get::<_, i64>(4) as u64,
+            parked_during_recovery: row.get(5),
+        }))
+    }
+
+    async fn evict_expired_queued_txns(
+        &self,
+        now: u64,
+    ) -> anyhow::Result<Vec<(String, u64, TxHash)>> {
+        // Ephemeral txpool: TTL expiry DELETES (see the trait doc for the
+        // design decision and the re-broadcast contract that makes it safe).
+        let client = self.pool.get().await?;
+        // (review round 3, codex B1) Stamped rows are EXEMPT. A
+        // `parked_during_recovery` row is the ONLY proof of a continuing
+        // wallet's post-restore eligibility; evicting it re-creates the exact
+        // wedge the marker closes — the re-broadcast arrives with the window
+        // shut, parks UNSTAMPED, expires, evicts, re-broadcasts, forever, and
+        // never reaches "nonce too low" because the empty ledger keeps reading
+        // 0. The exempt population is bounded (a stamp is only mintable while
+        // the recovery window is open) and leaves the queue through baseline
+        // adoption + promotion, not TTL.
+        let rows = client
+            .query(
+                "DELETE FROM queued_txns
+                 WHERE expires_at <= $1 AND NOT parked_during_recovery
+                 RETURNING signer, nonce, tx_hash",
+                &[&(now as i64)],
+            )
+            .await?;
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    row.get::<_, String>(0),
+                    row.get::<_, i64>(1) as u64,
+                    parse_queued_hash(row.get(2))?,
+                ))
+            })
+            .collect()
+    }
+
     // ── Nonces ───────────────────────────────────────────────────
+
+    async fn nonce_ledger_is_populated(&self) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_one("SELECT EXISTS (SELECT 1 FROM nonces)", &[])
+            .await?;
+        Ok(row.get::<_, bool>(0))
+    }
 
     async fn nonce_get(&self, addr: &str) -> anyhow::Result<u64> {
         let client = self.pool.get().await?;
@@ -3404,5 +3661,35 @@ fn pg_row_to_faucet_entry(row: &tokio_postgres::Row) -> Option<FaucetEntry> {
             let m: &[u8] = row.get(7);
             m.to_vec()
         },
+    })
+}
+
+/// Decode a `queued_txns.envelope` BYTEA back to a signed transaction (#146).
+fn decode_queued_envelope(bytes: &[u8]) -> anyhow::Result<TxEnvelope> {
+    use alloy::eips::Decodable2718;
+    TxEnvelope::decode_2718(&mut &bytes[..])
+        .map_err(|e| anyhow::anyhow!("stored queued envelope cannot be decoded ({e})"))
+}
+
+/// Parse a `queued_txns.tx_hash` text column back to a `TxHash` (#146).
+fn parse_queued_hash(hash_str: &str) -> anyhow::Result<TxHash> {
+    hash_str
+        .parse::<TxHash>()
+        .map_err(|e| anyhow::anyhow!("stored queued tx_hash {hash_str} is invalid ({e})"))
+}
+
+/// Build a `QueuedTxn` from a `SELECT tx_hash, envelope, expires_at` row (#146).
+fn row_to_queued_txn(
+    signer: String,
+    nonce: u64,
+    row: &tokio_postgres::Row,
+) -> anyhow::Result<QueuedTxn> {
+    Ok(QueuedTxn {
+        signer,
+        nonce,
+        tx_hash: parse_queued_hash(row.get(0))?,
+        envelope: decode_queued_envelope(row.get(1))?,
+        expires_at: row.get::<_, i64>(2) as u64,
+        parked_during_recovery: row.get(3),
     })
 }

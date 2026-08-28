@@ -364,6 +364,54 @@ pub struct RecoverablePendingTxn {
     pub age_secs: u64,
 }
 
+/// A future-nonce transaction PARKED in the per-signer queue ("mempool") until
+/// the gap below it fills. See `migrations/020_queued_txns.sql` and the
+/// accept/drain logic in `service_send_raw_txn`. `signer` is lowercased hex.
+#[derive(Debug, Clone)]
+pub struct QueuedTxn {
+    pub signer: String,
+    pub nonce: u64,
+    pub tx_hash: TxHash,
+    pub envelope: TxEnvelope,
+    /// Block number after which the expiry sweep drops this parked tx.
+    pub expires_at: u64,
+    /// True iff this row was parked while the #90 post-rebuild recovery window
+    /// was open. Carried durably so a tx parked inside the final settle margin
+    /// stays eligible for baseline adoption after the global window closes.
+    pub parked_during_recovery: bool,
+}
+
+/// Capacity bounds for the future-nonce queue, passed to [`Store::queue_txn`]
+/// (kept as a parameter rather than a store constant so tests can drive the
+/// bound paths with small limits).
+#[derive(Debug, Clone, Copy)]
+pub struct QueueBounds {
+    /// Max parked txns for a single signer.
+    pub per_signer: usize,
+    /// Max parked txns across all signers.
+    pub global: usize,
+}
+
+/// Outcome of parking a future-nonce transaction (`Store::queue_txn`). Explicit
+/// so the RPC path can distinguish an idempotent re-broadcast (accept) from a
+/// conflict / bound breach (reject) without stringly-typed error matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueOutcome {
+    /// Newly parked at `(signer, nonce)`.
+    Parked,
+    /// The SAME `tx_hash` was already parked at `(signer, nonce)` — idempotent
+    /// no-op; the caller returns the hash (accepted).
+    AlreadyParked,
+    /// A DIFFERENT tx is already parked at `(signer, nonce)`; the existing one
+    /// is kept and this one is refused (conservative "first wins", no
+    /// replacement). The caller rejects.
+    ConflictDifferentHash,
+    /// The signer already has `max_per_signer` parked txns. The caller rejects.
+    PerSignerBoundExceeded,
+    /// The global queue already holds `max_global` parked txns. Caller rejects.
+    GlobalBoundExceeded,
+}
+
 pub(crate) fn envelope_nonce(envelope: &TxEnvelope) -> u64 {
     match envelope {
         TxEnvelope::Eip1559(s) => s.tx().nonce,
@@ -766,7 +814,104 @@ pub trait Store: Send + Sync + 'static {
     ) -> anyhow::Result<()>;
     async fn txn_expire_pending(&self, block_num: u64, block_hash: [u8; 32]) -> anyhow::Result<()>;
 
+    // === Future-nonce queue ("mempool") — #146 ===
+    //
+    // A persistent per-signer parking lot for txns whose nonce is AHEAD of the
+    // signer's next expected nonce. See `migrations/020_queued_txns.sql` and the
+    // accept/drain/resume logic in `service_send_raw_txn`.
+
+    /// Park `envelope` at `(signer, nonce)` with a block-denominated TTL, subject
+    /// to a per-signer and a global bound. Idempotent on the SAME `tx_hash`;
+    /// refuses (never overwrites) a DIFFERENT hash at the same `(signer, nonce)`;
+    /// refuses when either bound is already met. The returned [`QueueOutcome`]
+    /// tells the caller whether to accept (return the hash) or reject.
+    #[allow(clippy::too_many_arguments)] // one flag past the lint's 7; splitting
+    // the park into a struct would obscure that `parked_during_recovery` is
+    // captured at THIS instant, which is the whole point of the marker.
+    async fn queue_txn(
+        &self,
+        signer: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+        envelope: &TxEnvelope,
+        expires_at: u64,
+        parked_during_recovery: bool,
+        bounds: QueueBounds,
+    ) -> anyhow::Result<QueueOutcome>;
+
+    /// The tx parked at exactly `(signer, nonce)`, if any — WITHOUT removing it
+    /// (the drain deletes only after the tx is durably admitted, so an ack'd
+    /// future tx is never lost between take and admit).
+    async fn get_queued_txn(&self, signer: &str, nonce: u64) -> anyhow::Result<Option<QueuedTxn>>;
+
+    /// Delete the tx parked at `(signer, nonce)` iff it still carries `tx_hash`
+    /// (guards against deleting a row a concurrent conflicting park replaced).
+    /// Returns whether a row was deleted.
+    async fn delete_queued_txn(
+        &self,
+        signer: &str,
+        nonce: u64,
+        tx_hash: TxHash,
+    ) -> anyhow::Result<bool>;
+
+    /// Smallest parked nonce for `signer`, or `None` if nothing is parked.
+    async fn peek_queued_min_nonce(&self, signer: &str) -> anyhow::Result<Option<u64>>;
+
+    /// Every signer with at least one parked tx (for startup resume).
+    async fn queued_signers(&self) -> anyhow::Result<Vec<String>>;
+
+    /// Look up a parked tx by its hash (for `eth_getTransactionByHash`).
+    async fn queued_txn_by_hash(&self, tx_hash: TxHash) -> anyhow::Result<Option<QueuedTxn>>;
+
+    /// Delete every parked tx whose `expires_at` block is `<= now`, returning
+    /// `(signer, nonce, tx_hash)` for each evicted row so the sweep can log the
+    /// drops individually.
+    ///
+    /// #146 design decision (maintainer, 2026-08-27): the queue is EPHEMERAL,
+    /// like geth's txpool. Persistence is best-effort crash convenience, NOT a
+    /// delivery guarantee. A gap that has not filled within the TTL forfeits its
+    /// slot: the row is deleted, capacity returns to the per-signer/global
+    /// bounds, and the tx hash stops resolving — which is precisely the signal
+    /// an EVM sender understands. claimtxman re-broadcasts a monitored tx whose
+    /// hash no longer resolves, and the resubmission is then judged against the
+    /// CURRENT nonce state (parks again, executes, or hits a nonce error it
+    /// already self-heals from via the #111 wording contract).
+    ///
+    /// This supersedes the earlier surface-never-reap stance: retaining
+    /// permanently-impossible work pinned the bounds forever, so enough dead
+    /// rows could lock every unrelated future-nonce submission out of the
+    /// queue with no operator remedy short of hand-editing the table.
+    ///
+    /// EXEMPTION (review round 3): rows with `parked_during_recovery` are NOT
+    /// evicted. That stamp is the only proof of a continuing wallet's
+    /// post-restore eligibility; evicting it re-creates the wedge the marker
+    /// closes (re-broadcast parks unstamped forever against an empty ledger).
+    /// The exempt population is bounded — stamps are only mintable while the
+    /// recovery window is open — and leaves via adoption + promotion.
+    async fn evict_expired_queued_txns(
+        &self,
+        now: u64,
+    ) -> anyhow::Result<Vec<(String, u64, TxHash)>>;
+
     // === Nonces ===
+    /// Does ANY signer hold a nonce ledger row?
+    ///
+    /// #90 — durable evidence that traffic has resumed after a store rebuild.
+    /// The restore leaves this empty; the first admitted transaction repopulates
+    /// it. Used to decide when the post-rebuild bootstrap may retire, so the
+    /// decision survives a restart (a process-local timer did not).
+    async fn nonce_ledger_is_populated(&self) -> anyhow::Result<bool>;
+
+    /// Unix seconds when the nonce ledger was last rebuilt, or `None`.
+    ///
+    /// #90 — the post-restore bootstrap window is measured from THIS, durably, so
+    /// it neither resets on restart nor retires early. See
+    /// `migrations/025_nonce_rebuild_stamp.sql` for why the three earlier bounds
+    /// were unsound.
+    async fn nonce_ledger_rebuilt_at(&self) -> anyhow::Result<Option<u64>> {
+        Ok(None)
+    }
+
     async fn nonce_get(&self, addr: &str) -> anyhow::Result<u64>;
     /// Increment nonce, returning the value **before** increment.
     async fn nonce_increment(&self, addr: &str) -> anyhow::Result<u64>;
@@ -1291,6 +1436,29 @@ impl SyncListener for StoreSyncListener {
             self.store
                 .txn_expire_pending(data.block_num, block_hash)
                 .await?;
+            // #146 — EVICT parked future-nonce txns whose gap outlived the TTL
+            // (ephemeral-txpool design; see `evict_expired_queued_txns`). The
+            // hash stops resolving, the sender re-broadcasts, and the queue
+            // capacity the dead row was pinning returns to the pool.
+            // (review round 3) Evict against the PROJECTED tip — the same
+            // clock `expires_at` was computed from at park time. `data.block_num`
+            // is the raw sync tip; if projection lagged it by more than the TTL,
+            // a freshly parked row could be evicted on the next sync.
+            let evict_now = self.store.get_latest_block_number().await?;
+            let evicted = self.store.evict_expired_queued_txns(evict_now).await?;
+            if !evicted.is_empty() {
+                ::metrics::counter!("rpc_future_nonce_evicted_total")
+                    .increment(evicted.len() as u64);
+                for (signer, nonce, tx_hash) in &evicted {
+                    tracing::warn!(
+                        target: "rpc::mempool",
+                        %signer, nonce, %tx_hash, block = data.block_num,
+                        "evicted expired parked tx (gap never filled within its TTL); \
+                         the hash no longer resolves, so the sender's monitoring \
+                         re-broadcasts it to be re-judged at the current nonce state"
+                    );
+                }
+            }
         }
         Ok(())
     }

@@ -298,6 +298,40 @@ struct Command {
     #[arg(long, env = "MIDEN_PROVER_TIMEOUT_SECS", default_value_t = 120)]
     miden_prover_timeout_secs: u64,
 
+    /// Ceiling on outbound Miden node RPC, in requests per second. Unset (the
+    /// default) means unpaced — behaviour is unchanged from before this flag.
+    ///
+    /// Set this to what the node or its gateway will actually allow. The proxy
+    /// then spaces its own calls to stay under that, rather than discovering the
+    /// limit by being throttled: the client library treats `ResourceExhausted`
+    /// as retryable and re-sends, so without pacing a bulk scan *survives* the
+    /// rate limit instead of respecting it — thousands of retries, the same work
+    /// done no faster, and a hard error for any burst that outlasts the retry
+    /// budget.
+    ///
+    /// A recovery scan over a deep chain is the case this exists for, and it
+    /// WILL take longer when paced. That is the intended trade.
+    ///
+    /// Covers every component's node handle (restore, synthetic projector,
+    /// persistent client) because they share one constructor AND one governor,
+    /// so this is a process-wide rate rather than a per-handle one. The
+    /// `bridge-out-tool` and `note-probe` binaries read `MIDEN_RPC_MAX_RPS` from
+    /// the environment directly, since they never see this flag.
+    ///
+    /// IMPORTANT — this bounds CALLS, not wire requests, so PROVISION BELOW the
+    /// limit you are trying to respect. One paced call can become several
+    /// requests inside the client library, which this process cannot see or
+    /// gate:
+    /// - `get_notes_by_id` fetches the node's batch limits and then splits the
+    ///   ids into `note_ids_limit`-sized chunks, one request each;
+    /// - each of those chunks carries its own retry budget, and the retries are
+    ///   issued below this gate.
+    ///
+    /// Treat the number as "roughly this many calls per second", and leave
+    /// headroom rather than setting it exactly at the gateway's ceiling.
+    #[arg(long, env = "MIDEN_RPC_MAX_RPS")]
+    miden_rpc_max_rps: Option<u32>,
+
     /// When the remote prover fails (timeout / connection error), retry the proof
     /// against an in-process LocalTransactionProver. Trades OOM safety for availability.
     /// Default OFF — preserves the bali OOM fix as the default behaviour.
@@ -669,6 +703,18 @@ async fn main() -> anyhow::Result<()> {
     // emissions never reached the served registry).
     let metrics_handle = miden_agglayer_service::metrics::install_prometheus_recorder()?;
     miden_agglayer_service::bridge_address::init_bridge_address(command.bridge_address.clone());
+    // Install the RPC pace BEFORE anything can build a node handle. `restore`
+    // and the projector both construct their own clients early, and an unpaced
+    // handle created before this line would stay unpaced for its whole life.
+    miden_agglayer_service::rpc_pacer::install_max_rps(command.miden_rpc_max_rps);
+    if let Some(rps) = command.miden_rpc_max_rps.filter(|rps| *rps > 0) {
+        tracing::info!(
+            max_rps = rps,
+            "pacing outbound Miden RPC — bulk scans (recovery in particular) will take longer \
+             by design, in exchange for staying under the node's rate limit instead of \
+             absorbing it as retries"
+        );
+    }
     // Install the read-only switch BEFORE any client / submit path exists so
     // the guarantee holds from the very first instruction that could mutate
     // chain state (including the init phase's deploy transactions).
@@ -866,6 +912,25 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     } else {
+        // #146 (review) — the future-nonce queue makes durability a CORRECTNESS
+        // property, not just an operational preference: a parked tx has been
+        // ACKNOWLEDGED to its sender, which will never resubmit it. An ephemeral
+        // store loses every parked tx on restart, silently orphaning accepted
+        // work (#119). Refuse to start that way unless an operator opts in
+        // explicitly, which keeps tests and local runs working while making the
+        // unsafe production shape impossible to reach by accident.
+        if std::env::var("ALLOW_EPHEMERAL_STORE").ok().as_deref() != Some("1") {
+            anyhow::bail!(
+                "refusing to start with an in-memory store: transactions accepted into the \
+                 future-nonce queue would be silently lost on restart after being acknowledged \
+                 to their sender. Pass --database-url for a durable store, or set \
+                 ALLOW_EPHEMERAL_STORE=1 to accept that data loss (never in production)."
+            );
+        }
+        tracing::warn!(
+            "starting with an EPHEMERAL in-memory store (ALLOW_EPHEMERAL_STORE=1): every \
+             acknowledged future-nonce transaction is lost on restart"
+        );
         Arc::new(InMemoryStore::new())
     };
 
@@ -1548,6 +1613,66 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // #146 mempool resume — promote any future-nonce txns that were durably
+    // parked before a restart and whose gap is now filled, so an acknowledged
+    // future tx is never silently dropped across a process restart.
+    //
+    // PR#155 blocker #2: the original awaited this BEFORE the HTTP bind, so a
+    // slow/unavailable Miden node (the drain can wait on GER observation) would
+    // stall the bind and health/readiness could never answer. Mirror the #156
+    // startup-recovery shape instead: bounded, backgrounded, best-effort — the
+    // periodic drain sweep continues the promotion regardless.
+    // PR#155 review history: an outer blanket `tokio::time::timeout` here once
+    // defeated the resume's cancellation contract (codex round-2 #2) and was
+    // removed. Since then the contract CHANGED (round-2 #3): the baseline
+    // insert became an explicit transaction with a server-side
+    // statement_timeout, so cancellation rolls back instead of abandoning a
+    // statement, and `resume_queued_drain` now bounds EACH signer's whole
+    // slice — bootstrap included — with its per-signer budget. No outer bound
+    // is needed here: being backgrounded is what keeps a slow Miden node from
+    // stalling the HTTP bind, and per-signer budgets keep one signer from
+    // starving the rest.
+    {
+        let queued_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                miden_agglayer_service::service_send_raw_txn::resume_queued_drain(&queued_state)
+                    .await
+            {
+                tracing::error!(
+                    error = %e,
+                    "startup mempool resume_queued_drain failed (periodic sweep will retry)"
+                );
+            }
+        });
+    }
+
+    // #146 — PERIODIC drain sweep. Promotion is otherwise only attempted when a
+    // gap-filling tx is admitted, so a transiently failed drain (writer
+    // saturated, Miden briefly unavailable, a crash between admit and delete)
+    // leaves an ACKNOWLEDGED parked tx sitting until the next admission for that
+    // signer — which may never come, since the sender believes it was accepted.
+    // The startup resume alone does not cover a long-lived process. Sweep on the
+    // same bounded interval as orphan recovery so parked work always self-heals.
+    {
+        let sweep_state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                miden_agglayer_service::orphan_recovery::RECOVERY_SWEEP_INTERVAL_SECS,
+            ));
+            interval.tick().await; // consume the immediate first tick
+            loop {
+                interval.tick().await;
+                if let Err(e) =
+                    miden_agglayer_service::service_send_raw_txn::resume_queued_drain(&sweep_state)
+                        .await
+                {
+                    tracing::warn!(error = %e, "periodic mempool drain sweep failed (will retry next tick)");
+                }
+            }
+        });
+    }
+
     let url = build_service_url(&command.bind, command.port)?;
     service::serve(url, state.clone(), metrics_handle).await?;
 
@@ -1671,6 +1796,9 @@ mod hardening_tests {
             miden_prover_url: prover_url,
             miden_prover_timeout_secs: 120,
             miden_prover_fallback_to_local: false,
+            // Unpaced: these fixtures exercise the hardening invariants, and
+            // pacing is deliberately orthogonal to them.
+            miden_rpc_max_rps: None,
             read_only: false,
         }
     }

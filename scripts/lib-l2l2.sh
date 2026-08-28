@@ -116,15 +116,154 @@ _pred_deposit_indexed() {                                                       
     [[ -n "$dep" ]]
 }
 
+# How long to keep watching AFTER the nominal window expires, purely to classify
+# the failure. Does NOT make a slow run pass — it decides which failure is being
+# reported. Set WAIT_GRACE_SECS=0 to disable.
+#
+# Empty by default so it scales with the window instead of being a flat constant:
+# a 900s cert wait needs far more grace than a 60s one to tell LATE from LOST.
+# An explicit value still wins.
+WAIT_GRACE_PCT="${WAIT_GRACE_PCT:-50}"
+
+# ---------------------------------------------------------------------------
+# aggkit cold-start gate
+# ---------------------------------------------------------------------------
+# Measured 2026-08-25: aggkit was RECREATED at 17:02:03 and produced its first
+# settled certificate at 17:21:03 — a NINETEEN MINUTE cold start. A 900s
+# readiness wait opened at 17:01 and expired at 17:15:58, entirely inside that
+# window. Nothing could be ready_for_claim because no certificate had settled
+# yet; afterwards settles ran every ~45s and every deposit was ready.
+#
+# So a timed wait started while aggkit is cold does not measure the system —
+# it measures the cold start, and FAILS DETERMINISTICALLY. That, not
+# flakiness, is why the chaos gate looked "~25% reliable" (#41): reliability
+# depended on whether a wait happened to straddle a recreate.
+#
+# Raising the timeout is the wrong fix. Wait for aggkit to be ABLE to answer
+# first, then start the timed wait.
+
+# Seconds since the aggkit container was (re)created.
+aggkit_uptime_secs() {
+    local started
+    started=$(docker inspect "${AGGKIT_CONTAINER:-l2l2-aggkit-1}" \
+        --format '{{.State.StartedAt}}' 2>/dev/null) || { echo 0; return; }
+    python3 - "$started" <<'PY' 2>/dev/null || echo 0
+import sys, datetime
+t = sys.argv[1].split('.')[0].rstrip('Z')
+started = datetime.datetime.fromisoformat(t).replace(tzinfo=datetime.timezone.utc)
+print(int((datetime.datetime.now(datetime.timezone.utc) - started).total_seconds()))
+PY
+}
+
+# How many certificates aggkit has settled since it started.
+aggkit_settled_count() {
+    docker logs "${AGGKIT_CONTAINER:-l2l2-aggkit-1}" 2>&1 \
+        | grep -c "changed status.*Settled" || echo 0
+}
+
+# Ready == it has actually SETTLED a certificate since this container started.
+# Deliberately not "the process is up" or "the log has no errors": aggkit is up
+# and error-free for the whole 19-minute cold start, and during it every
+# readiness wait is guaranteed to fail. Producing a certificate is the first
+# moment it can answer the question the suite is about to ask.
+aggkit_ready() { [[ "$(aggkit_settled_count)" -gt 0 ]]; }
+
+# Gate a timed wait behind aggkit being able to answer. Call after anything that
+# recreates it (restore drill, chaos fault, compose recreate).
+#
+# Fails loudly if it never becomes ready — a cold start that never finishes is a
+# real problem, and silently proceeding would just relocate the confusion into
+# whatever wait ran next.
+wait_for_aggkit_ready() {
+    local timeout="${1:-1500}" interval="${2:-15}" waited=0 up
+    if aggkit_ready; then return 0; fi
+    up=$(aggkit_uptime_secs)
+    log "aggkit has settled NO certificate yet (up ${up}s) — gating on cold start \
+before starting any timed wait (measured cold start: ~19min)"
+    while [[ $waited -lt $timeout ]]; do
+        sleep "$interval"; waited=$((waited + interval))
+        if aggkit_ready; then
+            log "aggkit ready: first certificate settled after ${waited}s of gating \
+(container up $(aggkit_uptime_secs)s) — timed waits are now meaningful"
+            return 0
+        fi
+    done
+    fail "aggkit never settled a certificate within ${timeout}s of gating \
+(container up $(aggkit_uptime_secs)s). It is NOT merely cold — the certificate \
+pipeline is not recovering. Investigate aggkit/agglayer before trusting any \
+settle or readiness result."
+}
+
 # wait_for <desc> <timeout> <interval> <predicate-fn> [args...]
 # Polls the NAMED predicate function until it succeeds or <timeout>s elapse.
+#
+# On expiry it does NOT fail immediately. A settle/readiness wait that expires
+# has two completely different causes and the old message conflated them:
+#
+#   LATE  — the window was too short; the thing completes shortly after.
+#           WARNS and CONTINUES. Delivery is intact, so failing the run would be
+#           reporting a harness-window problem (#41/#99/#106) as a product
+#           defect — which is exactly what happened on the 2026-08-25 paced run,
+#           where two "Timed out" legs had in fact delivered 7/7 and 26/26.
+#           The warning carries observed-vs-expected so the window gets tuned
+#           from data.
+#   LOST  — it never completes. FAILS, as it should.
+#
+# Both used to print "Timed out: <desc>" and exit, so every triage started by
+# hand-querying the stack hours later to find out which one it was — and that
+# query is easy to get wrong (asking a bridge-service about a deposit it does
+# not index by construction reads exactly like loss). So on expiry we keep
+# polling for a bounded grace period and report WHICH failure occurred, with the
+# observed latency when it is LATE.
+#
+# Only LOST fails. LATE is loud but non-fatal, because the transfer arrived.
 wait_for() {
     local desc="$1" timeout="$2" interval="${3:-5}"; shift 3
     local elapsed=0
+    # MEASURED wall time, for the LATE report. Do NOT reconstruct it from
+    # `elapsed`: that counter increments BEFORE its sleep, so it runs one
+    # interval ahead of reality, and adding it to the nominal `timeout` yields a
+    # number that is neither the budget nor the observed latency. A "settled
+    # after 5s" line for something that settled at 4s is worse than no number —
+    # it is the kind of figure someone later tunes a timeout against.
+    local started=$SECONDS
+    # Grace scales with the window unless pinned explicitly: telling LATE from
+    # LOST on a 900s cert wait needs minutes, on a 60s wait it needs seconds.
+    local grace_budget="${WAIT_GRACE_SECS:-$(( timeout * WAIT_GRACE_PCT / 100 ))}"
     log "Waiting: $desc (timeout: ${timeout}s)..."
     while ! ( set +o pipefail; "$@" ) 2>/dev/null; do
         elapsed=$((elapsed + interval))
-        [[ $elapsed -ge $timeout ]] && fail "Timed out: $desc"
+        if [[ $elapsed -ge $timeout ]]; then
+            echo ""
+            if [[ "$grace_budget" -le 0 ]]; then
+                fail "Timed out: $desc (no grace configured — LATE vs LOST not distinguished)"
+            fi
+            log "Window expired for: $desc — watching ${grace_budget}s more to classify LATE vs LOST"
+            local grace=0
+            while [[ $grace -lt $grace_budget ]]; do
+                sleep "$interval"; grace=$((grace + interval))
+                if ( set +o pipefail; "$@" ) 2>/dev/null; then
+                    local took=$((SECONDS - started))
+                    # NOT a failure: the thing arrived, so delivery is intact and
+                    # the run continues. It is loud, and it carries observed-vs-
+                    # expected so the window can be tuned from data instead of
+                    # guesswork.
+                    echo "LATE-SETTLE: $desc took ${took}s vs ${timeout}s expected \
+(+$((took - timeout))s, $(( took * 100 / (timeout > 0 ? timeout : 1) ))% of window) \
+— delivered, NOT lost; settle-window/latency (#41/#99/#106)" >&2
+                    log "LATE (warning, continuing): $desc took ${took}s, expected ${timeout}s"
+                    # Machine-readable trail for the driver to aggregate.
+                    [[ -n "${WAIT_LATE_LOG:-}" ]] &&
+                        echo "$(date +%H:%M:%S)|$desc|took=${took}|expected=${timeout}" \
+                            >> "$WAIT_LATE_LOG"
+                    return 0
+                fi
+            done
+            fail "LOST (still not satisfied): $desc did not complete within \
+$((timeout + grace_budget))s (${timeout}s window + ${grace_budget}s grace). \
+Nothing arrived late either, so treat this as a genuine wedge/loss and preserve \
+the stack for forensics."
+        fi
         echo -n "."; sleep "$interval"
     done
     echo ""
