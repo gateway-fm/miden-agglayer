@@ -881,6 +881,13 @@ pub trait Store: Send + Sync + 'static {
     /// permanently-impossible work pinned the bounds forever, so enough dead
     /// rows could lock every unrelated future-nonce submission out of the
     /// queue with no operator remedy short of hand-editing the table.
+    ///
+    /// EXEMPTION (review round 3): rows with `parked_during_recovery` are NOT
+    /// evicted. That stamp is the only proof of a continuing wallet's
+    /// post-restore eligibility; evicting it re-creates the wedge the marker
+    /// closes (re-broadcast parks unstamped forever against an empty ledger).
+    /// The exempt population is bounded — stamps are only mintable while the
+    /// recovery window is open — and leaves via adoption + promotion.
     async fn evict_expired_queued_txns(
         &self,
         now: u64,
@@ -1433,7 +1440,12 @@ impl SyncListener for StoreSyncListener {
             // (ephemeral-txpool design; see `evict_expired_queued_txns`). The
             // hash stops resolving, the sender re-broadcasts, and the queue
             // capacity the dead row was pinning returns to the pool.
-            let evicted = self.store.evict_expired_queued_txns(data.block_num).await?;
+            // (review round 3) Evict against the PROJECTED tip — the same
+            // clock `expires_at` was computed from at park time. `data.block_num`
+            // is the raw sync tip; if projection lagged it by more than the TTL,
+            // a freshly parked row could be evicted on the next sync.
+            let evict_now = self.store.get_latest_block_number().await?;
+            let evicted = self.store.evict_expired_queued_txns(evict_now).await?;
             if !evicted.is_empty() {
                 ::metrics::counter!("rpc_future_nonce_evicted_total")
                     .increment(evicted.len() as u64);

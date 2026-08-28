@@ -1622,20 +1622,16 @@ async fn main() -> anyhow::Result<()> {
     // stall the bind and health/readiness could never answer. Mirror the #156
     // startup-recovery shape instead: bounded, backgrounded, best-effort — the
     // periodic drain sweep continues the promotion regardless.
-    // PR#155 review (codex, blocking #2): this used to wrap the whole call in
-    // `tokio::time::timeout`, which DEFEATED the resume's own cancellation
-    // contract. `resume_queued_drain` deliberately runs `bootstrap_one_signer`
-    // OUTSIDE its per-signer timeout because cancelling a PostgreSQL insert
-    // mid-flight is unsafe here: the client goes away, the server keeps the
-    // statement, and the abandoned insert can still commit a baseline AFTER a
-    // lower nonce has parked and been acknowledged — stranding that nonce below
-    // the frontier permanently. An outer blanket timeout reintroduced exactly
-    // the cancellation the inner design forbids.
-    //
-    // The inner function already bounds every cancel-SAFE region per signer, so
-    // the outer bound is removed rather than replaced. Being backgrounded is
-    // what keeps a slow Miden node from stalling the HTTP bind (the original
-    // reason a bound was reached for); it does not require cancellation.
+    // PR#155 review history: an outer blanket `tokio::time::timeout` here once
+    // defeated the resume's cancellation contract (codex round-2 #2) and was
+    // removed. Since then the contract CHANGED (round-2 #3): the baseline
+    // insert became an explicit transaction with a server-side
+    // statement_timeout, so cancellation rolls back instead of abandoning a
+    // statement, and `resume_queued_drain` now bounds EACH signer's whole
+    // slice — bootstrap included — with its per-signer budget. No outer bound
+    // is needed here: being backgrounded is what keeps a slow Miden node from
+    // stalling the HTTP bind, and per-signer budgets keep one signer from
+    // starving the rest.
     {
         let queued_state = state.clone();
         tokio::spawn(async move {

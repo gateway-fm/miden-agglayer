@@ -1,3 +1,15 @@
+# SUPERSEDED (2026-08-28)
+
+Everything below describes the state at review round 1 and is retained as
+history only. Since then: all four open blockers were fixed, the TTL design
+was CHANGED to ephemeral eviction (stamped recovery rows exempt),
+`count_stale_queued_txns` was replaced by `evict_expired_queued_txns`, and
+bootstrap moved INSIDE the per-signer sweep budget. Authoritative docs:
+migration 020's header, the `Store` trait docs, and
+`pr155-finding1-recovery-marker.md`.
+
+---
+
 # #146 future-nonce queue (stacked on rc.1) — review status
 
 Branch: `feat/0.16-146-future-nonce-stacked` (upstream draft PR #155 replayed onto

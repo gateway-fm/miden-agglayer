@@ -1583,7 +1583,8 @@ impl Store for InMemoryStore {
         let mut map = self.queued_txns.write();
         for (signer, txs) in map.iter_mut() {
             txs.retain(|nonce, q| {
-                if q.expires_at <= now {
+                // Stamped rows are exempt — see the postgres impl / trait doc.
+                if q.expires_at <= now && !q.parked_during_recovery {
                     evicted.push((signer.clone(), *nonce, q.tx_hash));
                     false
                 } else {
@@ -4274,9 +4275,29 @@ mod tests {
                 .unwrap();
         }
 
-        // All three are long past their TTL block: evict them.
+        // A STAMPED row, equally expired, parked alongside them. It must
+        // SURVIVE eviction: the stamp is the only post-restore eligibility
+        // proof, and evicting it re-creates the park-unstamped-forever wedge
+        // (review round 3, codex B1).
+        let (hs, es) = mk(0x5A);
+        store
+            .queue_txn(signer, 30, hs, &es, 10, true, bounds)
+            .await
+            .unwrap();
+
+        // All four are long past their TTL block: evict.
         let evicted = store.evict_expired_queued_txns(100).await.unwrap();
-        assert_eq!(evicted.len(), 3, "all three expired rows must be evicted");
+        assert_eq!(
+            evicted.len(),
+            3,
+            "the three UNSTAMPED expired rows are evicted"
+        );
+        assert!(
+            store.get_queued_txn(signer, 30).await.unwrap().is_some(),
+            "the stamped row is EXEMPT from TTL eviction — it is the continuing \
+             wallet's eligibility proof and leaves via adoption, not expiry"
+        );
+        store.delete_queued_txn(signer, 30, hs).await.unwrap();
 
         for n in [7u64, 8, 10] {
             assert!(

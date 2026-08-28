@@ -2045,32 +2045,49 @@ async fn bootstrap_one_signer(service: &ServiceState, signer: &str, bootstrap: b
         && let Ok(addr) = signer.parse::<Address>()
     {
         let guard = service.per_signer_locks.lock(addr).await;
+        // (review round 3, codex B2) ONE read of the minimum row serves the
+        // proof check, the settle check AND the seed. The pre-lock
+        // `signer_may_bootstrap` ran against whatever was the minimum THEN; an
+        // eviction or promotion between check and lock can change the minimum,
+        // and seeding from a row whose own stamp was never verified is the
+        // round-4 amnesty again (a new wallet at 42 seeded to 42). Re-verify
+        // eligibility on the exact row being adopted, under the lock, so the
+        // three reads cannot diverge.
+        let candidate = match service.store.peek_queued_min_nonce(signer).await {
+            Ok(Some(min)) => service
+                .store
+                .get_queued_txn(signer, min)
+                .await
+                .ok()
+                .flatten(),
+            _ => None,
+        };
+        let eligible_now = candidate
+            .as_ref()
+            .is_some_and(|q| bootstrap || q.parked_during_recovery);
         let settled = match (
-            service.store.peek_queued_min_nonce(signer).await,
+            candidate.as_ref(),
             service.store.get_latest_block_number().await,
         ) {
-            (Ok(Some(min)), Ok(now_block)) => {
-                match service.store.get_queued_txn(signer, min).await {
-                    Ok(Some(q)) => {
-                        let parked_at = q.expires_at.saturating_sub(QUEUE_TTL_BLOCKS);
-                        now_block >= parked_at.saturating_add(BOOTSTRAP_SETTLE_BLOCKS)
-                    }
-                    _ => false,
-                }
+            (Some(q), Ok(now_block)) => {
+                let parked_at = q.expires_at.saturating_sub(QUEUE_TTL_BLOCKS);
+                now_block >= parked_at.saturating_add(BOOTSTRAP_SETTLE_BLOCKS)
             }
             _ => false,
         };
-        if settled
-            && let Ok(Some(min_parked)) = service.store.peek_queued_min_nonce(signer).await
-            && min_parked > 0
+        if eligible_now
+            && settled
+            && let Some(q) = candidate
+            && q.nonce > 0
             && matches!(
                 service
                     .store
-                    .nonce_bootstrap_if_absent(signer, min_parked)
+                    .nonce_bootstrap_if_absent(signer, q.nonce)
                     .await,
                 Ok(true)
             )
         {
+            let min_parked = q.nonce;
             ::metrics::counter!("rpc_nonce_ledger_bootstrapped_total").increment(1);
             tracing::warn!(
                 target: "rpc::nonce_repair",
@@ -3498,6 +3515,69 @@ mod tests {
             is_nonce_error_mirror(&msg),
             "the durable-lower refusal must trigger claimtxman's self-heal, or the sender \
              retries a doomed nonce forever (#119): {msg}"
+        );
+    }
+
+    /// Round 3 (codex B1/B2 + glm N3) — the marker's rescue arm, driven at the
+    /// service level. A tx parked WHILE the recovery window was open must still
+    /// be adopted AFTER the window closes (its stamp is the proof), and an
+    /// UNSTAMPED row must never be adopted once the window is shut — including
+    /// when it becomes the queue minimum only because eviction removed rows
+    /// ahead of it (the B2 check-then-seed divergence).
+    #[tokio::test]
+    async fn stamped_row_is_adopted_after_window_close_and_unstamped_never() {
+        let (service, _sd) = mempool_service();
+        let store = service.store.clone();
+
+        // Continuing wallet: parked while the window is OPEN -> stamped.
+        store.set_nonce_ledger_rebuilt(true).await.unwrap();
+        let key_a = alloy::signers::local::PrivateKeySigner::random();
+        let a = format!("{:#x}", key_a.address());
+        let (raw_a, _) = ger_tx_at(&key_a, 21, 0xB1);
+        service_send_raw_txn(service.clone(), raw_a).await.unwrap();
+        assert!(
+            store
+                .get_queued_txn(&a, 21)
+                .await
+                .unwrap()
+                .unwrap()
+                .parked_during_recovery,
+            "parked while the window is open must be stamped"
+        );
+
+        // The window RETIRES durably (what the sweep does when it expires).
+        store.set_nonce_ledger_rebuilt(false).await.unwrap();
+
+        // New wallet: parked AFTER the close -> unstamped.
+        let key_b = alloy::signers::local::PrivateKeySigner::random();
+        let b = format!("{:#x}", key_b.address());
+        let (raw_b, _) = ger_tx_at(&key_b, 42, 0xB2);
+        service_send_raw_txn(service.clone(), raw_b).await.unwrap();
+
+        // Let the settle margin elapse, then sweep.
+        let now = store.get_latest_block_number().await.unwrap();
+        store
+            .set_latest_block_number(now + BOOTSTRAP_SETTLE_BLOCKS + 1)
+            .await
+            .unwrap();
+        resume_queued_drain(&service).await.unwrap();
+
+        // The STAMPED wallet was rescued: seeded at 21, promoted, next is 22.
+        assert_eq!(
+            store.nonce_get(&a).await.unwrap(),
+            22,
+            "a stamped row parked inside the window must be adopted after it closes"
+        );
+        // The UNSTAMPED wallet was NOT: ledger still absent, row still parked.
+        assert_eq!(
+            store.nonce_get(&b).await.unwrap(),
+            0,
+            "an unstamped row must never be seeded once the window is shut \
+             (the round-4 amnesty must not return through the rescue arm)"
+        );
+        assert!(
+            store.get_queued_txn(&b, 42).await.unwrap().is_some(),
+            "the unstamped row simply stays parked (until TTL eviction)"
         );
     }
 

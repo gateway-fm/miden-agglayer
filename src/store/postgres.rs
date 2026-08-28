@@ -299,23 +299,18 @@ impl Store for PgStore {
     async fn nonce_bootstrap_if_absent(&self, addr: &str, nonce: u64) -> anyhow::Result<bool> {
         let mut client = self.pool.get().await?;
         let key = addr.to_lowercase();
-        // PR#155 review (codex, blocking #3): bound this SERVER-side rather than
-        // by cancelling the caller.
+        // PR#155 review (codex round-2 #3): bound this SERVER-side.
         //
-        // The sweep runs bootstrap serially and deliberately OUTSIDE its
-        // per-signer timeout, because cancelling this insert mid-flight is
-        // unsafe: the client future goes away, PostgreSQL keeps the statement,
-        // and the abandoned insert can still commit a baseline AFTER a lower
-        // nonce has parked and been acknowledged — stranding it below the
-        // frontier forever. That non-cancellability is correct, but it left a
-        // single signer blocked on a row lock able to stall every LATER signer's
-        // drain, since nothing bounded it at all.
-        //
-        // `statement_timeout` dissolves the tension: the SERVER gives up and
-        // returns an error, so the work is bounded WITHOUT a client-side cancel
-        // and without a statement that can outlive its caller. SET LOCAL scopes
-        // it to this transaction, so the pooled connection is not mutated for
-        // whoever gets it next.
+        // A bare `execute` was un-cancellable safely (a dropped future abandons
+        // a statement the server may still commit), which once forced the sweep
+        // to run bootstrap OUTSIDE its per-signer budget — and that left one
+        // hung signer able to starve every later signer's drain. The explicit
+        // transaction changes the cancellation semantics: dropping the future
+        // drops the Transaction, which rolls back, so bootstrap now runs
+        // INSIDE the per-signer budget (see `resume_queued_drain`).
+        // `statement_timeout` additionally bounds each statement on the server,
+        // and SET LOCAL scopes it to this transaction so the pooled connection
+        // is not mutated for whoever gets it next.
         let tx = client.transaction().await?;
         tx.batch_execute("SET LOCAL statement_timeout = '10s'")
             .await?;
@@ -1970,6 +1965,13 @@ impl Store for PgStore {
         // One transaction so the count checks and the insert are atomic against a
         // concurrent park for the same signer / global pool.
         let tx = client.transaction().await?;
+        // (review round 3) The global bound was COUNT-then-INSERT under READ
+        // COMMITTED, so two parks crossing the threshold concurrently could
+        // both pass and overshoot the cap. Parks are rare (future-nonce only),
+        // so serialising them with a transaction-scoped advisory lock is cheap
+        // and makes the bound exact.
+        tx.batch_execute("SELECT pg_advisory_xact_lock(hashtext('queued_txns_bounds'))")
+            .await?;
         // Idempotency / conflict at (signer, nonce) FIRST — an already-parked
         // same-hash re-broadcast must accept even when a bound is met.
         if let Some(row) = tx
@@ -2115,9 +2117,19 @@ impl Store for PgStore {
         // Ephemeral txpool: TTL expiry DELETES (see the trait doc for the
         // design decision and the re-broadcast contract that makes it safe).
         let client = self.pool.get().await?;
+        // (review round 3, codex B1) Stamped rows are EXEMPT. A
+        // `parked_during_recovery` row is the ONLY proof of a continuing
+        // wallet's post-restore eligibility; evicting it re-creates the exact
+        // wedge the marker closes — the re-broadcast arrives with the window
+        // shut, parks UNSTAMPED, expires, evicts, re-broadcasts, forever, and
+        // never reaches "nonce too low" because the empty ledger keeps reading
+        // 0. The exempt population is bounded (a stamp is only mintable while
+        // the recovery window is open) and leaves the queue through baseline
+        // adoption + promotion, not TTL.
         let rows = client
             .query(
-                "DELETE FROM queued_txns WHERE expires_at <= $1
+                "DELETE FROM queued_txns
+                 WHERE expires_at <= $1 AND NOT parked_during_recovery
                  RETURNING signer, nonce, tx_hash",
                 &[&(now as i64)],
             )
