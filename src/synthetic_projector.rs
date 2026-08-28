@@ -71,7 +71,7 @@ use miden_protocol::note::{
 use miden_standards::note::NoteFile;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Blocks per `sync_notes` window walked by the note-visibility reconciler.
@@ -403,6 +403,15 @@ pub struct SyntheticProjector {
     audit_resolved: std::sync::Mutex<HashSet<([u8; 32], u64, u32)>>,
     /// Tick counter driving the every-[`AUDIT_EVERY_N_TICKS`] audit cadence.
     audit_tick_counter: AtomicU64,
+    /// #167 (review) — restore-mode guard switch: when set, `tick_pass` fails
+    /// closed on any bridge-consumed input that is neither in the local
+    /// consumed feed nor authoritatively resolved as a bridge-out (an
+    /// ERASED/unrecoverable note would otherwise silently vanish from the
+    /// restored history). Live ticks keep the tolerant posture: the LET
+    /// cardinality gate already halts on invisible B2AGG gaps, and a
+    /// legitimately-consumed CLAIM/GER is always in the local feed on an
+    /// un-wiped store.
+    require_full_coverage: AtomicBool,
     /// Cumulative per-kind emission counts accumulated by every projected
     /// block. Live ticks ignore it; `--restore` (issue #167) reads it once
     /// after `catch_up_to` completes to build the restore report from the
@@ -487,6 +496,7 @@ impl SyntheticProjector {
             reconcile_concurrency,
             reconcile_budget,
             pending_duplicate_cursor: std::sync::Mutex::new(None),
+            require_full_coverage: AtomicBool::new(false),
             projection_totals: std::sync::Mutex::new(Default::default()),
             audit_resolved: std::sync::Mutex::new(HashSet::new()),
             audit_tick_counter: AtomicU64::new(0),
@@ -1649,7 +1659,7 @@ impl SyntheticProjector {
         let consumed_refs = bridge_consumed_nullifiers(&txs, self.bridge_id)?;
         let fetcher = RpcNoteFetcher(&*self.node_rpc);
         let mut auth_b2agg = self
-            .resolve_b2agg_consumptions(&fetcher, consumed_refs, &mut within_tx_pos)
+            .resolve_b2agg_consumptions(&fetcher, consumed_refs.clone(), &mut within_tx_pos)
             .await?;
         // Same canonical comparator as every other projection sort (see
         // `projection_order`); the id here is always known (authoritative feed).
@@ -1668,6 +1678,51 @@ impl SyntheticProjector {
         for (id, rec) in &auth_b2agg {
             if let Some(h) = rec.state().consumed_block_height().map(|h| h.as_u64()) {
                 by_block.entry(h).or_default().push((Some(*id), rec));
+            }
+            // #167 (review blocker) — AUTHORITATIVE COVERAGE GUARD (restore mode):
+            // the deleted node-scan engine could recover CLAIM/GER consumptions the
+            // client store lost (same-block created-and-consumed "erased" notes,
+            // headerless inputs after a full store wipe). The canonical path sources
+            // CLAIM/GER from the local consumed feed; a bridge-consumed input that is
+            // neither in that feed nor authoritatively resolved as a B2AGG here would
+            // silently vanish from restored history. Fail closed BEFORE sealing with
+            // an actionable error (the issue's stated hard boundary for ERASED notes)
+            // instead of emitting a divergent log stream and reporting success.
+            if self.require_full_coverage.load(Ordering::Acquire) {
+                let local_nullifiers: HashSet<Nullifier> =
+                    consumed.iter().filter_map(|n| n.nullifier()).collect();
+                let resolved: HashSet<Nullifier> = consumed_refs
+                    .keys()
+                    .filter(|nul| {
+                        auth_b2agg
+                            .iter()
+                            .any(|(_, rec)| rec.nullifier().is_some_and(|n| n == **nul))
+                    })
+                    .copied()
+                    .collect();
+                let mut uncovered: Vec<(&Nullifier, &ConsumedRef)> = consumed_refs
+                    .iter()
+                    .filter(|(nul, _)| !local_nullifiers.contains(*nul) && !resolved.contains(*nul))
+                    .collect();
+                uncovered.sort_by_key(|(_, r)| (r.block, r.order, r.within_tx_pos));
+                if let Some((nul, first)) = uncovered.first() {
+                    metrics::counter!("restore_authoritative_coverage_gaps_total").increment(1);
+                    anyhow::bail!(
+                        "restore: bridge-consumed input at block {} (tx order {}, input {}) has no \
+                     recoverable identity — its nullifier {} is absent from the client store's \
+                     consumed feed and it does not resolve as a bridge-out (issue #167 ERASED-note \
+                     boundary). {} input(s) affected in window {}..{}. The node/protocol cannot \
+                     reconstruct this body, so restore refuses to seal a divergent history; \
+                     re-run against a node/archive that can serve the note.",
+                        first.block,
+                        first.order,
+                        first.within_tx_pos,
+                        nul.to_hex(),
+                        uncovered.len(),
+                        cursor + 1,
+                        tip
+                    );
+                }
             }
         }
         // A crash after an old commitment-keyed event but before cursor advance must replay
@@ -1849,7 +1904,14 @@ impl SyntheticProjector {
                     .await?;
                 Ok(self.cursor.load(Ordering::Acquire))
             }
-            CatchUpMode::Restore => self.drive_catch_up_to_tip(client, target_tip).await,
+            CatchUpMode::Restore => {
+                // #167 (review) — restore holds the coverage guard: any
+                // bridge-consumed input the canonical path cannot account for
+                // halts the restore instead of silently diverging from live
+                // history.
+                self.require_full_coverage.store(true, Ordering::Release);
+                self.drive_catch_up_to_tip(client, target_tip).await
+            }
         }
     }
 
@@ -1859,6 +1921,12 @@ impl SyntheticProjector {
     /// without moving a cursor; beyond this patience the discovery/projection
     /// feed is wedged and the restore must stop loudly.
     const RESTORE_STALL_PATIENCE: usize = 4;
+
+    /// #167 (review) — per-pass projection span in restore catch-up: each
+    /// pass projects at most this many blocks, bounding a pass's by-block
+    /// map / transaction feed regardless of chain size (memory stays
+    /// O(window), never O(history)).
+    const RESTORE_PASS_WINDOW: u64 = 5_000;
 
     /// The restore catch-up loop: Recovery-patience passes (no tick time
     /// budget) until BOTH cursors reach the fixed `target_tip`; any pass
@@ -1877,7 +1945,16 @@ impl SyntheticProjector {
         };
         let mut progress = CatchUpProgress::new(cursor_pair());
         loop {
-            self.tick_pass(client, target_tip, ReconcilePatience::Recovery)
+            // #167 (review) — bound each pass's PROJECTION span so a genesis
+            // restore on a grown chain cannot balloon one pass's by-block map
+            // and transaction feed without limit: each pass drives at most
+            // `RESTORE_PASS_WINDOW` blocks toward the fixed target. Memory
+            // stays O(window); progress across passes is what completes the
+            // restore. (The consumed-feed and output-metadata reads remain
+            // client-store queries — bounded by store content, not history.)
+            let pass_tip =
+                target_tip.min(self.cursor.load(Ordering::Acquire) + Self::RESTORE_PASS_WINDOW);
+            self.tick_pass(client, pass_tip, ReconcilePatience::Recovery)
                 .await?;
             let now = cursor_pair();
             match progress.observe(now, target_tip, Self::RESTORE_STALL_PATIENCE) {

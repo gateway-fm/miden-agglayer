@@ -544,14 +544,11 @@ pub trait Store: Send + Sync + 'static {
     /// (issue #167): `--restore` / `--resweep-from-genesis` hand the store to
     /// a fresh reconstruction, and a torn reset (one column reset, the other
     /// still at the old height) would make projection SKIP history the
-    /// re-sweep rediscovers. The default implementation is two separate
-    /// commits and therefore only as atomic as the backend allows; PostgreSQL
-    /// overrides it with a single statement.
-    async fn reset_cursors_to_genesis(&self) -> anyhow::Result<()> {
-        self.set_reconcile_cursor(0).await?;
-        self.set_projector_cursor(0).await?;
-        Ok(())
-    }
+    /// re-sweep rediscovers. REQUIRED per backend so the atomicity contract
+    /// is explicit: PostgreSQL implements it as a single UPDATE on the
+    /// service_state row; the in-memory store writes both fields under their
+    /// respective locks (nothing durable to tear).
+    async fn reset_cursors_to_genesis(&self) -> anyhow::Result<()>;
 
     /// #90 — did a restore rebuild this store, leaving the `nonces` table empty?
     ///

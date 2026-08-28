@@ -1092,12 +1092,22 @@ async fn main() -> anyhow::Result<()> {
         "SyntheticProjector registered: the SOLE synthetic-event producer and the SINGLE owner of \
          the synthetic tip. SINGLE-PROCESS ONLY — multiple replicas are NOT supported."
     );
-    let sync_listeners: Vec<Arc<dyn miden_agglayer_service::miden_client::SyncListener>> = vec![
-        sync_listener,
-        block_state.clone(),
-        bridge_out_scanner,
-        projector,
-    ];
+    // Issue #167 (review): in `--restore` mode the projector is NOT registered
+    // as a live sync listener — restore builds and drives its OWN projector
+    // instance (after resetting the cursors), so a registered instance would
+    // hold stale pre-reset cursor atomics and could project past the captured
+    // tip in the window between restore finishing and client shutdown.
+    let sync_listeners: Vec<Arc<dyn miden_agglayer_service::miden_client::SyncListener>> =
+        if command.restore {
+            vec![sync_listener, block_state.clone(), bridge_out_scanner]
+        } else {
+            vec![
+                sync_listener,
+                block_state.clone(),
+                bridge_out_scanner,
+                projector,
+            ]
+        };
 
     let client = MidenClient::new(
         miden_store_dir.clone(),

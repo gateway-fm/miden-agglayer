@@ -451,6 +451,13 @@ pub fn init_metrics() {
          pending forever (review blocker 3)."
     );
     describe_counter!(
+        "restore_authoritative_coverage_gaps_total",
+        "#167 — restore catch-ups halted because a bridge-consumed input had NO recoverable \
+         identity (absent from the client consumed feed and not resolvable as a bridge-out: \
+         the ERASED-note boundary). Each increment is a restore that REFUSED to seal a \
+         divergent history; the node/protocol cannot serve that body."
+    );
+    describe_counter!(
         "synthetic_claim_calldata_persisted_total",
         "synthesized (derived-hash) claims whose FULL authoritative claimAsset calldata was \
          recovered (CLAIM note storage: both SMT proofs, both exit roots, networks, addresses, \

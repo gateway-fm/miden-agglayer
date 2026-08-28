@@ -1,28 +1,35 @@
-//! Restore — Reconstruct PgStore state from miden node.
+//! Restore — Reconstruct PgStore state via the canonical projector.
 //!
 //! This module implements disaster recovery: when the PostgreSQL store is
-//! empty (fresh deploy or data loss), it rebuilds all state from authoritative
-//! sources (miden node consumed notes, miden sync state).
+//! empty (fresh deploy or data loss) — possibly alongside a wiped miden-client
+//! store (`--reset-miden-store`) — it rebuilds all state by driving the SAME
+//! `SyntheticProjector` the live scheduler runs, pinned to a captured tip
+//! (issue #167). There is no second projection engine: the former node-scan /
+//! replay machinery was deleted, and this module is a thin offline
+//! orchestration wrapper.
 //!
 //! ## Algorithm
 //!
-//! 0. Re-import configured accounts, then sync one Miden tip/LET snapshot.
-//! 1. Scan canonical public B2AGG bodies and bridge transactions; prove exact
-//!    NoteId, execution order, reservation prefix, and LET cardinality.
-//! 2. Rebuild faucet identities, then replay B2AGG, CLAIM, and GER events at
-//!    their original consumption blocks.
-//! 3. Finalize the synthetic tip/projector cursor, reset the identity-reconcile
-//!    cursor for its historical sweep, and verify counts.
+//! 0. Re-import configured accounts (bootstrap; emits no history).
+//! 1. Rebuild faucet identities from bridge state (bootstrap; Cantina #6).
+//! 2. Reset both cursors to genesis (atomic), then run
+//!    `SyntheticProjector::catch_up_to(.., CatchUpMode::Restore)` inside ONE
+//!    frozen actor session: the Miden tip + LET snapshot and the entire
+//!    discovery → order → project → seal → cursor-commit catch-up observe the
+//!    same chain state, fail-closed on any stall, with the
+//!    authoritative-coverage guard refusing to seal unrecoverable inputs.
+//! 3. Verify LET accounting + emitted frontier, finalize the synthetic
+//!    tip / projector / reconcile cursors (the reconcile cursor is PARKED at
+//!    the tip the catch-up reached), and emit the report.
 //!
 //! ## GER restoration via consumed notes
 //!
 //! For recovery we only care about consumed notes — actually injected GERs.
 //! When the proxy injects a GER, it creates an UpdateGerNote that gets consumed
-//! by the Miden bridge account. The Miden node retains consumed notes, so we can
-//! scan them to reconstruct the full GER history.
-//!
-//! Each consumed UpdateGerNote stores the GER as 8 Felts in note storage.
-//! The consumption block number gives us the ordering for hash chain reconstruction.
+//! by the Miden bridge account; the projector's note-visibility sweep re-imports
+//! those public notes from genesis and the shared per-block unit
+//! (`crate::projection`) re-emits their events at the original consumption
+//! blocks, folding the hash chain in canonical order.
 //!
 //! See: https://github.com/0xMiden/protocol/issues/2341
 //!
@@ -32,12 +39,15 @@
 //!   TODO: switch to NoteFilter::ConsumedByScriptRoot when available
 //! - No block range queries for notes (full scan from genesis)
 //!   TODO: switch to dedicated get_gers() endpoint when Marti's team ships it
+//! - A bridge-consumed input the canonical path cannot reconstruct (created-
+//!   and-consumed in one block on a wiped store, headerless, no durable
+//!   identity) fails the restore with an actionable error (coverage guard) —
+//!   it can never be silently skipped.
 
 use crate::accounts_config::AccountsConfig;
 use crate::block_state::BlockState;
 use crate::miden_client::MidenClient;
 use crate::store::Store;
-use miden_protocol::account::AccountId;
 use std::sync::Arc;
 
 /// Result of a restore operation.
@@ -105,12 +115,11 @@ pub async fn restore(
     crate::account_recovery::reimport_known_accounts(miden_client, accounts).await;
     tracing::info!("Phase 0 complete: bridge account reimport pass done");
 
-    // Phase 1: Sync miden state + read the Miden tip — the block the synthetic
-    // chain catches up to under Miden-1:1. Each restored event is attributed to
-    // its OWN consumed block (below); `miden_tip` is only the orphan fallback.
-    tracing::info!("Phase 1: syncing miden state...");
-    let (miden_tip, let_leaves) = sync_miden_snapshot(miden_client, accounts.bridge.0).await?;
-    tracing::info!("Phase 1 complete: miden tip {miden_tip}, LET leaves {let_leaves}");
+    // Phase 1 (the Miden snapshot) is taken INSIDE the Phase-2 actor session
+    // below — see the frozen-store rationale there. (issue #167 review: a
+    // snapshot taken in a separate session can go stale while background
+    // sync keeps running, making the LET gate nondeterministic on a
+    // producing node.)
 
     // Phase 1.7 (Cantina #6): rebuild missing non-ETH faucet identity rows from the
     // bridge's authoritative `faucet_metadata_map` BEFORE projecting bridge-outs.
@@ -134,12 +143,19 @@ pub async fn restore(
     // sweep) is deleted: `SyntheticProjector::catch_up_to` in
     // `CatchUpMode::Restore` drives the SAME discovery → join → order →
     // project → seal → cursor-commit path the live scheduler runs, in
-    // blocking fail-closed mode, pinned to the Phase-1 captured tip. A node
+    // blocking fail-closed mode, pinned to the captured tip. A node
     // producing beyond the captured tip cannot drag the snapshot forward.
     // The genesis re-sweep of the client store is the driver's discovery
     // phase itself (Recovery-patience reconcile from cursor zero), so the
     // heal-before-projection ordering of the old Phase 1.1 is preserved
     // structurally: nothing projects until discovery has reached the tip.
+    //
+    // FROZEN-STORE SESSION (issue #167 review): the whole snapshot + catch-up
+    // runs as ONE request on the serialized Miden actor. While it runs, the
+    // actor's own sync ticker cannot interleave, so the captured
+    // `(tip, LET leaves)` and every account/state read the gates make inside
+    // the session observe the SAME chain state — restore is deterministic
+    // even against a node that keeps producing.
     //
     // Cursor reset happens BEFORE the projector is constructed (it loads the
     // persisted cursors once in `new()`), through the single-statement atomic
@@ -158,14 +174,31 @@ pub async fn restore(
         )
         .await?,
     );
-    tracing::info!(
-        target_tip = miden_tip,
-        "Phase 2: canonical catch-up from cursor zero (blocking, fail-closed)..."
-    );
+    tracing::info!("Phase 2: canonical catch-up from cursor zero (blocking, fail-closed)...");
+    let snapshot = Arc::new(std::sync::Mutex::new(None::<(u64, u64)>));
+    let snapshot_inner = snapshot.clone();
     let projector_for_run = projector.clone();
+    let bridge_id = accounts.bridge.0;
     miden_client
         .with(move |client| {
             Box::new(async move {
+                // Phase 1 — frozen-store snapshot: tip + LET cardinality.
+                client.sync_state().await?;
+                let miden_tip = client
+                    .get_sync_height()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to get sync height: {e}"))?
+                    .as_u64();
+                let bridge = client
+                    .get_account(bridge_id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to read bridge account {bridge_id}: {e}"))?
+                    .ok_or_else(|| anyhow::anyhow!("bridge account {bridge_id} is unavailable"))?;
+                let let_leaves = miden_base_agglayer::AggLayerBridge::read_let_num_leaves(&bridge);
+                *snapshot_inner.lock().expect("restore snapshot") = Some((miden_tip, let_leaves));
+                tracing::info!("Phase 1 complete: miden tip {miden_tip}, LET leaves {let_leaves}");
+
+                // Phase 2 — the canonical catch-up itself.
                 projector_for_run
                     .catch_up_to(
                         client,
@@ -177,6 +210,11 @@ pub async fn restore(
             })
         })
         .await?;
+    let (miden_tip, let_leaves) = snapshot
+        .lock()
+        .expect("restore snapshot")
+        .take()
+        .expect("restore snapshot captured");
     let counts = projector.take_projection_counts();
     let (bridge_outs, claims, gers) = (counts.bridge_outs, counts.claims, counts.gers);
     let total_logs = bridge_outs + claims + gers;
@@ -218,22 +256,21 @@ pub async fn restore(
 ///
 /// Miden-1:1 — the synthetic tip == the Miden tip, and the projector cursor is
 /// set to the Miden tip so the live projector resumes from there rather than
-/// re-scanning the blocks restore just replayed (idempotent dedup would skip
+/// re-scanning the blocks restore just projected (idempotent dedup would skip
 /// them anyway). The restored events already sit at their own Miden blocks.
 ///
-/// The note-reconciler sweep cursor is the OPPOSITE: it is reset to 0. Restore
-/// runs against a wiped/rebuilt miden store (`--reset-miden-store --restore` is
-/// the canonical recovery invocation), so the client has forgotten every
-/// imported note — the genesis re-sweep IS the healing pass that re-discovers
-/// externally-created network notes, and it must not be skipped by a stale
-/// persisted cursor.
+/// The note-reconciler sweep cursor is PARKED at the tip the canonical
+/// catch-up reached (`swept_to == Some(miden_tip)` from the driver): the
+/// catch-up's discovery phase already ran the genesis heal to the tip, so
+/// leaving the cursor there avoids a redundant full-history re-walk on the
+/// next boot. The genesis-reset fallback remains for an incomplete heal.
 /// Review 0814 (blocking): `accounted == let_leaves` proves every leaf is
 /// RESERVED, not EMITTED — `project_b2agg_note` has post-reservation `Skipped`
 /// paths (unparsable / no asset / unknown faucet / oversize / self-target).
 /// Finalizing over a skipped leaf would ship the exact permanent
 /// `depositCount` gap the live emitted-frontier gate refuses to seal past.
-/// Same gate, same fail-closed posture, run after replay and BEFORE cursor
-/// finalization: the one-shot fails and the operator repairs the leaf's
+/// Same gate, same fail-closed posture, run after the catch-up and BEFORE
+/// cursor finalization: the one-shot fails and the operator repairs the leaf's
 /// metadata (registry backfill) before re-running `--restore`.
 pub(crate) async fn verify_emitted_frontier(store: &Arc<dyn Store>) -> anyhow::Result<()> {
     if let Some((idx, note)) = store.first_unemitted_reservation().await? {
@@ -300,40 +337,6 @@ pub(crate) async fn finalize_restore_cursors(
         }
     }
     Ok(())
-}
-
-/// Phase 1: sync miden and return the current MIDEN tip (sync height) — the
-/// block the synthetic chain catches up to under Miden-1:1.
-async fn sync_miden_snapshot(
-    miden_client: &MidenClient,
-    bridge_id: AccountId,
-) -> anyhow::Result<(u64, u64)> {
-    let snapshot = Arc::new(std::sync::Mutex::new(None));
-    let snapshot_inner = snapshot.clone();
-    miden_client
-        .with(move |client| {
-            Box::new(async move {
-                client.sync_state().await?;
-                let height = client
-                    .get_sync_height()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("failed to get sync height: {e}"))?
-                    .as_u64();
-                let bridge = client
-                    .get_account(bridge_id)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("failed to read bridge account {bridge_id}: {e}"))?
-                    .ok_or_else(|| anyhow::anyhow!("bridge account {bridge_id} is unavailable"))?;
-                let leaves = miden_base_agglayer::AggLayerBridge::read_let_num_leaves(&bridge);
-                *snapshot_inner.lock().unwrap() = Some((height, leaves));
-                Ok(())
-            })
-        })
-        .await?;
-    snapshot
-        .lock()
-        .unwrap()
-        .ok_or_else(|| anyhow::anyhow!("Miden snapshot was not captured"))
 }
 
 /// Phase 1.7 (Cantina #6): rebuild missing non-ETH faucet `faucet_registry` rows
