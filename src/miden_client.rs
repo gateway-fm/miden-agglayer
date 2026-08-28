@@ -36,11 +36,14 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// queue admits writers in sender order (tokio mpsc is FIFO and fair — that
 /// part is unchanged), moves backpressure to this depth, and lets
 /// `miden_client_mailbox_depth` make the queue visible. Execution stays fully
-/// serialized: the actor still runs one request closure at a time. Note that
-/// admission is not cancellation: once `send` accepts a request it will
-/// execute even if the caller's future is dropped awaiting the response —
-/// this was already true of the capacity-1 buffer, only the accepted-window
-/// depth changes.
+/// serialized: the actor still runs one request closure at a time. Two
+/// admission semantics are deliberate and unchanged from capacity-1: (a)
+/// admission is not cancellation — once `send` accepts a request it will
+/// execute even if the caller's future is dropped awaiting the response;
+/// (b) at shutdown, admitted-but-unstarted requests are dropped and their
+/// callers observe a closed channel — every caller's existing crash-recovery
+/// re-drive (writer worker re-enqueue, claim/GER retry, recovery sweeps) is
+/// the recovery path, so no new durability obligation is created.
 const REQUEST_MAILBOX_CAPACITY: usize = 64;
 
 /// #173 — after this many consecutive write requests the actor forces a
@@ -49,6 +52,12 @@ const REQUEST_MAILBOX_CAPACITY: usize = 64;
 /// sync tick (and the projector listeners that fire on it) indefinitely;
 /// this bounds that staleness while still giving writes strict priority.
 const REQUESTS_PER_FORCED_SYNC: usize = 8;
+
+/// #173 (review) — sync attempts per bounded sync pass in the actor loop.
+/// A pass that exhausts these returns to write arbitration instead of
+/// wedging the mailbox for the whole outage (the previous behaviour was an
+/// unbounded retry loop); the next ticker/forced sync retries.
+const SYNC_ATTEMPTS_PER_PASS: usize = 3;
 
 /// #173 — warn threshold for the client store's on-disk size. The store is
 /// the amplifier behind every serialized-actor latency: `sync_state` cost
@@ -905,6 +914,10 @@ impl MidenClient {
         }
     }
 
+    /// Startup sync with unbounded retries: the service must not come alive
+    /// against an unsynced store, so unlike the actor loop's
+    /// [`Self::sync_bounded`] passes this deliberately never gives up
+    /// (shutdown interrupts via the biased select at the call site).
     async fn sync(client: &mut MidenClientLib) -> anyhow::Result<SyncSummary> {
         let mut backoff = BACKOFF_MIN;
         loop {
@@ -936,6 +949,49 @@ impl MidenClient {
                 }
             }
         }
+    }
+
+    /// One bounded sync pass for the actor loop (#173 review): at most
+    /// [`SYNC_ATTEMPTS_PER_PASS`] tries with exponential backoff, then back
+    /// to arbitration. The old forever-retrying sync wedged the whole
+    /// mailbox — and through the forced cadence, every later queued write
+    /// too — for the entire duration of a node outage; a bounded pass lets
+    /// queued requests proceed and the next ticker/forced sync retry.
+    /// Returns `None` when every attempt failed (listeners are skipped for
+    /// that pass; there is no summary to project).
+    async fn sync_bounded(client: &mut MidenClientLib) -> Option<SyncSummary> {
+        let mut backoff = BACKOFF_MIN;
+        for attempt in 1..=SYNC_ATTEMPTS_PER_PASS {
+            match client.sync_state().await {
+                Ok(summary) => return Some(summary),
+                Err(client_err) => {
+                    match Self::unwrap_connection_error(client_err) {
+                        Ok(conn_err) => {
+                            metrics::counter!("miden_sync_errors_total", "kind" => "connection")
+                                .increment(1);
+                            tracing::error!(
+                                "MidenClient::sync_bounded connection error (attempt {attempt}/{}): {conn_err:?}",
+                                SYNC_ATTEMPTS_PER_PASS
+                            );
+                        }
+                        Err(other_err) => {
+                            metrics::counter!("miden_sync_errors_total", "kind" => "other")
+                                .increment(1);
+                            tracing::error!(
+                                "MidenClient::sync_bounded non-connection error (attempt {attempt}/{}): {other_err:#}",
+                                SYNC_ATTEMPTS_PER_PASS
+                            );
+                        }
+                    }
+                    if attempt < SYNC_ATTEMPTS_PER_PASS {
+                        tokio::time::sleep(backoff).await;
+                        backoff = next_backoff(backoff);
+                    }
+                }
+            }
+        }
+        ::metrics::counter!("miden_sync_passes_failed_total").increment(1);
+        None
     }
 
     async fn on_sync(
@@ -1054,16 +1110,20 @@ impl MidenClient {
             }
         }
 
-        // initial sync
+        // initial sync — deliberately UNBOUNDED retries: the service must
+        // not come alive against an unsynced store. Shutdown stays prompt
+        // via biased done-first arbitration.
         tokio::select! {
+            biased;
+
+            _ = &mut *done_receiver => {
+                tracing::debug!("MidenClient::run loop done");
+                return Ok(());
+            }
             result = Self::sync(&mut client) => {
                 if let Err(err) = Self::on_sync(result, &mut client, sync_listeners, listeners_paused).await {
                     tracing::error!("MidenClient initial sync listener error: {err:#}");
                 }
-            },
-            _ = &mut *done_receiver => {
-                tracing::debug!("MidenClient::run loop done");
-                return Ok(());
             }
         }
 
@@ -1094,13 +1154,17 @@ impl MidenClient {
                     request.response_sender.send(result).unwrap_or(());
                     if cadence.on_request() {
                         sample_store_size(&store_dir, &mut store_size_warned);
-                        tokio::select! {
-                            result = Self::sync(&mut client) => {
-                                if let Err(err) = Self::on_sync(result, &mut client, sync_listeners, listeners_paused).await {
+                        match Self::sync_bounded(&mut client).await {
+                            Some(summary) => {
+                                if let Err(err) = Self::on_sync(Ok(summary), &mut client, sync_listeners, listeners_paused).await {
                                     tracing::error!("MidenClient sync listener error: {err:#}");
                                 }
-                            },
-                            _ = &mut *done_receiver => break,
+                            }
+                            None => {
+                                tracing::warn!(
+                                    "MidenClient forced sync pass failed; the next ticker/forced sync will retry"
+                                );
+                            }
                         }
                         // The forced sync substitutes for the ticker: realign
                         // the deadline to a full period from now. Without this,
@@ -1113,18 +1177,34 @@ impl MidenClient {
                 _ = sync_interval.tick() => {
                     cadence.on_sync();
                     sample_store_size(&store_dir, &mut store_size_warned);
-                    tokio::select! {
-                        result = Self::sync(&mut client) => {
-                            if let Err(err) = Self::on_sync(result, &mut client, sync_listeners, listeners_paused).await {
+                    match Self::sync_bounded(&mut client).await {
+                        Some(summary) => {
+                            if let Err(err) = Self::on_sync(Ok(summary), &mut client, sync_listeners, listeners_paused).await {
                                 tracing::error!("MidenClient sync listener error: {err:#}");
                             }
-                        },
-                        _ = &mut *done_receiver => break,
+                        }
+                        None => {
+                            tracing::warn!(
+                                "MidenClient ticker sync pass failed; the next ticker/forced sync will retry"
+                            );
+                        }
                     }
+                    // Realign the deadline to a full period from NOW, not
+                    // from when the overdue tick was polled: `Delay`
+                    // reschedules at poll time, so once sync work outgrows
+                    // the 5s period every completion finds another overdue
+                    // tick and chains back-to-back syncs — an arriving write
+                    // would wait through a full sync every single time
+                    // (#173 review). With the realignment the actor always
+                    // returns to arbitration for one full period first.
+                    sync_interval = new_sync_interval();
                 },
             }
         }
 
+        // Clear the depth gauge so a shutdown doesn't leave a stale queue
+        // depth in the exporter (sampled between requests only).
+        ::metrics::gauge!("miden_client_mailbox_depth").set(0.0);
         tracing::debug!("MidenClient::run loop done");
         Ok(())
     }
@@ -1267,20 +1347,24 @@ fn sample_store_size(store_dir: &Path, warned: &mut bool) {
     };
     let bytes = meta.len();
     ::metrics::gauge!("miden_client_store_bytes").set(bytes as f64);
-    if bytes >= STORE_SIZE_WARN_BYTES {
-        if !*warned {
-            *warned = true;
-            tracing::warn!(
-                store_mb = bytes / (1024 * 1024),
-                warn_mb = STORE_SIZE_WARN_BYTES / (1024 * 1024),
-                "miden-client store is large — sync_state cost (and thus write \
-                 queue latency, #173) scales with it; schedule a restore-driven \
-                 compaction window (docs/UPGRADE.md)"
-            );
-        }
-    } else {
-        *warned = false;
+    if should_warn_store_size(bytes, *warned) {
+        tracing::warn!(
+            store_mb = bytes / (1024 * 1024),
+            warn_mb = STORE_SIZE_WARN_BYTES / (1024 * 1024),
+            "miden-client store is large — sync_state cost (and thus write \
+             queue latency, #173) scales with it; schedule a restore-driven \
+             compaction window (docs/UPGRADE.md)"
+        );
     }
+    *warned = bytes >= STORE_SIZE_WARN_BYTES;
+}
+
+/// Pure transition for the large-store warning latch (#173): fires exactly
+/// on crossing above [`STORE_SIZE_WARN_BYTES`], stays suppressed while the
+/// store remains oversized, and re-arms once it shrinks back below (so a
+/// future growth regime warns again).
+fn should_warn_store_size(bytes: u64, warned: bool) -> bool {
+    bytes >= STORE_SIZE_WARN_BYTES && !warned
 }
 
 #[cfg(test)]
@@ -1399,8 +1483,11 @@ mod tests {
     /// #173 (review) — pins the sync ticker construction: the first real
     /// deadline is a FULL period out (the immediate first tick is consumed
     /// at construction, not inside the loop), and the missed-tick policy is
-    /// `Delay` — a long elapsed span collapses into ONE catch-up tick whose
-    /// next deadline is again a full period out, never a Burst replay.
+    /// exactly `Delay`. The missed span is deliberately NOT period-aligned
+    /// (5s period, 12s miss): `Burst` would have TWO expired ticks queued
+    /// (immediate second tick), and `Skip` would reschedule to the next
+    /// boundary 3s out — only `Delay` yields one catch-up tick now and the
+    /// next a full period after the catch-up.
     #[tokio::test(start_paused = true)]
     async fn sync_interval_first_deadline_is_a_full_period_out_and_misses_delay() {
         let mut interval = new_sync_interval();
@@ -1418,22 +1505,39 @@ mod tests {
                 .await
                 .is_ok()
         );
-        // Three periods elapse while the actor is busy with writes...
-        tokio::time::advance(Duration::from_secs(15)).await;
+        // Twelve seconds (2 periods + 2s) elapse while the actor is busy...
+        tokio::time::advance(Duration::from_secs(12)).await;
         let _ = interval.tick().await; // exactly ONE catch-up tick (Delay)
-        // ...and the next deadline is a full period out. Under the default
-        // Burst policy this tick would already be ready (and the next one,
-        // and the next) — a redundant sync burst right after write activity.
+        // ...and the next deadline is a FULL period after the catch-up, not
+        // at the skipped boundary 3s from now (Skip) and not immediately
+        // (Burst's second expired tick).
         assert!(
-            tokio::time::timeout(Duration::from_secs(4), interval.tick())
+            tokio::time::timeout(Duration::from_secs(2), interval.tick())
                 .await
                 .is_err()
         );
         assert!(
-            tokio::time::timeout(Duration::from_secs(1), interval.tick())
+            tokio::time::timeout(Duration::from_secs(3), interval.tick())
                 .await
                 .is_ok()
         );
+    }
+
+    /// #173 (review) — pins the pure warning-latch transition: fires on the
+    /// first sample at/above the threshold, suppresses while it persists,
+    /// re-arms below it.
+    #[test]
+    fn store_size_warning_latch_transition() {
+        let under = STORE_SIZE_WARN_BYTES - 1;
+        let over = STORE_SIZE_WARN_BYTES;
+        // Cold start below the threshold: no warning.
+        assert!(!should_warn_store_size(under, false));
+        // Crossing arms exactly once; repeats while oversized stay silent.
+        assert!(should_warn_store_size(over, false));
+        assert!(!should_warn_store_size(over, true));
+        assert!(!should_warn_store_size(under, true));
+        // Below re-arms; a fresh crossing warns again.
+        assert!(should_warn_store_size(over, false));
     }
 
     #[tokio::test]

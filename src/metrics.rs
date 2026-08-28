@@ -270,9 +270,18 @@ pub fn init_metrics() {
     describe_gauge!(
         "miden_client_mailbox_depth",
         "#173 — write requests admitted into the actor's mailbox but not yet \
-         picked up (0 = idle; sustained growth means writers are outpacing the \
-         serialized actor, e.g. during long proofs or slow syncs). Backpressure \
+         picked up, sampled when the actor is between requests (during a long \
+         request the exported value is the depth observed at its start; reset \
+         to 0 on actor exit). Sustained growth means writers are outpacing the \
+         serialized actor, e.g. during long proofs or slow syncs. Backpressure \
          (send awaiting) begins at the mailbox capacity."
+    );
+    describe_counter!(
+        "miden_sync_passes_failed_total",
+        "#173 — bounded actor sync passes that exhausted all retries without a \
+         successful sync_state. Non-zero during a Miden node outage is expected \
+         (writes proceed between passes); sustained growth with the node healthy \
+         means connectivity or RPC trouble."
     );
     describe_counter!(
         "miden_client_build_errors_total",
