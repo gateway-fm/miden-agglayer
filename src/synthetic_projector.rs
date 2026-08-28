@@ -312,6 +312,21 @@ struct PendingDuplicate {
     note_id: String,
 }
 
+/// Scheduling policy for [`SyntheticProjector::catch_up_to`] (issue #167).
+/// Both modes drive the SAME discovery/ordering/projection/sealing path
+/// (`tick_pass`); they differ only in scheduling and failure posture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatchUpMode {
+    /// Bounded per-pass work under the live scheduler; a transient
+    /// discovery/projection failure is logged and retried next tick.
+    Live,
+    /// Blocking fail-closed catch-up (`--restore`): no tick time budget,
+    /// the tip stays fixed at the captured target, and any
+    /// discovery/projection stall propagates instead of being retried
+    /// silently.
+    Restore,
+}
+
 pub struct SyntheticProjector {
     store: Arc<dyn Store>,
     block_state: Arc<BlockState>,
@@ -1523,11 +1538,30 @@ impl SyntheticProjector {
             .await
             .map_err(|e| anyhow::anyhow!("failed to get sync height: {e}"))?
             .as_u64();
+        self.tick_pass(client, tip, ReconcilePatience::LiveTick)
+            .await
+    }
+
+    /// One projection pass toward an EXPLICIT tip (issue #167): the shared
+    /// per-pass unit behind both scheduling policies — the live scheduler
+    /// (`LiveTick` patience, bounded per-pass work, transient failures
+    /// retried next tick) and the restore catch-up driver (`Recovery`
+    /// patience, no tick budget, failures propagated fail-closed).
+    ///
+    /// The tip is a parameter, never re-queried: a restore pinned at a
+    /// captured `target_tip` must not be dragged forward by a node that
+    /// keeps producing blocks during the catch-up.
+    async fn tick_pass(
+        &self,
+        client: &mut MidenClientLib,
+        tip: u64,
+        reconcile_patience: ReconcilePatience,
+    ) -> anyhow::Result<u64> {
         let mut cursor = self.cursor.load(Ordering::Acquire);
         // Reconcile even when projection is already at the tip so note imports do not stall
         // while block production is paused.
         if let Err(e) = self
-            .reconcile_notes(client, &self.node_rpc, tip, ReconcilePatience::LiveTick)
+            .reconcile_notes(client, &self.node_rpc, tip, reconcile_patience)
             .await
         {
             tracing::warn!(
@@ -1791,6 +1825,156 @@ impl SyntheticProjector {
             "synthetic projector tick: caught up to the Miden tip"
         );
         Ok(cursor)
+    }
+
+    /// Reset BOTH cursors — note-visibility discovery and block projection —
+    /// to genesis, updating the persisted store AND the in-memory atomics.
+    ///
+    /// Issue #167: resetting only PostgreSQL after the projector was
+    /// constructed is invalid — the in-memory atomics would keep their old
+    /// values and the projector would silently skip history. Persistence
+    /// happens FIRST so a crash mid-reset can never leave the durable cursor
+    /// ahead of projected state on restart.
+    pub async fn reset_cursors_to_genesis(&self) -> anyhow::Result<()> {
+        self.store.set_reconcile_cursor(0).await?;
+        self.store.set_projector_cursor(0).await?;
+        self.reconcile_cursor.store(0, Ordering::Release);
+        self.cursor.store(0, Ordering::Release);
+        tracing::warn!(
+            "projector cursors reset to genesis (discovery + projection, persisted + in-memory)"
+        );
+        Ok(())
+    }
+
+    /// Drive the canonical live path from the current cursors to
+    /// `target_tip` (issue #167, fixed-tip fail-closed catch-up driver).
+    ///
+    /// - `CatchUpMode::Live` runs ONE bounded pass; the scheduler retries
+    ///   transient failures. Returns the projection cursor after the pass
+    ///   (it may legitimately be below `target_tip`).
+    /// - `CatchUpMode::Restore` loops passes (Recovery patience, no tick
+    ///   time budget) until BOTH the discovery and projection cursors reach
+    ///   `target_tip`; a pass error propagates, and a run that repeatedly
+    ///   moves neither cursor fails closed after [`RESTORE_STALL_PATIENCE`]
+    ///   consecutive no-progress passes (bounding a silently-wedged
+    ///   discovery feed instead of spinning forever).
+    ///
+    /// `target_tip` is authoritative: a node advancing beyond it does not
+    /// extend the restore snapshot (`tick_pass` never re-queries the tip).
+    pub async fn catch_up_to(
+        &self,
+        client: &mut MidenClientLib,
+        target_tip: u64,
+        mode: CatchUpMode,
+    ) -> anyhow::Result<u64> {
+        match mode {
+            CatchUpMode::Live => {
+                self.tick_pass(client, target_tip, ReconcilePatience::LiveTick)
+                    .await?;
+                Ok(self.cursor.load(Ordering::Acquire))
+            }
+            CatchUpMode::Restore => self.drive_catch_up_to_tip(client, target_tip).await,
+        }
+    }
+
+    /// Consecutive passes allowed to move NEITHER cursor in restore catch-up
+    /// before the driver fails closed. Non-zero because a pass can make
+    /// real (uncounted) progress — e.g. pending-duplicate reconciliation —
+    /// without moving a cursor; beyond this patience the discovery/projection
+    /// feed is wedged and the restore must stop loudly.
+    const RESTORE_STALL_PATIENCE: usize = 4;
+
+    /// The restore catch-up loop: Recovery-patience passes (no tick time
+    /// budget) until BOTH cursors reach the fixed `target_tip`; any pass
+    /// error propagates fail-closed. The completion/stall decision lives in
+    /// [`CatchUpProgress::observe`], unit-tested without a Miden client.
+    async fn drive_catch_up_to_tip(
+        &self,
+        client: &mut MidenClientLib,
+        target_tip: u64,
+    ) -> anyhow::Result<u64> {
+        let cursor_pair = || {
+            (
+                self.cursor.load(Ordering::Acquire),
+                self.reconcile_cursor.load(Ordering::Acquire),
+            )
+        };
+        let mut progress = CatchUpProgress::new(cursor_pair());
+        loop {
+            self.tick_pass(client, target_tip, ReconcilePatience::Recovery)
+                .await?;
+            let now = cursor_pair();
+            match progress.observe(now, target_tip, Self::RESTORE_STALL_PATIENCE) {
+                CatchUpStep::Complete => {
+                    tracing::info!(
+                        target_tip,
+                        projector_cursor = now.0,
+                        reconcile_cursor = now.1,
+                        "restore catch-up complete: both cursors at the captured tip"
+                    );
+                    return Ok(now.0);
+                }
+                CatchUpStep::Stalled => anyhow::bail!(
+                    "restore catch-up stalled: cursors {now:?} below target {target_tip} \
+                     after {} passes without progress",
+                    Self::RESTORE_STALL_PATIENCE
+                ),
+                CatchUpStep::Continue => {}
+            }
+        }
+    }
+}
+
+/// One restore catch-up iteration decision ([`SyntheticProjector::drive_catch_up_to_tip`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatchUpStep {
+    /// Both cursors reached the target tip.
+    Complete,
+    /// Patience exhausted below the target — fail closed.
+    Stalled,
+    /// Keep driving passes.
+    Continue,
+}
+
+/// Progress tracker for the restore catch-up loop: distinguishes real
+/// forward movement from passes that moved neither cursor.
+#[derive(Debug)]
+struct CatchUpProgress {
+    last: (u64, u64),
+    stalled_passes: usize,
+}
+
+impl CatchUpProgress {
+    fn new(start: (u64, u64)) -> Self {
+        Self {
+            last: start,
+            stalled_passes: 0,
+        }
+    }
+
+    /// Records a completed pass's cursors and decides the next step.
+    fn observe(&mut self, now: (u64, u64), target_tip: u64, patience: usize) -> CatchUpStep {
+        if now.0 >= target_tip && now.1 >= target_tip {
+            return CatchUpStep::Complete;
+        }
+        if now == self.last {
+            self.stalled_passes += 1;
+            if self.stalled_passes >= patience {
+                return CatchUpStep::Stalled;
+            }
+            tracing::warn!(
+                stalled_passes = self.stalled_passes,
+                patience,
+                cursors = ?now,
+                target_tip,
+                "restore catch-up pass made no cursor progress"
+            );
+            CatchUpStep::Continue
+        } else {
+            self.stalled_passes = 0;
+            self.last = now;
+            CatchUpStep::Continue
+        }
     }
 }
 
@@ -2477,6 +2661,108 @@ mod tests {
             store.get_reconcile_cursor().await.unwrap(),
             2_000,
             "multiple windows must advance the persisted cursor to the tip in ONE tick"
+        );
+    }
+
+    /// ISSUE #167 — the restore catch-up driver's completion/stall contract,
+    /// pinned on the pure decision ([`CatchUpProgress::observe`]) so no Miden
+    /// client is needed: completion requires BOTH cursors at the fixed tip;
+    /// movement resets the stall counter; a run below the tip that moves
+    /// neither cursor for `patience` consecutive passes fails closed.
+    #[test]
+    fn catch_up_progress_completes_at_fixed_tip_and_fails_closed_on_stall() {
+        const PATIENCE: usize = 4;
+
+        // Projection alone at the tip is NOT completion: the discovery
+        // (reconcile) cursor must catch up too.
+        let mut p = CatchUpProgress::new((0, 0));
+        assert_eq!(
+            p.observe((10, 4), 10, PATIENCE),
+            CatchUpStep::Continue,
+            "projection cursor alone at the tip must not complete"
+        );
+        assert_eq!(p.observe((10, 10), 10, PATIENCE), CatchUpStep::Complete);
+
+        // Real movement resets the stall counter mid-catch-up.
+        let mut p = CatchUpProgress::new((0, 0));
+        for n in 1..=3 {
+            assert_eq!(p.observe((n, n), 10, PATIENCE), CatchUpStep::Continue);
+        }
+        // One no-progress pass below the tip: tolerated (pending-duplicate
+        // reconciliation can move nothing countable), counter armed.
+        assert_eq!(p.observe((3, 3), 10, PATIENCE), CatchUpStep::Continue);
+        // Movement again: counter resets, so the next quiet pass starts over.
+        assert_eq!(p.observe((4, 4), 10, PATIENCE), CatchUpStep::Continue);
+        assert_eq!(p.observe((4, 4), 10, PATIENCE), CatchUpStep::Continue);
+        assert_eq!(p.observe((5, 5), 10, PATIENCE), CatchUpStep::Continue);
+
+        // Fail-closed: exactly `patience` quiet passes below the tip, then a
+        // stall — never a silent infinite spin.
+        let mut p = CatchUpProgress::new((0, 0));
+        for _ in 1..PATIENCE {
+            assert_eq!(p.observe((0, 0), 10, PATIENCE), CatchUpStep::Continue);
+        }
+        assert_eq!(p.observe((0, 0), 10, PATIENCE), CatchUpStep::Stalled);
+    }
+
+    /// ISSUE #167 — `reset_cursors_to_genesis` must update the persisted
+    /// store AND the in-memory atomics: resetting only PostgreSQL after the
+    /// projector was constructed is invalid (the atomics would silently skip
+    /// history), and the durable state must move first.
+    #[tokio::test]
+    async fn reset_cursors_to_genesis_resets_persisted_and_in_memory() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        // Pretend the projector is mid-history.
+        store.set_reconcile_cursor(4_200).await.unwrap();
+        store.set_projector_cursor(4_100).await.unwrap();
+        projector.reconcile_cursor.store(4_200, Ordering::Release);
+        projector.cursor.store(4_100, Ordering::Release);
+
+        projector.reset_cursors_to_genesis().await.unwrap();
+
+        assert_eq!(store.get_reconcile_cursor().await.unwrap(), 0);
+        assert_eq!(store.get_projector_cursor().await.unwrap(), 0);
+        assert_eq!(projector.reconcile_cursor.load(Ordering::Acquire), 0);
+        assert_eq!(projector.cursor.load(Ordering::Acquire), 0);
+
+        // A projector constructed AFTER the reset (the restore handoff shape:
+        // reset before (re)construction) starts from genesis too.
+        let fresh = test_projector(&store, &block_state).await;
+        assert_eq!(fresh.reconcile_cursor.load(Ordering::Acquire), 0);
+        assert_eq!(fresh.cursor.load(Ordering::Acquire), 0);
+    }
+
+    /// ISSUE #167 — restore catch-up is fail-closed against a wedged feed:
+    /// with a node that never serves state, passes make no progress and the
+    /// driver STOPS with an actionable stall error after
+    /// [`SyntheticProjector::RESTORE_STALL_PATIENCE`] passes, instead of
+    /// spinning forever or silently declaring success. (The live scheduler
+    /// tolerates the same condition by design — one warn per tick, retried.)
+    #[tokio::test]
+    async fn restore_catch_up_fails_closed_against_a_dead_node() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state)
+            .await
+            .with_reconcile_tuning(200, 1, Duration::ZERO);
+        let mut client = crate::test_helpers::offline_miden_client_lib().await;
+
+        let err = projector
+            .catch_up_to(&mut client, 2, CatchUpMode::Restore)
+            .await
+            .expect_err("a dead node must stall the restore catch-up, not hang or succeed");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("restore catch-up stalled"),
+            "error must be the actionable stall: {rendered}"
+        );
+        assert_eq!(
+            store.get_projector_cursor().await.unwrap(),
+            0,
+            "no projection may be attributed below the stalled discovery feed"
         );
     }
 
