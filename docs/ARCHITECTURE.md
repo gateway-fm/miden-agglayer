@@ -99,15 +99,22 @@ sequenceDiagram
     C->>R: eth_sendRawTransaction
     R->>R: decode, chain-id and signer checks
     R->>S: known-hash and state checks
-    R->>S: fenced signer/nonce reservation
-    R->>S: persist signed envelope
-    R->>S: compare-and-set next accepted nonce
-    R->>W: non-blocking enqueue
-    R-->>C: transaction hash
-    W->>M: serialized claim or GER dispatch
-    M->>S: persist exact note handoff
-    M->>N: submit proven Miden transaction
-    N-->>M: accepted or rejected
+    R->>S: read executable nonce and durable lower intent
+    alt valid future nonce with a gap
+        R->>S: persist envelope in bounded ephemeral queued_txns
+        R-->>C: transaction hash (accepted, still pending)
+    else executable nonce
+        R->>S: fenced signer/nonce reservation
+        R->>S: persist signed envelope
+        R->>S: compare-and-set next accepted nonce
+        R->>W: non-blocking enqueue
+        R->>S: promote contiguous parked successors
+        R-->>C: transaction hash
+        W->>M: serialized claim or GER dispatch
+        M->>S: persist exact note handoff
+        M->>N: submit proven Miden transaction
+        N-->>M: accepted or rejected
+    end
 ```
 
 Important behavior:
@@ -115,6 +122,18 @@ Important behavior:
 - The default queue capacity is 64 and is configurable through
   `AGGLAYER_WRITER_QUEUE_DEPTH`.
 - Queue saturation is returned as JSON-RPC error `-32005`.
+- A valid nonce above the executable frontier is parked in `queued_txns` and
+  returns its hash immediately. When the missing nonce is admitted, the
+  proxy attempts to promote the contiguous parked run in order and retries
+  retained failures periodically. The production pool survives a process
+  restart in Postgres but is intentionally ephemeral, not a delivery guarantee.
+  It is bounded at 256 rows per signer and 4096 globally; non-recovery rows
+  still resident at their 3600-projected-block TTL may be evicted. Rows stamped
+  during an accepted full-loss recovery window are TTL-exempt; they remain
+  until admission/reconciliation, or until an operator handles a surfaced
+  stranded row.
+- Serving without durable Postgres is refused unless
+  `ALLOW_EPHEMERAL_STORE=1` explicitly opts into development/test data loss.
 - A repeated signed transaction is deduplicated by transaction hash before the
   nonce check. A durable unlinked intent can be resumed after restart by
   submitting the same signed transaction again.
