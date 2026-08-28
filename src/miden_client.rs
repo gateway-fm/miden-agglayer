@@ -68,23 +68,33 @@ const SYNC_ATTEMPTS_PER_PASS: usize = 3;
 const STORE_SIZE_WARN_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The actor's periodic sync ticker: a 5s interval with `Delay` missed-tick
-/// behaviour and the immediate first tick pre-consumed. #173 (review) — the
+/// behaviour whose first deadline is a full period out. #173 (review) — the
 /// default `Burst` policy would replay every tick that elapsed while long
 /// write requests were being serviced as a back-to-back sync burst once the
 /// mailbox briefly emptied, each tick a full store-size-dependent
 /// `sync_state` — quietly recreating the very queue stall this fix removes.
-/// `Delay` collapses any elapsed span into a single catch-up sync, and the
-/// forced-sync arm realigns via a fresh interval (see the actor loop).
+/// `Delay` collapses any elapsed span into a single catch-up sync, and both
+/// sync arms realign via a fresh interval (see the actor loop). Built with
+/// `interval_at(now + period, ..)` rather than polling away an immediate
+/// first tick: `poll_tick` may return `Pending` under an exhausted
+/// cooperative budget, which would leave the zero deadline armed.
 fn new_sync_interval() -> tokio::time::Interval {
-    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        Duration::from_secs(5),
+    );
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Consume the immediate first tick synchronously (a fresh interval's
-    // first tick is always ready) so the loop's first real deadline is a
-    // full period out.
-    let waker = std::task::Waker::noop();
-    let mut cx = std::task::Context::from_waker(waker);
-    let _ = interval.poll_tick(&mut cx);
     interval
+}
+
+/// Outcome of one bounded actor sync pass ([`MidenClient::sync_bounded`]).
+enum SyncPass {
+    /// `sync_state` succeeded; the caller drains listener dispatch.
+    Committed(SyncSummary),
+    /// Every attempt failed; listeners skipped, retry on the next pass.
+    Failed,
+    /// Shutdown was signalled mid-pass; the caller must exit the loop.
+    Shutdown,
 }
 
 /// #173 — write-vs-sync arbitration state for the actor loop. Forces a sync
@@ -957,13 +967,35 @@ impl MidenClient {
     /// mailbox — and through the forced cadence, every later queued write
     /// too — for the entire duration of a node outage; a bounded pass lets
     /// queued requests proceed and the next ticker/forced sync retry.
-    /// Returns `None` when every attempt failed (listeners are skipped for
-    /// that pass; there is no summary to project).
-    async fn sync_bounded(client: &mut MidenClientLib) -> Option<SyncSummary> {
+    ///
+    /// Every attempt and backoff sleep races `done_receiver` (biased
+    /// shutdown-first), so an in-flight pass can no longer delay actor
+    /// shutdown by up to ~3 RPC timeouts + backoffs during an outage —
+    /// the termination grace period must not depend on RPC health.
+    /// A successful pass still drains its listeners at the call site: that
+    /// work is bounded by one projector tick and deliberately NOT cancelled
+    /// mid-flight (listeners write store state; cancelling risks
+    /// inconsistency — outage-path shutdown is what must be prompt, and it
+    /// is).
+    async fn sync_bounded(
+        client: &mut MidenClientLib,
+        done_receiver: &mut oneshot::Receiver<()>,
+    ) -> SyncPass {
         let mut backoff = BACKOFF_MIN;
         for attempt in 1..=SYNC_ATTEMPTS_PER_PASS {
-            match client.sync_state().await {
-                Ok(summary) => return Some(summary),
+            // biased shutdown-first: a gRPC call dropped mid-flight is
+            // cancellation-safe (the request is simply aborted).
+            let result = tokio::select! {
+                biased;
+
+                _ = &mut *done_receiver => return SyncPass::Shutdown,
+                result = client.sync_state() => result,
+            };
+            match result {
+                Ok(summary) => {
+                    tracing::debug!(target: concat!(module_path!(), "::sync::debug"), "MidenClient::sync succeeded at block {}", summary.block_num);
+                    return SyncPass::Committed(summary);
+                }
                 Err(client_err) => {
                     match Self::unwrap_connection_error(client_err) {
                         Ok(conn_err) => {
@@ -984,14 +1016,19 @@ impl MidenClient {
                         }
                     }
                     if attempt < SYNC_ATTEMPTS_PER_PASS {
-                        tokio::time::sleep(backoff).await;
+                        tokio::select! {
+                            biased;
+
+                            _ = &mut *done_receiver => return SyncPass::Shutdown,
+                            _ = tokio::time::sleep(backoff) => {},
+                        }
                         backoff = next_backoff(backoff);
                     }
                 }
             }
         }
         ::metrics::counter!("miden_sync_passes_failed_total").increment(1);
-        None
+        SyncPass::Failed
     }
 
     async fn on_sync(
@@ -1154,17 +1191,18 @@ impl MidenClient {
                     request.response_sender.send(result).unwrap_or(());
                     if cadence.on_request() {
                         sample_store_size(&store_dir, &mut store_size_warned);
-                        match Self::sync_bounded(&mut client).await {
-                            Some(summary) => {
+                        match Self::sync_bounded(&mut client, &mut *done_receiver).await {
+                            SyncPass::Committed(summary) => {
                                 if let Err(err) = Self::on_sync(Ok(summary), &mut client, sync_listeners, listeners_paused).await {
                                     tracing::error!("MidenClient sync listener error: {err:#}");
                                 }
                             }
-                            None => {
+                            SyncPass::Failed => {
                                 tracing::warn!(
                                     "MidenClient forced sync pass failed; the next ticker/forced sync will retry"
                                 );
                             }
+                            SyncPass::Shutdown => break,
                         }
                         // The forced sync substitutes for the ticker: realign
                         // the deadline to a full period from now. Without this,
@@ -1177,17 +1215,18 @@ impl MidenClient {
                 _ = sync_interval.tick() => {
                     cadence.on_sync();
                     sample_store_size(&store_dir, &mut store_size_warned);
-                    match Self::sync_bounded(&mut client).await {
-                        Some(summary) => {
+                    match Self::sync_bounded(&mut client, &mut *done_receiver).await {
+                        SyncPass::Committed(summary) => {
                             if let Err(err) = Self::on_sync(Ok(summary), &mut client, sync_listeners, listeners_paused).await {
                                 tracing::error!("MidenClient sync listener error: {err:#}");
                             }
                         }
-                        None => {
+                        SyncPass::Failed => {
                             tracing::warn!(
                                 "MidenClient ticker sync pass failed; the next ticker/forced sync will retry"
                             );
                         }
+                        SyncPass::Shutdown => break,
                     }
                     // Realign the deadline to a full period from NOW, not
                     // from when the overdue tick was polled: `Delay`
@@ -1508,16 +1547,17 @@ mod tests {
         // Twelve seconds (2 periods + 2s) elapse while the actor is busy...
         tokio::time::advance(Duration::from_secs(12)).await;
         let _ = interval.tick().await; // exactly ONE catch-up tick (Delay)
-        // ...and the next deadline is a FULL period after the catch-up, not
-        // at the skipped boundary 3s from now (Skip) and not immediately
-        // (Burst's second expired tick).
+        // ...and the next deadline is a FULL period after the catch-up.
+        // Pending through 4s rules out `Skip` (next skipped boundary would
+        // fire 3s after the catch-up) and `Burst` (second expired tick
+        // would be ready immediately); ready at 5s pins `Delay`.
         assert!(
-            tokio::time::timeout(Duration::from_secs(2), interval.tick())
+            tokio::time::timeout(Duration::from_secs(4), interval.tick())
                 .await
                 .is_err()
         );
         assert!(
-            tokio::time::timeout(Duration::from_secs(3), interval.tick())
+            tokio::time::timeout(Duration::from_secs(1), interval.tick())
                 .await
                 .is_ok()
         );
