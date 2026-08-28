@@ -218,7 +218,7 @@ pub fn classify_b2agg_consumer(
 //
 // The MINT/BURN/CLAIM/B2AGG note scripts are deployment-independent (identical
 // bytes across every agglayer instance on a chain), so — exactly like
-// [`crate::restore::classify_claim_note`] — a script-root match alone cannot
+// [`crate::projection::classify_claim_note`] — a script-root match alone cannot
 // tell OUR deployment's notes from a foreign deployment sharing the chain. The
 // bridge MASM emits its MINT/BURN output notes with the DEFAULT (0) tag
 // (`bridge_in_output.masm` / `bridge_out.masm` both `push.DEFAULT_TAG`), the
@@ -3660,7 +3660,7 @@ mod tests {
     }
 
     /// Run a consumed B2AGG note through the PRODUCTION derivation
-    /// (`restore::project_b2agg_note`, what the SyntheticProjector uses) and map
+    /// (`projection::project_b2agg_note`, what the SyntheticProjector uses) and map
     /// its outcome to the legacy `project_b2agg_note` bool (Emitted == "advanced").
     /// `local_network_id = 7`; every note built here targets destination-network 0,
     /// so the Cantina #13 self-target gate never fires (that gate has its own test).
@@ -3686,7 +3686,7 @@ mod tests {
         bridge_id: AccountId,
         block: u64,
     ) -> bool {
-        crate::restore::project_b2agg_note(
+        crate::projection::project_b2agg_note(
             store,
             note,
             test_b2agg_note_id(note, bridge_id),
@@ -3700,7 +3700,7 @@ mod tests {
         )
         .await
         .unwrap()
-            == crate::restore::B2AggRestoreOutcome::Emitted
+            == crate::projection::B2AggRestoreOutcome::Emitted
     }
 
     /// Cantina #13 Layer 2 — FAIL-CLOSED (no tombstone). A bridge-consumed ERC-20
@@ -3741,7 +3741,7 @@ mod tests {
         let note_id = test_b2agg_note_id(&note, bridge_id).to_hex();
 
         // No client → bridge metadata hash unreadable → Unrecoverable → FAIL CLOSED (Err).
-        let outcome = crate::restore::project_b2agg_note(
+        let outcome = crate::projection::project_b2agg_note(
             &store,
             &note,
             test_b2agg_note_id(&note, bridge_id),

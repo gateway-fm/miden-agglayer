@@ -343,7 +343,7 @@ pub struct SyntheticProjector {
     /// mints every ClaimNote from). Together with `bridge_id` this backs the
     /// claim provenance gate: on a chain shared with a FOREIGN miden-agglayer
     /// deployment, foreign claims share our ClaimNote script root and must
-    /// not be projected (see `restore::classify_claim_note`).
+    /// not be projected (see `projection::classify_claim_note`).
     expected_claim_sender: AccountId,
     /// Per-origin-network JSON-RPC endpoints for the Cantina #13 Layer-2 ERC-20
     /// metadata recovery path. Threaded into `project_b2agg_note`, which selects
@@ -403,6 +403,11 @@ pub struct SyntheticProjector {
     audit_resolved: std::sync::Mutex<HashSet<([u8; 32], u64, u32)>>,
     /// Tick counter driving the every-[`AUDIT_EVERY_N_TICKS`] audit cadence.
     audit_tick_counter: AtomicU64,
+    /// Cumulative per-kind emission counts accumulated by every projected
+    /// block. Live ticks ignore it; `--restore` (issue #167) reads it once
+    /// after `catch_up_to` completes to build the restore report from the
+    /// canonical path itself instead of a parallel bookkeeping pass.
+    projection_totals: std::sync::Mutex<crate::projection::BlockProjectionCounts>,
     /// Synthesized-claim calldata backfill: details-commitments of consumed CLAIM notes
     /// whose derived-hash tx record is RESOLVED (full claimAsset calldata persisted, or
     /// proven to ride a real eth-tx hash instead). Unresolved notes are re-checked every
@@ -482,6 +487,7 @@ impl SyntheticProjector {
             reconcile_concurrency,
             reconcile_budget,
             pending_duplicate_cursor: std::sync::Mutex::new(None),
+            projection_totals: std::sync::Mutex::new(Default::default()),
             audit_resolved: std::sync::Mutex::new(HashSet::new()),
             audit_tick_counter: AtomicU64::new(0),
             claim_calldata_resolved: std::sync::Mutex::new(HashSet::new()),
@@ -669,54 +675,6 @@ impl SyntheticProjector {
         let fetcher: Arc<dyn ReconcileFetcher> = Arc::new(RpcReconcileFetcher(Arc::clone(rpc)));
         self.reconcile_notes_with(Some(client), Some(rpc.as_ref()), &fetcher, tip, patience)
             .await
-    }
-
-    /// Drive the note-visibility sweep to COMPLETION (genesis → `tip`). This is
-    /// the recovery one-shot's healing pass.
-    ///
-    /// [`Self::reconcile_notes`] is tick-shaped: it returns when
-    /// `RECONCILE_TICK_BUDGET_MS` is spent so a live tick stays responsive.
-    /// Recovery has no such constraint, and it has a HARD ORDERING DEPENDENCY
-    /// that a partial sweep silently breaks: `restore_gers` replays the
-    /// order-sensitive GER hash chain from the client store's CONSUMED feed —
-    /// exactly what `--reset-miden-store` just emptied. Deferring the heal to the
-    /// serving proxy's first ticks is TOO LATE: restore parks the projector
-    /// cursor at the tip, so notes imported after it are never projected and the
-    /// GER history is lost permanently (observed: UpdateHashChain 40 → 0, and the
-    /// re-injection of already-registered GERs then mints immortal
-    /// ERR_GER_ALREADY_REGISTERED poison notes, #86). So recovery performs the
-    /// sweep itself, to completion, BEFORE the replay that consumes it.
-    ///
-    /// Fails closed: a batch that makes no forward progress aborts rather than
-    /// looping forever or returning a silently incomplete feed.
-    pub(crate) async fn sweep_notes_to_completion(
-        &self,
-        client: &mut MidenClientLib,
-        tip: u64,
-    ) -> anyhow::Result<u64> {
-        loop {
-            let before = self.reconcile_cursor.load(Ordering::Acquire);
-            if before >= tip {
-                return Ok(before);
-            }
-            self.reconcile_notes(client, &self.node_rpc, tip, ReconcilePatience::Recovery)
-                .await?;
-            let after = self.reconcile_cursor.load(Ordering::Acquire);
-            if after <= before {
-                anyhow::bail!(
-                    "recovery note sweep stalled at block {after} (tip {tip}): a window made no \
-                     forward progress, so the consumed-note feed is INCOMPLETE. Refusing to \
-                     continue — replaying the GER hash chain from a partial feed would silently \
-                     drop history."
-                );
-            }
-            tracing::info!(
-                from = before,
-                to = after,
-                tip,
-                "recovery note sweep: window batch complete"
-            );
-        }
     }
 
     /// Catch-up driver behind [`Self::reconcile_notes`], with the window fetch
@@ -1182,7 +1140,7 @@ impl SyntheticProjector {
 
     /// Synthesized-claim CALLDATA BACKFILL — retroactive self-heal for derived-hash
     /// ClaimEvents whose full `claimAsset` calldata is not yet persisted (see
-    /// `restore::persist_synthetic_claim_tx`). Covers: claims synthesized by an OLDER
+    /// `projection::persist_synthetic_claim_tx`). Covers: claims synthesized by an OLDER
     /// build (event committed, no calldata record — the live-soak block-8831 wedge), a
     /// crash between the event commit and the calldata persist, and a transient persist
     /// failure at synthesis time. Runs every tick over the already-fetched consumed feed;
@@ -1228,7 +1186,7 @@ impl SyntheticProjector {
             // is still unrecoverable.
             let derived_logs = self.store.get_logs_for_tx(&derived).await?;
             let resolved = if let Some(log) = derived_logs.first() {
-                crate::restore::persist_synthetic_claim_tx(
+                crate::projection::persist_synthetic_claim_tx(
                     &self.store,
                     note.details().storage(),
                     &note_id_str,
@@ -1244,7 +1202,7 @@ impl SyntheticProjector {
                 // re-check next tick, do NOT resolve.
                 match self.store.get_logs_for_tx(&real).await?.first() {
                     Some(log) => {
-                        crate::restore::persist_synthetic_claim_tx(
+                        crate::projection::persist_synthetic_claim_tx(
                             &self.store,
                             note.details().storage(),
                             &note_id_str,
@@ -1477,13 +1435,13 @@ impl SyntheticProjector {
         within_tx_pos: &HashMap<NoteId, u32>,
     ) -> anyhow::Result<usize> {
         // The order + dispatch live in the SHARED per-block unit
-        // (`restore::BlockProjection`) — the same code `--restore` replays
+        // (`projection::BlockProjection`) — the same code `--restore` replays
         // through, so live emission and restored emission cannot diverge.
         // This wrapper keeps only the live-tick concerns: block metadata
         // lookup, the emitted-frontier gate, and the seal.
         let block_hash = self.block_state.get_block_hash(miden_block);
         let timestamp = self.block_state.get_block_timestamp(miden_block);
-        let counts = crate::restore::BlockProjection {
+        let counts = crate::projection::BlockProjection {
             store: &self.store,
             bridge_id: self.bridge_id,
             local_network_id: self.local_network_id,
@@ -1502,6 +1460,14 @@ impl SyntheticProjector {
             within_tx_pos,
         )
         .await?;
+        // Cumulative report accumulator (read by `--restore` after the
+        // catch-up; ignored by live ticks).
+        {
+            let mut totals = self.projection_totals.lock().expect("projection_totals");
+            totals.bridge_outs += counts.bridge_outs;
+            totals.claims += counts.claims;
+            totals.gers += counts.gers;
+        }
         let logs = counts.bridge_outs + counts.claims + counts.gers;
 
         // #66 — emitted-frontier gate, enforced AT EMIT TIME (after this block's notes are
@@ -1835,9 +1801,19 @@ impl SyntheticProjector {
     /// values and the projector would silently skip history. Persistence
     /// happens FIRST so a crash mid-reset can never leave the durable cursor
     /// ahead of projected state on restart.
+    /// Drain the cumulative per-kind emission counts (see `projection_totals`).
+    /// Called by `--restore` after `catch_up_to` completes; live code never
+    /// reads it.
+    pub fn take_projection_counts(&self) -> crate::projection::BlockProjectionCounts {
+        let mut totals = self.projection_totals.lock().expect("projection_totals");
+        std::mem::take(&mut *totals)
+    }
+
     pub async fn reset_cursors_to_genesis(&self) -> anyhow::Result<()> {
-        self.store.set_reconcile_cursor(0).await?;
-        self.store.set_projector_cursor(0).await?;
+        // One durable commit for BOTH columns (Store::reset_cursors_to_genesis)
+        // — a torn reset would let projection skip history the re-sweep
+        // rediscovers — then the in-memory caches.
+        self.store.reset_cursors_to_genesis().await?;
         self.reconcile_cursor.store(0, Ordering::Release);
         self.cursor.store(0, Ordering::Release);
         tracing::warn!(
@@ -2674,7 +2650,9 @@ mod tests {
         const PATIENCE: usize = 4;
 
         // Projection alone at the tip is NOT completion: the discovery
-        // (reconcile) cursor must catch up too.
+        // (reconcile) cursor must catch up too. Completion is `>=` on BOTH —
+        // overshooting the target (e.g. a window batch that crossed it)
+        // completes rather than spinning.
         let mut p = CatchUpProgress::new((0, 0));
         assert_eq!(
             p.observe((10, 4), 10, PATIENCE),
@@ -2682,6 +2660,13 @@ mod tests {
             "projection cursor alone at the tip must not complete"
         );
         assert_eq!(p.observe((10, 10), 10, PATIENCE), CatchUpStep::Complete);
+        // Overshoot on either side completes too.
+        let mut p = CatchUpProgress::new((0, 0));
+        assert_eq!(p.observe((11, 9), 10, PATIENCE), CatchUpStep::Continue);
+        assert_eq!(p.observe((11, 11), 10, PATIENCE), CatchUpStep::Complete);
+        let mut p = CatchUpProgress::new((0, 0));
+        assert_eq!(p.observe((9, 12), 10, PATIENCE), CatchUpStep::Continue);
+        assert_eq!(p.observe((12, 12), 10, PATIENCE), CatchUpStep::Complete);
 
         // Real movement resets the stall counter mid-catch-up.
         let mut p = CatchUpProgress::new((0, 0));
@@ -2741,13 +2726,22 @@ mod tests {
     /// [`SyntheticProjector::RESTORE_STALL_PATIENCE`] passes, instead of
     /// spinning forever or silently declaring success. (The live scheduler
     /// tolerates the same condition by design — one warn per tick, retried.)
+    ///
+    /// Hermetic by construction: the reconciler's RPC handle is swapped to a
+    /// real gRPC client on 127.0.0.1:1 (never routable/listenable without
+    /// root), so the pass fails with a plain, non-backpressure ConnectionError
+    /// instantly — no wall-clock backoff, no dependency on whether a node
+    /// happens to run on the developer's default port.
     #[tokio::test]
     async fn restore_catch_up_fails_closed_against_a_dead_node() {
         let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
         let block_state = StdArc::new(BlockState::new());
-        let projector = test_projector(&store, &block_state)
+        let mut projector = test_projector(&store, &block_state)
             .await
             .with_reconcile_tuning(200, 1, Duration::ZERO);
+        // Deterministically dead endpoint: port 1 on loopback.
+        let dead_endpoint = crate::miden_client::parse_node_url("http://127.0.0.1:1").unwrap();
+        projector.node_rpc = crate::miden_client::build_rpc_client(&dead_endpoint, 1_000, None);
         let mut client = crate::test_helpers::offline_miden_client_lib().await;
 
         let err = projector
