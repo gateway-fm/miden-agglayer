@@ -1171,8 +1171,33 @@ impl MidenClient {
         // regime (re-armed when a compaction shrinks the store back below
         // the threshold — see [`sample_store_size`]).
         let mut store_size_warned = false;
+        // #173 (final review) — sync health gate: after an EXHAUSTED sync
+        // pass, writes are held until a sync succeeds. A stale local snapshot
+        // must not answer negative bridge-state checks (applied claim? bound
+        // route?) that would otherwise emit a duplicate or rebind. Healthy
+        // nodes never see this gate; during an outage writes resume exactly
+        // when a fresh sync lands, and shutdown still preempts instantly
+        // (sync_bounded races the done signal).
+        let mut sync_healthy = true;
 
         loop {
+            if !sync_healthy {
+                match Self::sync_bounded(&mut client, &mut *done_receiver).await {
+                    SyncPass::Committed(_) => sync_healthy = true,
+                    SyncPass::Failed => {
+                        // Brief pause so the retry loop doesn't spin hot;
+                        // done still preempts inside sync_bounded.
+                        tokio::select! {
+                            biased;
+
+                            _ = &mut *done_receiver => break,
+                            _ = tokio::time::sleep(BACKOFF_MIN) => {},
+                        }
+                        continue;
+                    }
+                    SyncPass::Shutdown => break,
+                }
+            }
             // #173 — `biased` gives the arms strict priority instead of a
             // random coin flip: a queued write can no longer lose the
             // iteration to the 5s sync ticker (measured 0.5s-91s queue waits
@@ -1193,13 +1218,16 @@ impl MidenClient {
                         sample_store_size(&store_dir, &mut store_size_warned);
                         match Self::sync_bounded(&mut client, &mut *done_receiver).await {
                             SyncPass::Committed(summary) => {
+                                sync_healthy = true;
                                 if let Err(err) = Self::on_sync(Ok(summary), &mut client, sync_listeners, listeners_paused).await {
                                     tracing::error!("MidenClient sync listener error: {err:#}");
                                 }
                             }
                             SyncPass::Failed => {
+                                sync_healthy = false;
                                 tracing::warn!(
-                                    "MidenClient forced sync pass failed; the next ticker/forced sync will retry"
+                                    "MidenClient forced sync pass failed; writes are held until a \
+                                     fresh sync succeeds (stale-snapshot guard, #173 final review)"
                                 );
                             }
                             SyncPass::Shutdown => break,
@@ -1217,13 +1245,16 @@ impl MidenClient {
                     sample_store_size(&store_dir, &mut store_size_warned);
                     match Self::sync_bounded(&mut client, &mut *done_receiver).await {
                         SyncPass::Committed(summary) => {
+                            sync_healthy = true;
                             if let Err(err) = Self::on_sync(Ok(summary), &mut client, sync_listeners, listeners_paused).await {
                                 tracing::error!("MidenClient sync listener error: {err:#}");
                             }
                         }
                         SyncPass::Failed => {
+                            sync_healthy = false;
                             tracing::warn!(
-                                "MidenClient ticker sync pass failed; the next ticker/forced sync will retry"
+                                "MidenClient ticker sync pass failed; writes are held until a \
+                                 fresh sync succeeds (stale-snapshot guard, #173 final review)"
                             );
                         }
                         SyncPass::Shutdown => break,
