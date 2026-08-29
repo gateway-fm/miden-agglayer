@@ -1,27 +1,21 @@
-# Build the production `miden-node` binary from the 0xMiden/miden-node repo,
-# NOT the testing-node-builder from the miden-client repo.
+# Build the 0xMiden/node v0.16.0-rc.3 binaries from source.
 #
-# Why: the agglayer integration moved between v0.14.0 and v0.14.10.
-#   - Old path (revitteth fork + AGGLAYER_GENESIS env): testing-node-builder
-#     in miden-client hardcoded the agglayer accounts into its GenesisState.
-#     Upstream dropped this — testing-node-builder in upstream v0.14.7 has
-#     no agglayer code.
-#   - New path (v0.14.10+): the production miden-node binary's
-#     `bundled bootstrap --genesis-config-file <toml>` loads pre-built
-#     `.mac` account files into the genesis block. miden-node-store's
-#     build.rs generates the sample agglayer .mac files (bridge,
-#     agglayer_faucet_eth, agglayer_faucet_usdc) deterministically.
+# 0.16 removed the all-in-one `miden-node bundled` mode: the node is a
+# microservice stack of SEPARATE binaries (miden-node sequencer,
+# miden-validator, miden-ntx-builder, miden-remote-prover), bootstrapped by
+# `genesis` + per-service `bootstrap` subcommands — exactly what the official
+# runner (scripts/run-node.sh @ v0.16.0-rc.3) and this repo's
+# docker-compose.e2e.yml drive. This image therefore builds ALL of them and
+# selects one via the BIN build-arg (upstream Dockerfile's shape: one binary
+# per image, BIN + PORT args), instead of carrying a bundled entrypoint.
 #
-# We use the sample `02-with-account-files.toml` config that ships in
-# miden-node-store. The proxy's own init.rs still creates a separate
-# runtime bridge — that's fine; the genesis bridge's MAST tree registers
-# the BURN/MINT note scripts in the miden-node store so the runtime
-# bridge's emissions resolve through `StandardNote::from_script_root`.
-#
-# Proto schemas align: both this miden-node v0.14.10 and our proxy
-# (Cargo.toml miden-client = v0.14.7) pin miden-node-proto-build v0.14.10.
-# Hash function identical (miden-crypto 0.23.0 on both). BURN script root
-# identical between miden-standards 0.14.4 and 0.14.5 (empirically verified).
+# There is intentionally NO in-image genesis/bootstrap step: the rc.3 genesis
+# flow needs the validator signing key + `--validator.key` flags and is owned
+# by the compose bootstrap services (see docker-compose.e2e.yml), which mount
+# our vendored genesis config (fixtures/genesis/02-with-account-files.toml).
+# The old `crates/store/src/genesis/config/samples/02-with-account-files.toml`
+# sample no longer exists upstream at rc.3 (only 01-simple.toml), so nothing
+# is copied from the repo for that purpose either.
 
 ARG MIDEN_NODE_GIT_URL
 ARG MIDEN_NODE_GIT_REF
@@ -54,19 +48,19 @@ RUN git rev-parse HEAD > /tmp/miden-node-commit.txt && \
     echo "Ref: ${MIDEN_NODE_GIT_REF}" >> /tmp/miden-node-commit.txt && \
     echo "Url: ${MIDEN_NODE_GIT_URL}" >> /tmp/miden-node-commit.txt
 
-# Build the miden-node binary. The build.rs in crates/store generates the
-# agglayer sample .mac files deterministically; they end up in
-# crates/store/src/genesis/config/samples/02-with-account-files/.
-RUN cargo build --release --bin miden-node
-
-# Capture the genesis config + .mac files for the runtime stage.
-RUN cp -r crates/store/src/genesis/config/samples /tmp/genesis-samples
+# Build every e2e binary in one cargo invocation (upstream builder-local
+# shape): miden-node (sequencer), miden-validator, miden-ntx-builder and
+# miden-remote-prover.
+RUN cargo build --release \
+    --bin miden-node \
+    --bin miden-validator \
+    --bin miden-ntx-builder \
+    --bin miden-remote-prover
 
 # Runtime
 FROM debian:trixie-slim
 
 COPY --from=builder /tmp/miden-node-commit.txt /app/miden-node-commit.txt
-COPY --from=builder /tmp/genesis-samples /app/genesis-samples
 
 RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     ca-certificates \
@@ -78,46 +72,17 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y \
 
 WORKDIR /app
 
-COPY --from=builder /build/target/release/miden-node /usr/local/bin/
+# Which binary this image serves — one image per service, mirroring the
+# upstream rc.3 Dockerfile (BIN/PORT build-args).
+ARG BIN=miden-node
+RUN test -n "${BIN}" || (echo "BIN build-arg is required" >&2 && exit 1)
+COPY --from=builder /build/target/release/miden-node /usr/local/bin/miden-node
+COPY --from=builder /build/target/release/miden-validator /usr/local/bin/miden-validator
+COPY --from=builder /build/target/release/miden-ntx-builder /usr/local/bin/miden-ntx-builder
+COPY --from=builder /build/target/release/miden-remote-prover /usr/local/bin/miden-remote-prover
 
-EXPOSE 57291
+ARG PORT=57291
+EXPOSE ${PORT}
 
-RUN mkdir -p /app/data /app/accounts
-
-COPY <<'EOF' /usr/local/bin/entrypoint.sh
-#!/bin/bash
-set -e
-echo "=== Miden Node (production binary, bundled mode) ==="
-cat /app/miden-node-commit.txt
-
-GENESIS_CONFIG=/app/genesis-samples/02-with-account-files.toml
-DATA_DIR=/app/data
-ACCOUNTS_DIR=/app/accounts
-
-# HARD-PIN the remote tx-prover. The in-process tx-prover OOM-kills miden-node
-# during bridge-consumption proof generation under any non-trivial load.
-# `tx-prover.devnet.miden.io` is the publicly-exposed devnet endpoint.
-# Override via MIDEN_NODE_NTX_PROVER_URL env var only if explicitly set;
-# otherwise default to the remote so no test path accidentally exercises
-# the OOM-prone in-process prover.
-TX_PROVER_URL="${MIDEN_NODE_NTX_PROVER_URL:-https://tx-prover.devnet.miden.io}"
-echo "tx-prover (remote): ${TX_PROVER_URL}"
-
-if [ ! -f "$DATA_DIR/.bootstrapped" ]; then
-  echo "Bootstrapping genesis with agglayer accounts from $GENESIS_CONFIG"
-  rm -rf "$DATA_DIR"
-  mkdir -p "$DATA_DIR" "$ACCOUNTS_DIR"
-  miden-node bundled bootstrap --data-directory "$DATA_DIR" --accounts-directory "$ACCOUNTS_DIR" --genesis-config-file "$GENESIS_CONFIG"
-  touch "$DATA_DIR/.bootstrapped"
-fi
-
-echo "Starting miden-node bundled..."
-exec miden-node bundled start \
-  --rpc.url "http://0.0.0.0:57291" \
-  --data-directory "$DATA_DIR" \
-  --tx-prover.url "${TX_PROVER_URL}"
-EOF
-RUN chmod +x /usr/local/bin/entrypoint.sh
-
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD []
+ENV MIDEN_BIN=${BIN}
+CMD ["/bin/sh", "-c", "exec /usr/local/bin/$MIDEN_BIN"]

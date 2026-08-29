@@ -193,25 +193,37 @@ install-tools: ## Install development tools
 # miden-node-store's build.rs auto-generates those files deterministically
 # from miden-agglayer's account builders, so the e2e image is fully
 # reproducible.
+# (Historical context for the v0.14-era `node-init`/`start-node` targets
+# below — the 0.16 node no longer ships a `bundled` CLI; see the
+# compatibility note at the MIDEN_NODE_GIT_REF pin.)
 #
-# Protocol 0.16: the node repo is `0xMiden/node` (package name stays
-# `miden-node`, so `--bin miden-node` and the `bundled bootstrap/start` CLI are
-# unchanged, and the genesis sample `02-with-account-files.toml` is at the same
-# path). We pin to the v0.16.0-rc.3 tag, whose transitive miden-protocol
-# 0.16.0-rc.6 / miden-assembly 0.29.x versions match our Cargo.toml pins, so
-# the BURN/MINT/CLAIM/B2AGG MAST roots agree across the node/client boundary.
+# Protocol 0.16: the node repo is `0xMiden/node`. The old all-in-one
+# `bundled bootstrap/start` CLI is GONE (rc.1+ split it into `genesis` +
+# per-service `bootstrap`/`start` subcommands across separate binaries), and
+# the `02-with-account-files.toml` genesis sample no longer exists upstream —
+# the compose file and Dockerfile.miden-node mirror the official rc.3 runner
+# (scripts/run-node.sh) instead. We pin to the v0.16.0-rc.3 tag.
+#
+# COMPATIBILITY ASSUMPTION — NOT YET VERIFIED: node rc.3's official Cargo.lock
+# resolves miden-protocol/standards/tx 0.16.0-rc.4 and the VM train
+# (miden-assembly/core/processor/crypto) 0.29.1, while our proxy pins protocol
+# rc.6 and the VM train 0.29.4. We assume the BURN/MINT/CLAIM/B2AGG note MAST
+# roots are unchanged between those releases, so roots agree across the
+# node/client boundary. Cross-binary evidence (same root computed by the node
+# binary and by our pinned crates in a live e2e run) is still PENDING; if a
+# bridge-out fails with "note script with root <X> not found", align this pin
+# or the crate pins first.
 # This Makefile is the single source of truth for the node ref: run-all.sh and
 # docs/RUNNING-E2E.md read it via `make miden-node-image-coords`.
 #
 # Bumping: edit MIDEN_NODE_GIT_REF here. The build.args plumb it through
 # docker-compose so the Dockerfile picks it up at build time.
 MIDEN_NODE_GIT_URL := https://github.com/0xMiden/node.git
-# v0.16.0-rc.3. Builds against the miden-protocol/standards/tx 0.16.0-rc.6 and
-# miden-assembly/core 0.29.x crates our service pins, so BURN/MINT/CLAIM/B2AGG
-# MAST roots agree across the node/client boundary with no Cargo.lock-alignment
-# hack. fixtures/patches/0001 is not applied (the node-store callback-vault-key
-# bug is fixed upstream), and the AggLayer network id is a runtime storage
-# slot, so no vendor patch.
+# v0.16.0-rc.3. See the compatibility note above: its lock pins protocol rc.4
+# + VM 0.29.1 vs our rc.6 + 0.29.4 — MAST-root agreement is an assumption
+# pending cross-binary evidence. fixtures/patches/0001 is not applied (the
+# node-store callback-vault-key bug is fixed upstream), and the AggLayer
+# network id is a runtime storage slot, so no vendor patch.
 MIDEN_NODE_GIT_REF := v0.16.0-rc.3
 
 E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml --env-file fixtures/.env

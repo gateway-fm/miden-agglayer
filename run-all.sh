@@ -121,7 +121,20 @@ provision() {
   grep -q "deploy_miden_services: false" "$cdkpkg/params.yaml" 2>/dev/null || \
     sed -i 's/^miden:/miden:\n  deploy_miden_services: false/' "$cdkpkg/params.yaml" 2>/dev/null || true
   [ -d "$WORK/kurtosis-cdk" ]   || git clone --depth 1 https://github.com/0xPolygon/kurtosis-cdk.git "$WORK/kurtosis-cdk"
-  [ -d "$WORK/miden-node-src" ] || git clone --depth 1 --branch "$MIDEN_NODE_GIT_REF" "$MIDEN_NODE_GIT_URL" "$WORK/miden-node-src"
+  # Clone-or-reuse, then FORCE the exact tag. A pre-existing checkout may hold
+  # ANY version (this rig has had v0.15.0 there) — silently building "rc.3"
+  # images from it would mislabel the whole stack. Fetch + checkout --force,
+  # then verify the checkout IS the tag (image provenance: the build_node_img
+  # cache below only skips the compile; the source ref is always verified).
+  if [ -d "$WORK/miden-node-src" ]; then
+    git -C "$WORK/miden-node-src" fetch --tags --force origin "$MIDEN_NODE_GIT_REF" || \
+      die "cannot fetch $MIDEN_NODE_GIT_REF into $WORK/miden-node-src"
+  else
+    git clone --depth 1 --branch "$MIDEN_NODE_GIT_REF" "$MIDEN_NODE_GIT_URL" "$WORK/miden-node-src"
+  fi
+  git -C "$WORK/miden-node-src" checkout -q --force "$MIDEN_NODE_GIT_REF"
+  [ "$(git -C "$WORK/miden-node-src" describe --tags --exact-match 2>/dev/null)" = "$MIDEN_NODE_GIT_REF" ] || \
+    die "$WORK/miden-node-src is NOT at $MIDEN_NODE_GIT_REF (found $(git -C "$WORK/miden-node-src" describe --tags 2>/dev/null || git -C "$WORK/miden-node-src" rev-parse --short HEAD 2>/dev/null || echo '?'))"
   # Raise the ntx-builder remote-prover client timeout (10s default < ~12.5s
   # B2AGG proof on a normal VM) so L2->L1 consumption isn't cancelled.
   # 0.15 shape: RemoteTransactionProver::new(url).with_timeout(..) appended.
@@ -139,7 +152,7 @@ provision() {
 
   section "0c · docker images (built only if missing)"
   build_node_img() { # bin port tag
-    docker image inspect "$3" >/dev/null 2>&1 && { ok "$3 (cached)"; return; }
+    docker image inspect "$3" >/dev/null 2>&1 && { ok "$3 (cached; built from the verified checkout of $MIDEN_NODE_GIT_REF above)"; return; }
     say "building $3 ..."; ( cd "$WORK/miden-node-src" && DOCKER_BUILDKIT=1 docker build --build-arg CREATED=2026-01-01T00:00:00Z --build-arg VERSION="$MIDEN_NODE_GIT_REF" --build-arg COMMIT="$(git rev-parse HEAD)" --build-arg BIN="$1" --build-arg PORT="$2" -t "$3" . ) | tail -2
   }
   build_node_img miden-validator     50101 miden-validator
