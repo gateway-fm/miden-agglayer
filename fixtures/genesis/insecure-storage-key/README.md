@@ -17,10 +17,18 @@ genesis, the ceremony manifest, and signed transcripts.
 
 ## Regenerating
 
-The fixture is derived deterministically by `bin/validator/src/storage_key.rs`
-(`tests::values_for`). Regenerate it with:
+The fixture is derived deterministically by the node's
+`bin/validator/src/storage_key.rs` (`tests::values_for`). Run this INSIDE the
+pinned node checkout (`$WORK/miden-node-src`), then copy participant 1's share
+here under the root filename:
 
 ```sh
 cargo test -p miden-validator --lib \
   storage_key::tests::write_insecure_storage_key_fixture -- --ignored
+# the generator also rewrites setup-context.wire + public-key-set.wire —
+# copy ALL three so the fixture never mixes key material
+cp scripts/testdata/insecure-storage-key/{setup-context.wire,public-key-set.wire} \
+  /path/to/miden-agglayer/fixtures/genesis/insecure-storage-key/
+cp scripts/testdata/insecure-storage-key/validator-1/secret-share.wire \
+  /path/to/miden-agglayer/fixtures/genesis/insecure-storage-key/secret-share.wire
 ```

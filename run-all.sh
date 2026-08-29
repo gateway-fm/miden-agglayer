@@ -127,52 +127,36 @@ provision() {
   grep -q "deploy_miden_services: false" "$cdkpkg/params.yaml" 2>/dev/null || \
     sed -i 's/^miden:/miden:\n  deploy_miden_services: false/' "$cdkpkg/params.yaml" 2>/dev/null || true
   [ -d "$WORK/kurtosis-cdk" ]   || git clone --depth 1 https://github.com/0xPolygon/kurtosis-cdk.git "$WORK/kurtosis-cdk"
-  # Clone-or-reuse, then FORCE the exact tag. A pre-existing checkout may hold
-  # ANY version (this rig has had v0.15.0 there) — silently building "rc.3"
-  # images from it would mislabel the whole stack. Fetch + checkout --force,
-  # then verify the checkout IS the tag (image provenance: the build_node_img
-  # cache below only skips the compile; the source ref is always verified).
+  # Clone-or-reuse a FETCH CACHE only — the provisioning build context is a
+  # DISPOSABLE WORKTREE created at the pin-verified commit, so the cache's
+  # working tree is never modified, never checked out, and no foreign edit
+  # can ride into the images. A pre-existing cache may hold ANY version (this
+  # rig has had v0.15.0 there), so every run re-fetches the tag from the
+  # CONFIGURED upstream (a fork's origin must not shadow it) and the tag is
+  # verified against the pinned upstream commit before anything is built.
   if [ -d "$WORK/miden-node-src" ]; then
-    # Fetch from the CONFIGURED upstream, never from whatever 'origin' a reused
-    # clone names — a fork must not be able to shadow the tag.
-    git -C "$WORK/miden-node-src" fetch --tags --force "$MIDEN_NODE_GIT_URL" "refs/tags/$MIDEN_NODE_GIT_REF:refs/tags/$MIDEN_NODE_GIT_REF" || \
+    git -C "$WORK/miden-node-src" fetch --force "$MIDEN_NODE_GIT_URL" "refs/tags/$MIDEN_NODE_GIT_REF:refs/tags/$MIDEN_NODE_GIT_REF" || \
       die "cannot fetch $MIDEN_NODE_GIT_REF from $MIDEN_NODE_GIT_URL into $WORK/miden-node-src"
   else
-    git clone --depth 1 --branch "$MIDEN_NODE_GIT_REF" "$MIDEN_NODE_GIT_URL" "$WORK/miden-node-src"
+    git clone "$MIDEN_NODE_GIT_URL" "$WORK/miden-node-src" || \
+      die "cannot clone $MIDEN_NODE_GIT_URL"
   fi
-  git -C "$WORK/miden-node-src" checkout -q --force "$MIDEN_NODE_GIT_REF"
-  [ "$(git -C "$WORK/miden-node-src" describe --tags --exact-match 2>/dev/null)" = "$MIDEN_NODE_GIT_REF" ] || \
-    die "$WORK/miden-node-src is NOT at $MIDEN_NODE_GIT_REF (found $(git -C "$WORK/miden-node-src" describe --tags 2>/dev/null || git -C "$WORK/miden-node-src" rev-parse --short HEAD 2>/dev/null || echo '?'))"
-  # The tag must be the OFFICIAL one: HEAD must equal the pinned upstream
-  # commit (MIDEN_NODE_GIT_COMMIT in the Makefile), so a fork-supplied tag
-  # cannot pass the describe check above.
-  [ "$(git -C "$WORK/miden-node-src" rev-parse HEAD)" = "$MIDEN_NODE_GIT_COMMIT" ] || \
-    die "$MIDEN_NODE_GIT_REF does not point at the pinned upstream commit $MIDEN_NODE_GIT_COMMIT (found $(git -C "$WORK/miden-node-src" rev-parse HEAD))"
-  # The Docker build context must be a CLEAN checkout: untracked leftovers
-  # would silently ship in the image. The ONLY permitted modification is the
-  # intentional prover-timeout patch applied immediately below.
-  st="$(git -C "$WORK/miden-node-src" -c status.showUntrackedFiles=all status --porcelain --ignored=matching)" \
-    || die "git status failed in $WORK/miden-node-src — refusing to build an unverifiable context"
-  [ -z "$st" ] || \
-    die "$WORK/miden-node-src is dirty/untracked — clean checkout required before applying the prover-timeout patch"
-  # Raise the ntx-builder remote-prover client timeout (10s default < ~12.5s
-  # B2AGG proof on a normal VM) so L2->L1 consumption isn't cancelled.
-  # 0.15 shape: RemoteTransactionProver::new(url).with_timeout(..) appended.
-  # 0.16 shape: the ctor takes (url, timeout); lib.rs uses the
-  # DEFAULT_PROVER_TIMEOUT const and actor/mod.rs an inline from_secs(10).
+  [ "$(git -C "$WORK/miden-node-src" rev-parse "refs/tags/$MIDEN_NODE_GIT_REF^{commit}")" = "$MIDEN_NODE_GIT_COMMIT" ] || \
+    die "$MIDEN_NODE_GIT_REF does not point at the pinned upstream commit $MIDEN_NODE_GIT_COMMIT — refusing to build (fork-supplied tag?)"
+  git -C "$WORK/miden-node-src" worktree remove --force "$WORK/miden-node-build" 2>/dev/null || true
+  git -C "$WORK/miden-node-src" worktree add --detach "$WORK/miden-node-build" "$MIDEN_NODE_GIT_COMMIT" >/dev/null 2>&1 || \
+    die "cannot create build worktree at $WORK/miden-node-build"
   for f in bin/ntx-builder/src/lib.rs bin/ntx-builder/src/actor/mod.rs; do
-    p="$WORK/miden-node-src/$f"
-    grep -q "with_timeout(Duration::from_secs(180))" "$p" 2>/dev/null || \
-      sed -i 's#RemoteTransactionProver::new(\(self\.\)\?\(tx_prover_url\|url\)\.as_str())#&\n                    .with_timeout(Duration::from_secs(180))#' "$p" 2>/dev/null || true
+    p="$WORK/miden-node-build/$f"
+    case "$f" in
+      */actor/mod.rs)
+        sed -i 's/RemoteTransactionProver::new(url.clone(), Duration::from_secs(10))/RemoteTransactionProver::new(url.clone(), Duration::from_secs(180))/' "$p" 2>/dev/null || true ;;
+      *)
+        sed -i 's/const DEFAULT_PROVER_TIMEOUT: Duration = Duration::from_secs(10);/const DEFAULT_PROVER_TIMEOUT: Duration = Duration::from_secs(180);/' "$p" 2>/dev/null || true ;;
+    esac
+    grep -q "from_secs(180)" "$p" || \
+      die "prover-timeout patch did not land in $f — node source shape changed? (#180 tracks unpatching)"
   done
-  sed -i 's/const DEFAULT_PROVER_TIMEOUT: Duration = Duration::from_secs(10);/const DEFAULT_PROVER_TIMEOUT: Duration = Duration::from_secs(180);/' "$WORK/miden-node-src/bin/ntx-builder/src/lib.rs" 2>/dev/null || true
-  sed -i 's/RemoteTransactionProver::new(url.clone(), Duration::from_secs(10))/RemoteTransactionProver::new(url.clone(), Duration::from_secs(180))/' "$WORK/miden-node-src/bin/ntx-builder/src/actor/mod.rs" 2>/dev/null || true
-  # The seds are best-effort by shape — verify they LANDED, or fail now instead
-  # of building unpatched images (and #180 tracks removing the patch entirely).
-  grep -q "from_secs(180)" "$WORK/miden-node-src/bin/ntx-builder/src/lib.rs" || \
-    die "prover-timeout patch did not land in ntx-builder/src/lib.rs — node source shape changed?"
-  grep -q "from_secs(180)" "$WORK/miden-node-src/bin/ntx-builder/src/actor/mod.rs" || \
-    die "prover-timeout patch did not land in ntx-builder/src/actor/mod.rs — node source shape changed?"
   [ -d "$WORK/zkevm-bridge-service" ] || git clone --depth 1 --branch fix/pending-bridges-rollup-disambiguation https://github.com/revitteth/zkevm-bridge-service.git "$WORK/zkevm-bridge-service"
   ok "repos present under $WORK"
 
@@ -195,7 +179,7 @@ provision() {
       warn "$3 cached but stale (labels: ${lv:-none}/${lr:-none}/patch:${lp:-none}) — rebuilding from $MIDEN_NODE_GIT_REF @ ${want_rev:0:12}"
     fi
     say "building $3 ..."
-    ( cd "$WORK/miden-node-src" && DOCKER_BUILDKIT=1 docker build \
+    ( cd "$WORK/miden-node-build" && DOCKER_BUILDKIT=1 docker build \
       --label org.opencontainers.image.version="$MIDEN_NODE_GIT_REF" \
       --label org.opencontainers.image.revision="$want_rev" \
       --label com.miden-agglayer.ntx-prover-timeout=180s \
