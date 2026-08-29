@@ -18,9 +18,11 @@ genesis, the ceremony manifest, and signed transcripts.
 ## Regenerating
 
 The fixture is derived deterministically by the node's
-`bin/validator/src/storage_key.rs` (`tests::values_for`). Run this INSIDE the
-pinned node checkout (`$WORK/miden-node-src`), then copy participant 1's share
-here under the root filename:
+`bin/validator/src/storage_key.rs` (`tests::values_for`). Run this inside a
+VERIFIED detached worktree at the pinned node commit (see `MIDEN_NODE_GIT_*`
+in the Makefile — e.g. `git worktree add --detach <dir>
+<MIDEN_NODE_GIT_COMMIT>`), then copy participant 1's share here under the
+root filename:
 
 ```sh
 cargo test -p miden-validator --lib \

@@ -165,7 +165,10 @@ provision() {
     # A cached image is only trusted if its LABELS prove it was built from the
     # verified checkout (ref + exact commit). Unversioned leftovers from any
     # other node build are rebuilt, never silently reused.
-    local want_rev; want_rev="$(git -C "$WORK/miden-node-src" rev-parse HEAD)"
+    # Provenance comes from the PIN, never the fetch cache's arbitrary HEAD.
+    local want_rev="$MIDEN_NODE_GIT_COMMIT"
+    [ "$(git -C "$WORK/miden-node-build" rev-parse HEAD)" = "$want_rev" ] || \
+      die "$WORK/miden-node-build is NOT at the pinned commit $want_rev — refusing to build"
     if docker image inspect "$3" >/dev/null 2>&1; then
       local lv lr
       lv="$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$3" 2>/dev/null)"
