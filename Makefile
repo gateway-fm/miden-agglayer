@@ -201,8 +201,10 @@ install-tools: ## Install development tools
 # `bundled bootstrap/start` CLI is GONE (rc.1+ split it into `genesis` +
 # per-service `bootstrap`/`start` subcommands across separate binaries), and
 # the `02-with-account-files.toml` genesis sample no longer exists upstream —
-# the compose file and Dockerfile.miden-node mirror the official rc.3 runner
-# (scripts/run-node.sh) instead. We pin to the v0.16.0-rc.3 tag.
+# the compose file mirrors the official rc.3 runner (scripts/run-node.sh)
+# instead. We pin to the v0.16.0-rc.3 tag. E2E node images are built by
+# run-all.sh FROM THE UPSTREAM CHECKOUT'S OWN Dockerfile — there is no
+# repo-local node Dockerfile.
 #
 # COMPATIBILITY ASSUMPTION — NOT YET VERIFIED: node rc.3's official Cargo.lock
 # resolves miden-protocol/standards/tx 0.16.0-rc.4 and the VM train
@@ -216,8 +218,7 @@ install-tools: ## Install development tools
 # This Makefile is the single source of truth for the node ref: run-all.sh and
 # docs/RUNNING-E2E.md read it via `make miden-node-image-coords`.
 #
-# Bumping: edit MIDEN_NODE_GIT_REF here. The build.args plumb it through
-# docker-compose so the Dockerfile picks it up at build time.
+# Bumping: edit MIDEN_NODE_GIT_REF (+ MIDEN_NODE_GIT_COMMIT) here.
 MIDEN_NODE_GIT_URL := https://github.com/0xMiden/node.git
 # v0.16.0-rc.3. See the compatibility note above: its lock pins protocol rc.4
 # + VM 0.29.1 vs our rc.6 + 0.29.4 — MAST-root agreement is an assumption
@@ -225,6 +226,10 @@ MIDEN_NODE_GIT_URL := https://github.com/0xMiden/node.git
 # node-store callback-vault-key bug is fixed upstream), and the AggLayer
 # network id is a runtime storage slot, so no vendor patch.
 MIDEN_NODE_GIT_REF := v0.16.0-rc.3
+# The exact commit the tag points at (verified by `git ls-remote` at pin
+# time). run-all.sh checks the checkout's HEAD against this so a fork cannot
+# shadow the tag. Bump BOTH together.
+MIDEN_NODE_GIT_COMMIT := 901a7a8817d46b24a1fc9b39beed60c6d14d34e5
 
 E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
 

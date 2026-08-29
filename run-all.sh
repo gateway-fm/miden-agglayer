@@ -103,9 +103,13 @@ provision() {
   # pins the same value and fails loudly if the two drift.
   MIDEN_NODE_GIT_URL="https://github.com/0xMiden/node.git"
   MIDEN_NODE_GIT_REF="v0.16.0-rc.3"
-  export MIDEN_NODE_GIT_URL MIDEN_NODE_GIT_REF
-  grep -q "MIDEN_NODE_GIT_REF := $MIDEN_NODE_GIT_REF" "$(git rev-parse --show-toplevel)/Makefile" || \
+  MIDEN_NODE_GIT_COMMIT="901a7a8817d46b24a1fc9b39beed60c6d14d34e5"
+  export MIDEN_NODE_GIT_URL MIDEN_NODE_GIT_REF MIDEN_NODE_GIT_COMMIT
+  makefile_pin="$(git rev-parse --show-toplevel)/Makefile"
+  grep -q "MIDEN_NODE_GIT_REF := $MIDEN_NODE_GIT_REF" "$makefile_pin" || \
     die "run-all.sh node ref ($MIDEN_NODE_GIT_REF) drifted from the Makefile's MIDEN_NODE_GIT_REF"
+  grep -q "MIDEN_NODE_GIT_COMMIT := $MIDEN_NODE_GIT_COMMIT" "$makefile_pin" || \
+    die "run-all.sh node commit drifted from the Makefile's MIDEN_NODE_GIT_COMMIT"
   # Must be a 0.16 node: a 0.15 node produces an incompatible account/genesis
   # format (PR #159 review).
   ok "node pin: $MIDEN_NODE_GIT_REF ($MIDEN_NODE_GIT_URL)"
@@ -127,14 +131,26 @@ provision() {
   # then verify the checkout IS the tag (image provenance: the build_node_img
   # cache below only skips the compile; the source ref is always verified).
   if [ -d "$WORK/miden-node-src" ]; then
-    git -C "$WORK/miden-node-src" fetch --tags --force origin "$MIDEN_NODE_GIT_REF" || \
-      die "cannot fetch $MIDEN_NODE_GIT_REF into $WORK/miden-node-src"
+    # Fetch from the CONFIGURED upstream, never from whatever 'origin' a reused
+    # clone names — a fork must not be able to shadow the tag.
+    git -C "$WORK/miden-node-src" fetch --tags --force "$MIDEN_NODE_GIT_URL" "refs/tags/$MIDEN_NODE_GIT_REF:refs/tags/$MIDEN_NODE_GIT_REF" || \
+      die "cannot fetch $MIDEN_NODE_GIT_REF from $MIDEN_NODE_GIT_URL into $WORK/miden-node-src"
   else
     git clone --depth 1 --branch "$MIDEN_NODE_GIT_REF" "$MIDEN_NODE_GIT_URL" "$WORK/miden-node-src"
   fi
   git -C "$WORK/miden-node-src" checkout -q --force "$MIDEN_NODE_GIT_REF"
   [ "$(git -C "$WORK/miden-node-src" describe --tags --exact-match 2>/dev/null)" = "$MIDEN_NODE_GIT_REF" ] || \
     die "$WORK/miden-node-src is NOT at $MIDEN_NODE_GIT_REF (found $(git -C "$WORK/miden-node-src" describe --tags 2>/dev/null || git -C "$WORK/miden-node-src" rev-parse --short HEAD 2>/dev/null || echo '?'))"
+  # The tag must be the OFFICIAL one: HEAD must equal the pinned upstream
+  # commit (MIDEN_NODE_GIT_COMMIT in the Makefile), so a fork-supplied tag
+  # cannot pass the describe check above.
+  [ "$(git -C "$WORK/miden-node-src" rev-parse HEAD)" = "$MIDEN_NODE_GIT_COMMIT" ] || \
+    die "$MIDEN_NODE_GIT_REF does not point at the pinned upstream commit $MIDEN_NODE_GIT_COMMIT (found $(git -C "$WORK/miden-node-src" rev-parse HEAD))"
+  # The Docker build context must be a CLEAN checkout: untracked leftovers
+  # would silently ship in the image. The ONLY permitted modification is the
+  # intentional prover-timeout patch applied immediately below.
+  [ -z "$(git -C "$WORK/miden-node-src" status --porcelain)" ] || \
+    die "$WORK/miden-node-src is dirty/untracked — clean checkout required before applying the prover-timeout patch"
   # Raise the ntx-builder remote-prover client timeout (10s default < ~12.5s
   # B2AGG proof on a normal VM) so L2->L1 consumption isn't cancelled.
   # 0.15 shape: RemoteTransactionProver::new(url).with_timeout(..) appended.
@@ -147,13 +163,35 @@ provision() {
   done
   sed -i 's/const DEFAULT_PROVER_TIMEOUT: Duration = Duration::from_secs(10);/const DEFAULT_PROVER_TIMEOUT: Duration = Duration::from_secs(180);/' "$WORK/miden-node-src/bin/ntx-builder/src/lib.rs" 2>/dev/null || true
   sed -i 's/RemoteTransactionProver::new(url.clone(), Duration::from_secs(10))/RemoteTransactionProver::new(url.clone(), Duration::from_secs(180))/' "$WORK/miden-node-src/bin/ntx-builder/src/actor/mod.rs" 2>/dev/null || true
+  # The seds are best-effort by shape — verify they LANDED, or fail now instead
+  # of building unpatched images (and #180 tracks removing the patch entirely).
+  grep -q "from_secs(180)" "$WORK/miden-node-src/bin/ntx-builder/src/lib.rs" || \
+    die "prover-timeout patch did not land in ntx-builder/src/lib.rs — node source shape changed?"
+  grep -q "from_secs(180)" "$WORK/miden-node-src/bin/ntx-builder/src/actor/mod.rs" || \
+    die "prover-timeout patch did not land in ntx-builder/src/actor/mod.rs — node source shape changed?"
   [ -d "$WORK/zkevm-bridge-service" ] || git clone --depth 1 --branch fix/pending-bridges-rollup-disambiguation https://github.com/revitteth/zkevm-bridge-service.git "$WORK/zkevm-bridge-service"
   ok "repos present under $WORK"
 
   section "0c · docker images (built only if missing)"
   build_node_img() { # bin port tag
-    docker image inspect "$3" >/dev/null 2>&1 && { ok "$3 (cached; built from the verified checkout of $MIDEN_NODE_GIT_REF above)"; return; }
-    say "building $3 ..."; ( cd "$WORK/miden-node-src" && DOCKER_BUILDKIT=1 docker build --build-arg CREATED=2026-01-01T00:00:00Z --build-arg VERSION="$MIDEN_NODE_GIT_REF" --build-arg COMMIT="$(git rev-parse HEAD)" --build-arg BIN="$1" --build-arg PORT="$2" -t "$3" . ) | tail -2
+    # A cached image is only trusted if its LABELS prove it was built from the
+    # verified checkout (ref + exact commit). Unversioned leftovers from any
+    # other node build are rebuilt, never silently reused.
+    local want_rev; want_rev="$(git -C "$WORK/miden-node-src" rev-parse HEAD)"
+    if docker image inspect "$3" >/dev/null 2>&1; then
+      local lv lr
+      lv="$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$3" 2>/dev/null)"
+      lr="$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$3" 2>/dev/null)"
+      if [ "$lv" = "$MIDEN_NODE_GIT_REF" ] && [ "$lr" = "$want_rev" ]; then
+        ok "$3 (cached; labels match $MIDEN_NODE_GIT_REF @ ${want_rev:0:12})"
+        return
+      fi
+      warn "$3 cached but stale (labels: ${lv:-none}/${lr:-none}) — rebuilding from $MIDEN_NODE_GIT_REF @ ${want_rev:0:12}"
+    fi
+    say "building $3 ..."; ( cd "$WORK/miden-node-src" && DOCKER_BUILDKIT=1 docker build \
+      --label org.opencontainers.image.version="$MIDEN_NODE_GIT_REF" \
+      --label org.opencontainers.image.revision="$want_rev" \
+      --build-arg CREATED=2026-01-01T00:00:00Z --build-arg VERSION="$MIDEN_NODE_GIT_REF" --build-arg COMMIT="$want_rev" --build-arg BIN="$1" --build-arg PORT="$2" -t "$3" . ) | tail -2
   }
   build_node_img miden-validator     50101 miden-validator
   build_node_img miden-node          57291 miden-node
