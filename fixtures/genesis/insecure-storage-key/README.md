@@ -1,23 +1,22 @@
 # Insecure storage key
 
-These files hold a deterministic **two-of-three** storage key used by the docker-compose network (single-validator topology) and the benchmark smoke
-test to exercise threshold storage.
+These files hold a deterministic **2-of-3** threshold storage key for the miden
+node's encrypted-store feature. The e2e Compose stack runs a SINGLE validator;
+the participant-1 share (`secret-share.wire`, identical to
+`validator-1/secret-share.wire`) is what that validator consumes. The
+`validator-{1,2,3}/` directories and the 2-of-3 combiner requirements date from
+the older three-validator topology and are kept only so multi-validator
+tooling (e.g. the benchmark smoke test) keeps working unchanged.
 
 Layout:
 
-- `setup-context.wire`, `public-key-set.wire` — the shared public setup, the same for every validator.
-- `validator-1/secret-share.wire`, `validator-2/secret-share.wire`, `validator-3/secret-share.wire` — each participant's
-  **distinct** secret share. The Compose bootstrap service stages only the matching share in each validator's bundle.
-- `secret-share.wire` — participant 1's share (identical to `validator-1/secret-share.wire`), kept at the top level so
-  single-validator tooling such as the CI benchmark smoke test keeps working unchanged.
-
-Every validator must hold a **different** share. Mounting the same share into all three validators makes any 2-of-3
-recovery collapse to a single participant, which the combiner rejects — so threshold recovery would silently be
-impossible even though each validator stores encrypted records.
+- `setup-context.wire`, `public-key-set.wire` — the shared public setup.
+- `secret-share.wire` — participant 1's secret share; THE share the
+  single-validator Compose stack mounts.
+- `validator-{1,2,3}/secret-share.wire` — the three participant shares
+  (participant 1's is duplicated at the top level).
 
 This key is public and must not be used outside tests.
-
-Compose checks each staged bundle with `miden-validator dkg validate-fixture` before it marks the local network as
 bootstrapped. This fixture-only check binds the secret share to its expected participant index. Production bundles must
 use `miden-validator dkg validate`, which also checks genesis, the ceremony manifest, and signed transcript.
 
