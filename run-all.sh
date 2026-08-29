@@ -106,9 +106,9 @@ provision() {
   MIDEN_NODE_GIT_COMMIT="901a7a8817d46b24a1fc9b39beed60c6d14d34e5"
   export MIDEN_NODE_GIT_URL MIDEN_NODE_GIT_REF MIDEN_NODE_GIT_COMMIT
   makefile_pin="$(git rev-parse --show-toplevel)/Makefile"
-  grep -q "MIDEN_NODE_GIT_REF := $MIDEN_NODE_GIT_REF" "$makefile_pin" || \
+  grep -Fx "MIDEN_NODE_GIT_REF := $MIDEN_NODE_GIT_REF" "$makefile_pin" || \
     die "run-all.sh node ref ($MIDEN_NODE_GIT_REF) drifted from the Makefile's MIDEN_NODE_GIT_REF"
-  grep -q "MIDEN_NODE_GIT_COMMIT := $MIDEN_NODE_GIT_COMMIT" "$makefile_pin" || \
+  grep -Fx "MIDEN_NODE_GIT_COMMIT := $MIDEN_NODE_GIT_COMMIT" "$makefile_pin" || \
     die "run-all.sh node commit drifted from the Makefile's MIDEN_NODE_GIT_COMMIT"
   # Must be a 0.16 node: a 0.15 node produces an incompatible account/genesis
   # format (PR #159 review).
@@ -149,7 +149,9 @@ provision() {
   # The Docker build context must be a CLEAN checkout: untracked leftovers
   # would silently ship in the image. The ONLY permitted modification is the
   # intentional prover-timeout patch applied immediately below.
-  [ -z "$(git -C "$WORK/miden-node-src" status --porcelain)" ] || \
+  st="$(git -C "$WORK/miden-node-src" -c status.showUntrackedFiles=all status --porcelain)" \
+    || die "git status failed in $WORK/miden-node-src — refusing to build an unverifiable context"
+  [ -z "$st" ] || \
     die "$WORK/miden-node-src is dirty/untracked — clean checkout required before applying the prover-timeout patch"
   # Raise the ntx-builder remote-prover client timeout (10s default < ~12.5s
   # B2AGG proof on a normal VM) so L2->L1 consumption isn't cancelled.
@@ -188,10 +190,17 @@ provision() {
       fi
       warn "$3 cached but stale (labels: ${lv:-none}/${lr:-none}) — rebuilding from $MIDEN_NODE_GIT_REF @ ${want_rev:0:12}"
     fi
-    say "building $3 ..."; ( cd "$WORK/miden-node-src" && DOCKER_BUILDKIT=1 docker build \
+    say "building $3 ..."
+    ( cd "$WORK/miden-node-src" && DOCKER_BUILDKIT=1 docker build \
       --label org.opencontainers.image.version="$MIDEN_NODE_GIT_REF" \
       --label org.opencontainers.image.revision="$want_rev" \
-      --build-arg CREATED=2026-01-01T00:00:00Z --build-arg VERSION="$MIDEN_NODE_GIT_REF" --build-arg COMMIT="$want_rev" --build-arg BIN="$1" --build-arg PORT="$2" -t "$3" . ) | tail -2
+      --build-arg CREATED=2026-01-01T00:00:00Z --build-arg VERSION="$MIDEN_NODE_GIT_REF" --build-arg COMMIT="$want_rev" --build-arg BIN="$1" --build-arg PORT="$2" -t "$3" . ) | tail -2 \
+      || die "building $3 FAILED — refusing to provision (a stale image must never be left in place)"
+    # Re-verify the freshly built image actually carries the pin labels.
+    lv="$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$3" 2>/dev/null)"
+    lr="$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$3" 2>/dev/null)"
+    [ "$lv" = "$MIDEN_NODE_GIT_REF" ] && [ "$lr" = "$want_rev" ] || \
+      die "$3 was rebuilt but its labels do not match $MIDEN_NODE_GIT_REF @ ${want_rev:0:12} — image provenance unverifiable"
   }
   build_node_img miden-validator     50101 miden-validator
   build_node_img miden-node          57291 miden-node

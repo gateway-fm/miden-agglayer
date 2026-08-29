@@ -14,7 +14,7 @@ not a tooling roadmap.
 4. `make test-unit`
 5. `make test-scripts`
 
-The crate declares Rust **1.93** as its minimum supported version in
+The crate declares Rust **1.96.1** as its minimum supported version in
 `Cargo.toml`. The repository does not pin a rustup toolchain, so developers and
 CI must select a compatible toolchain themselves.
 

@@ -1,6 +1,6 @@
 # Insecure storage key
 
-These files hold a deterministic **two-of-three** storage key used by the docker-compose network and the benchmark smoke
+These files hold a deterministic **two-of-three** storage key used by the docker-compose network (single-validator topology) and the benchmark smoke
 test to exercise threshold storage.
 
 Layout:

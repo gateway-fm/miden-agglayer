@@ -215,10 +215,14 @@ install-tools: ## Install development tools
 # binary and by our pinned crates in a live e2e run) is still PENDING; if a
 # bridge-out fails with "note script with root <X> not found", align this pin
 # or the crate pins first.
-# This Makefile is the single source of truth for the node ref: run-all.sh and
-# docs/RUNNING-E2E.md read it via `make miden-node-image-coords`.
+# Node-pin coordination: the Makefile and run-all.sh BOTH carry the pin
+# (run-all.sh reads plain constants — no make-in-shell plumbing) and each
+# drift-checks the other at setup time. Bump BOTH together: edit
+# MIDEN_NODE_GIT_REF + MIDEN_NODE_GIT_COMMIT here and the three constants at
+# the top of run-all.sh's provisioning section. `make miden-node-image-coords`
+# prints url/ref/commit for docs and compose flows.
 #
-# Bumping: edit MIDEN_NODE_GIT_REF (+ MIDEN_NODE_GIT_COMMIT) here.
+# Bumping checklist: Makefile (REF + COMMIT) and run-all.sh (URL/REF/COMMIT).
 MIDEN_NODE_GIT_URL := https://github.com/0xMiden/node.git
 # v0.16.0-rc.3. See the compatibility note above: its lock pins protocol rc.4
 # + VM 0.29.1 vs our rc.6 + 0.29.4 — MAST-root agreement is an assumption
@@ -243,9 +247,10 @@ WEB3SIGNER_COMPOSE_EXTRA := $(if $(WITH_WEB3SIGNER),-f docker-compose.web3signer
 L2L2_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml $(WEB3SIGNER_COMPOSE_EXTRA) --env-file fixtures/.env
 
 .PHONY: miden-node-image-coords
-miden-node-image-coords: ## Print the git URL + ref the miden-node image is built from
+miden-node-image-coords: ## Print the git URL + ref + commit the miden-node image is built from
 	@echo "url: $(MIDEN_NODE_GIT_URL)"
 	@echo "ref: $(MIDEN_NODE_GIT_REF)"
+	@echo "commit: $(MIDEN_NODE_GIT_COMMIT)"
 
 .PHONY: e2e-setup
 e2e-setup: ## One-time: extract Anvil snapshot + configs from Kurtosis
