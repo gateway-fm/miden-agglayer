@@ -98,12 +98,14 @@ provision() {
   fi
   ok "tools: $(cargo --version | cut -d' ' -f1-2), cast $(cast --version | head -1 | awk '{print $2}'), kurtosis $(kurtosis version 2>/dev/null | awk '/CLI/{print $3}'), node $(node --version)"
 
-  section "0a' · node pin (read from the Makefile — single source of truth)"
-  MIDEN_NODE_GIT_URL="$(make -s miden-node-image-coords | sed -n 's/^url: //p')"
-  MIDEN_NODE_GIT_REF="$(make -s miden-node-image-coords | sed -n 's/^ref: //p')"
+  section "0a' · node pin"
+  # Single source of truth is MIDEN_NODE_GIT_REF in the Makefile; this script
+  # pins the same value and fails loudly if the two drift.
+  MIDEN_NODE_GIT_URL="https://github.com/0xMiden/node.git"
+  MIDEN_NODE_GIT_REF="v0.16.0-rc.3"
   export MIDEN_NODE_GIT_URL MIDEN_NODE_GIT_REF
-  [ -n "$MIDEN_NODE_GIT_URL" ] && [ -n "$MIDEN_NODE_GIT_REF" ] || \
-    die "could not read node coords via 'make miden-node-image-coords'"
+  grep -q "MIDEN_NODE_GIT_REF := $MIDEN_NODE_GIT_REF" "$(git rev-parse --show-toplevel)/Makefile" || \
+    die "run-all.sh node ref ($MIDEN_NODE_GIT_REF) drifted from the Makefile's MIDEN_NODE_GIT_REF"
   # Must be a 0.16 node: a 0.15 node produces an incompatible account/genesis
   # format (PR #159 review).
   ok "node pin: $MIDEN_NODE_GIT_REF ($MIDEN_NODE_GIT_URL)"
