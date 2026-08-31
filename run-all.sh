@@ -37,11 +37,9 @@ OUT="$PROJECT_DIR/out"; mkdir -p "$OUT"
 REPORT="$OUT/RUN-ALL-REPORT.txt"
 : > "$REPORT"
 
-# Pin coords (kept in sync with the Makefile / setup-fixtures expectations).
-export MIDEN_NODE_GIT_URL="https://github.com/0xMiden/node.git"
-# Must track the Makefile pin: this branch is protocol 0.16 and a 0.15 node
-# produces an incompatible account/genesis format (PR #159 review).
-export MIDEN_NODE_GIT_REF="v0.16.0-alpha.2"
+# Node pin coords are read from the Makefile (miden-node-image-coords) inside
+# provision() — the Makefile is the single source of truth, so the ref cannot
+# drift between the two again. See MIDEN_NODE_GIT_REF in the Makefile.
 export PATH="/usr/local/bin:$HOME/.cargo/bin:$PATH"
 [ -s "$HOME/.cargo/env" ] && . "$HOME/.cargo/env" 2>/dev/null || true
 
@@ -100,6 +98,24 @@ provision() {
   fi
   ok "tools: $(cargo --version | cut -d' ' -f1-2), cast $(cast --version | head -1 | awk '{print $2}'), kurtosis $(kurtosis version 2>/dev/null | awk '/CLI/{print $3}'), node $(node --version)"
 
+  section "0a' · node pin"
+  # Single source of truth is MIDEN_NODE_GIT_REF in the Makefile; this script
+  # pins the same value and fails loudly if the two drift.
+  MIDEN_NODE_GIT_URL="https://github.com/0xMiden/node.git"
+  MIDEN_NODE_GIT_REF="v0.16.0-rc.3"
+  MIDEN_NODE_GIT_COMMIT="901a7a8817d46b24a1fc9b39beed60c6d14d34e5"
+  export MIDEN_NODE_GIT_URL MIDEN_NODE_GIT_REF MIDEN_NODE_GIT_COMMIT
+  makefile_pin="$(git rev-parse --show-toplevel)/Makefile"
+  grep -Fx "MIDEN_NODE_GIT_URL := $MIDEN_NODE_GIT_URL" "$makefile_pin" || \
+    die "run-all.sh node URL drifted from the Makefile's MIDEN_NODE_GIT_URL"
+  grep -Fx "MIDEN_NODE_GIT_REF := $MIDEN_NODE_GIT_REF" "$makefile_pin" || \
+    die "run-all.sh node ref ($MIDEN_NODE_GIT_REF) drifted from the Makefile's MIDEN_NODE_GIT_REF"
+  grep -Fx "MIDEN_NODE_GIT_COMMIT := $MIDEN_NODE_GIT_COMMIT" "$makefile_pin" || \
+    die "run-all.sh node commit drifted from the Makefile's MIDEN_NODE_GIT_COMMIT"
+  # Must be a 0.16 node: a 0.15 node produces an incompatible account/genesis
+  # format (PR #159 review).
+  ok "node pin: $MIDEN_NODE_GIT_REF ($MIDEN_NODE_GIT_URL)"
+
   section "0b · companion repos (siblings of this checkout)"
   [ -d "$WORK/aggkit-proxy" ]   || git clone https://github.com/mandrigin/aggkit-proxy.git "$WORK/aggkit-proxy"
   # The 0.15 migration is now on main (feat/protocol-0.15-migration merged in).
@@ -111,26 +127,73 @@ provision() {
   grep -q "deploy_miden_services: false" "$cdkpkg/params.yaml" 2>/dev/null || \
     sed -i 's/^miden:/miden:\n  deploy_miden_services: false/' "$cdkpkg/params.yaml" 2>/dev/null || true
   [ -d "$WORK/kurtosis-cdk" ]   || git clone --depth 1 https://github.com/0xPolygon/kurtosis-cdk.git "$WORK/kurtosis-cdk"
-  [ -d "$WORK/miden-node-src" ] || git clone --depth 1 --branch "$MIDEN_NODE_GIT_REF" "$MIDEN_NODE_GIT_URL" "$WORK/miden-node-src"
-  # Raise the ntx-builder remote-prover client timeout (10s default < ~12.5s
-  # B2AGG proof on a normal VM) so L2->L1 consumption isn't cancelled.
-  # 0.15 shape: RemoteTransactionProver::new(url).with_timeout(..) appended.
-  # 0.16 shape: the ctor takes (url, timeout); lib.rs uses the
-  # DEFAULT_PROVER_TIMEOUT const and actor/mod.rs an inline from_secs(10).
+  # Clone-or-reuse a FETCH CACHE only — the provisioning build context is a
+  # DISPOSABLE WORKTREE created at the pin-verified commit, so the cache's
+  # working tree is never modified, never checked out, and no foreign edit
+  # can ride into the images. A pre-existing cache may hold ANY version (this
+  # rig has had v0.15.0 there), so every run re-fetches the tag from the
+  # CONFIGURED upstream (a fork's origin must not shadow it) and the tag is
+  # verified against the pinned upstream commit before anything is built.
+  if [ -d "$WORK/miden-node-src" ]; then
+    git -C "$WORK/miden-node-src" fetch --force "$MIDEN_NODE_GIT_URL" "refs/tags/$MIDEN_NODE_GIT_REF:refs/tags/$MIDEN_NODE_GIT_REF" || \
+      die "cannot fetch $MIDEN_NODE_GIT_REF from $MIDEN_NODE_GIT_URL into $WORK/miden-node-src"
+  else
+    git clone "$MIDEN_NODE_GIT_URL" "$WORK/miden-node-src" || \
+      die "cannot clone $MIDEN_NODE_GIT_URL"
+  fi
+  [ "$(git -C "$WORK/miden-node-src" rev-parse "refs/tags/$MIDEN_NODE_GIT_REF^{commit}")" = "$MIDEN_NODE_GIT_COMMIT" ] || \
+    die "$MIDEN_NODE_GIT_REF does not point at the pinned upstream commit $MIDEN_NODE_GIT_COMMIT — refusing to build (fork-supplied tag?)"
+  git -C "$WORK/miden-node-src" worktree remove --force "$WORK/miden-node-build" 2>/dev/null || true
+  git -C "$WORK/miden-node-src" worktree add --detach "$WORK/miden-node-build" "$MIDEN_NODE_GIT_COMMIT" >/dev/null 2>&1 || \
+    die "cannot create build worktree at $WORK/miden-node-build"
   for f in bin/ntx-builder/src/lib.rs bin/ntx-builder/src/actor/mod.rs; do
-    p="$WORK/miden-node-src/$f"
-    grep -q "with_timeout(Duration::from_secs(180))" "$p" 2>/dev/null || \
-      sed -i 's#RemoteTransactionProver::new(\(self\.\)\?\(tx_prover_url\|url\)\.as_str())#&\n                    .with_timeout(Duration::from_secs(180))#' "$p" 2>/dev/null || true
+    p="$WORK/miden-node-build/$f"
+    case "$f" in
+      */actor/mod.rs)
+        sed -i 's/RemoteTransactionProver::new(url.clone(), Duration::from_secs(10))/RemoteTransactionProver::new(url.clone(), Duration::from_secs(180))/' "$p" 2>/dev/null || true ;;
+      *)
+        sed -i 's/const DEFAULT_PROVER_TIMEOUT: Duration = Duration::from_secs(10);/const DEFAULT_PROVER_TIMEOUT: Duration = Duration::from_secs(180);/' "$p" 2>/dev/null || true ;;
+    esac
+    grep -q "from_secs(180)" "$p" || \
+      die "prover-timeout patch did not land in $f — node source shape changed? (#180 tracks unpatching)"
   done
-  sed -i 's/const DEFAULT_PROVER_TIMEOUT: Duration = Duration::from_secs(10);/const DEFAULT_PROVER_TIMEOUT: Duration = Duration::from_secs(180);/' "$WORK/miden-node-src/bin/ntx-builder/src/lib.rs" 2>/dev/null || true
-  sed -i 's/RemoteTransactionProver::new(url.clone(), Duration::from_secs(10))/RemoteTransactionProver::new(url.clone(), Duration::from_secs(180))/' "$WORK/miden-node-src/bin/ntx-builder/src/actor/mod.rs" 2>/dev/null || true
   [ -d "$WORK/zkevm-bridge-service" ] || git clone --depth 1 --branch fix/pending-bridges-rollup-disambiguation https://github.com/revitteth/zkevm-bridge-service.git "$WORK/zkevm-bridge-service"
   ok "repos present under $WORK"
 
   section "0c · docker images (built only if missing)"
   build_node_img() { # bin port tag
-    docker image inspect "$3" >/dev/null 2>&1 && { ok "$3 (cached)"; return; }
-    say "building $3 ..."; ( cd "$WORK/miden-node-src" && DOCKER_BUILDKIT=1 docker build --build-arg CREATED=2026-01-01T00:00:00Z --build-arg VERSION="$MIDEN_NODE_GIT_REF" --build-arg COMMIT="$(git rev-parse HEAD)" --build-arg BIN="$1" --build-arg PORT="$2" -t "$3" . ) | tail -2
+    # A cached image is only trusted if its LABELS prove it was built from the
+    # verified checkout (ref + exact commit). Unversioned leftovers from any
+    # other node build are rebuilt, never silently reused.
+    # Provenance comes from the PIN, never the fetch cache's arbitrary HEAD.
+    local want_rev="$MIDEN_NODE_GIT_COMMIT"
+    [ "$(git -C "$WORK/miden-node-build" rev-parse HEAD)" = "$want_rev" ] || \
+      die "$WORK/miden-node-build is NOT at the pinned commit $want_rev — refusing to build"
+    if docker image inspect "$3" >/dev/null 2>&1; then
+      local lv lr
+      lv="$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$3" 2>/dev/null)"
+      lr="$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$3" 2>/dev/null)"
+      local lp
+      lp="$(docker image inspect -f '{{ index .Config.Labels "com.miden-agglayer.ntx-prover-timeout" }}' "$3" 2>/dev/null)"
+      if [ "$lv" = "$MIDEN_NODE_GIT_REF" ] && [ "$lr" = "$want_rev" ] && [ "$lp" = "180s" ]; then
+        ok "$3 (cached; labels match $MIDEN_NODE_GIT_REF @ ${want_rev:0:12}, prover-timeout patch 180s)"
+        return
+      fi
+      warn "$3 cached but stale (labels: ${lv:-none}/${lr:-none}/patch:${lp:-none}) — rebuilding from $MIDEN_NODE_GIT_REF @ ${want_rev:0:12}"
+    fi
+    say "building $3 ..."
+    ( cd "$WORK/miden-node-build" && DOCKER_BUILDKIT=1 docker build \
+      --label org.opencontainers.image.version="$MIDEN_NODE_GIT_REF" \
+      --label org.opencontainers.image.revision="$want_rev" \
+      --label com.miden-agglayer.ntx-prover-timeout=180s \
+      --build-arg CREATED=2026-01-01T00:00:00Z --build-arg VERSION="$MIDEN_NODE_GIT_REF" --build-arg COMMIT="$want_rev" --build-arg BIN="$1" --build-arg PORT="$2" -t "$3" . ) | tail -2 \
+      || die "building $3 FAILED — refusing to provision (a stale image must never be left in place)"
+    # Re-verify the freshly built image actually carries the pin labels.
+    lv="$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$3" 2>/dev/null)"
+    lr="$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$3" 2>/dev/null)"
+    lp="$(docker image inspect -f '{{ index .Config.Labels "com.miden-agglayer.ntx-prover-timeout" }}' "$3" 2>/dev/null)"
+    { [ "$lv" = "$MIDEN_NODE_GIT_REF" ] && [ "$lr" = "$want_rev" ] && [ "$lp" = "180s" ]; } || \
+      die "$3 was rebuilt but its labels do not match $MIDEN_NODE_GIT_REF @ ${want_rev:0:12} + prover-timeout patch — image provenance unverifiable"
   }
   build_node_img miden-validator     50101 miden-validator
   build_node_img miden-node          57291 miden-node

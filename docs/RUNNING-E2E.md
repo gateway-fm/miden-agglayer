@@ -24,14 +24,14 @@ state must be retained.
 ## Prerequisites
 
 The normal host needs Docker with Compose, Foundry (`cast`), Bash, `jq`, Python
-3, Node.js, and Rust 1.96 or newer. Fixture generation also needs Kurtosis.
+3, Node.js, and Rust 1.96.1 or newer. Fixture generation also needs Kurtosis.
 
 Compose expects four locally built Miden images and one patched bridge-service
 image:
 
 | Image | Source used by repository scripts |
 |---|---|
-| `miden-validator` | `https://github.com/0xMiden/node.git` at `v0.16.0-alpha.2` |
+| `miden-validator` | `https://github.com/0xMiden/node.git` at `v0.16.0-rc.3` |
 | `miden-node` | same checkout and ref |
 | `miden-ntx-builder` | same checkout and ref |
 | `miden-remote-prover` | same checkout and ref |

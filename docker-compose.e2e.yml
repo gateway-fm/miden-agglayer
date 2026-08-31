@@ -66,22 +66,25 @@ services:
   # service is intentionally removed — its replacement embeds the SQL via
   # `include_str!` into the binary so the proxy and its schema cannot drift.
 
-  # ── L2 Chain (Miden node — protocol 0.15 microservice topology) ─────────────
-  # Protocol 0.15 decomposed the all-in-one `bundled` node into separate
-  # services (mirrors 0xMiden/node's own docker-compose.yml):
+  # ── L2 Chain (Miden node — 0.16 microservice topology) ─────────────────────
+  # The 0.16 node decomposed the all-in-one `bundled` node into separate
+  # services (mirrors 0xMiden/node's own compose/ files):
   #   validator    — genesis bootstrap + block signing (:50101)
   #   sequencer    — block production + public RPC (:57291)  [service `miden-node`]
   #   ntx-builder  — consumes network-account notes, i.e. the agglayer bridge's
   #                  CLAIM/CONFIG notes, and submits them as network txs (:50301)
   #   tx-prover    — remote transaction prover (:50051)
-  # Images are built from 0xMiden/node @ the rev pinned in the Makefile by
-  # `make e2e-build-node` (tags: miden-node / miden-validator / miden-ntx-builder
+  # Images are built from 0xMiden/node @ the rev pinned in the Makefile
+  # (MIDEN_NODE_GIT_REF) by run-all.sh phase 0c — one binary per image
+  # (tags: miden-node / miden-validator / miden-ntx-builder
   # / miden-remote-prover). Genesis is bootstrapped from our vendored agglayer
-  # config (fixtures/genesis/02-with-account-files.toml → bridge + ETH/USDC
-  # faucets); the bridge is deployed but left UNCONFIGURED — faucet registration
+  # config (fixtures/genesis/02-with-account-files.toml — chain parameters
+  # only; the proxy's --init deploys bridge + ETH/USDC faucets at runtime).
+  # The bridge is deployed but left UNCONFIGURED — faucet registration
   # happens at runtime via the proxy's CONFIG_AGG_BRIDGE note.
   #
-  # NODE IMAGE PATCH (v0.16.0-rc.1): upstream still hardcodes the ntx-builder's
+  # NODE IMAGE PATCH (applied to the pinned v0.16.0-rc.3 checkout): upstream
+  # still hardcodes the ntx-builder's
   # per-request remote-prover timeout to 10s (bin/ntx-builder/src/lib.rs
   # DEFAULT_PROVER_TIMEOUT, no CLI flag). Bridge CLAIM-consumption proofs
   # exceed that on shared e2e hardware, so the miden-ntx-builder image must be
@@ -96,16 +99,25 @@ services:
   # submitted by users yet". The proxy submits ordinary user txs and needs no
   # such header.
 
-  # v0.16.0-rc.1 split the old one-shot `bootstrap --genesis-config-file` into:
-  #   1. `genesis`   — build the UNSIGNED genesis block (its header commits the
-  #      validator set, so the config must list the validator public keys; we
-  #      compute the pubkey of the insecure dev signing key at runtime with
-  #      `miden-validator pubkey`, exactly like the upstream run-node.sh);
-  #   2. `bootstrap --genesis <block file>` — each service seeds its DB from it.
-  # The validator `start` additionally requires the threshold storage-key
-  # material from the DKG ceremony; for this throwaway devnet we vendor the
-  # node repo's committed INSECURE fixture (fixtures/genesis/insecure-storage-key,
-  # participant 1) — public, deterministic, never for production.
+  # The 0.16 node split the old one-shot `bootstrap --genesis-config-file`
+  # (since v0.16.0-rc.1) into `genesis` + `bootstrap`, and rc.3 tightened the
+  # CLI (mirrors upstream run-node.sh, scripts/run-node.sh @ v0.16.0-rc.3):
+  #   1. `miden-validator pubkey --signing-key.hex <key>` — derive the public
+  #      key of the insecure dev signing key;
+  #   2. `miden-validator genesis ... --validator.key <pubkey>` — build the
+  #      UNSIGNED genesis block. The validator set is NOT part of the config
+  #      TOML in rc.3; it is committed via repeated `--validator.key` flags
+  #      (one per validator; we run one);
+  #   3. `bootstrap --genesis <block file>` — each service seeds its DB from
+  #      it.
+  # The validator `start` requires the signing key, the transaction
+  # encryption key, and the threshold storage-key material from the DKG
+  # ceremony; for this throwaway devnet we use run-node.sh's committed
+  # INSECURE dev constants (signing 0x0101…, encryption 0x0303…, epoch
+  # 0x0909…) and vendor the node repo's committed INSECURE storage-key
+  # fixture (fixtures/genesis/insecure-storage-key, participant 1 — the same
+  # share run-node.sh feeds its validator 1). Public, deterministic, never
+  # for production.
   node-bootstrap-validator:
     image: miden-validator
     volumes:
@@ -118,12 +130,14 @@ services:
         if [ -f /data/validator/.bootstrapped ]; then echo "validator already bootstrapped"; exit 0; fi
         rm -rf /data/genesis /data/validator /data/accounts
         mkdir -p /data/genesis /data/validator /data/accounts
-        VALIDATOR_PUBKEY=$$(miden-validator pubkey)
-        { printf 'validators = ["%s"]\n' "$$VALIDATOR_PUBKEY"; cat /genesis/02-with-account-files.toml; } > /tmp/genesis-config.toml
+        # Insecure local-dev signing key — run-node.sh's VALIDATOR_1_KEY_HEX.
+        VALIDATOR_SIGNING_KEY=0101010101010101010101010101010101010101010101010101010101010101
+        VALIDATOR_PUBKEY=$$(miden-validator pubkey --signing-key.hex "$$VALIDATOR_SIGNING_KEY")
         miden-validator genesis \
           --genesis-block-directory /data/genesis \
           --accounts-directory /data/accounts \
-          --config /tmp/genesis-config.toml
+          --config /genesis/02-with-account-files.toml \
+          --validator.key "$$VALIDATOR_PUBKEY"
         miden-validator bootstrap \
           --data-directory /data/validator \
           --genesis /data/genesis/genesis.dat
@@ -177,6 +191,11 @@ services:
       - start
       - --listen=0.0.0.0:50101
       - --data-directory=/data/validator
+      # Block-signing key — run-node.sh's insecure VALIDATOR_1_KEY_HEX; its
+      # derived public key is committed in the genesis header above.
+      - --signing-key.hex=0101010101010101010101010101010101010101010101010101010101010101
+      # Shared transaction encryption key — run-node.sh's ENCRYPTION_KEY_HEX.
+      - --encryption-key.hex=0303030303030303030303030303030303030303030303030303030303030303
       # Threshold-storage material — the vendored INSECURE dev fixture (see the
       # bootstrap comment above). Epoch mirrors upstream run-node.sh.
       - --storage-key.epoch=0909090909090909090909090909090909090909090909090909090909090909

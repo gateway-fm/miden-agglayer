@@ -5,7 +5,7 @@ exclude = [".github/"]
 license = "MIT OR Apache-2.0"
 name = "miden-agglayer-service"
 readme = "README.md"
-rust-version = "1.96"
+rust-version = "1.96.1"
 version = "0.1.0"
 
 [[bin]]
@@ -32,8 +32,8 @@ path = "src/bin/bridge_autoclaim.rs"
 [dev-dependencies]
 # testing exposes the generated proto types — the ONLY public construction
 # path for rpc TransactionRecord fixtures (consumed_note_refs is pub(crate)
-# upstream in rc.1).
-miden-client = { version = "=0.16.0-rc.2", features = ["testing", "tonic"] }
+# upstream in rc.3).
+miden-client = { version = "=0.16.0-rc.3", features = ["testing", "tonic"] }
 tempfile = "3.10"
 # test-util enables tokio's paused virtual clock (start_paused) — used by the
 # ger::poll_until_ready timing regression test to pin the exact sleep count
@@ -140,20 +140,25 @@ deadpool-postgres = { version = "0.14", optional = true }
 # pages, so it returns ALL matches with bounded memory. Only used on the pg path.
 futures-util = { version = "0.3", optional = true }
 
-# Protocol 0.16.0-alpha migration (feat/protocol-0.16). Official matrix from the
-# core team's migration guide (2026-08-04):
+# Release matrix (refreshed for #178, 2026-08-28):
 #   - protocol crates (miden-protocol / miden-standards / miden-agglayer /
-#     miden-tx) = 0.16.0-alpha.5 (alpha.5 backports the runtime-configurable
-#     bridge network id — a storage slot set at account creation, restoring
-#     the 0.15.3 model — which alpha.4 had regressed to a compile-time MASM
-#     constant; the short-lived vendored network-id patch is gone)
-#   - miden-client = 0.16.0-alpha.1 (published from the 0xMiden/rust-sdk repo —
-#     client development moved there; the old miden-client repo's main still
-#     tracks 0.15.3 and is NOT the source of this release)
-#   - services interact with a node of v0.16.0-alpha.2 or later (devnet). The
-#     node binaries internally lock protocol alpha.2; client-side alpha.4
-#     against an alpha.2-kernel node is the SUPPORTED combination per the guide.
-#   - Rust toolchain 1.96+.
+#     miden-tx) = 0.16.0-rc.6, exact pins kept aligned (never mix protocol
+#     releases). rc.6 keeps the runtime-configurable bridge network id — a
+#     storage slot set at account creation, restoring the 0.15.3 model — and
+#     restored read_let_num_leaves/is_ger_registered as public API.
+#   - miden-client = 0.16.0-rc.3, VENDORED (see [patch.crates-io] below). The
+#     published rc.3 still retries SubmitProvenTx/SubmitProvenBatch and is
+#     UNSAFE to adopt unpatched; the vendored copy forces single-attempt
+#     submit. rc.3 is also the release that is wire-compatible with the
+#     miden-node v0.16.0-rc.3 e2e stack (storage-map proofs moved to a
+#     PartialSmt field the rc.2 client cannot read). sqlite-store is pinned to
+#     rc.3 in lockstep. Coordinate with #177.
+#   - VM train (miden-assembly / miden-core / miden-processor) = 0.29, lock
+#     cohort at 0.29.4 — the newest release compatible with protocol rc.6; do
+#     not jump to 0.30 (breaking train).
+#   - services interact with a miden-node v0.16.0-rc.3 e2e stack; the Makefile
+#     (MIDEN_NODE_GIT_REF) is the single source of truth for the node ref.
+#   - Rust toolchain 1.96.1 (rust-version above).
 # Headline API changes ported in this migration: create_bridge_account grew a
 # GER-remover role (4 args), duplicate GER injection now aborts with
 # ERR_GER_ALREADY_REGISTERED (was silent success), B2AGG notes must be
@@ -163,9 +168,9 @@ futures-util = { version = "0.3", optional = true }
 # MAST-root consistency note (carried over from the 0.14/0.15 pins): the
 # proxy-side `BurnNote::script_root()` MUST match the miden-node binary's, or
 # every L2→L1 bridge-out fails in the node's NTX `before_created` handler with
-# "note script with root <X> not found". The alpha.4 base crates resolve
-# miden-assembly/core 0.25.x; keep these in lockstep with the deployed
-# miden-node v0.16.0-alpha.x release and tighten to an exact patch if a root
+# "note script with root <X> not found". The rc.6 base crates resolve
+# miden-assembly/core 0.29.x; keep these in lockstep with the deployed
+# miden-node v0.16.0-rc.x release and tighten to an exact patch if a root
 # mismatch resurfaces during the e2e regression.
 miden-base-agglayer = { package = "miden-agglayer", version = "=0.16.0-rc.6" }
 miden-protocol = { default-features = false, features = [
@@ -186,13 +191,13 @@ miden-processor = { default-features = false, features = [
   "std",
 ], version = "0.29" }
 
-# miden-client 0.16.0-alpha.1 — released from 0xMiden/rust-sdk (tag
-# v0.16.0-alpha.1, ref 0f89705c). Requires protocol ^0.16.0-alpha.4, matching
-# the pins above.
+# miden-client 0.16.0-rc.3 — published from 0xMiden/rust-sdk. VENDORED (see
+# [patch.crates-io] below): single-attempt submit. sqlite-store is pinned in
+# lockstep (its ^0.16.0-rc.3 requirement is satisfied by the vendored crate).
 miden-client = { default-features = false, features = [
   "tonic",
-], version = "=0.16.0-rc.2" }
-miden-client-sqlite-store = { version = "=0.16.0-rc.2" }
+], version = "=0.16.0-rc.3" }
+miden-client-sqlite-store = { version = "=0.16.0-rc.3" }
 
 [features]
 default = []
@@ -211,10 +216,11 @@ postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:futures-util"]
 # `upstream-api-gate` CI job now PASSES, with the miden-client vendor below as a
 # reviewed, allow-listed exception (see .github/workflows/check.yml).
 [patch.crates-io]
-# TEMPORARY vendor patch — miden-client rc.2 routes `submit_proven_transaction`
-# through `call_with_retry`, which re-sends on `ResourceExhausted | Unavailable`.
-# Submitting a proven transaction is NOT idempotent (it consumes notes), so if the
-# node ACCEPTS it and the response is then lost, the SAME transaction is silently
+# TEMPORARY vendor patch — miden-client rc.3 routes `submit_proven_transaction`
+# AND `submit_proven_batch` through `call_with_retry`, which re-sends on
+# `ResourceExhausted | Unavailable`. Submitting a proven transaction (or batch)
+# is NOT idempotent (it consumes notes / may execute input notes), so if the
+# node ACCEPTS it and the response is then lost, the SAME submission is silently
 # re-sent. The retry reaches a node that has already spent the nullifier and
 # answers with an APPLICATION-level rejection — and only that second error ever
 # reaches the caller.
@@ -227,17 +233,17 @@ postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:futures-util"]
 # bridged the same assets twice. See `submit_is_indeterminate` in
 # src/bin/bridge_out_tool.rs — the caller-side backstop for exactly this.
 #
-# The vendored copy is byte-identical to the crates.io release except that submit
-# does not retry; every OTHER endpoint keeps its retries (they are reads, where a
-# re-send is free).
+# The vendored copy is byte-identical to the crates.io release except that both
+# submit endpoints are single-attempt; every OTHER endpoint keeps its retries
+# (they are reads, where a re-send is free).
 #
 # rc.1 additionally needed a `VaultFetch::Always` patch (an omitted "unchanged"
 # vault reconstructed as EMPTY and wedged every bridge-targeted transaction once
-# the bridge vault held a locked native asset). rc.2 fixes that upstream, and
+# the bridge vault held a locked native asset). rc.2 fixed that upstream, and
 # better — it keeps the bandwidth optimisation and validates the rebuilt vault
-# against the header root, falling back to a root-only partial vault. That second
-# patch is therefore GONE.
+# against the header root, falling back to a root-only partial vault. That
+# patch is therefore still gone.
 #
 # Remove this patch AND the vendor copy when upstream stops retrying submit, makes
 # retryability per-endpoint, or makes submit idempotent server-side.
-miden-client = { path = "vendor/miden-client-0.16.0-rc.2" }
+miden-client = { path = "vendor/miden-client-0.16.0-rc.3" }

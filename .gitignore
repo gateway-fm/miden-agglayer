@@ -54,3 +54,10 @@ fixtures/web3signer-keys/
 fixtures/web3signer-keys.env
 __pycache__/
 *.pyc
+
+# Operator-local live-test scratch (may contain credentials/keystores).
+# fixtures/ itself holds COMMITTED e2e inputs (configs, genesis, patches) —
+# only generated/secret artifacts are ignored here.
+fixtures/live*
+fixtures/*.env
+demo/state/

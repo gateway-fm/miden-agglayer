@@ -60,8 +60,13 @@ if [[ "$INNER_EXIT" -eq 0 ]]; then
     exit 0
 fi
 
-# Inner script failed — was it because miden-node crash-looped?
-if [[ "$DELTA_DESYNCS" -gt 0 ]] || [[ "$DELTA_RESTARTS" -gt 0 ]]; then
+# Inner script failed — was it the KNOWN v0.14.10 signature (block-producer
+# chain-tip desync crash-loop)? Only the desync log line identifies that bug:
+# a bare container restart is NOT the signature. rc.3+ nodes may restart for
+# their own reasons, and treating any restart as the old known-skip would
+# bury REAL rc.3 regressions under an environmental skip. Restarts without
+# desyncs therefore fall through to the hard failure below.
+if [[ "$DELTA_DESYNCS" -gt 0 ]]; then
     cat <<EOF >&2
 
 ╔══════════════════════════════════════════════════════════════════════════════╗

@@ -6,7 +6,7 @@ WORKDIR /usr/src/app
 COPY src src
 COPY axum-jrpc axum-jrpc
 COPY migrations migrations
-# vendor/ carries the temporary miden-agglayer [patch.crates-io] override —
+# vendor/ carries the temporary miden-client [patch.crates-io] override —
 # the build cannot resolve the patch path without it.
 COPY vendor vendor
 COPY Cargo.* .

@@ -1,8 +1,11 @@
-# Local patches for the 0.15 e2e node images
+# Local patches for the e2e node images
 
-**None currently required.** The `miden-node` / `miden-validator` e2e images are
-built from a clean clone of `0xMiden/node` at the ref pinned in the `Makefile`
-(`MIDEN_NODE_GIT_REF`), with no patches applied.
+**None applied as files.** The `miden-node` / `miden-validator` e2e images are
+built from a verified clone of `0xMiden/node` at the ref pinned in the
+`Makefile` (`MIDEN_NODE_GIT_REF`, commit-pinned via `MIDEN_NODE_GIT_COMMIT`),
+with one intentional in-place source edit applied by `run-all.sh`: the
+ntx-builder remote-prover timeout (10s -> 180s, verified post-apply). Removing
+that patch is tracked in issue #180.
 
 ## History (resolved at node `v0.15.0`)
 

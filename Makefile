@@ -193,24 +193,47 @@ install-tools: ## Install development tools
 # miden-node-store's build.rs auto-generates those files deterministically
 # from miden-agglayer's account builders, so the e2e image is fully
 # reproducible.
+# (Historical context for the v0.14-era `node-init`/`start-node` targets
+# below — the 0.16 node no longer ships a `bundled` CLI; see the
+# compatibility note at the MIDEN_NODE_GIT_REF pin.)
 #
-# Protocol 0.16: the node repo is `0xMiden/node` (package name stays
-# `miden-node`, so `--bin miden-node` and the `bundled bootstrap/start` CLI are
-# unchanged, and the genesis sample `02-with-account-files.toml` is at the same
-# path). We pin to the alpha tag whose transitive miden-protocol/assembly
-# versions match our Cargo.toml pins, so the BURN/MINT/CLAIM/B2AGG MAST roots
-# agree across the node/client boundary. When a stable v0.16.x tag ships, pin
-# to that instead.
+# Protocol 0.16: the node repo is `0xMiden/node`. The old all-in-one
+# `bundled bootstrap/start` CLI is GONE (rc.1+ split it into `genesis` +
+# per-service `bootstrap`/`start` subcommands across separate binaries), and
+# the `02-with-account-files.toml` genesis sample no longer exists upstream —
+# the compose file mirrors the official rc.3 runner (scripts/run-node.sh)
+# instead. We pin to the v0.16.0-rc.3 tag. E2E node images are built by
+# run-all.sh FROM THE UPSTREAM CHECKOUT'S OWN Dockerfile — there is no
+# repo-local node Dockerfile.
 #
-# Bumping: edit MIDEN_NODE_GIT_REF here. The build.args plumb it through
-# docker-compose so the Dockerfile picks it up at build time.
+# COMPATIBILITY ASSUMPTION — NOT YET VERIFIED: node rc.3's official Cargo.lock
+# resolves miden-protocol/standards/tx 0.16.0-rc.4 and the VM train
+# (miden-assembly/core/processor/crypto) 0.29.1, while our proxy pins protocol
+# rc.6 and the VM train 0.29.4. We assume the BURN/MINT/CLAIM/B2AGG note MAST
+# roots are unchanged between those releases, so roots agree across the
+# node/client boundary. Cross-binary evidence (same root computed by the node
+# binary and by our pinned crates in a live e2e run) is still PENDING; if a
+# bridge-out fails with "note script with root <X> not found", align this pin
+# or the crate pins first.
+# Node-pin coordination: the Makefile and run-all.sh BOTH carry the pin
+# (run-all.sh reads plain constants — no make-in-shell plumbing) and each
+# drift-checks the other at setup time. Bump BOTH together: edit
+# MIDEN_NODE_GIT_REF + MIDEN_NODE_GIT_COMMIT here and the three constants at
+# the top of run-all.sh's provisioning section. `make miden-node-image-coords`
+# prints url/ref/commit for docs and compose flows.
+#
+# Bumping checklist: Makefile (REF + COMMIT) and run-all.sh (URL/REF/COMMIT).
 MIDEN_NODE_GIT_URL := https://github.com/0xMiden/node.git
-# v0.16.0-alpha.2. Builds against the miden-protocol/standards/tx 0.16 alphas
-# our service pins, so BURN/MINT/CLAIM/B2AGG MAST roots agree across the
-# node/client boundary with no Cargo.lock-alignment hack. fixtures/patches/0001
-# is not applied (the node-store callback-vault-key bug is fixed upstream), and
-# the AggLayer network id is a runtime storage slot again, so no vendor patch.
-MIDEN_NODE_GIT_REF := v0.16.0-rc.1
+# v0.16.0-rc.3. See the compatibility note above: its lock pins protocol rc.4
+# + VM 0.29.1 vs our rc.6 + 0.29.4 — MAST-root agreement is an assumption
+# pending cross-binary evidence. fixtures/patches/0001 is not applied (the
+# node-store callback-vault-key bug is fixed upstream), and the AggLayer
+# network id is a runtime storage slot, so no vendor patch.
+MIDEN_NODE_GIT_REF := v0.16.0-rc.3
+# The exact commit the tag points at (verified by `git ls-remote` at pin
+# time). run-all.sh checks the checkout's HEAD against this so a fork cannot
+# shadow the tag. Bump BOTH together.
+MIDEN_NODE_GIT_COMMIT := 901a7a8817d46b24a1fc9b39beed60c6d14d34e5
 
 E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
 
@@ -224,9 +247,10 @@ WEB3SIGNER_COMPOSE_EXTRA := $(if $(WITH_WEB3SIGNER),-f docker-compose.web3signer
 L2L2_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml $(WEB3SIGNER_COMPOSE_EXTRA) --env-file fixtures/.env
 
 .PHONY: miden-node-image-coords
-miden-node-image-coords: ## Print the git URL + ref the miden-node image is built from
+miden-node-image-coords: ## Print the git URL + ref + commit the miden-node image is built from
 	@echo "url: $(MIDEN_NODE_GIT_URL)"
 	@echo "ref: $(MIDEN_NODE_GIT_REF)"
+	@echo "commit: $(MIDEN_NODE_GIT_COMMIT)"
 
 .PHONY: e2e-setup
 e2e-setup: ## One-time: extract Anvil snapshot + configs from Kurtosis
