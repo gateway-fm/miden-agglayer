@@ -24,14 +24,14 @@ state must be retained.
 ## Prerequisites
 
 The normal host needs Docker with Compose, Foundry (`cast`), Bash, `jq`, Python
-3, Node.js, and Rust 1.96.1 or newer. Fixture generation also needs Kurtosis.
+3, Node.js, and Rust 1.98 or newer. Fixture generation also needs Kurtosis.
 
 Compose expects four locally built Miden images and one patched bridge-service
 image:
 
 | Image | Source used by repository scripts |
 |---|---|
-| `miden-validator` | `https://github.com/0xMiden/node.git` at `v0.16.0-rc.3` |
+| `miden-validator` | `https://github.com/0xMiden/node.git` at `v0.16.0-rc.5` |
 | `miden-node` | same checkout and ref |
 | `miden-ntx-builder` | same checkout and ref |
 | `miden-remote-prover` | same checkout and ref |
@@ -39,8 +39,8 @@ image:
 
 `run-all.sh` is the repository's supported bootstrap for a bare Ubuntu host. It
 installs/checks tools, clones companion repositories next to this checkout,
-patches the ntx-builder prover timeout used by this test environment, builds
-missing images, and generates missing fixtures:
+builds missing images from the unmodified upstream node checkout, and
+generates missing fixtures:
 
 ```bash
 ./run-all.sh
@@ -75,10 +75,11 @@ docker build \
   -f Dockerfile .
 ```
 
-The current `run-all.sh` also raises the ntx-builder's remote-prover timeout to
-180 seconds before building. Apply the same source change when reproducing its
-manual build; otherwise a slow B2AGG proof can exceed the upstream client
-timeout.
+The node source is built as-is. The ntx-builder's remote-prover timeout
+(10 seconds by default, too short for a slow B2AGG proof) is raised to 180
+seconds at runtime with the `--tx-prover.timeout=180s` flag in
+`docker-compose.e2e.yml`, available since node `v0.16.0-rc.4`; older node
+refs needed a source patch instead and are refused by `run-all.sh`.
 
 ## Generate fixtures
 

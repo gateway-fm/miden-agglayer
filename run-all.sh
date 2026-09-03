@@ -102,8 +102,8 @@ provision() {
   # Single source of truth is MIDEN_NODE_GIT_REF in the Makefile; this script
   # pins the same value and fails loudly if the two drift.
   MIDEN_NODE_GIT_URL="https://github.com/0xMiden/node.git"
-  MIDEN_NODE_GIT_REF="v0.16.0-rc.3"
-  MIDEN_NODE_GIT_COMMIT="901a7a8817d46b24a1fc9b39beed60c6d14d34e5"
+  MIDEN_NODE_GIT_REF="v0.16.0-rc.5"
+  MIDEN_NODE_GIT_COMMIT="461ac961951c19543b3b2e6db99a0bf82349dbde"
   export MIDEN_NODE_GIT_URL MIDEN_NODE_GIT_REF MIDEN_NODE_GIT_COMMIT
   makefile_pin="$(git rev-parse --show-toplevel)/Makefile"
   grep -Fx "MIDEN_NODE_GIT_URL := $MIDEN_NODE_GIT_URL" "$makefile_pin" || \
@@ -146,17 +146,17 @@ provision() {
   git -C "$WORK/miden-node-src" worktree remove --force "$WORK/miden-node-build" 2>/dev/null || true
   git -C "$WORK/miden-node-src" worktree add --detach "$WORK/miden-node-build" "$MIDEN_NODE_GIT_COMMIT" >/dev/null 2>&1 || \
     die "cannot create build worktree at $WORK/miden-node-build"
-  for f in bin/ntx-builder/src/lib.rs bin/ntx-builder/src/actor/mod.rs; do
-    p="$WORK/miden-node-build/$f"
-    case "$f" in
-      */actor/mod.rs)
-        sed -i 's/RemoteTransactionProver::new(url.clone(), Duration::from_secs(10))/RemoteTransactionProver::new(url.clone(), Duration::from_secs(180))/' "$p" 2>/dev/null || true ;;
-      *)
-        sed -i 's/const DEFAULT_PROVER_TIMEOUT: Duration = Duration::from_secs(10);/const DEFAULT_PROVER_TIMEOUT: Duration = Duration::from_secs(180);/' "$p" 2>/dev/null || true ;;
-    esac
-    grep -q "from_secs(180)" "$p" || \
-      die "prover-timeout patch did not land in $f — node source shape changed? (#180 tracks unpatching)"
-  done
+  # The node source is built UNMODIFIED (#180). The ntx-builder's remote-prover
+  # timeout used to be a hardcoded 10s that this script sed-patched to 180s;
+  # since node v0.16.0-rc.4 it is the `--tx-prover.timeout` flag
+  # (0xMiden/node#2537), which docker-compose.e2e.yml passes. Refuse to build a
+  # node that still hardcodes it — that would silently bring the claim
+  # timeouts back — and refuse a dirty worktree, so no edit can ride into the
+  # images.
+  grep -q -- 'long = "tx-prover.timeout"' "$WORK/miden-node-build/bin/ntx-builder/src/commands/mod.rs" || \
+    die "pinned node $MIDEN_NODE_GIT_REF has no --tx-prover.timeout flag (needs >= v0.16.0-rc.4) — refusing to build a node with a hardcoded 10s prover timeout"
+  [ -z "$(git -C "$WORK/miden-node-build" status --porcelain)" ] || \
+    die "node build worktree $WORK/miden-node-build is not clean — the e2e stack builds the UNMODIFIED upstream checkout"
   [ -d "$WORK/zkevm-bridge-service" ] || git clone --depth 1 --branch fix/pending-bridges-rollup-disambiguation https://github.com/revitteth/zkevm-bridge-service.git "$WORK/zkevm-bridge-service"
   ok "repos present under $WORK"
 
@@ -173,27 +173,26 @@ provision() {
       local lv lr
       lv="$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$3" 2>/dev/null)"
       lr="$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$3" 2>/dev/null)"
-      local lp
-      lp="$(docker image inspect -f '{{ index .Config.Labels "com.miden-agglayer.ntx-prover-timeout" }}' "$3" 2>/dev/null)"
-      if [ "$lv" = "$MIDEN_NODE_GIT_REF" ] && [ "$lr" = "$want_rev" ] && [ "$lp" = "180s" ]; then
-        ok "$3 (cached; labels match $MIDEN_NODE_GIT_REF @ ${want_rev:0:12}, prover-timeout patch 180s)"
+      # Images built by the pre-#180 flow carry a com.miden-agglayer.ntx-prover-timeout
+      # label (the source patch); they are for an older ref, so the ref/commit
+      # labels alone already force a rebuild.
+      if [ "$lv" = "$MIDEN_NODE_GIT_REF" ] && [ "$lr" = "$want_rev" ]; then
+        ok "$3 (cached; labels match $MIDEN_NODE_GIT_REF @ ${want_rev:0:12}, unmodified upstream source)"
         return
       fi
-      warn "$3 cached but stale (labels: ${lv:-none}/${lr:-none}/patch:${lp:-none}) — rebuilding from $MIDEN_NODE_GIT_REF @ ${want_rev:0:12}"
+      warn "$3 cached but stale (labels: ${lv:-none}/${lr:-none}) — rebuilding from $MIDEN_NODE_GIT_REF @ ${want_rev:0:12}"
     fi
     say "building $3 ..."
     ( cd "$WORK/miden-node-build" && DOCKER_BUILDKIT=1 docker build \
       --label org.opencontainers.image.version="$MIDEN_NODE_GIT_REF" \
       --label org.opencontainers.image.revision="$want_rev" \
-      --label com.miden-agglayer.ntx-prover-timeout=180s \
       --build-arg CREATED=2026-01-01T00:00:00Z --build-arg VERSION="$MIDEN_NODE_GIT_REF" --build-arg COMMIT="$want_rev" --build-arg BIN="$1" --build-arg PORT="$2" -t "$3" . ) | tail -2 \
       || die "building $3 FAILED — refusing to provision (a stale image must never be left in place)"
     # Re-verify the freshly built image actually carries the pin labels.
     lv="$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$3" 2>/dev/null)"
     lr="$(docker image inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$3" 2>/dev/null)"
-    lp="$(docker image inspect -f '{{ index .Config.Labels "com.miden-agglayer.ntx-prover-timeout" }}' "$3" 2>/dev/null)"
-    { [ "$lv" = "$MIDEN_NODE_GIT_REF" ] && [ "$lr" = "$want_rev" ] && [ "$lp" = "180s" ]; } || \
-      die "$3 was rebuilt but its labels do not match $MIDEN_NODE_GIT_REF @ ${want_rev:0:12} + prover-timeout patch — image provenance unverifiable"
+    { [ "$lv" = "$MIDEN_NODE_GIT_REF" ] && [ "$lr" = "$want_rev" ]; } || \
+      die "$3 was rebuilt but its labels do not match $MIDEN_NODE_GIT_REF @ ${want_rev:0:12} — image provenance unverifiable"
   }
   build_node_img miden-validator     50101 miden-validator
   build_node_img miden-node          57291 miden-node

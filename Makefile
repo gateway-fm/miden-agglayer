@@ -201,20 +201,23 @@ install-tools: ## Install development tools
 # `bundled bootstrap/start` CLI is GONE (rc.1+ split it into `genesis` +
 # per-service `bootstrap`/`start` subcommands across separate binaries), and
 # the `02-with-account-files.toml` genesis sample no longer exists upstream —
-# the compose file mirrors the official rc.3 runner (scripts/run-node.sh)
-# instead. We pin to the v0.16.0-rc.3 tag. E2E node images are built by
+# the compose file mirrors the official rc.3+ runner (scripts/run-node.sh)
+# instead. We pin to the v0.16.0-rc.5 tag. E2E node images are built by
 # run-all.sh FROM THE UPSTREAM CHECKOUT'S OWN Dockerfile — there is no
-# repo-local node Dockerfile.
+# repo-local node Dockerfile — and the checkout is built UNMODIFIED: since
+# node v0.16.0-rc.4 the ntx-builder's remote-prover timeout is a CLI flag
+# (`--tx-prover.timeout`, 0xMiden/node#2537), passed in docker-compose.e2e.yml,
+# so the source patch #180 tracked is gone. run-all.sh fails setup if the
+# pinned checkout lacks that flag.
 #
-# COMPATIBILITY ASSUMPTION — NOT YET VERIFIED: node rc.3's official Cargo.lock
-# resolves miden-protocol/standards/tx 0.16.0-rc.4 and the VM train
-# (miden-assembly/core/processor/crypto) 0.29.1, while our proxy pins protocol
-# rc.6 and the VM train 0.29.4. We assume the BURN/MINT/CLAIM/B2AGG note MAST
-# roots are unchanged between those releases, so roots agree across the
-# node/client boundary. Cross-binary evidence (same root computed by the node
-# binary and by our pinned crates in a live e2e run) is still PENDING; if a
-# bridge-out fails with "note script with root <X> not found", align this pin
-# or the crate pins first.
+# COMPATIBILITY: node rc.5's official Cargo.lock resolves
+# miden-protocol/standards/tx/agglayer 0.16.0-rc.9 — the SAME protocol
+# release our proxy pins — and the VM train (miden-assembly/core/processor)
+# 0.29.1 vs our 0.29.4 (patch releases on the same minor). The BURN/MINT/
+# CLAIM/B2AGG note MAST roots therefore agree by construction on the protocol
+# side; cross-binary evidence from a live e2e run against rc.5 is still
+# PENDING for this bump. If a bridge-out fails with "note script with root <X>
+# not found", tighten the VM-train pin to the node's 0.29.1 first.
 # Node-pin coordination: the Makefile and run-all.sh BOTH carry the pin
 # (run-all.sh reads plain constants — no make-in-shell plumbing) and each
 # drift-checks the other at setup time. Bump BOTH together: edit
@@ -224,16 +227,15 @@ install-tools: ## Install development tools
 #
 # Bumping checklist: Makefile (REF + COMMIT) and run-all.sh (URL/REF/COMMIT).
 MIDEN_NODE_GIT_URL := https://github.com/0xMiden/node.git
-# v0.16.0-rc.3. See the compatibility note above: its lock pins protocol rc.4
-# + VM 0.29.1 vs our rc.6 + 0.29.4 — MAST-root agreement is an assumption
-# pending cross-binary evidence. fixtures/patches/0001 is not applied (the
-# node-store callback-vault-key bug is fixed upstream), and the AggLayer
-# network id is a runtime storage slot, so no vendor patch.
-MIDEN_NODE_GIT_REF := v0.16.0-rc.3
+# v0.16.0-rc.5. See the compatibility note above: its lock pins protocol rc.9
+# (ours too) + VM 0.29.1 (ours 0.29.4). No source patch, no vendor patch: the
+# prover timeout is a flag, the node-store callback-vault-key bug is fixed
+# upstream, and the AggLayer network id is a runtime storage slot.
+MIDEN_NODE_GIT_REF := v0.16.0-rc.5
 # The exact commit the tag points at (verified by `git ls-remote` at pin
 # time). run-all.sh checks the checkout's HEAD against this so a fork cannot
 # shadow the tag. Bump BOTH together.
-MIDEN_NODE_GIT_COMMIT := 901a7a8817d46b24a1fc9b39beed60c6d14d34e5
+MIDEN_NODE_GIT_COMMIT := 461ac961951c19543b3b2e6db99a0bf82349dbde
 
 E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
 

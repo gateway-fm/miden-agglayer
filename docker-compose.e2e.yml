@@ -83,14 +83,14 @@ services:
   # The bridge is deployed but left UNCONFIGURED — faucet registration
   # happens at runtime via the proxy's CONFIG_AGG_BRIDGE note.
   #
-  # NODE IMAGE PATCH (applied to the pinned v0.16.0-rc.3 checkout): upstream
-  # still hardcodes the ntx-builder's
-  # per-request remote-prover timeout to 10s (bin/ntx-builder/src/lib.rs
-  # DEFAULT_PROVER_TIMEOUT, no CLI flag). Bridge CLAIM-consumption proofs
-  # exceed that on shared e2e hardware, so the miden-ntx-builder image must be
-  # built with the one-line 10s->180s patch (companion checkout, commit
-  # "e2e-local: raise ntx-builder remote-prover timeout 10s->180s") or every
-  # deposit mint retries forever on "Timeout expired".
+  # NTX-BUILDER PROVER TIMEOUT: the ntx-builder's per-request remote-prover
+  # timeout defaults to 10s. Bridge CLAIM-consumption proofs exceed that on
+  # shared e2e hardware, so the ntx-builder service below passes
+  # `--tx-prover.timeout=180s` (a flag since node v0.16.0-rc.4,
+  # 0xMiden/node#2537 — before that the images had to be built from a
+  # sed-patched checkout, #180). Without it every deposit mint retries
+  # forever on "Timeout expired". Keep it in step with tx-prover's own
+  # `--timeout` (the prover-side bound on the same request).
   #
   # The ntx-builder authorises network-tx submission to the sequencer with a
   # shared secret that MUST match on both sides (sequencer
@@ -101,7 +101,8 @@ services:
 
   # The 0.16 node split the old one-shot `bootstrap --genesis-config-file`
   # (since v0.16.0-rc.1) into `genesis` + `bootstrap`, and rc.3 tightened the
-  # CLI (mirrors upstream run-node.sh, scripts/run-node.sh @ v0.16.0-rc.3):
+  # CLI (mirrors upstream run-node.sh, scripts/run-node.sh — unchanged between
+  # v0.16.0-rc.3 and the pinned v0.16.0-rc.5):
   #   1. `miden-validator pubkey --signing-key.hex <key>` — derive the public
   #      key of the insecure dev signing key;
   #   2. `miden-validator genesis ... --validator.key <pubkey>` — build the
@@ -269,6 +270,8 @@ services:
       - --rpc.url=http://miden-node:57291
       - --rpc.auth-header-value=${MIDEN_NTX_AUTH:-e2e-ntx-secret}
       - --tx-prover.url=http://tx-prover:50051
+      # See "NTX-BUILDER PROVER TIMEOUT" above (#180).
+      - --tx-prover.timeout=180s
       - --data-directory=/data/ntx-builder
 
     # ── L2 EVM Proxy (service under test) ──────────────────────────────────────
