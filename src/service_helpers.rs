@@ -153,7 +153,7 @@ pub(crate) fn build_synthetic_tx_json(
 ) -> serde_json::Value {
     // NB a ClaimEvent-bearing tx should never reach this synthetic fallback: its full
     // authoritative claimAsset calldata is PERSISTED under the derived hash
-    // (`restore::persist_synthetic_claim_tx` + the projector backfill) and served by the
+    // (`projection::persist_synthetic_claim_tx` + the projector backfill) and served by the
     // stored-envelope path that precedes this. Reaching here with a ClaimEvent means the
     // calldata was unrecoverable (alarmed at the call site) — serve the legacy empty
     // input rather than fabricating fields aggkit would persist as claim truth.

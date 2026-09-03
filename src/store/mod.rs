@@ -591,7 +591,7 @@ pub trait Store: Send + Sync + 'static {
     /// retained-PostgreSQL + reset-Miden-store recovery, where the ClaimEvent
     /// rows are retained but their tx envelopes were lost, until the genesis
     /// reconciler re-observes each historical CLAIM note and backfills its
-    /// calldata (`restore::persist_synthetic_claim_tx`). Readiness gates on this
+    /// calldata (`projection::persist_synthetic_claim_tx`). Readiness gates on this
     /// reaching 0 so consumers are never released while `eth_getTransactionByHash`
     /// would serve an empty-input claim (aggkit's bridgesync parser stalls on it).
     /// Default 0 — stores that do not track claim calldata report themselves ready.

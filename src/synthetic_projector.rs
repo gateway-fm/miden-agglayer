@@ -1080,6 +1080,8 @@ impl SyntheticProjector {
             bodies,
             returned_ids,
         } = fetcher.fetch_public_bodies(&fetch_ids).await?;
+        let any_body_by_id: HashMap<NoteId, &FetchedBody> =
+            bodies.iter().map(|b| (b.id, b)).collect();
         let body_by_id: HashMap<NoteId, &FetchedBody> = bodies
             .iter()
             .filter(|b| is_b2agg_note(&b.details))
@@ -1125,7 +1127,28 @@ impl SyntheticProjector {
                 );
             } else if returned_ids.contains(note_id) {
                 // Node RETURNED it but it is non-public / non-b2agg — legit CLAIM/GER. Safe skip
-                // (must NOT fail-closed, or a legit consumption wedges the tip).
+                // (must NOT fail-closed, or a legit consumption wedges the tip)...
+                // UNLESS the returned body's own nullifier is not the one this
+                // reference was resolved for: a CROSS-TYPE swap (a B2AGG
+                // nullifier paired with a CLAIM/GER id) would otherwise slip
+                // through this branch as a "legit CLAIM" and silently drop the
+                // bridge-out, leaving only the LET gate to notice (#167 review —
+                // this restores the deleted engine's cross-type refusal).
+                if let Some(body) = any_body_by_id.get(note_id)
+                    && body.nullifier != *nullifier
+                {
+                    metrics::counter!("synthetic_projector_b2agg_ref_mismatch_total").increment(1);
+                    anyhow::bail!(
+                        "projector: note {} (not a bridge-out) was resolved for consumed \
+                         nullifier {} but its own nullifier is {} — the node's (nullifier, \
+                         note_id) reference is inconsistent (cross-type swap). Refusing to \
+                         seal block {}.",
+                        note_id.to_hex(),
+                        nullifier.to_hex(),
+                        body.nullifier.to_hex(),
+                        cref.block,
+                    );
+                }
                 tracing::debug!(
                     note_id = %note_id.to_hex(),
                     block = cref.block,
@@ -1543,10 +1566,24 @@ impl SyntheticProjector {
             .reconcile_notes(client, &self.node_rpc, tip, reconcile_patience)
             .await
         {
-            tracing::warn!(
-                error = %format!("{e:#}"),
-                "note reconciler failed (transient — will retry next tick)"
-            );
+            match reconcile_patience {
+                // Live: transient, the scheduler retries next tick.
+                ReconcilePatience::LiveTick => tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "note reconciler failed (transient — will retry next tick)"
+                ),
+                // Restore (#167 review): fail closed WITH the cause. Swallowing
+                // it here left the operator with only a generic "stalled after
+                // N passes" from the catch-up driver, never the auth failure /
+                // pruned range / unserviceable window that actually stopped
+                // discovery.
+                ReconcilePatience::Recovery => {
+                    return Err(e.context(
+                        "restore catch-up: note discovery failed (fail-closed under Recovery \
+                         patience — the restore cannot seal history it could not discover)",
+                    ));
+                }
+            }
         }
         // Receipt polling is store-only. Resolve confirmed duplicates here, on
         // the existing single-flight projector task, with a bounded batch.
@@ -1833,14 +1870,6 @@ impl SyntheticProjector {
         Ok(cursor)
     }
 
-    /// Reset BOTH cursors — note-visibility discovery and block projection —
-    /// to genesis, updating the persisted store AND the in-memory atomics.
-    ///
-    /// Issue #167: resetting only PostgreSQL after the projector was
-    /// constructed is invalid — the in-memory atomics would keep their old
-    /// values and the projector would silently skip history. Persistence
-    /// happens FIRST so a crash mid-reset can never leave the durable cursor
-    /// ahead of projected state on restart.
     /// Drain the cumulative per-kind emission counts (see `projection_totals`).
     /// Called by `--restore` after `catch_up_to` completes; live code never
     /// reads it.
@@ -1849,6 +1878,19 @@ impl SyntheticProjector {
         std::mem::take(&mut *totals)
     }
 
+    /// Reset BOTH cursors — note-visibility discovery and block projection —
+    /// to genesis, updating the persisted store AND the in-memory atomics.
+    ///
+    /// Issue #167: resetting only PostgreSQL after the projector was
+    /// constructed is invalid — the in-memory atomics would keep their old
+    /// values and the projector would silently skip history. Persistence
+    /// happens FIRST so a crash mid-reset can never leave the durable cursor
+    /// ahead of projected state on restart.
+    ///
+    /// Production `--restore` resets via [`Store::reset_cursors_to_genesis`]
+    /// BEFORE constructing its projector (the issue's other valid ordering),
+    /// so this method currently has no production caller; it exists for a
+    /// projector that must be reset after construction.
     pub async fn reset_cursors_to_genesis(&self) -> anyhow::Result<()> {
         // One durable commit for BOTH columns (Store::reset_cursors_to_genesis)
         // — a torn reset would let projection skip history the re-sweep
@@ -1907,10 +1949,13 @@ impl SyntheticProjector {
     /// feed is wedged and the restore must stop loudly.
     const RESTORE_STALL_PATIENCE: usize = 4;
 
-    /// #167 (review) — per-pass projection span in restore catch-up: each
+    /// #167 (review) — per-pass PROJECTION span in restore catch-up: each
     /// pass projects at most this many blocks, bounding a pass's by-block
-    /// map / transaction feed regardless of chain size (memory stays
-    /// O(window), never O(history)).
+    /// map and bridge-transaction feed regardless of chain size. NOTE what
+    /// it does not bound: the consumed-note feed and the output-metadata
+    /// read are whole-client-store queries repeated every pass, so per-pass
+    /// memory is O(window + store), not O(window) — issue #167 item 2
+    /// (bounded resolved-input pipeline) is what removes the store term.
     const RESTORE_PASS_WINDOW: u64 = 5_000;
 
     /// The restore catch-up loop: Recovery-patience passes (no tick time
@@ -1933,10 +1978,10 @@ impl SyntheticProjector {
             // #167 (review) — bound each pass's PROJECTION span so a genesis
             // restore on a grown chain cannot balloon one pass's by-block map
             // and transaction feed without limit: each pass drives at most
-            // `RESTORE_PASS_WINDOW` blocks toward the fixed target. Memory
-            // stays O(window); progress across passes is what completes the
-            // restore. (The consumed-feed and output-metadata reads remain
-            // client-store queries — bounded by store content, not history.)
+            // `RESTORE_PASS_WINDOW` blocks toward the fixed target; progress
+            // across passes is what completes the restore. (The consumed-feed
+            // and output-metadata reads remain whole-client-store queries per
+            // pass — see the constant's doc; not O(window) yet.)
             let pass_tip =
                 target_tip.min(self.cursor.load(Ordering::Acquire) + Self::RESTORE_PASS_WINDOW);
             self.tick_pass(
@@ -2178,6 +2223,15 @@ fn ensure_authoritative_coverage(
     // records — it is a safety net ON TOP of the LET cardinality gate.
     let mut local: HashMap<u64, usize> = HashMap::new();
     for n in consumed {
+        // A local B2AGG record is NOT coverage: projection deliberately skips
+        // B2AGG records from the consumed feed (`by_block` excludes them; only
+        // authoritative resolution projects a bridge-out), so counting one here
+        // would let a locally-visible B2AGG stand in for a MISSING CLAIM/GER at
+        // the same block — exactly the silent drop this guard exists to stop,
+        // and one the (B2AGG-only) LET gate cannot catch (#167 review).
+        if is_b2agg_note(n.details()) {
+            continue;
+        }
         if let Some(h) = n.state().consumed_block_height() {
             *local.entry(h.as_u64()).or_default() += 1;
         }
@@ -2842,6 +2896,35 @@ mod tests {
             format!("{err:#}").contains("at block 7"),
             "error must name the uncovered block, not the covered one: {err:#}"
         );
+
+        // #167 review — a LOCAL B2AGG RECORD IS NOT COVERAGE. Projection never
+        // projects a B2AGG from the consumed feed (only authoritative
+        // resolution does), so a locally-visible B2AGG must not stand in for
+        // a missing CLAIM/GER at the same block. Block 5: one input resolved
+        // as a bridge-out, one CLAIM unaccounted for; the feed holds two
+        // B2AGG records at block 5 — the guard must still halt.
+        let refs = refs_at(&[5, 5]);
+        let mut one_resolved: HashSet<Nullifier> = HashSet::new();
+        one_resolved.insert(nullifier(0x10));
+        let b2agg_only = vec![b2agg_note(5, Some(0)), b2agg_note(5, Some(1))];
+        let err = ensure_authoritative_coverage(&b2agg_only, &refs, &one_resolved, 0, 10)
+            .expect_err("a local B2AGG record must not cover for a missing CLAIM/GER");
+        assert!(
+            format!("{err:#}").contains("at block 5"),
+            "error must name the masked block: {err:#}"
+        );
+        // ...and an UNRESOLVED local B2AGG is itself a drop (projection skips
+        // it), so it cannot count either — even when it is the only input.
+        let refs = refs_at(&[5]);
+        let unresolved_b2agg = vec![b2agg_note(5, Some(0))];
+        ensure_authoritative_coverage(&unresolved_b2agg, &refs, &empty, 0, 10)
+            .expect_err("an unresolved local B2AGG must not count as coverage");
+        // The same block with a real CLAIM record alongside the resolved
+        // bridge-out passes: B2AGG excluded, CLAIM counted.
+        let refs = refs_at(&[5, 5]);
+        let mixed = vec![b2agg_note(5, Some(0)), claim_note(5, Some(1))];
+        ensure_authoritative_coverage(&mixed, &refs, &one_resolved, 0, 10)
+            .expect("resolved bridge-out + local CLAIM must pass");
     }
 
     /// ISSUE #167 — the restore catch-up driver's completion/stall contract,
@@ -2924,12 +3007,14 @@ mod tests {
         assert_eq!(fresh.cursor.load(Ordering::Acquire), 0);
     }
 
-    /// ISSUE #167 — restore catch-up is fail-closed against a wedged feed:
-    /// with a node that never serves state, passes make no progress and the
-    /// driver STOPS with an actionable stall error after
-    /// [`SyntheticProjector::RESTORE_STALL_PATIENCE`] passes, instead of
+    /// ISSUE #167 — restore catch-up is fail-closed against a dead feed:
+    /// with a node that never serves state, the FIRST pass propagates the
+    /// discovery failure with its cause (review finding: swallowing it left
+    /// only a generic "stalled after N passes" from the driver), instead of
     /// spinning forever or silently declaring success. (The live scheduler
-    /// tolerates the same condition by design — one warn per tick, retried.)
+    /// tolerates the same condition by design — one warn per tick, retried.
+    /// The stall bound itself is pinned on the pure decision in
+    /// `catch_up_progress_completes_at_fixed_tip_and_fails_closed_on_stall`.)
     ///
     /// Hermetic by construction: the reconciler's RPC handle is swapped to a
     /// real gRPC client on 127.0.0.1:1 (never routable/listenable without
@@ -2954,13 +3039,13 @@ mod tests {
             .expect_err("a dead node must stall the restore catch-up, not hang or succeed");
         let rendered = format!("{err:#}");
         assert!(
-            rendered.contains("restore catch-up stalled"),
-            "error must be the actionable stall: {rendered}"
+            rendered.contains("note discovery failed"),
+            "error must name the discovery failure, not a generic stall: {rendered}"
         );
         assert_eq!(
             store.get_projector_cursor().await.unwrap(),
             0,
-            "no projection may be attributed below the stalled discovery feed"
+            "no projection may be attributed below the failed discovery feed"
         );
     }
 
@@ -4031,6 +4116,93 @@ mod tests {
         assert!(
             report.contains("inconsistent"),
             "the error must name the inconsistent reference, got: {report}"
+        );
+    }
+
+    /// CROSS-TYPE swap (#167 review — coverage that was deleted with the
+    /// replay engine): a B2AGG nullifier paired with a CLAIM note id. The
+    /// fetched body is not a bridge-out, so it used to fall into the "legit
+    /// CLAIM/GER — safe skip" branch and the bridge-out silently vanished,
+    /// leaving only the LET gate to notice. The body's own nullifier
+    /// disagrees with the consumed one, which is conclusive: fail closed.
+    #[tokio::test]
+    async fn cross_type_swapped_ref_is_refused() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        let claim = claim_note(600, Some(0));
+        let details = claim.details().clone();
+        assert!(!is_b2agg_note(&details), "fixture must be a non-B2AGG body");
+        let claim_id = NoteId::new(
+            claim.details_commitment(),
+            &NoteMetadata::new(
+                PartialNoteMetadata::new(aid(BRIDGE), NoteType::Public),
+                &NoteAttachments::default(),
+            ),
+        );
+        let b2agg_nf = nullifier(0xb2);
+        let claim_nf = nullifier(0xc1);
+
+        let consumed_refs = HashMap::from([(
+            b2agg_nf,
+            ConsumedRef {
+                block: 600,
+                order: 0,
+                note_id: Some(claim_id),
+                within_tx_pos: 0,
+            },
+        )]);
+        let fetcher = MockFetcher {
+            bodies: vec![FetchedBody {
+                id: claim_id,
+                details,
+                attachments: NoteAttachments::default(),
+                nullifier: claim_nf,
+            }],
+            ..Default::default()
+        };
+
+        let err = projector
+            .resolve_b2agg_consumptions(
+                &fetcher,
+                consumed_refs,
+                &mut HashMap::new(),
+                &mut Default::default(),
+            )
+            .await
+            .expect_err(
+                "a non-B2AGG body whose nullifier is not the consumed one must fail closed",
+            );
+        let report = format!("{err:#}");
+        assert!(
+            report.contains("cross-type swap"),
+            "the error must name the cross-type inconsistency, got: {report}"
+        );
+
+        // Control: a returned non-B2AGG body whose nullifier IS the consumed
+        // one is a legitimate CLAIM — still a safe skip, never an error.
+        let consumed_refs = HashMap::from([(
+            claim_nf,
+            ConsumedRef {
+                block: 600,
+                order: 0,
+                note_id: Some(claim_id),
+                within_tx_pos: 0,
+            },
+        )]);
+        let resolved = projector
+            .resolve_b2agg_consumptions(
+                &fetcher,
+                consumed_refs,
+                &mut HashMap::new(),
+                &mut Default::default(),
+            )
+            .await
+            .expect("a consistent CLAIM reference is a safe skip");
+        assert!(
+            resolved.is_empty(),
+            "a CLAIM never resolves as a bridge-out"
         );
     }
 

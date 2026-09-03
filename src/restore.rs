@@ -480,8 +480,6 @@ async fn restore_faucet_identities(
     Ok(n)
 }
 
-/// Tallies from the merged replay, kept per-kind so the phase-level log lines
-/// (and the restore summary) stay unchanged for operators.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,21 +489,6 @@ mod tests {
     use crate::store::memory::InMemoryStore;
 
     use std::sync::Arc as StdArc;
-
-    // Test AccountIds — four distinct, valid protocol-0.15 (version-1) ids.
-    // Protocol 0.15 dropped the 0.14 v0 id encoding (and folded the old
-    // Network *storage mode* away: `AccountType` is now just `Private`/`Public`,
-    // and network-account behaviour comes from the `AuthNetworkAccount`
-    // *component*, not an id bit). So `NetworkAccountTarget::new` no longer
-    // constrains the target id's encoding, and these plain public/private ids
-    // are accepted as targets. They are hardcoded hex (rather than pulled from
-    // the `testing` feature) to keep this a dependency-light pure-predicate test;
-    // the only property the ma28 classifier relies on is that the four ids are
-    // mutually distinct.
-
-    // PR#164 blocker #1 — the node-metadata join must fail closed on a
-    // details-commitment collision that carries different provenance, never
-    // last-write-wins.
 
     /// Review 0814 (blocking): a leaf can be RESERVED (satisfying the
     /// `accounted == let_leaves` cardinality check) yet never EMITTED — the
@@ -698,21 +681,4 @@ mod tests {
             );
         }
     }
-
-    // GER-shaped `ConsumedExternal` fixture (MA#28) — shared with the projection
-    // tests in `crate::projection`; used here by the erased-replay recovery test.
-
-    // ── ClaimEvent provenance gate — foreign-deployment claims (live-proven) ─
-    //
-    // A read-only reindex of the real testnet (which hosts a FOREIGN
-    // miden-agglayer deployment on the SAME Miden chain) projected 3
-    // ClaimEvents from the foreign deployment's claims into our
-    // synthetic_logs: `project_claim_note` gated only on the ClaimNote
-    // script root, unlike the GER path's MA#28 sender/target gate and the
-    // B2AGG path's MA#3 consumer gate. These tests pin the fix: a
-    // CLAIM-shaped consumed note must be provably OURS (consumed by OUR
-    // bridge, or minted by OUR service targeting OUR bridge) before a
-    // synthetic ClaimEvent is projected.
-
-    // ── Finding #69 — node-scan CLAIM replay (Phase 2.6) ─────────────────────
 }
