@@ -1,29 +1,15 @@
-//! Faucet-identity BOOTSTRAP — the chain-derived state the canonical projector
-//! needs before the first dependent B2AGG / CLAIM is projected (issue #167,
-//! item 5).
+//! Faucet identities are the chain-derived state a bridge-out needs before it
+//! can be projected. The bridge's `faucet_metadata_map` is authoritative, so
+//! after a PostgreSQL loss they are rebuilt from public state; the faucet
+//! account itself is never re-deployed, because its seed is unrecoverable and a
+//! second generation would strand balances (Cantina #6).
 //!
-//! A B2AGG bridge-out is projectable only when its faucet's origin identity
-//! (L1 token address / network / scale) is known locally; a CLAIM's synthetic
-//! calldata resolves through the same registry. The bridge account holds the
-//! authoritative `faucet_metadata_map`, so after a PostgreSQL loss every
-//! registered faucet's identity can be rebuilt from public on-chain state —
-//! faucets are bridge-owned (mint/burn), no signing key is involved, and the
-//! account is never re-deployed (its random seed is unrecoverable; a re-deploy
-//! would strand balances in a second generation — Cantina #6).
+//! Fail-closed on purpose: the previous best-effort version quarantined the
+//! affected exits and let a restore "succeed" over a `depositCount` gap.
 //!
-//! This used to be a restore-private phase (`restore::restore_faucet_identities`,
-//! best-effort: per-faucet failures logged and skipped, historical exits then
-//! QUARANTINED as `UnknownFaucet` and the restore "succeeded" over a
-//! `depositCount` gap the emitted-frontier gate later refused). It is now a
-//! normal reconciliation primitive the projector runs itself in restore
-//! posture, FAIL-CLOSED: an unknown faucet type, a failed rebuild, or an
-//! unavailable bridge account halts projection before any dependent event
-//! seals, instead of quarantining history and continuing.
-//!
-//! Live posture deliberately does NOT run this: on a live proxy a bridge
-//! faucet with no local row is a security signal (the admin key was used
-//! outside the proxy — see `faucet_registry_reconciler`), and adopting it would
-//! launder a compromise. `--restore` is the one sanctioned import path.
+//! Restore only. On a live proxy an unregistered bridge faucet means the admin
+//! key was used outside the proxy (`faucet_registry_reconciler`); adopting it
+//! would launder a compromise.
 
 use std::sync::Arc;
 
@@ -35,31 +21,14 @@ use crate::metadata_recovery::{
 use crate::miden_client::MidenClientLib;
 use crate::store::Store;
 
-/// What one bootstrap pass did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct FaucetBootstrapReport {
-    /// `faucet_registry` rows rebuilt from the bridge's `faucet_metadata_map`.
     pub rebuilt: usize,
-    /// Faucets the bridge registers that already had a local row.
     pub already_known: usize,
 }
 
-/// Rebuild every MISSING local faucet-identity row from the bridge's
-/// authoritative `faucet_metadata_map`, fail-closed.
-///
-/// Idempotent and cheap when nothing is missing (one local bridge-account read
-/// plus one registry lookup per registered faucet), so the projector runs it at
-/// the start of every restore pass. Requires the bridge account to be tracked
-/// locally (restore's Phase 0 reimports it).
-///
-/// Errors (all halt the caller before it projects anything):
-/// * the bridge account is not available locally;
-/// * a registered faucet matches no supported faucet kind (`UNKNOWN faucet
-///   type` — malformed or hostile registration; counted in
-///   `restore_unknown_faucet_type_total`);
-/// * a faucet's identity could not be read back from chain, or the rebuilt row
-///   could not be persisted (counted in
-///   `restore_faucet_identity_rebuild_failed_total`).
+/// Idempotent and cheap when nothing is missing, so the projector can run it
+/// before every restore pass. Needs the bridge account tracked locally.
 pub async fn rebuild_missing_faucet_identities(
     client: &mut MidenClientLib,
     store: &Arc<dyn Store>,
@@ -92,10 +61,8 @@ pub async fn rebuild_missing_faucet_identities(
         }
         let Some(conversion) = read_faucet_conversion_metadata(bridge_account.storage(), faucet_id)
         else {
-            // All-zero conversion = the native-ETH sentinel (seeded from config at
-            // startup, never rebuilt from chain) or an unregistered id. A registered
-            // NATIVE faucet has a non-zero origin (origin_network == network_id,
-            // scale 0), so it does NOT land here.
+            // All-zero conversion is the native-ETH sentinel, seeded from config
+            // at startup rather than from chain.
             continue;
         };
         let entry = match crate::faucet_ops::rebuild_faucet_entry_from_chain(

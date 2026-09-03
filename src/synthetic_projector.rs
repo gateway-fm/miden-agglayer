@@ -312,18 +312,15 @@ struct PendingDuplicate {
     note_id: String,
 }
 
-/// Scheduling policy for [`SyntheticProjector::catch_up_to`] (issue #167).
-/// Both modes drive the SAME discovery/ordering/projection/sealing path
-/// (`tick_pass`); they differ only in scheduling and failure posture.
+/// Scheduling and failure posture for [`SyntheticProjector::catch_up_to`].
+/// Both modes run the same `tick_pass`, so live and restored history cannot
+/// diverge (issue #167).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatchUpMode {
-    /// Bounded per-pass work under the live scheduler; a transient
-    /// discovery/projection failure is logged and retried next tick.
+    /// One bounded pass; transient failures are the scheduler's to retry.
     Live,
-    /// Blocking fail-closed catch-up (`--restore`): no tick time budget,
-    /// the tip stays fixed at the captured target, and any
-    /// discovery/projection stall propagates instead of being retried
-    /// silently.
+    /// Loop to a fixed tip with no time budget; any failure aborts, because a
+    /// restore must not seal history it could not fully reconstruct.
     Restore,
 }
 
@@ -403,25 +400,13 @@ pub struct SyntheticProjector {
     audit_resolved: std::sync::Mutex<HashSet<([u8; 32], u64, u32)>>,
     /// Tick counter driving the every-[`AUDIT_EVERY_N_TICKS`] audit cadence.
     audit_tick_counter: AtomicU64,
-    /// #167 (review) — restore-mode guard switch: when set, `tick_pass` fails
-    /// closed on any bridge-consumed input that is neither in the local
-    /// consumed feed nor authoritatively resolved as a bridge-out (an
-    /// ERASED/unrecoverable note would otherwise silently vanish from the
-    /// restored history). Live ticks keep the tolerant posture: the LET
-    /// cardinality gate already halts on invisible B2AGG gaps, and a
-    /// legitimately-consumed CLAIM/GER is always in the local feed on an
-    /// un-wiped store.
-    /// #167 — restore posture: exact authoritative coverage (any bridge-consumed
-    /// input without a recoverable identity halts before sealing), the faucet
-    /// bootstrap primitive before projection, and the live-only O(store)
-    /// self-heal passes (claim-calldata backfill, completeness audit) skipped.
+    /// Set by `CatchUpMode::Restore`. Restore fails closed where a live tick
+    /// tolerates and retries, because it has no later tick to heal in.
     restore_posture: AtomicBool,
-    /// Faucet-identity rows the restore-posture bootstrap rebuilt (report only).
+    /// For the restore report only.
     faucet_identities_rebuilt: AtomicUsize,
-    /// Cumulative per-kind emission counts accumulated by every projected
-    /// block. Live ticks ignore it; `--restore` (issue #167) reads it once
-    /// after `catch_up_to` completes to build the restore report from the
-    /// canonical path itself instead of a parallel bookkeeping pass.
+    /// For the restore report only; counted here so the report comes from the
+    /// canonical path rather than separate bookkeeping.
     projection_totals: std::sync::Mutex<crate::projection::BlockProjectionCounts>,
     /// Synthesized-claim calldata backfill: details-commitments of consumed CLAIM notes
     /// whose derived-hash tx record is RESOLVED (full claimAsset calldata persisted, or
@@ -952,11 +937,10 @@ impl SyntheticProjector {
                 );
             }
 
-            // Persist every visible note identity (issue #167 item 3: EVERY public
-            // note kind, not just B2AGG — CLAIM/GER must survive a client-store loss
-            // too). If miden-client dropped an already-spent note or collapsed
-            // same-details siblings, fetch just the missing IDs directly. This
-            // completes before the caller advances the durable reconcile cursor.
+            // Every public note kind is persisted, not just B2AGG: the ledger is
+            // what lets CLAIM/GER history survive a client-store loss. Notes
+            // miden-client dropped (already spent) or collapsed (same details)
+            // are fetched by id so no identity is lost before the cursor advances.
             let visible = client
                 .get_input_notes(NoteFilter::List(candidates.to_vec()))
                 .await
@@ -974,9 +958,8 @@ impl SyntheticProjector {
         Ok(())
     }
 
-    /// Persist the nullifier-to-NoteId join while local records still expose metadata —
-    /// for every note kind (the ledger is the identity source for any bridge-consumed
-    /// input whose transaction header carries no reference).
+    /// Persist the nullifier-to-NoteId join while local records still expose
+    /// metadata; a consumed record loses it.
     async fn persist_note_identities(&self, records: &[InputNoteRecord]) -> anyhow::Result<()> {
         let identities = records
             .iter()
@@ -1010,16 +993,15 @@ impl SyntheticProjector {
             let FetchedNote::Public(note, _inclusion) = f else {
                 continue;
             };
-            // Private notes carry no body: no nullifier to key, and never a projectable
-            // event (B2AGG / CLAIM / UpdateGerNote are all public).
+            // Private notes have no body to key by, and are never events (all
+            // three event kinds are public).
             identities.push((note.nullifier(), id));
         }
         self.store.put_note_identities(&identities).await
     }
 
-    /// Test/compat adapter over [`Self::resolve_bridge_consumptions`]: the resolved
-    /// B2AGG exits only (the shape the per-kind unit tests pin), with every
-    /// nullifier the pipeline accounted for merged into `resolved_nullifiers`.
+    /// B2AGG-only view of [`Self::resolve_bridge_consumptions`] for the tests
+    /// written against the older per-kind shape.
     #[cfg(test)]
     async fn resolve_b2agg_consumptions(
         &self,
@@ -1035,37 +1017,14 @@ impl SyntheticProjector {
         Ok(resolved.b2agg)
     }
 
-    /// THE resolved-input pipeline (issue #167 item 2): turn a window's
-    /// bridge-consumed inputs — EVERY event family, from ONE authoritative source
-    /// (the bridge's transaction feed) — into projectable records carrying exact
-    /// identity, body, attachments, authoritative metadata, consuming account,
-    /// consumption block / transaction order / input position.
+    /// Resolve a window's bridge-consumed inputs into projectable records —
+    /// every event kind from the one authoritative source (the bridge's
+    /// transaction feed), so history rebuilds identically tick-by-tick and from
+    /// genesis, and a client-store loss cannot erase CLAIM/GER events.
     ///
-    /// Identity resolution, in order (issue #167 item 3):
-    ///   1. the transaction input header's `NoteId`, when the client exposes it;
-    ///   2. the node's `(nullifier, note_id)` reference for public inputs;
-    ///   3. the durable identity ledger the reconciler's windowed sweep records
-    ///      for every public note in the bridge's tag space (`Store::
-    ///      get_note_identities`) — the bounded archive lookup for
-    ///      historical / headerless inputs;
-    ///   4. exact body retrieval by id (`get_notes_by_id`).
-    ///
-    /// Every returned body is bound to its consumption by its own nullifier
-    /// (a swapped `(nullifier, note_id)` reference of ANY kind is refused), then
-    /// classified by script root: B2AGG exits carry their within-transaction
-    /// position (the on-chain LET append order); CLAIM / UpdateGerNote become
-    /// `ConsumedExternal` records WITH metadata (the MA#28 / claim provenance
-    /// gates read it straight from the authoritative body — no output-note
-    /// fallback map, no whole-store read); setup notes and private inputs are
-    /// accounted for and project nothing.
-    ///
-    /// Inputs with NO recoverable identity are returned in `unresolved` — never
-    /// dropped silently. Live posture skips them (a hidden B2AGG still fails
-    /// closed at the LET cardinality gate); restore posture halts on them
-    /// (`ensure_authoritative_coverage`).
-    ///
-    /// Memory and RPC work are bounded by the window: the inputs are the
-    /// window's bridge transactions and the bodies fetched for them.
+    /// Identity falls back from the header reference to the durable ledger the
+    /// note sweep records; the body is then fetched by exact id. Work is
+    /// bounded by the window's transactions.
     async fn resolve_bridge_consumptions(
         &self,
         fetcher: &dyn PublicNoteFetcher,
@@ -1077,8 +1036,8 @@ impl SyntheticProjector {
                 nullifier_block_height: BlockNumber::from(cref.block as u32),
                 consumer_account: Some(self.bridge_id),
                 consumed_tx_order: Some(cref.order),
-                // The authoritative metadata (sender / tag / type) from the node's
-                // public record: what the provenance gates verify against.
+                // From the node's public record, so the provenance gates verify
+                // against chain data rather than a local output-note copy.
                 metadata: Some(body.metadata),
             });
             InputNoteRecord::new(body.details.clone(), body.attachments.clone(), None, state)
@@ -1086,7 +1045,6 @@ impl SyntheticProjector {
 
         let mut out = ResolvedInputs::default();
 
-        // Steps 1-3: identity.
         let nullifiers: Vec<Nullifier> = consumed_refs.keys().copied().collect();
         let durable_ids = self.store.get_note_identities(&nullifiers).await?;
         let mut refs = Vec::new();
@@ -1111,7 +1069,6 @@ impl SyntheticProjector {
             return Ok(out);
         }
 
-        // Step 4: exact bodies.
         let fetch_ids: Vec<NoteId> = refs
             .iter()
             .map(|(_, _, note_id)| *note_id)
@@ -1126,9 +1083,8 @@ impl SyntheticProjector {
         for (nullifier, cref, note_id) in &refs {
             let Some(body) = body_by_id.get(note_id) else {
                 if returned_ids.contains(note_id) {
-                    // Node RETURNED it but it is PRIVATE: no body, and provably not an
-                    // event (B2AGG / CLAIM / UpdateGerNote are all public notes). Accounted
-                    // for; nothing to project.
+                    // Returned but private: provably not an event (all three event
+                    // kinds are public), so it is accounted for without a body.
                     out.resolved_nullifiers.insert(*nullifier);
                     tracing::debug!(
                         note_id = %note_id.to_hex(),
@@ -1151,15 +1107,11 @@ impl SyntheticProjector {
                     cref.block
                 );
             };
-            // BIND the fetched body to the consumption it was resolved for — for EVERY
-            // kind. The id can come from the transaction's (nullifier, note_id) refs, and
-            // upstream's `trusted_consumed_note_refs` only checks that the ref's NULLIFIER
-            // was consumed by this transaction — never that the paired id is the note that
-            // nullifier belongs to. Two refs with swapped ids both pass that filter, and
-            // since the id carries `within_tx_pos`, a swap would reorder BridgeEvents and
-            // shift deposit counts while every count stayed correct; a cross-type swap
-            // (a B2AGG nullifier paired with a CLAIM id) would silently drop the exit.
-            // The body's own nullifier settles it.
+            // Upstream's `trusted_consumed_note_refs` only checks that a ref's
+            // nullifier was consumed, never that its id is that nullifier's note.
+            // Swapped ids would reorder bridge-outs (the id carries the LET input
+            // position) or, across kinds, drop an exit as a "CLAIM"; the body's
+            // own nullifier is the fact that catches both.
             if body.nullifier != *nullifier {
                 metrics::counter!("synthetic_projector_b2agg_ref_mismatch_total").increment(1);
                 anyhow::bail!(
@@ -1587,15 +1539,9 @@ impl SyntheticProjector {
             .await
     }
 
-    /// One projection pass toward an EXPLICIT tip (issue #167): the shared
-    /// per-pass unit behind both scheduling policies — the live scheduler
-    /// (`LiveTick` patience, bounded per-pass work, transient failures
-    /// retried next tick) and the restore catch-up driver (`Recovery`
-    /// patience, no tick budget, failures propagated fail-closed).
-    ///
-    /// The tip is a parameter, never re-queried: a restore pinned at a
-    /// captured `target_tip` must not be dragged forward by a node that
-    /// keeps producing blocks during the catch-up.
+    /// One projection pass toward `tip`, shared by the live tick and the
+    /// restore driver. The tip is a parameter and never re-queried so a
+    /// producing node cannot drag a restore past its captured target.
     async fn tick_pass(
         &self,
         client: &mut MidenClientLib,
@@ -1611,16 +1557,12 @@ impl SyntheticProjector {
             .await
         {
             match reconcile_patience {
-                // Live: transient, the scheduler retries next tick.
                 ReconcilePatience::LiveTick => tracing::warn!(
                     error = %format!("{e:#}"),
                     "note reconciler failed (transient — will retry next tick)"
                 ),
-                // Restore (#167 review): fail closed WITH the cause. Swallowing
-                // it here left the operator with only a generic "stalled after
-                // N passes" from the catch-up driver, never the auth failure /
-                // pruned range / unserviceable window that actually stopped
-                // discovery.
+                // Restore has no next tick; propagate with the cause, or the
+                // operator only ever sees the driver's generic stall.
                 ReconcilePatience::Recovery => {
                     return Err(e.context(
                         "restore catch-up: note discovery failed (fail-closed under Recovery \
@@ -1661,16 +1603,10 @@ impl SyntheticProjector {
         }
         let live = matches!(reconcile_patience, ReconcilePatience::LiveTick);
         let restore_posture = self.restore_posture.load(Ordering::Acquire);
-        // Claim-calldata REPAIR (live ticks only) runs EVERY tick — including at the tip —
-        // so a historical broken ClaimEvent (full calldata never stored: an older-build
-        // synthesis, or a crash between recording the note→hash link and persisting the
-        // envelope) heals on the very next tick, NOT only when new traffic advances the
-        // cursor past the tip. It therefore runs BEFORE the at-tip early return. It reads
-        // the client store's consumed feed — an O(store) read that is a live SELF-HEAL
-        // concern, not projection: restore projects every ClaimEvent with its calldata
-        // inline (`projection::persist_synthetic_claim_tx`), so restore posture skips it
-        // and the whole-store read with it (issue #167 item 2: a genesis recovery stays
-        // O(window)). Projection itself no longer reads this feed in either posture.
+        // Claim-calldata repair runs every live tick, before the at-tip return,
+        // so a historical ClaimEvent missing its calldata heals without waiting
+        // for new traffic. It is a whole-store read; restore skips it because it
+        // projects calldata inline and must stay bounded by the window.
         let consumed: Vec<InputNoteRecord> = if live {
             client
                 .get_input_notes(NoteFilter::Consumed)
@@ -1692,18 +1628,9 @@ impl SyntheticProjector {
         if cursor >= tip {
             return Ok(cursor);
         }
-        // RESOLVED-INPUT PIPELINE (issue #167 item 2, docs/design/UNIFIED-PROJECTOR.md):
-        // ONE bounded source for every event family. The bridge's transaction feed for
-        // the window attributes every consumption (CLAIM, UpdateGerNote, B2AGG, setup
-        // notes) to its finalized block, per-block transaction order and input position;
-        // `resolve_bridge_consumptions` recovers each input's exact NoteId and fetches
-        // its body + authoritative metadata from the node. The client store's consumed
-        // feed and output-note metadata are no longer projection sources — history is
-        // rebuilt identically whether it arrives one tick at a time or in a from-genesis
-        // catch-up, and per-pass memory is O(window), not O(history).
-        // Cantina #7 (part 1): NoteId → position within the consuming tx's ordered
-        // input_notes() (the on-chain LET append order), filled by the pipeline from the
-        // same authoritative feed; `project_block_notes` breaks same-tx sibling ties with it.
+        // Design: docs/design/UNIFIED-PROJECTOR.md. Cantina #7: the within-tx
+        // input position is the on-chain LET append order, the only correct
+        // tiebreak for same-transaction B2AGG siblings.
         let mut within_tx_pos: HashMap<NoteId, u32> = HashMap::new();
         let txs = self
             .node_rpc
@@ -1719,10 +1646,8 @@ impl SyntheticProjector {
         let resolved = self
             .resolve_bridge_consumptions(&fetcher, consumed_refs, &mut within_tx_pos)
             .await?;
-        // #167 — AUTHORITATIVE COVERAGE (restore posture): every bridge-consumed input in
-        // the window resolved to an exact identity (body fetched, or proven private), or
-        // the restore halts before anything seals. Live posture tolerates an unresolved
-        // input (a hidden B2AGG still fails closed at the LET cardinality gate below).
+        // Live can tolerate an unresolved input (a hidden B2AGG still trips the
+        // LET gate below); restore cannot, it would seal a divergent history.
         if restore_posture {
             ensure_authoritative_coverage(&resolved.unresolved, cursor, tip)?;
         }
@@ -1731,13 +1656,8 @@ impl SyntheticProjector {
             events,
             ..
         } = resolved;
-        // #167 item 5 — chain-derived BOOTSTRAP state through a normal primitive, run
-        // before the first dependent B2AGG / CLAIM projects: rebuild any faucet identity
-        // the bridge registers that the local registry lacks, fail-closed, and refuse to
-        // project a bridge-out whose faucet is still unknown (it would otherwise be
-        // quarantined as `UnknownFaucet` and the restore would "succeed" over a
-        // depositCount gap). Restore posture only — on a live proxy an unknown bridge
-        // faucet is a security signal (`faucet_registry_reconciler`), never adopted.
+        // Restore only: on a live proxy an unknown bridge faucet is a security
+        // signal (`faucet_registry_reconciler`) and must never be adopted.
         if restore_posture {
             let report = crate::faucet_bootstrap::rebuild_missing_faucet_identities(
                 client,
@@ -1750,11 +1670,7 @@ impl SyntheticProjector {
                 .fetch_add(report.rebuilt, Ordering::Relaxed);
             ensure_faucet_identities_known(&*self.store, &auth_b2agg).await?;
         }
-        // Every resolved record carries its own authoritative metadata, so the legacy
-        // output-note fallback map the projection unit still accepts is empty.
         let output_metadata: HashMap<[u8; 32], NoteMetadata> = HashMap::new();
-        // Per-block buckets carry the note's unique NoteId alongside the record — known
-        // for every resolved input now, mandatory for B2AGG (LET reservation identity).
         let mut by_block: HashMap<u64, Vec<(Option<NoteId>, &InputNoteRecord)>> = HashMap::new();
         for (id, rec) in &events {
             if let Some(h) = rec.state().consumed_block_height().map(|h| h.as_u64()) {
@@ -1795,12 +1711,10 @@ impl SyntheticProjector {
         }
         // Before sealing, every on-chain LET leaf must be represented by either the audited
         // legacy offset, a durable reservation, or an unreserved B2AGG in this tip window.
-        // #167 (review): the on-chain leaf count is read from the FROZEN synced account
-        // (the session tip). In windowed restore catch-up an intermediate pass's window
-        // covers only cursor..pass_tip, so leaves consumed after pass_tip are EXPECTED to
-        // be invisible here — the equality gate runs only on the FINAL pass (tip == the
-        // captured restore target). Live ticks always enforce it. The reservation-prefix
-        // checks below are window-local and always run.
+        // The leaf count is read at the session tip, so on an intermediate
+        // restore pass leaves beyond `pass_tip` are legitimately not yet
+        // reserved; the equality gate therefore runs on the final pass only.
+        // The prefix checks are window-local and always run.
         let bridge_account = client
             .get_account(self.bridge_id)
             .await
@@ -1890,8 +1804,7 @@ impl SyntheticProjector {
         // blocks. Reuses this tick's already-fetched `consumed` feed — zero extra queries.
         // Non-fatal by construction: an audit failure warns and retries next cycle, it never
         // blocks projection.
-        // Live posture only: detection over the client store's consumed feed (O(store)),
-        // meaningless while restore is still rebuilding history.
+        // Live only: a whole-store read, and meaningless mid-rebuild.
         if live
             && self
                 .audit_tick_counter
@@ -1914,38 +1827,23 @@ impl SyntheticProjector {
         Ok(cursor)
     }
 
-    /// Faucet-identity rows the restore-posture bootstrap rebuilt so far
-    /// (`faucet_bootstrap::rebuild_missing_faucet_identities`, run before every
-    /// restore pass). Report only; live posture never runs the bootstrap.
+    /// For the restore report.
     pub fn faucet_identities_rebuilt(&self) -> usize {
         self.faucet_identities_rebuilt.load(Ordering::Relaxed)
     }
 
-    /// Drain the cumulative per-kind emission counts (see `projection_totals`).
-    /// Called by `--restore` after `catch_up_to` completes; live code never
-    /// reads it.
+    /// For the restore report.
     pub fn take_projection_counts(&self) -> crate::projection::BlockProjectionCounts {
         let mut totals = self.projection_totals.lock().expect("projection_totals");
         std::mem::take(&mut *totals)
     }
 
-    /// Reset BOTH cursors — note-visibility discovery and block projection —
-    /// to genesis, updating the persisted store AND the in-memory atomics.
-    ///
-    /// Issue #167: resetting only PostgreSQL after the projector was
-    /// constructed is invalid — the in-memory atomics would keep their old
-    /// values and the projector would silently skip history. Persistence
-    /// happens FIRST so a crash mid-reset can never leave the durable cursor
-    /// ahead of projected state on restart.
-    ///
-    /// Production `--restore` resets via [`Store::reset_cursors_to_genesis`]
-    /// BEFORE constructing its projector (the issue's other valid ordering),
-    /// so this method currently has no production caller; it exists for a
-    /// projector that must be reset after construction.
+    /// Resetting only the store after construction would leave the in-memory
+    /// cursors ahead and silently skip history; persisting first keeps a crash
+    /// mid-reset from leaving the durable cursor ahead of projected state.
+    /// `--restore` resets the store before constructing its projector instead,
+    /// so this has no production caller today.
     pub async fn reset_cursors_to_genesis(&self) -> anyhow::Result<()> {
-        // One durable commit for BOTH columns (Store::reset_cursors_to_genesis)
-        // — a torn reset would let projection skip history the re-sweep
-        // rediscovers — then the in-memory caches.
         self.store.reset_cursors_to_genesis().await?;
         self.reconcile_cursor.store(0, Ordering::Release);
         self.cursor.store(0, Ordering::Release);
@@ -1955,21 +1853,8 @@ impl SyntheticProjector {
         Ok(())
     }
 
-    /// Drive the canonical live path from the current cursors to
-    /// `target_tip` (issue #167, fixed-tip fail-closed catch-up driver).
-    ///
-    /// - `CatchUpMode::Live` runs ONE bounded pass; the scheduler retries
-    ///   transient failures. Returns the projection cursor after the pass
-    ///   (it may legitimately be below `target_tip`).
-    /// - `CatchUpMode::Restore` loops passes (Recovery patience, no tick
-    ///   time budget) until BOTH the discovery and projection cursors reach
-    ///   `target_tip`; a pass error propagates, and a run that repeatedly
-    ///   moves neither cursor fails closed after [`RESTORE_STALL_PATIENCE`]
-    ///   consecutive no-progress passes (bounding a silently-wedged
-    ///   discovery feed instead of spinning forever).
-    ///
-    /// `target_tip` is authoritative: a node advancing beyond it does not
-    /// extend the restore snapshot (`tick_pass` never re-queries the tip).
+    /// Drive the canonical path to `target_tip`. Returns the projection
+    /// cursor, which after a `Live` pass may still be below the target.
     pub async fn catch_up_to(
         &self,
         client: &mut MidenClientLib,
@@ -1983,36 +1868,23 @@ impl SyntheticProjector {
                 Ok(self.cursor.load(Ordering::Acquire))
             }
             CatchUpMode::Restore => {
-                // #167 (review) — restore holds the coverage guard: any
-                // bridge-consumed input the canonical path cannot account for
-                // halts the restore instead of silently diverging from live
-                // history.
                 self.restore_posture.store(true, Ordering::Release);
                 self.drive_catch_up_to_tip(client, target_tip).await
             }
         }
     }
 
-    /// Consecutive passes allowed to move NEITHER cursor in restore catch-up
-    /// before the driver fails closed. Non-zero because a pass can make
-    /// real (uncounted) progress — e.g. pending-duplicate reconciliation —
-    /// without moving a cursor; beyond this patience the discovery/projection
-    /// feed is wedged and the restore must stop loudly.
+    /// Passes that move neither cursor before the restore fails closed. More
+    /// than one because a pass can make uncounted progress (e.g. pending
+    /// duplicate reconciliation) without moving a cursor.
     const RESTORE_STALL_PATIENCE: usize = 4;
 
-    /// #167 (review) — per-pass PROJECTION span in restore catch-up: each
-    /// pass projects at most this many blocks, bounding a pass's by-block
-    /// map and bridge-transaction feed regardless of chain size. NOTE what
-    /// it does not bound: the consumed-note feed and the output-metadata
-    /// read are whole-client-store queries repeated every pass, so per-pass
-    /// memory is O(window + store), not O(window) — issue #167 item 2
-    /// (bounded resolved-input pipeline) is what removes the store term.
+    /// Blocks projected per restore pass, so a from-genesis catch-up on a
+    /// grown chain holds one window of transactions and bodies at a time.
     const RESTORE_PASS_WINDOW: u64 = 5_000;
 
-    /// The restore catch-up loop: Recovery-patience passes (no tick time
-    /// budget) until BOTH cursors reach the fixed `target_tip`; any pass
-    /// error propagates fail-closed. The completion/stall decision lives in
-    /// [`CatchUpProgress::observe`], unit-tested without a Miden client.
+    /// Completion requires both cursors at the target: projection at the tip
+    /// with discovery behind it would seal blocks whose notes it never saw.
     async fn drive_catch_up_to_tip(
         &self,
         client: &mut MidenClientLib,
@@ -2026,13 +1898,6 @@ impl SyntheticProjector {
         };
         let mut progress = CatchUpProgress::new(cursor_pair());
         loop {
-            // #167 (review) — bound each pass's PROJECTION span so a genesis
-            // restore on a grown chain cannot balloon one pass's by-block map
-            // and transaction feed without limit: each pass drives at most
-            // `RESTORE_PASS_WINDOW` blocks toward the fixed target; progress
-            // across passes is what completes the restore. (The consumed-feed
-            // and output-metadata reads remain whole-client-store queries per
-            // pass — see the constant's doc; not O(window) yet.)
             let pass_tip =
                 target_tip.min(self.cursor.load(Ordering::Acquire) + Self::RESTORE_PASS_WINDOW);
             self.tick_pass(
@@ -2064,7 +1929,7 @@ impl SyntheticProjector {
     }
 }
 
-/// One restore catch-up iteration decision ([`SyntheticProjector::drive_catch_up_to_tip`]).
+/// One restore catch-up iteration decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CatchUpStep {
     /// Both cursors reached the target tip.
@@ -2075,8 +1940,8 @@ enum CatchUpStep {
     Continue,
 }
 
-/// Progress tracker for the restore catch-up loop: distinguishes real
-/// forward movement from passes that moved neither cursor.
+/// Pure completion/stall decision for the restore loop, kept free of I/O so
+/// it can be tested without a Miden client.
 #[derive(Debug)]
 struct CatchUpProgress {
     last: (u64, u64),
@@ -2091,7 +1956,6 @@ impl CatchUpProgress {
         }
     }
 
-    /// Records a completed pass's cursors and decides the next step.
     fn observe(&mut self, now: (u64, u64), target_tip: u64, patience: usize) -> CatchUpStep {
         if now.0 >= target_tip && now.1 >= target_tip {
             return CatchUpStep::Complete;
@@ -2162,22 +2026,17 @@ pub(crate) struct FetchedBody {
     /// details conversion drops its metadata. Kept so a consumption can be
     /// bound to the body it claims — see the check in the resolve loop.
     pub nullifier: Nullifier,
-    /// The note's authoritative metadata (sender, type, tag, attachment) from
-    /// the node's public record — what the CLAIM / GER provenance gates verify
-    /// against (issue #167 item 2: no output-note fallback map needed).
+    /// From the node's public record, so provenance gates verify chain data.
     pub metadata: NoteMetadata,
 }
 
-/// Kind of a bridge-consumed input, classified by note-script root.
+/// Bridge-consumed input kind, by note-script root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BridgeInputKind {
-    /// A bridge-out exit (B2AGG).
     B2agg,
-    /// A `ClaimNote` (bridge-in) consumption.
     Claim,
-    /// An `UpdateGerNote` consumption.
     Ger,
-    /// A public note the bridge consumed that projects to nothing (setup / config notes).
+    /// Setup / config notes: consumed by the bridge, never an event.
     Other,
 }
 
@@ -2206,21 +2065,17 @@ impl BridgeInputKind {
     }
 }
 
-/// One window's projection inputs, resolved from the authoritative feed
-/// ([`SyntheticProjector::resolve_bridge_consumptions`]).
+/// One window's projection inputs.
 #[derive(Default)]
 pub(crate) struct ResolvedInputs {
-    /// Bridge-out exits, in feed order (the caller sorts canonically); their
-    /// within-transaction positions are recorded in the caller's map.
+    /// Unsorted; the caller applies the canonical order.
     pub b2agg: Vec<(NoteId, InputNoteRecord)>,
-    /// CLAIM / UpdateGerNote consumptions, rebuilt from their authoritative
-    /// bodies with metadata.
+    /// CLAIM and UpdateGerNote records, with metadata.
     pub events: Vec<(NoteId, InputNoteRecord)>,
-    /// Bridge-consumed inputs with NO recoverable identity (no header reference,
-    /// no ledger entry) — reported, never dropped silently.
+    /// Inputs with no header reference and no ledger entry. Reported rather
+    /// than dropped: the caller decides whether that is fatal.
     pub unresolved: Vec<(Nullifier, ConsumedRef)>,
-    /// Every nullifier accounted for: resolved to a body of any kind, or proven
-    /// private (not an event).
+    /// Bodies of any kind plus proven-private inputs.
     pub resolved_nullifiers: HashSet<Nullifier>,
 }
 
@@ -2297,20 +2152,10 @@ impl PublicNoteFetcher for RpcNoteFetcher<'_> {
 /// (`consumer == bridge`). The account-id re-check is fail-closed defense in
 /// depth against a node that ignores the server-side filter. Pure (no I/O) so
 /// it is unit-testable directly.
-/// #167 — AUTHORITATIVE COVERAGE GUARD (pure, restore posture).
-///
-/// The resolved-input pipeline accounts for every bridge-consumed input it can
-/// identify: a body fetched by exact id (any kind), or a private note the node
-/// returned (provably not an event). What remains is an input with NO
-/// recoverable identity — no transaction-header reference, no entry in the
-/// durable identity ledger the windowed sweep records for every public note in
-/// the bridge's tag space. Such an input is exactly the issue's ERASED-note
-/// boundary (created and consumed on a wiped store with nothing durable left,
-/// or a note created outside the sweep's reach): the available node APIs cannot
-/// reconstruct its body, so the restore fails deterministically BEFORE sealing,
-/// naming the block(s) and nullifier(s) so the node/protocol limitation is
-/// exposed instead of a silently divergent history. There is deliberately no
-/// heuristic override.
+/// An input with no recoverable identity is one the node cannot reconstruct
+/// (issue #167's erased-note boundary). Restore fails before sealing and names
+/// it, so the limitation is exposed rather than papered over; deliberately no
+/// override.
 fn ensure_authoritative_coverage(
     unresolved: &[(Nullifier, ConsumedRef)],
     window_from: u64,
@@ -2350,19 +2195,16 @@ fn ensure_authoritative_coverage(
     );
 }
 
-/// #167 item 5 — refuse to project a bridge-out whose faucet has no local
-/// identity even after the faucet bootstrap ran (restore posture). Without
-/// this the note would be quarantined as `UnknownFaucet`, the LET leaf would be
-/// reserved-but-unemitted, and the restore would "complete" over a
-/// `depositCount` gap that the emitted-frontier gate then refuses forever.
+/// After the bootstrap, an unknown faucet is unrecoverable: projecting the note
+/// would quarantine it and leave a `depositCount` gap the emitted-frontier gate
+/// refuses forever, so a restore must stop here instead.
 async fn ensure_faucet_identities_known(
     store: &dyn Store,
     b2agg: &[(NoteId, InputNoteRecord)],
 ) -> anyhow::Result<()> {
     for (id, rec) in b2agg {
         let Some(asset) = rec.details().assets().iter_fungible().next() else {
-            // No fungible asset: malformed, quarantined by the projection unit as
-            // `NoFungibleAsset` — not a faucet-identity question.
+            // Malformed; the projection unit quarantines it for its own reason.
             continue;
         };
         let faucet_id = asset.faucet_id();
@@ -2571,7 +2413,6 @@ mod tests {
     const GER_MANAGER: &str = "0xfa0000000000bb010000cc000000de";
     const SERVICE: &str = "0xbf0000000000cc010000dc000000ee";
 
-    /// Public-note metadata from the bridge, for fetched-body fixtures.
     fn public_bridge_metadata() -> NoteMetadata {
         NoteMetadata::new(
             PartialNoteMetadata::new(aid(BRIDGE), NoteType::Public),
@@ -2960,11 +2801,8 @@ mod tests {
         );
     }
 
-    /// ISSUE #167 — the authoritative coverage guard, pinned as a pure decision:
-    /// the resolved-input pipeline accounts for every input it can identify, so
-    /// the guard's only input is what remains unresolved. Nothing unresolved
-    /// passes; anything unresolved halts the restore naming the first block and
-    /// the offending nullifiers (the ERASED-note boundary), never a silent drop.
+    /// An unresolved input must halt the restore and name where history
+    /// diverges; the operator has nothing else to go on.
     #[test]
     fn coverage_guard_halts_on_unresolved_inputs_and_passes_when_none() {
         ensure_authoritative_coverage(&[], 0, 10).expect("nothing unresolved must pass");
@@ -2994,13 +2832,9 @@ mod tests {
         );
     }
 
-    /// ISSUE #167 items 2/3 — the resolved-input pipeline is kind-agnostic: a
-    /// CLAIM consumption resolves through the SAME identity + body path as a
-    /// bridge-out, into a `ConsumedExternal` record that carries the node's
-    /// authoritative metadata (so the provenance gates need no output-note
-    /// fallback), attributed to the bridge at its consumption block / order;
-    /// a private returned input is accounted for without a body; an input with
-    /// no identity is reported as unresolved, never dropped.
+    /// A CLAIM must resolve through the same path as a bridge-out, with the
+    /// metadata the provenance gates need, and an input with no identity must
+    /// be reported rather than dropped.
     #[tokio::test]
     async fn resolved_input_pipeline_covers_every_kind_and_reports_unresolved() {
         let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
@@ -3022,7 +2856,7 @@ mod tests {
         );
         let exit_id = NoteId::new(exit.details_commitment(), &public_bridge_metadata());
         let exit_nf = nullifier(0xb2);
-        // Distinct details (a different amount) so the id cannot collide with the exit's.
+        // Distinct details, or its id would collide with the exit's.
         let private_id = NoteId::new(
             b2agg_note_with_amount(601, Some(0), 777).details_commitment(),
             &public_bridge_metadata(),
@@ -3060,7 +2894,6 @@ mod tests {
                     metadata: public_bridge_metadata(),
                 },
             ],
-            // Returned by the node, but private: no body.
             also_returned: vec![private_id],
         };
 
@@ -3070,7 +2903,6 @@ mod tests {
             .await
             .expect("every identified input resolves");
 
-        // The CLAIM became a projectable record with authoritative metadata.
         assert_eq!(resolved.events.len(), 1, "one CLAIM event record");
         let (id, rec) = &resolved.events[0];
         assert_eq!(*id, claim_id);
@@ -3090,16 +2922,14 @@ mod tests {
             Some(600)
         );
         assert_eq!(rec.state().consumed_tx_order(), Some(2));
-        // CLAIM/GER never enter the within-tx map (their ordering key stays the
-        // canonical `None`-order shape — see `projection_order`).
+        // CLAIM/GER must not enter the within-tx map, or their ordering key
+        // would change and re-chain existing history (`projection_order`).
         assert!(!within_tx_pos.contains_key(&claim_id));
 
-        // The exit resolved as before, with its LET input position.
         assert_eq!(resolved.b2agg.len(), 1);
         assert_eq!(resolved.b2agg[0].0, exit_id);
         assert_eq!(within_tx_pos.get(&exit_id), Some(&1));
 
-        // Accounted for: both bodies AND the private note; NOT the orphan.
         assert!(resolved.resolved_nullifiers.contains(&claim_nf));
         assert!(resolved.resolved_nullifiers.contains(&exit_nf));
         assert!(resolved.resolved_nullifiers.contains(&private_nf));
@@ -3108,15 +2938,13 @@ mod tests {
         assert_eq!(resolved.unresolved[0].0, orphan_nf);
         assert_eq!(resolved.unresolved[0].1.block, 602);
 
-        // And the restore-posture guard turns that one orphan into a halt.
         let err = ensure_authoritative_coverage(&resolved.unresolved, 599, 602)
             .expect_err("an unresolved input halts restore");
         assert!(format!("{err:#}").contains("at block 602"));
     }
 
-    /// ISSUE #167 item 3 — the identity ledger is kind-agnostic: a CLAIM record
-    /// that once exposed its metadata is persisted, and its identity comes back
-    /// from the ledger for a headerless reference.
+    /// The ledger must hold CLAIM identities too, or a client-store loss
+    /// erases CLAIM history.
     #[tokio::test]
     async fn identity_ledger_persists_non_b2agg_kinds() {
         let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
@@ -3143,19 +2971,13 @@ mod tests {
         assert_eq!(found.get(&nf), Some(&id), "CLAIM identity must be durable");
     }
 
-    /// ISSUE #167 — the restore catch-up driver's completion/stall contract,
-    /// pinned on the pure decision ([`CatchUpProgress::observe`]) so no Miden
-    /// client is needed: completion requires BOTH cursors at the fixed tip;
-    /// movement resets the stall counter; a run below the tip that moves
-    /// neither cursor for `patience` consecutive passes fails closed.
+    /// Completion needs both cursors, movement resets patience, and a quiet
+    /// run below the tip must end in a stall rather than spin.
     #[test]
     fn catch_up_progress_completes_at_fixed_tip_and_fails_closed_on_stall() {
         const PATIENCE: usize = 4;
 
-        // Projection alone at the tip is NOT completion: the discovery
-        // (reconcile) cursor must catch up too. Completion is `>=` on BOTH —
-        // overshooting the target (e.g. a window batch that crossed it)
-        // completes rather than spinning.
+        // `>=`, because a window batch can legitimately overshoot the target.
         let mut p = CatchUpProgress::new((0, 0));
         assert_eq!(
             p.observe((10, 4), 10, PATIENCE),
@@ -3163,7 +2985,6 @@ mod tests {
             "projection cursor alone at the tip must not complete"
         );
         assert_eq!(p.observe((10, 10), 10, PATIENCE), CatchUpStep::Complete);
-        // Overshoot on either side completes too.
         let mut p = CatchUpProgress::new((0, 0));
         assert_eq!(p.observe((11, 9), 10, PATIENCE), CatchUpStep::Continue);
         assert_eq!(p.observe((11, 11), 10, PATIENCE), CatchUpStep::Complete);
@@ -3171,21 +2992,15 @@ mod tests {
         assert_eq!(p.observe((9, 12), 10, PATIENCE), CatchUpStep::Continue);
         assert_eq!(p.observe((12, 12), 10, PATIENCE), CatchUpStep::Complete);
 
-        // Real movement resets the stall counter mid-catch-up.
         let mut p = CatchUpProgress::new((0, 0));
         for n in 1..=3 {
             assert_eq!(p.observe((n, n), 10, PATIENCE), CatchUpStep::Continue);
         }
-        // One no-progress pass below the tip: tolerated (pending-duplicate
-        // reconciliation can move nothing countable), counter armed.
         assert_eq!(p.observe((3, 3), 10, PATIENCE), CatchUpStep::Continue);
-        // Movement again: counter resets, so the next quiet pass starts over.
         assert_eq!(p.observe((4, 4), 10, PATIENCE), CatchUpStep::Continue);
         assert_eq!(p.observe((4, 4), 10, PATIENCE), CatchUpStep::Continue);
         assert_eq!(p.observe((5, 5), 10, PATIENCE), CatchUpStep::Continue);
 
-        // Fail-closed: exactly `patience` quiet passes below the tip, then a
-        // stall — never a silent infinite spin.
         let mut p = CatchUpProgress::new((0, 0));
         for _ in 1..PATIENCE {
             assert_eq!(p.observe((0, 0), 10, PATIENCE), CatchUpStep::Continue);
@@ -3193,17 +3008,14 @@ mod tests {
         assert_eq!(p.observe((0, 0), 10, PATIENCE), CatchUpStep::Stalled);
     }
 
-    /// ISSUE #167 — `reset_cursors_to_genesis` must update the persisted
-    /// store AND the in-memory atomics: resetting only PostgreSQL after the
-    /// projector was constructed is invalid (the atomics would silently skip
-    /// history), and the durable state must move first.
+    /// Resetting only the store would leave the in-memory cursors ahead and
+    /// silently skip history.
     #[tokio::test]
     async fn reset_cursors_to_genesis_resets_persisted_and_in_memory() {
         let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
         let block_state = StdArc::new(BlockState::new());
         let projector = test_projector(&store, &block_state).await;
 
-        // Pretend the projector is mid-history.
         store.set_reconcile_cursor(4_200).await.unwrap();
         store.set_projector_cursor(4_100).await.unwrap();
         projector.reconcile_cursor.store(4_200, Ordering::Release);
@@ -3216,27 +3028,16 @@ mod tests {
         assert_eq!(projector.reconcile_cursor.load(Ordering::Acquire), 0);
         assert_eq!(projector.cursor.load(Ordering::Acquire), 0);
 
-        // A projector constructed AFTER the reset (the restore handoff shape:
-        // reset before (re)construction) starts from genesis too.
+        // The shape `--restore` uses: reset, then construct.
         let fresh = test_projector(&store, &block_state).await;
         assert_eq!(fresh.reconcile_cursor.load(Ordering::Acquire), 0);
         assert_eq!(fresh.cursor.load(Ordering::Acquire), 0);
     }
 
-    /// ISSUE #167 — restore catch-up is fail-closed against a dead feed:
-    /// with a node that never serves state, the FIRST pass propagates the
-    /// discovery failure with its cause (review finding: swallowing it left
-    /// only a generic "stalled after N passes" from the driver), instead of
-    /// spinning forever or silently declaring success. (The live scheduler
-    /// tolerates the same condition by design — one warn per tick, retried.
-    /// The stall bound itself is pinned on the pure decision in
-    /// `catch_up_progress_completes_at_fixed_tip_and_fails_closed_on_stall`.)
-    ///
-    /// Hermetic by construction: the reconciler's RPC handle is swapped to a
-    /// real gRPC client on 127.0.0.1:1 (never routable/listenable without
-    /// root), so the pass fails with a plain, non-backpressure ConnectionError
-    /// instantly — no wall-clock backoff, no dependency on whether a node
-    /// happens to run on the developer's default port.
+    /// A dead node must fail the restore with the discovery cause, not hang
+    /// and not surface only as a generic stall. Port 1 on loopback is used
+    /// because it can never be listened on without root, so the failure is a
+    /// plain connection error with no backoff.
     #[tokio::test]
     async fn restore_catch_up_fails_closed_against_a_dead_node() {
         let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
@@ -3244,7 +3045,6 @@ mod tests {
         let mut projector = test_projector(&store, &block_state)
             .await
             .with_reconcile_tuning(200, 1, Duration::ZERO);
-        // Deterministically dead endpoint: port 1 on loopback.
         let dead_endpoint = crate::miden_client::parse_node_url("http://127.0.0.1:1").unwrap();
         projector.node_rpc = crate::miden_client::build_rpc_client(&dead_endpoint, 1_000, None);
         let mut client = crate::test_helpers::offline_miden_client_lib().await;
@@ -4338,12 +4138,9 @@ mod tests {
         );
     }
 
-    /// CROSS-TYPE swap (#167 review — coverage that was deleted with the
-    /// replay engine): a B2AGG nullifier paired with a CLAIM note id. The
-    /// fetched body is not a bridge-out, so it used to fall into the "legit
-    /// CLAIM/GER — safe skip" branch and the bridge-out silently vanished,
-    /// leaving only the LET gate to notice. The body's own nullifier
-    /// disagrees with the consumed one, which is conclusive: fail closed.
+    /// A B2AGG nullifier paired with a CLAIM id used to pass as a "legitimate
+    /// CLAIM" and silently drop the exit; the body's own nullifier is
+    /// conclusive.
     #[tokio::test]
     async fn cross_type_swapped_ref_is_refused() {
         let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
@@ -4400,8 +4197,7 @@ mod tests {
             "the error must name the cross-type inconsistency, got: {report}"
         );
 
-        // Control: a returned non-B2AGG body whose nullifier IS the consumed
-        // one is a legitimate CLAIM — still a safe skip, never an error.
+        // Control: a consistent CLAIM reference must stay a safe skip.
         let consumed_refs = HashMap::from([(
             claim_nf,
             ConsumedRef {

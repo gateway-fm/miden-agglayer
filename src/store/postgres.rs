@@ -249,9 +249,6 @@ impl Store for PgStore {
         Ok(())
     }
 
-    /// Single-statement atomic reset of both service_state cursor columns
-    /// (issue #167) — a crash can never leave one cursor reset and the other
-    /// at the old height.
     async fn reset_cursors_to_genesis(&self) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
         client

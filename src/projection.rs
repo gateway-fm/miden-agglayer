@@ -1,17 +1,7 @@
-//! Projection — the canonical projection units shared by the live projector
-//! and recovery.
-//!
-//! This module turns authoritative Miden history (consumed B2AGG / CLAIM /
-//! GER notes) into synthetic blocks and logs. Every unit here is used verbatim
-//! by the LIVE projector tick (`SyntheticProjector::project_block_notes` via
-//! [`BlockProjection`]) and by `--restore`, which since issue #167 is a thin
-//! orchestration wrapper: it resets the cursors and drives the same
-//! `SyntheticProjector::catch_up_to` catch-up to a captured tip. Restored and
-//! live emission cannot diverge — they are the same code, and the former
-//! parallel restore replay engine was deleted.
-//!
-//! Moved out of `crate::restore` (issue #167): this module is now the single
-//! owner of the per-note derivations.
+//! The per-note projection units, owned here rather than in `restore` because
+//! they are the live path's code that recovery reuses, not the other way
+//! around (issue #167). Live and restored emission cannot diverge because there
+//! is no second copy.
 
 use crate::bridge_address::get_bridge_address;
 use crate::bridge_out::{

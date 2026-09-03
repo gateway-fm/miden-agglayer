@@ -489,9 +489,6 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
-    /// In-memory atomic reset: two lock-guarded writes, no durability to
-    /// tear (issue #167 — the required-method contract keeps the atomicity
-    /// promise explicit per backend).
     async fn reset_cursors_to_genesis(&self) -> anyhow::Result<()> {
         *self.projector_cursor.write() = 0;
         *self.reconcile_cursor.write() = 0;

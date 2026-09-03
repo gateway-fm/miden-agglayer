@@ -540,14 +540,10 @@ pub trait Store: Send + Sync + 'static {
         Ok(())
     }
 
-    /// Atomically reset BOTH cursors — projection and discovery — to genesis
-    /// (issue #167): `--restore` / `--resweep-from-genesis` hand the store to
-    /// a fresh reconstruction, and a torn reset (one column reset, the other
-    /// still at the old height) would make projection SKIP history the
-    /// re-sweep rediscovers. REQUIRED per backend so the atomicity contract
-    /// is explicit: PostgreSQL implements it as a single UPDATE on the
-    /// service_state row; the in-memory store writes both fields under their
-    /// respective locks (nothing durable to tear).
+    /// Reset both cursors atomically: a torn reset (one at genesis, the other
+    /// at the old height) would make projection skip history the re-sweep
+    /// rediscovers. Required per backend so that contract cannot be defaulted
+    /// away.
     async fn reset_cursors_to_genesis(&self) -> anyhow::Result<()>;
 
     /// #90 — did a restore rebuild this store, leaving the `nonces` table empty?
@@ -1215,13 +1211,9 @@ pub trait Store: Send + Sync + 'static {
         note_keys: &[String],
     ) -> anyhow::Result<std::collections::HashMap<String, u32>>;
 
-    /// Append to the durable note-identity ledger: `nullifier -> NoteId` for every
-    /// PUBLIC note the reconciler discovers in the bridge's tag space, regardless of
-    /// kind (B2AGG, CLAIM, UpdateGerNote, setup notes). The canonical projector
-    /// consults it to resolve a bridge-consumed input whose transaction header
-    /// carries no `(nullifier, note_id)` reference (issue #167 item 3: the ledger is
-    /// no longer B2AGG-only, so CLAIM/GER history survives a client-store loss the
-    /// same way B2AGG does). Existing nullifier mappings are immutable.
+    /// Durable `nullifier -> NoteId` for every public note the sweep sees, of
+    /// any kind: it is how a consumed input with no header reference is still
+    /// resolvable after a client-store loss. Existing mappings are immutable.
     async fn put_note_identities(&self, entries: &[(Nullifier, NoteId)]) -> anyhow::Result<()>;
     async fn get_note_identities(
         &self,
