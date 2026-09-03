@@ -264,8 +264,8 @@ pub fn init_metrics() {
          actor sync. sync_state cost scales with this (see \
          miden_sync_state_duration_seconds), and through the sync cadence so does \
          every queued write — the measured-bad deployment ran 354 MB with 91s queue \
-         waits. Alert on sustained growth; remediate with a restore-driven \
-         compaction window."
+         waits. Alert on sustained growth; remediate with a retained-PostgreSQL + \
+         --reset-miden-store recovery window (docs/operations/runbook.md)."
     );
     describe_gauge!(
         "miden_client_mailbox_depth",
@@ -280,8 +280,15 @@ pub fn init_metrics() {
         "miden_sync_passes_failed_total",
         "#173 — bounded actor sync passes that exhausted all retries without a \
          successful sync_state. Non-zero during a Miden node outage is expected \
-         (writes proceed between passes); sustained growth with the node healthy \
-         means connectivity or RPC trouble."
+         (requests are held and passes retry with backoff up to 60s); sustained \
+         growth with the node healthy means connectivity or RPC trouble."
+    );
+    describe_gauge!(
+        "miden_client_writes_held",
+        "#173 — 1 while the actor holds ALL MidenClient requests (writes and \
+         with()-routed reads) because its last sync pass exhausted its retries; \
+         0 once a sync succeeds or on actor exit. /health stays alive during a \
+         hold, so alert on this gauge for 'node unreachable, proxy frozen'."
     );
     describe_counter!(
         "miden_client_build_errors_total",
