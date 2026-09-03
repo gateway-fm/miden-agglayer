@@ -1061,46 +1061,11 @@ async fn publish_claim_internal(
         }
     }
 
-    let committed = crate::miden_client::wait_for_transaction_commit(
-        client,
-        txn_id,
-        20,
-        std::time::Duration::from_secs(1),
-    )
-    .await?;
-    if committed {
-        submission_fence.confirm(&note_commitment).await?;
-        tracing::info!("claim tx {txn_id} committed to block");
-        // Cantina #7: mark Landed once `wait_for_transaction_commit`
-        // confirms the CLAIM tx was committed. Aggkit's miden-client
-        // operates on the proxy's service account — it CANNOT observe
-        // the bridge account's consumption of our CLAIM via
-        // NoteFilter::Consumed (the consumed-set returned by miden-client
-        // is restricted to our tracked accounts, not the bridge's). The
-        // commit confirmation is the right closure point: from there,
-        // the bridge's MINT emission is deterministic, and tracking
-        // longer would only fire spurious StaleAlerts.
-        //
-        // We still keep the record_expected → tick path useful: any
-        // CLAIM that fails to commit (tx not in block within 20s) does
-        // NOT reach this branch, so the tracker entry remains and the
-        // tick eventually escalates to StaleAlert with the global_index
-        // for operator triage.
-        if let Some(tracker) = expected_mints {
-            let global_index_bytes: [u8; 32] = params.globalIndex.to_be_bytes();
-            if let Err(e) = tracker.mark_landed(global_index_bytes).await {
-                tracing::warn!(
-                    target: "claim",
-                    global_index = ?global_index_bytes,
-                    error = ?e,
-                    "RD-913: mark_landed store failure; staleness tick will eventually \
-                     time the entry out (one-shot StaleAlert)"
-                );
-            }
-        }
-    } else {
-        anyhow::bail!("claim tx {txn_id} was submitted but not committed within 20s");
-    }
+    // #174 — the commit wait no longer runs here, inside the actor. The
+    // closure returns right after the submit + local apply (+ the durable
+    // receipt/link the caller records), and `attempt_publish_claim` waits
+    // through `MidenClient::await_transaction_commit` OUTSIDE the actor, then
+    // confirms the fence and closes the expected-MINT entry.
 
     Ok(PublishClaimTxn {
         txn_id,
@@ -1152,6 +1117,19 @@ async fn publish_claim_internal(
 /// SyntheticProjector emits the `ClaimEvent` and finalises this receipt (at the
 /// Miden consumption block) when it observes the CLAIM note consumed — no
 /// synthetic log, tip advance, or receipt completion happens in this path.
+///
+/// #174 — what the closure does NOT include any more is the commit wait. It
+/// ends after submit + local `apply_transaction` (+ the durable receipt/link),
+/// and the wait runs outside the actor through
+/// `MidenClient::await_transaction_commit`: short per-attempt probes with the
+/// sleeps in between, so a GER insert or another claim is no longer queued
+/// behind up to 20s of this claim's polling. The per-account sequencing above
+/// survives because the local state already carries the pending tx when the
+/// actor is released — a later request on `service` executes as a CHAINED
+/// transaction, not a conflicting one. Faucet provisioning
+/// (`find_or_create_faucet` → `create_and_register_faucet`) still waits inside
+/// the closure on purpose: it is once per new token and its
+/// check→deploy→register→persist sequence is the TOCTOU boundary above.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn publish_claim(
     params: claimAssetCall,
@@ -1264,6 +1242,10 @@ async fn attempt_publish_claim(
     let local_prover_fallback = client.local_prover_fallback();
     let result = Arc::new(OnceLock::<PublishClaimTxn>::new());
     let result_inner = result.clone();
+    // Kept for the out-of-actor post-commit steps below.
+    let fence_for_confirm = submission_fence.clone();
+    let expected_mints_for_landed = expected_mints.clone();
+    let global_index_bytes: [u8; 32] = params.globalIndex.to_be_bytes();
     client
         .with(move |client| {
             Box::new(async move {
@@ -1310,10 +1292,53 @@ async fn attempt_publish_claim(
             })
         })
         .await?;
-    result
-        .get()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("publish_claim: closure completed but result was not set"))
+    let value = result.get().cloned().ok_or_else(|| {
+        anyhow::anyhow!("publish_claim: closure completed but result was not set")
+    })?;
+
+    // #174 — commit wait OUTSIDE the actor. The submit, local apply, PREPARED
+    // fence entry, pending receipt and note↔tx link are all durable by now
+    // (inside the closure above), so releasing the actor here changes nothing
+    // about crash safety: a same-hash retry observes the link and refuses to
+    // build a second note. This future runs behind the writer worker's
+    // dispatch task (`supervise_dispatch`), so an HTTP disconnect cannot drop
+    // it mid-wait. Each probe is one short mailbox request; other writers
+    // interleave between them instead of queueing behind up to 20s of polling.
+    let txn_id = value.txn_id;
+    let committed = client
+        .await_transaction_commit(txn_id, 20, std::time::Duration::from_secs(1))
+        .await?;
+    if committed {
+        fence_for_confirm.confirm(&value.note_commitment).await?;
+        tracing::info!("claim tx {txn_id} committed to block");
+        // Cantina #7: mark Landed once the commit is confirmed. Aggkit's
+        // miden-client operates on the proxy's service account — it CANNOT
+        // observe the bridge account's consumption of our CLAIM via
+        // NoteFilter::Consumed (the consumed-set returned by miden-client is
+        // restricted to our tracked accounts, not the bridge's). The commit
+        // confirmation is the right closure point: from there, the bridge's
+        // MINT emission is deterministic, and tracking longer would only fire
+        // spurious StaleAlerts.
+        //
+        // We still keep the record_expected → tick path useful: any CLAIM
+        // that fails to commit (tx not in block within 20s) does NOT reach
+        // this branch, so the tracker entry remains and the tick eventually
+        // escalates to StaleAlert with the global_index for operator triage.
+        if let Some(tracker) = expected_mints_for_landed
+            && let Err(e) = tracker.mark_landed(global_index_bytes).await
+        {
+            tracing::warn!(
+                target: "claim",
+                global_index = ?global_index_bytes,
+                error = ?e,
+                "RD-913: mark_landed store failure; staleness tick will eventually \
+                 time the entry out (one-shot StaleAlert)"
+            );
+        }
+    } else {
+        anyhow::bail!("claim tx {txn_id} was submitted but not committed within 20s");
+    }
+    Ok(value)
 }
 
 #[cfg(test)]

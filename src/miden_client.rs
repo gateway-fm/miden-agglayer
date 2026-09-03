@@ -713,6 +713,111 @@ impl MidenClient {
     /// against the configured prover first, then retry against this
     /// `Arc` when the result is a `ClientError::TransactionProvingError`.
     /// See `src/claim.rs::publish_claim_internal` for the canonical use.
+    /// #174 — wait for a submitted transaction to commit WITHOUT holding the
+    /// actor across the wait.
+    ///
+    /// The in-closure [`wait_for_transaction_commit`] holds the serialized
+    /// actor for every `sleep + sync_state` round (up to 20–30 of them), so a
+    /// queued write waits behind a poller's sleeps and its store-size-dependent
+    /// syncs. This variant runs the submission's caller OUTSIDE the actor:
+    /// each poll is one short mailbox request (`sync_state` + an exact-ID local
+    /// probe) and every sleep happens between requests, so other writers
+    /// interleave FIFO at the mailbox instead of queueing behind the whole
+    /// wait.
+    ///
+    /// Sequencing audit (issue #174): this is safe for the same reason the
+    /// serialized closure was — `apply_transaction` runs inside the submitting
+    /// closure BEFORE it returns, so the local account state already carries
+    /// the pending transaction when the actor is released; a later request on
+    /// the same account executes as a CHAINED transaction (the mempool accepts
+    /// a tx whose initial commitment is a pending tx's final commitment). The
+    /// bali IAIC incident (189 `IncorrectAccountInitialCommitment` failures)
+    /// came from two CLIENTS building on the SAME initial commitment, which
+    /// the single actor still makes structurally impossible.
+    ///
+    /// A connection failure during a probe's sync counts as "not yet": the
+    /// outer sleep is the backoff, and the actor's own ticker sync races the
+    /// probe anyway. Any other client error propagates.
+    pub async fn await_transaction_commit(
+        &self,
+        txn_id: miden_protocol::transaction::TransactionId,
+        max_attempts: usize,
+        poll_interval: Duration,
+    ) -> anyhow::Result<bool> {
+        // Local probe first, no sync: a repeat/retried wait, or a commit the
+        // actor's ticker already observed, returns without a round-trip.
+        if self.probe_commit(txn_id, false).await? == CommitProbe::Committed {
+            return Ok(true);
+        }
+        for attempt in 1..=max_attempts {
+            // OUTSIDE the actor: other requests run while we sleep.
+            tokio::time::sleep(poll_interval).await;
+            match self.probe_commit(txn_id, true).await? {
+                CommitProbe::Committed => {
+                    ::metrics::counter!("miden_commit_wait_probes_total", "outcome" => "committed")
+                        .increment(1);
+                    return Ok(true);
+                }
+                CommitProbe::Pending => {
+                    ::metrics::counter!("miden_commit_wait_probes_total", "outcome" => "pending")
+                        .increment(1);
+                }
+                CommitProbe::SyncUnavailable => {
+                    ::metrics::counter!("miden_commit_wait_probes_total", "outcome" => "sync_unavailable")
+                        .increment(1);
+                    tracing::warn!(
+                        %txn_id,
+                        attempt,
+                        max_attempts,
+                        "await_transaction_commit: sync unavailable this probe; retrying after the poll interval"
+                    );
+                }
+            }
+        }
+        ::metrics::counter!("miden_commit_wait_probes_total", "outcome" => "timed_out")
+            .increment(1);
+        Ok(false)
+    }
+
+    /// One short mailbox request for [`Self::await_transaction_commit`]:
+    /// optionally `sync_state`, then the exact-ID local commit probe.
+    async fn probe_commit(
+        &self,
+        txn_id: miden_protocol::transaction::TransactionId,
+        sync_first: bool,
+    ) -> anyhow::Result<CommitProbe> {
+        let slot: Arc<std::sync::Mutex<Option<CommitProbe>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let slot_inner = slot.clone();
+        self.with(move |client| {
+            Box::new(async move {
+                if sync_first && let Err(client_err) = sync_state_timed(client).await {
+                    match MidenClient::unwrap_connection_error(*client_err) {
+                        Ok(conn_err) => {
+                            tracing::warn!(
+                                "await_transaction_commit: sync connection error: {conn_err:?}"
+                            );
+                            *slot_inner.lock().expect("commit probe slot") =
+                                Some(CommitProbe::SyncUnavailable);
+                            return Ok(());
+                        }
+                        Err(other_err) => return Err(other_err),
+                    }
+                }
+                let committed = txn_committed_locally(client, txn_id).await?;
+                *slot_inner.lock().expect("commit probe slot") = Some(if committed {
+                    CommitProbe::Committed
+                } else {
+                    CommitProbe::Pending
+                });
+                Ok(())
+            })
+        })
+        .await?;
+        let outcome = slot.lock().expect("commit probe slot").take();
+        outcome.ok_or_else(|| anyhow::anyhow!("commit probe completed without an outcome"))
+    }
+
     pub fn local_prover_fallback(&self) -> Option<Arc<dyn TransactionProver + Send + Sync>> {
         self.local_prover_fallback.clone()
     }
@@ -1431,7 +1536,59 @@ async fn txn_committed_locally(
     }))
 }
 
-/// Poll until a transaction is committed on the Miden node.
+/// Outcome of one commit probe ([`MidenClient::probe_commit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitProbe {
+    /// The exact-ID local record reads `Committed`.
+    Committed,
+    /// Synced (or not asked to), and the record is not committed yet.
+    Pending,
+    /// `sync_state` hit a connection failure; nothing can be concluded.
+    SyncUnavailable,
+}
+
+/// `sync_state` with the #106 timing instrumentation: records
+/// `miden_sync_state_duration_seconds` and warns on a slow sync. Shared by the
+/// in-closure wait and the actor-aware probe so the number operators watch is
+/// the same on both paths.
+async fn sync_state_timed(client: &mut MidenClientLib) -> Result<(), Box<ClientError>> {
+    // FINDING #106: this full `sync_state` is the growth term behind claim
+    // latency at depth. Measured indirectly (writer-job duration 57.6s -> 13.5s
+    // for the SAME job kind when a restore shrank the client store 71 MB ->
+    // 29 MB), but never timed directly — so time it. Operators watching a
+    // long-lived deployment need this number: it is what turns a nominally-20s
+    // commit wait into 40s+ and, via the serialized claim queue, caps
+    // end-to-end delivery throughput.
+    let sync_started = std::time::Instant::now();
+    let sync_result = client.sync_state().await;
+    let sync_elapsed = sync_started.elapsed();
+    ::metrics::histogram!("miden_sync_state_duration_seconds").record(sync_elapsed.as_secs_f64());
+    if sync_elapsed >= std::time::Duration::from_secs(2) {
+        tracing::warn!(
+            sync_secs = sync_elapsed.as_secs_f64(),
+            "miden-client sync_state is slow — commit waits and claim \
+             throughput scale with this (client store growth, #106)"
+        );
+    }
+    sync_result.map(|_| ()).map_err(Box::new)
+}
+
+/// Poll until a transaction is committed on the Miden node — IN-CLOSURE
+/// variant, for callers that already hold the raw client.
+///
+/// Holds whatever is holding `client` (inside a `MidenClient::with` closure,
+/// the whole actor) across every sleep + sync. Issue #174 audit of who may
+/// still use it:
+///   * the bridge_out_tool bins — a standalone client, no actor to starve;
+///   * `init` account deployment — startup, before any writer contends;
+///   * faucet provisioning (`faucet_ops`) — deploy + bridge-config commits
+///     inside the claim / admin closure. Once per new token; deliberately kept
+///     serialized because the check→deploy→register→persist sequence is the
+///     documented TOCTOU boundary (finding #10) and its two commits are on
+///     different accounts that the following CLAIM chains on.
+///
+/// Every hot-path submission (GER insert, CLAIM publish) waits through
+/// [`MidenClient::await_transaction_commit`] instead, outside the actor.
 ///
 /// Returns `true` if committed within the given number of attempts.
 /// Connection errors during sync are retried up to 3 times per attempt.
@@ -1460,31 +1617,12 @@ pub async fn wait_for_transaction_commit(
         // Retry sync on connection errors (up to 3 retries per poll attempt)
         let mut sync_ok = false;
         for retry in 0..3u32 {
-            // FINDING #106: this full `sync_state` is the growth term behind
-            // claim latency at depth. Measured indirectly (writer-job duration
-            // 57.6s -> 13.5s for the SAME job kind when a restore shrank the
-            // client store 71 MB -> 29 MB), but never timed directly — so time
-            // it. Operators watching a long-lived deployment need this number:
-            // it is what turns a nominally-20s commit wait into 40s+ and, via
-            // the serialized claim queue, caps end-to-end delivery throughput.
-            let sync_started = std::time::Instant::now();
-            let sync_result = client.sync_state().await;
-            let sync_elapsed = sync_started.elapsed();
-            ::metrics::histogram!("miden_sync_state_duration_seconds")
-                .record(sync_elapsed.as_secs_f64());
-            if sync_elapsed >= std::time::Duration::from_secs(2) {
-                tracing::warn!(
-                    sync_secs = sync_elapsed.as_secs_f64(),
-                    "miden-client sync_state is slow — commit waits and claim \
-                     throughput scale with this (client store growth, #106)"
-                );
-            }
-            match sync_result {
-                Ok(_) => {
+            match sync_state_timed(client).await {
+                Ok(()) => {
                     sync_ok = true;
                     break;
                 }
-                Err(client_err) => match MidenClient::unwrap_connection_error(client_err) {
+                Err(client_err) => match MidenClient::unwrap_connection_error(*client_err) {
                     Ok(conn_err) => {
                         tracing::warn!(
                             "wait_for_transaction_commit: sync connection error (retry {}/3): {conn_err:?}",

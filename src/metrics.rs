@@ -283,6 +283,14 @@ pub fn init_metrics() {
          (requests are held and passes retry with backoff up to 60s); sustained \
          growth with the node healthy means connectivity or RPC trouble."
     );
+    describe_counter!(
+        "miden_commit_wait_probes_total",
+        "#174 — per-attempt commit probes made by MidenClient::await_transaction_commit \
+         (the out-of-actor wait used by GER inserts and CLAIM publishes), by outcome: \
+         committed / pending / sync_unavailable / timed_out. Each probe is one short \
+         mailbox request; sleeps between probes happen outside the actor, so writers \
+         interleave instead of queueing behind a whole commit wait."
+    );
     describe_gauge!(
         "miden_client_writes_held",
         "#173 — 1 while the actor holds ALL MidenClient requests (writes and \

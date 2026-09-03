@@ -136,6 +136,14 @@ pub fn combined_ger(mainnet: &[u8; 32], rollup: &[u8; 32]) -> [u8; 32] {
 /// not submit a second note. The serialized client also keeps projection behind
 /// this handoff. This mirrors the claim submission boundary.
 ///
+/// #174 — the closure ends right after `apply_transaction`: the commit wait
+/// runs OUTSIDE the actor (`MidenClient::await_transaction_commit`, short
+/// per-attempt probes with the sleeps in between), so other writers no longer
+/// queue behind up to 30 seconds of a GER insert's polling. Everything that
+/// must be serialized against other submissions — sync, note build, execute,
+/// prove, durable handoff, submit, local apply — still is. The post-commit
+/// handoff confirmation is a store write and needs no actor.
+///
 /// Cantina #21 (PR #127 review, points 1/4): this function deliberately does
 /// NOT wait for the NTX builder to consume the note into the bridge account.
 /// GER propagation is fail-fast/retry-later: `eth_estimateGas` and the C6
@@ -151,6 +159,12 @@ async fn submit_update_ger_note(
     signer: Address,
 ) -> anyhow::Result<()> {
     let inner_accounts = accounts.0.clone();
+    let store_for_confirm = store.clone();
+    // Filled by the closure once the tx is submitted and locally applied; the
+    // commit wait + handoff confirmation happen outside the actor.
+    let submitted: Arc<std::sync::OnceLock<(miden_protocol::transaction::TransactionId, String)>> =
+        Arc::new(std::sync::OnceLock::new());
+    let submitted_inner = submitted.clone();
     miden_client
         .with(move |client| {
             Box::new(async move {
@@ -248,29 +262,39 @@ async fn submit_update_ger_note(
                     ger = %hex::encode(ger_bytes),
                     "UpdateGerNote submitted, waiting for commit..."
                 );
-
-                let committed = crate::miden_client::wait_for_transaction_commit(
-                    client,
-                    tx_id,
-                    30,
-                    std::time::Duration::from_secs(1),
-                )
-                .await?;
-                if !committed {
-                    anyhow::bail!("UpdateGerNote tx {tx_id} not committed after 30s");
-                }
-                let tx_key = format!("{txn_hash:#x}");
-                if !store
-                    .confirm_note_handoff(&tx_key, &note_commitment)
-                    .await?
-                {
-                    anyhow::bail!("GER note handoff changed before commit confirmation");
-                }
-                tracing::info!(tx_id = %tx_id, "UpdateGerNote transaction committed");
+                let _ = submitted_inner.set((tx_id, note_commitment));
                 Ok(())
             })
         })
-        .await
+        .await?;
+    let Some((tx_id, note_commitment)) = submitted.get().cloned() else {
+        // A production closure sets the slot before it can return Ok. The only
+        // way to get here is a request that was acknowledged without running
+        // the closure — the `cfg(test)` MidenClient stub, whose contract is
+        // "every request succeeds with no side effects".
+        if cfg!(test) {
+            return Ok(());
+        }
+        anyhow::bail!("GER submission closure completed without a tx id");
+    };
+
+    // #174 — commit wait OUTSIDE the actor: each probe is one short mailbox
+    // request, every sleep runs here between them.
+    let committed = miden_client
+        .await_transaction_commit(tx_id, 30, std::time::Duration::from_secs(1))
+        .await?;
+    if !committed {
+        anyhow::bail!("UpdateGerNote tx {tx_id} not committed after 30s");
+    }
+    let tx_key = format!("{txn_hash:#x}");
+    if !store_for_confirm
+        .confirm_note_handoff(&tx_key, &note_commitment)
+        .await?
+    {
+        anyhow::bail!("GER note handoff changed before commit confirmation");
+    }
+    tracing::info!(tx_id = %tx_id, "UpdateGerNote transaction committed");
+    Ok(())
 }
 
 /// Durable pre-submit handoff for an `UpdateGerNote`: record the exact note link
