@@ -3026,7 +3026,7 @@ impl Store for PgStore {
             .collect()
     }
 
-    async fn put_b2agg_note_ids(&self, entries: &[(Nullifier, NoteId)]) -> anyhow::Result<()> {
+    async fn put_note_identities(&self, entries: &[(Nullifier, NoteId)]) -> anyhow::Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -3035,7 +3035,7 @@ impl Store for PgStore {
         let client = self.pool.get().await?;
         client
             .execute(
-                "INSERT INTO bridge_b2agg_note_ids (nullifier, note_id)
+                "INSERT INTO bridge_note_ids (nullifier, note_id)
                  SELECT * FROM unnest($1::text[], $2::text[])
                  ON CONFLICT (nullifier) DO NOTHING",
                 &[&nullifiers, &note_ids],
@@ -3044,7 +3044,7 @@ impl Store for PgStore {
         Ok(())
     }
 
-    async fn get_b2agg_note_ids(
+    async fn get_note_identities(
         &self,
         nullifiers: &[Nullifier],
     ) -> anyhow::Result<std::collections::HashMap<Nullifier, NoteId>> {
@@ -3056,7 +3056,7 @@ impl Store for PgStore {
         let rows = client
             .query(
                 "SELECT nullifier, note_id
-                 FROM bridge_b2agg_note_ids
+                 FROM bridge_note_ids
                  WHERE nullifier = ANY($1::text[])",
                 &[&keys],
             )

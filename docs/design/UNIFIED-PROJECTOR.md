@@ -1,10 +1,13 @@
-# Unified projector: authoritative B2AGG consumption sourcing
+# Unified projector: authoritative consumption sourcing
 
-Status: implemented on `main`.
+Status: implemented on `main`; generalized to every event family by issue #167.
 
-This design note explains why `SyntheticProjector` uses two consumption
-sources. It supersedes the former late-consumption sweep and direct-recovery
-queue.
+This design note explains how `SyntheticProjector` sources consumptions. It
+supersedes the former late-consumption sweep and direct-recovery queue, and —
+since issue #167 — the former split between an authoritative B2AGG source and
+a local-store CLAIM/GER source: there is now ONE resolved-input pipeline for
+every event family, so history is rebuilt identically whether it arrives one
+tick at a time or in a from-genesis catch-up.
 
 ## The consistency problem
 
@@ -14,11 +17,15 @@ proxy's next `sync_state`. A note-body import sweep can recover the body, but
 waiting for the local store to later discover the spend is not a safe basis for
 sealing an immutable synthetic block.
 
-CLAIM and GER notes have a different lifecycle: this proxy creates them through
-its serialized Miden client, records their output metadata and receipt linkage,
-and observes their consumed state locally.
+CLAIM and GER notes have a different lifecycle — this proxy creates them
+through its serialized Miden client and records their receipt linkage — but
+their CONSUMPTION is attributed the same way: the bridge account consumes them,
+so they appear in the bridge's transaction feed. Relying on the local
+consumed-note store for them instead meant that a client-store loss erased
+CLAIM/GER history that the node could still serve, and that a from-genesis
+rebuild read the whole store on every pass.
 
-## Implemented source split
+## Implemented pipeline
 
 ```mermaid
 flowchart TD
@@ -26,17 +33,21 @@ flowchart TD
     SWEEP["sync_notes tag-0 body sweep"]
     CEILING["Full-tip visibility gate"]
     TXS["sync_transactions for bridge account"]
-    LOCAL["Local consumed-note store"]
-    B2AGG["B2AGG consumptions"]
-    INTERNAL["CLAIM and GER consumptions"]
+    LEDGER["Durable nullifier-to-NoteId ledger (every public note kind)"]
+    RESOLVE["resolve_bridge_consumptions: identity, exact body, metadata, kind"]
+    B2AGG["B2AGG consumptions (with LET input position)"]
+    INTERNAL["CLAIM and GER consumptions (with authoritative metadata)"]
     ORDER["Order by block, transaction order, input position, NoteId"]
     EMIT["Shared project_* derivations"]
 
     TIP --> CEILING
     SWEEP --> CEILING
+    SWEEP --> LEDGER
     CEILING -->|"cursor plus one through ceiling"| TXS
-    TXS --> B2AGG
-    LOCAL --> INTERNAL
+    TXS --> RESOLVE
+    LEDGER --> RESOLVE
+    RESOLVE --> B2AGG
+    RESOLVE --> INTERNAL
     B2AGG --> ORDER
     INTERNAL --> ORDER
     ORDER --> EMIT
@@ -44,36 +55,62 @@ flowchart TD
 
 Projection waits until `reconcile_cursor >= tip`, then processes through that tip.
 
-For B2AGG, `sync_transactions` is filtered to the configured bridge account.
-It supplies the finalized block number, consuming transaction order, input
-nullifiers, and input order. The pinned miden-client drops protocol input
-headers, so the reconciler persists the B2AGG nullifier-to-NoteId join before
-advancing its cursor.
-The projector accepts a body only after the normal B2AGG script and
-bridge-consumer checks pass.
+`sync_transactions` is filtered to the configured bridge account. For EVERY
+consumption it supplies the finalized block number, consuming transaction
+order, input nullifiers, input order, and — for public inputs the node can
+resolve — the `(nullifier, note_id)` reference. The reconciler's windowed
+`sync_notes` sweep persists the nullifier-to-NoteId join for every public note
+in the bridge's tag space before advancing its cursor, so a headerless input
+still resolves after a client-store loss. The projector accepts a body only
+after the per-kind provenance checks pass (B2AGG script + bridge-consumer gate;
+CLAIM consumer/mint proof; GER sender/target gate — read from the fetched body's
+own metadata, no output-note fallback).
 
-For CLAIM and GER, the projector groups records from
-`get_input_notes(NoteFilter::Consumed)` by their consumed block. B2AGG records
-are explicitly excluded from this local path so the sources remain disjoint.
+The local consumed-note store is no longer a projection source in either
+posture. Live ticks still read it for two self-heal concerns that are not
+projection — the synthesized-claim calldata backfill and the completeness
+auditor — and restore posture skips both, so a from-genesis catch-up does
+window-bounded work per pass.
 
-## B2AGG body resolution
+## Body resolution (every kind)
 
 A consumed external input record no longer exposes the metadata needed to
-recompute its nullifier. Before that transition, the projector persists the
-minimal nullifier-to-NoteId join. Canonical bodies remain in the node.
+recompute its nullifier. Before that transition, the reconciler persists the
+nullifier-to-NoteId join. Canonical bodies remain in the node.
 
-Resolution order is:
+Resolution order is (issue #167 item 3):
 
-1. NoteId retained by a corrected transaction-header decoder, when available;
-2. otherwise, durable NoteId recovered by nullifier;
-3. canonical body fetched with `get_notes_by_id`.
+1. NoteId retained by the transaction input header, when the client exposes it;
+2. the node's `(nullifier, note_id)` reference for public inputs;
+3. durable NoteId recovered by nullifier from the ledger the bounded sweep
+   records (the archive lookup for historical / headerless inputs);
+4. canonical body — details, attachments, metadata, and the note's own
+   nullifier — fetched with `get_notes_by_id`.
 
-The node's transaction feed can briefly lead its note database. If an identified
-input is omitted from `get_notes_by_id`, the projector fails the tick and retries;
-it never relies on cardinality after an index may already have been reserved. No
-synthetic block is sealed with a missing leaf. The minimal nullifier-to-NoteId identity ledger is
-append-only and grows with observed B2AGG note history, so restart recovery never depends on
-cache lifetime or cleanup ordering. It can contain notes that never emit a bridge event.
+Every body is bound to its consumption by its own nullifier before use; a
+swapped reference of any kind is refused. The node's transaction feed can
+briefly lead its note database. If an identified input is omitted from
+`get_notes_by_id`, the projector fails the tick and retries; it never relies on
+cardinality after an index may already have been reserved. No synthetic block
+is sealed with a missing leaf. The identity ledger is append-only and grows with
+observed note history, so restart recovery never depends on cache lifetime or
+cleanup ordering. It can contain notes that never emit an event.
+
+An input with NO recoverable identity — no reference, no ledger entry — is the
+ERASED-note boundary. Live posture skips it (a hidden bridge-out still fails
+closed at the LET cardinality gate); restore posture halts before sealing,
+naming the block and nullifier, so a node/protocol limitation is exposed rather
+than papered over.
+
+## Bootstrap state
+
+Chain-derived bootstrap state is rebuilt through a normal primitive before the
+first dependent event projects: in restore posture the projector runs
+`faucet_bootstrap::rebuild_missing_faucet_identities` at the start of every
+pass (fail-closed on an unknown faucet type or a failed rebuild) and refuses to
+project a bridge-out whose faucet is still unknown. Live posture never adopts an
+unknown bridge faucet — that is a security signal, see
+`faucet_registry_reconciler`.
 
 ## Removed behavior
 

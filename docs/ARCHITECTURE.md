@@ -257,11 +257,14 @@ synthetic events or advance the tip. The projector enforces LET cardinality
 before sealing.
 
 `--restore` is an offline reconstruction mode. It pauses post-sync listener
-side effects, reimports configured accounts, rebuilds faucet identities, resets
-both projector cursors to genesis, and then drives the SAME `SyntheticProjector`
-catch-up the live scheduler runs — in blocking fail-closed mode, pinned to a
-captured Miden tip — through one frozen serialized actor session (issue #167;
-the former node-scan replay engine was deleted). It finalizes the synthetic tip
+side effects, reimports configured accounts, resets both projector cursors to
+genesis, and then drives the SAME `SyntheticProjector` catch-up the live
+scheduler runs — in blocking fail-closed mode, pinned to a captured Miden tip —
+through one frozen serialized actor session (issue #167; the former node-scan
+replay engine was deleted). The projector sources every event family (B2AGG,
+CLAIM, GER) from the bridge's transaction feed by exact note identity, rebuilds
+missing faucet identities through the `faucet_bootstrap` primitive before the
+first dependent event, and halts on any input it cannot reconstruct. It finalizes the synthetic tip
 and projector cursor, parks the note-sweep cursor at the tip the catch-up
 reached, and exits. `--reset-miden-store --restore` is the full local-state
 recovery path; the PostgreSQL volume still contains EVM envelopes and calldata

@@ -150,6 +150,10 @@ pass to populate nullifier-to-NoteId identities, and the full-tip visibility bar
 holds synthetic projection until that pass reaches the current tip. This is an
 expected one-time availability cost; later starts resume the persisted cursor.
 
+The upgrade that generalizes that ledger to every note kind (migration 026,
+issue #167: CLAIM/GER identities become durable too, and the table is renamed
+`bridge_note_ids`) performs the same one-time reset for the same reason.
+
 Stop the rollout immediately if startup tries to initialize new accounts,
 reports a migration checksum mismatch, points at a different network, or fails
 the hardening/prover probe.

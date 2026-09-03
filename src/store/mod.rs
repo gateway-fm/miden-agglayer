@@ -1215,10 +1215,15 @@ pub trait Store: Send + Sync + 'static {
         note_keys: &[String],
     ) -> anyhow::Result<std::collections::HashMap<String, u32>>;
 
-    /// Append to the durable identity ledger used to resolve headerless B2AGG
-    /// consumptions after restart. Existing nullifier mappings are immutable.
-    async fn put_b2agg_note_ids(&self, entries: &[(Nullifier, NoteId)]) -> anyhow::Result<()>;
-    async fn get_b2agg_note_ids(
+    /// Append to the durable note-identity ledger: `nullifier -> NoteId` for every
+    /// PUBLIC note the reconciler discovers in the bridge's tag space, regardless of
+    /// kind (B2AGG, CLAIM, UpdateGerNote, setup notes). The canonical projector
+    /// consults it to resolve a bridge-consumed input whose transaction header
+    /// carries no `(nullifier, note_id)` reference (issue #167 item 3: the ledger is
+    /// no longer B2AGG-only, so CLAIM/GER history survives a client-store loss the
+    /// same way B2AGG does). Existing nullifier mappings are immutable.
+    async fn put_note_identities(&self, entries: &[(Nullifier, NoteId)]) -> anyhow::Result<()>;
+    async fn get_note_identities(
         &self,
         nullifiers: &[Nullifier],
     ) -> anyhow::Result<std::collections::HashMap<Nullifier, NoteId>>;

@@ -11,6 +11,7 @@ pub mod claim;
 pub mod claim_watcher;
 pub mod exit;
 pub mod expected_mint_tracker;
+pub mod faucet_bootstrap;
 pub mod faucet_ops;
 pub mod faucet_ownership_monitor;
 pub mod faucet_registry_reconciler;

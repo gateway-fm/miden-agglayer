@@ -139,7 +139,7 @@ pub struct InMemoryStore {
     // quarantined/deferred/self-targeted classes — they occupy a LET leaf with no event);
     // the atomic commit reuses the reservation and flips emitted=true.
     processed_notes: RwLock<HashMap<String, (u32, bool)>>,
-    b2agg_note_ids: RwLock<HashMap<Nullifier, NoteId>>,
+    note_identities: RwLock<HashMap<Nullifier, NoteId>>,
     // Explicit upgrade offset for legacy LET leaves not in deposit_counter.
     let_gate_baseline: RwLock<u64>,
     deposit_counter: RwLock<u32>,
@@ -272,7 +272,7 @@ impl InMemoryStore {
             unbridgeable_bridge_outs: RwLock::new(HashMap::new()),
             address_mappings: RwLock::new(HashMap::new()),
             processed_notes: RwLock::new(HashMap::new()),
-            b2agg_note_ids: RwLock::new(HashMap::new()),
+            note_identities: RwLock::new(HashMap::new()),
             let_gate_baseline: RwLock::new(0),
             deposit_counter: RwLock::new(0),
             claim_watcher_processed: RwLock::new(HashMap::new()),
@@ -2156,19 +2156,19 @@ impl Store for InMemoryStore {
             .collect())
     }
 
-    async fn put_b2agg_note_ids(&self, entries: &[(Nullifier, NoteId)]) -> anyhow::Result<()> {
-        let mut stored = self.b2agg_note_ids.write();
+    async fn put_note_identities(&self, entries: &[(Nullifier, NoteId)]) -> anyhow::Result<()> {
+        let mut stored = self.note_identities.write();
         for (nullifier, note_id) in entries {
             stored.entry(*nullifier).or_insert(*note_id);
         }
         Ok(())
     }
 
-    async fn get_b2agg_note_ids(
+    async fn get_note_identities(
         &self,
         nullifiers: &[Nullifier],
     ) -> anyhow::Result<HashMap<Nullifier, NoteId>> {
-        let cached = self.b2agg_note_ids.read();
+        let cached = self.note_identities.read();
         Ok(nullifiers
             .iter()
             .filter_map(|nullifier| cached.get(nullifier).map(|id| (*nullifier, *id)))

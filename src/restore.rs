@@ -11,13 +11,15 @@
 //! ## Algorithm
 //!
 //! 0. Re-import configured accounts (bootstrap; emits no history).
-//! 1. Rebuild faucet identities from bridge state (bootstrap; Cantina #6).
-//! 2. Reset both cursors to genesis (atomic), then run
+//! 1. Reset both cursors to genesis (atomic), then run
 //!    `SyntheticProjector::catch_up_to(.., CatchUpMode::Restore)` inside ONE
 //!    frozen actor session: the Miden tip + LET snapshot and the entire
-//!    discovery → order → project → seal → cursor-commit catch-up observe the
-//!    same chain state, fail-closed on any stall, with the
-//!    authoritative-coverage guard refusing to seal unrecoverable inputs.
+//!    discovery → resolve → order → project → seal → cursor-commit catch-up
+//!    observe the same chain state, fail-closed on any stall, with the
+//!    authoritative-coverage guard refusing to seal unrecoverable inputs. The
+//!    chain-derived bootstrap state (faucet identities, Cantina #6) is rebuilt
+//!    by the projector itself through the normal
+//!    `faucet_bootstrap` primitive before the first dependent event projects.
 //! 3. Verify LET accounting + emitted frontier, finalize the synthetic
 //!    tip / projector / reconcile cursors (the reconcile cursor is PARKED at
 //!    the tip the catch-up reached), and emit the report.
@@ -39,10 +41,10 @@
 //!   TODO: switch to NoteFilter::ConsumedByScriptRoot when available
 //! - No block range queries for notes (full scan from genesis)
 //!   TODO: switch to dedicated get_gers() endpoint when Marti's team ships it
-//! - A bridge-consumed input the canonical path cannot reconstruct (created-
-//!   and-consumed in one block on a wiped store, headerless, no durable
-//!   identity) fails the restore with an actionable error (coverage guard) —
-//!   it can never be silently skipped.
+//! - A bridge-consumed input the canonical path cannot reconstruct (no
+//!   transaction-header reference and no durable identity from the note sweep)
+//!   fails the restore with an actionable error (coverage guard) — it can never
+//!   be silently skipped.
 
 use crate::accounts_config::AccountsConfig;
 use crate::block_state::BlockState;
@@ -54,11 +56,12 @@ use std::sync::Arc;
 pub struct RestoreResult {
     pub block_number: u64,
     pub bridge_outs_restored: usize,
-    /// Cantina #6 — number of non-ETH faucet `faucet_registry` rows rebuilt from
-    /// the bridge's authoritative `faucet_metadata_map` (rows that were missing
-    /// on a fresh-DB / `--restore` bootstrap). Rebuilding these BEFORE replaying
-    /// bridge-outs is what lets `resolve_faucet_origin` succeed so historical
-    /// exits replay instead of being quarantined as `UnknownFaucet`.
+    /// Cantina #6 — number of non-ETH faucet `faucet_registry` rows the
+    /// projector's faucet bootstrap (`faucet_bootstrap`) rebuilt from the
+    /// bridge's authoritative `faucet_metadata_map` (rows missing on a fresh-DB
+    /// / `--restore` bootstrap). Rebuilt BEFORE the first dependent bridge-out
+    /// projects, fail-closed, so historical exits replay instead of being
+    /// quarantined as `UnknownFaucet`.
     pub faucet_identities_rebuilt: usize,
     /// Cantina MA#27 — number of consumed CLAIM notes for which a synthetic
     /// ClaimEvent was emitted by restore (the offline equivalent of what the
@@ -121,20 +124,11 @@ pub async fn restore(
     // sync keeps running, making the LET gate nondeterministic on a
     // producing node.)
 
-    // Phase 1.7 (Cantina #6): rebuild missing non-ETH faucet identity rows from the
-    // bridge's authoritative `faucet_metadata_map` BEFORE projecting bridge-outs.
-    // Without this, a faucet whose local row was lost on a fresh-DB bootstrap makes
-    // `resolve_faucet_origin` error, so the canonical projector and the live
-    // `BridgeOutScanner` both quarantine/skip every historical exit tied to it, and
-    // the next claim/admin-register deploys a REPLACEMENT faucet → split-brain
-    // (Cantina #6). Best-effort: a per-faucet failure is logged + counted, never
-    // aborts restore.
-    tracing::info!("Phase 1.7: rebuilding faucet identities from bridge state (Cantina #6)...");
-    let faucet_identities_rebuilt =
-        restore_faucet_identities(store, miden_client, accounts, &network_rpcs).await?;
-    tracing::info!(
-        "Phase 1.7 complete: {faucet_identities_rebuilt} faucet identity row(s) rebuilt"
-    );
+    // Faucet identities (Cantina #6) are no longer a restore-private phase: the
+    // projector runs the `faucet_bootstrap` primitive in restore posture before
+    // every pass, fail-closed (issue #167 item 5), so a faucet whose local row
+    // was lost cannot make historical exits quarantine and the restore "succeed"
+    // over a depositCount gap.
 
     // ── Phase 2 (issue #167): CANONICAL CATCH-UP — recovery is normal
     // projection from cursor zero. The former parallel engine (the Phase 1.5
@@ -216,6 +210,11 @@ pub async fn restore(
         .take()
         .expect("restore snapshot captured");
     let counts = projector.take_projection_counts();
+    let faucet_identities_rebuilt = projector.faucet_identities_rebuilt();
+    tracing::info!(
+        "Phase 2: {faucet_identities_rebuilt} faucet identity row(s) rebuilt by the bootstrap \
+         primitive"
+    );
     let (bridge_outs, claims, gers) = (counts.bridge_outs, counts.claims, counts.gers);
     let total_logs = bridge_outs + claims + gers;
     tracing::info!(
@@ -337,147 +336,6 @@ pub(crate) async fn finalize_restore_cursors(
         }
     }
     Ok(())
-}
-
-/// Phase 1.7 (Cantina #6): rebuild missing non-ETH faucet `faucet_registry` rows
-/// from the bridge's authoritative `faucet_metadata_map`.
-///
-/// Enumerates every faucet registered on the bridge, and for each one WITHOUT a
-/// local row, reads its origin identity (address / network / scale) back from the
-/// bridge storage and its symbol / Miden-decimals from the faucet account, then
-/// `store.register_faucet(...)` the reconstructed row. This is a pure READ of
-/// public on-chain state — faucets are bridge-owned (mint/burn), so no signing
-/// key is involved and the account is never re-deployed (its random seed is
-/// unrecoverable; a re-deploy would strand balances in a second generation).
-///
-/// Returns the number of rows rebuilt. Best-effort: per-faucet failures are
-/// logged + counted and never abort restore.
-async fn restore_faucet_identities(
-    store: &Arc<dyn Store>,
-    miden_client: &MidenClient,
-    accounts: &AccountsConfig,
-    network_rpcs: &crate::metadata_recovery::NetworkRpcMap,
-) -> anyhow::Result<usize> {
-    let store_clone = store.clone();
-    let bridge_id = accounts.bridge.0;
-    // Owned clone moved into the `with(...)` closure; per-faucet RPC selection is
-    // keyed on the faucet's origin_network (finding #62 multi-network recovery).
-    let network_rpcs = network_rpcs.clone();
-
-    let count = Arc::new(std::sync::Mutex::new(0usize));
-    let count_inner = count.clone();
-
-    miden_client
-        .with(move |client| {
-            Box::new(async move {
-                // The bridge account holds the authoritative faucet_metadata_map;
-                // Phase 0 reimported it. If it's still unavailable we cannot rebuild.
-                let Some(bridge_account) = client.get_account(bridge_id).await.ok().flatten() else {
-                    tracing::warn!(
-                        bridge = %bridge_id,
-                        "Cantina #6: bridge account not available locally; skipping faucet-identity rebuild"
-                    );
-                    return Ok(());
-                };
-
-                let faucet_ids = crate::metadata_recovery::enumerate_registered_faucet_ids(
-                    bridge_account.storage(),
-                );
-                tracing::info!(
-                    count = faucet_ids.len(),
-                    "Cantina #6: bridge registers {} faucet(s); checking local rows",
-                    faucet_ids.len()
-                );
-
-                let mut rebuilt = 0usize;
-                for faucet_id in faucet_ids {
-                    match store_clone.get_faucet_by_id(faucet_id).await {
-                        Ok(Some(_)) => continue, // already have a local row
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!(faucet_id = %faucet_id, error = ?e,
-                                "Cantina #6: get_faucet_by_id failed; skipping");
-                            continue;
-                        }
-                    }
-                    let Some(conversion) = crate::metadata_recovery::read_faucet_conversion_metadata(
-                        bridge_account.storage(),
-                        faucet_id,
-                    ) else {
-                        // All-zero conversion = the native-ETH sentinel (pre-seeded, never
-                        // rebuilt from chain) or an unregistered id. A registered NATIVE
-                        // faucet has a non-zero origin (origin_network == network_id, scale 0),
-                        // so it does NOT land here — it proceeds to classify + rebuild below.
-                        continue;
-                    };
-                    match crate::faucet_ops::rebuild_faucet_entry_from_chain(
-                        client,
-                        &bridge_account,
-                        faucet_id,
-                        &conversion,
-                        network_rpcs
-                            .get(&conversion.origin_network)
-                            .map(String::as_str),
-                    )
-                    .await
-                    {
-                        Ok(entry) => {
-                            let (origin_network, scale) = (entry.origin_network, entry.scale);
-                            match store_clone.register_faucet(entry).await {
-                                Ok(()) => {
-                                    rebuilt += 1;
-                                    ::metrics::counter!("restore_faucet_identity_rebuilt_total")
-                                        .increment(1);
-                                    tracing::info!(
-                                        faucet_id = %faucet_id,
-                                        origin_network,
-                                        scale,
-                                        "Cantina #6: rebuilt missing faucet_registry row from \
-                                         bridge faucet_metadata_map"
-                                    );
-                                }
-                                Err(e) => tracing::warn!(faucet_id = %faucet_id, error = ?e,
-                                    "Cantina #6: register_faucet failed during rebuild"),
-                            }
-                        }
-                        Err(e) => {
-                            // An UNKNOWN faucet type registered in the bridge is a fail-LOUD
-                            // condition (malformed / hostile registration), distinct from a
-                            // recoverable metadata miss — surface it at ERROR with its own
-                            // metric so operators must investigate rather than let it pass as
-                            // a routine quarantine.
-                            if format!("{e:?}").contains("UNKNOWN faucet type") {
-                                ::metrics::counter!("restore_unknown_faucet_type_total")
-                                    .increment(1);
-                                tracing::error!(
-                                    faucet_id = %faucet_id,
-                                    error = ?e,
-                                    "restore: UNKNOWN faucet type registered in the bridge — \
-                                     matches no supported faucet kind; NOT rebuilt. Investigate: \
-                                     this should never happen for a proxy-registered faucet."
-                                );
-                            } else {
-                                ::metrics::counter!("restore_faucet_identity_rebuild_failed_total")
-                                    .increment(1);
-                                tracing::warn!(
-                                    faucet_id = %faucet_id,
-                                    error = ?e,
-                                    "Cantina #6: could not rebuild faucet row from chain; historical \
-                                     bridge-outs for this faucet stay quarantined until it is backfilled"
-                                );
-                            }
-                        }
-                    }
-                }
-
-                *count_inner.lock().unwrap() = rebuilt;
-                Ok(())
-            })
-        })
-        .await?;
-
-    let n = *count.lock().unwrap();
-    Ok(n)
 }
 
 #[cfg(test)]

@@ -71,7 +71,7 @@ use miden_protocol::note::{
 use miden_standards::note::NoteFile;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Blocks per `sync_notes` window walked by the note-visibility reconciler.
@@ -411,7 +411,13 @@ pub struct SyntheticProjector {
     /// cardinality gate already halts on invisible B2AGG gaps, and a
     /// legitimately-consumed CLAIM/GER is always in the local feed on an
     /// un-wiped store.
-    require_full_coverage: AtomicBool,
+    /// #167 — restore posture: exact authoritative coverage (any bridge-consumed
+    /// input without a recoverable identity halts before sealing), the faucet
+    /// bootstrap primitive before projection, and the live-only O(store)
+    /// self-heal passes (claim-calldata backfill, completeness audit) skipped.
+    restore_posture: AtomicBool,
+    /// Faucet-identity rows the restore-posture bootstrap rebuilt (report only).
+    faucet_identities_rebuilt: AtomicUsize,
     /// Cumulative per-kind emission counts accumulated by every projected
     /// block. Live ticks ignore it; `--restore` (issue #167) reads it once
     /// after `catch_up_to` completes to build the restore report from the
@@ -496,7 +502,8 @@ impl SyntheticProjector {
             reconcile_concurrency,
             reconcile_budget,
             pending_duplicate_cursor: std::sync::Mutex::new(None),
-            require_full_coverage: AtomicBool::new(false),
+            restore_posture: AtomicBool::new(false),
+            faucet_identities_rebuilt: AtomicUsize::new(0),
             projection_totals: std::sync::Mutex::new(Default::default()),
             audit_resolved: std::sync::Mutex::new(HashSet::new()),
             audit_tick_counter: AtomicU64::new(0),
@@ -945,14 +952,16 @@ impl SyntheticProjector {
                 );
             }
 
-            // Persist every visible B2AGG identity. If miden-client dropped an already-spent
-            // note or collapsed same-details siblings, fetch just the missing IDs directly.
-            // This completes before the caller advances the durable reconcile cursor.
+            // Persist every visible note identity (issue #167 item 3: EVERY public
+            // note kind, not just B2AGG — CLAIM/GER must survive a client-store loss
+            // too). If miden-client dropped an already-spent note or collapsed
+            // same-details siblings, fetch just the missing IDs directly. This
+            // completes before the caller advances the durable reconcile cursor.
             let visible = client
                 .get_input_notes(NoteFilter::List(candidates.to_vec()))
                 .await
                 .map_err(|e| anyhow::anyhow!("get_input_notes(List) post-import: {e}"))?;
-            self.persist_b2agg_note_ids(&visible).await?;
+            self.persist_note_identities(&visible).await?;
             let visible_ids: HashSet<NoteId> =
                 visible.iter().filter_map(InputNoteRecord::id).collect();
             let missing: Vec<NoteId> = candidates
@@ -960,24 +969,25 @@ impl SyntheticProjector {
                 .filter(|id| !visible_ids.contains(id))
                 .copied()
                 .collect();
-            self.persist_missing_b2agg_note_ids(rpc, &missing).await?;
+            self.persist_missing_note_identities(rpc, &missing).await?;
         }
         Ok(())
     }
 
-    /// Persist the nullifier-to-NoteId join while local records still expose metadata.
-    async fn persist_b2agg_note_ids(&self, records: &[InputNoteRecord]) -> anyhow::Result<()> {
+    /// Persist the nullifier-to-NoteId join while local records still expose metadata —
+    /// for every note kind (the ledger is the identity source for any bridge-consumed
+    /// input whose transaction header carries no reference).
+    async fn persist_note_identities(&self, records: &[InputNoteRecord]) -> anyhow::Result<()> {
         let identities = records
             .iter()
-            .filter(|record| is_b2agg_note(record.details()))
             .filter_map(|record| Some((record.nullifier()?, record.id()?)))
             .collect::<Vec<_>>();
-        self.store.put_b2agg_note_ids(&identities).await
+        self.store.put_note_identities(&identities).await
     }
 
     /// Fetch records hidden by miden-client's details-keyed SQLite store and persist only
     /// their identity join. The canonical body remains in the node and is fetched at use time.
-    async fn persist_missing_b2agg_note_ids(
+    async fn persist_missing_note_identities(
         &self,
         rpc: &dyn NodeRpcClient,
         missing: &[NoteId],
@@ -1000,26 +1010,17 @@ impl SyntheticProjector {
             let FetchedNote::Public(note, _inclusion) = f else {
                 continue;
             };
-            let nullifier = note.nullifier();
-            let details: NoteDetails = note.into();
-            if !is_b2agg_note(&details) {
-                continue;
-            }
-            identities.push((nullifier, id));
+            // Private notes carry no body: no nullifier to key, and never a projectable
+            // event (B2AGG / CLAIM / UpdateGerNote are all public).
+            identities.push((note.nullifier(), id));
         }
-        self.store.put_b2agg_note_ids(&identities).await
+        self.store.put_note_identities(&identities).await
     }
 
-    /// Resolve the note bodies for a window's bridge-consumed nullifiers into ConsumedExternal
-    /// records to project. `bridge_consumed_nullifiers` yields EVERY bridge consumption — real
-    /// B2AGG exits AND the non-B2AGG notes the bridge routinely consumes (CLAIM, UpdateGerNote,
-    /// genesis/setup notes) — so most inputs here are legitimately NOT B2AGG exits.
-    ///
-    /// The pinned miden-client drops transaction input headers, so B2AGG identity is normally
-    /// recovered from the durable nullifier-to-NoteId join. A corrected client header is also
-    /// accepted. Inputs with neither identity are normally CLAIM/GER
-    /// setup notes; if one is actually a B2AGG, the pre-seal LET gate blocks the tick.
-    ///
+    /// Test/compat adapter over [`Self::resolve_bridge_consumptions`]: the resolved
+    /// B2AGG exits only (the shape the per-kind unit tests pin), with every
+    /// nullifier the pipeline accounted for merged into `resolved_nullifiers`.
+    #[cfg(test)]
     async fn resolve_b2agg_consumptions(
         &self,
         fetcher: &dyn PublicNoteFetcher,
@@ -1027,28 +1028,67 @@ impl SyntheticProjector {
         within_tx_pos: &mut HashMap<NoteId, u32>,
         resolved_nullifiers: &mut HashSet<Nullifier>,
     ) -> anyhow::Result<Vec<(NoteId, InputNoteRecord)>> {
-        let build = |details: NoteDetails, attachments: NoteAttachments, cref: &ConsumedRef| {
+        let resolved = self
+            .resolve_bridge_consumptions(fetcher, consumed_refs, within_tx_pos)
+            .await?;
+        resolved_nullifiers.extend(resolved.resolved_nullifiers.iter().copied());
+        Ok(resolved.b2agg)
+    }
+
+    /// THE resolved-input pipeline (issue #167 item 2): turn a window's
+    /// bridge-consumed inputs — EVERY event family, from ONE authoritative source
+    /// (the bridge's transaction feed) — into projectable records carrying exact
+    /// identity, body, attachments, authoritative metadata, consuming account,
+    /// consumption block / transaction order / input position.
+    ///
+    /// Identity resolution, in order (issue #167 item 3):
+    ///   1. the transaction input header's `NoteId`, when the client exposes it;
+    ///   2. the node's `(nullifier, note_id)` reference for public inputs;
+    ///   3. the durable identity ledger the reconciler's windowed sweep records
+    ///      for every public note in the bridge's tag space (`Store::
+    ///      get_note_identities`) — the bounded archive lookup for
+    ///      historical / headerless inputs;
+    ///   4. exact body retrieval by id (`get_notes_by_id`).
+    ///
+    /// Every returned body is bound to its consumption by its own nullifier
+    /// (a swapped `(nullifier, note_id)` reference of ANY kind is refused), then
+    /// classified by script root: B2AGG exits carry their within-transaction
+    /// position (the on-chain LET append order); CLAIM / UpdateGerNote become
+    /// `ConsumedExternal` records WITH metadata (the MA#28 / claim provenance
+    /// gates read it straight from the authoritative body — no output-note
+    /// fallback map, no whole-store read); setup notes and private inputs are
+    /// accounted for and project nothing.
+    ///
+    /// Inputs with NO recoverable identity are returned in `unresolved` — never
+    /// dropped silently. Live posture skips them (a hidden B2AGG still fails
+    /// closed at the LET cardinality gate); restore posture halts on them
+    /// (`ensure_authoritative_coverage`).
+    ///
+    /// Memory and RPC work are bounded by the window: the inputs are the
+    /// window's bridge transactions and the bodies fetched for them.
+    async fn resolve_bridge_consumptions(
+        &self,
+        fetcher: &dyn PublicNoteFetcher,
+        consumed_refs: HashMap<Nullifier, ConsumedRef>,
+        within_tx_pos: &mut HashMap<NoteId, u32>,
+    ) -> anyhow::Result<ResolvedInputs> {
+        let build = |body: &FetchedBody, cref: &ConsumedRef| {
             let state = InputNoteState::ConsumedExternal(ConsumedExternalNoteState {
                 nullifier_block_height: BlockNumber::from(cref.block as u32),
                 consumer_account: Some(self.bridge_id),
                 consumed_tx_order: Some(cref.order),
-                // 0.16: ConsumedExternalNoteState retains note metadata when the
-                // prior state had it; we reconstruct from bare details (no prior
-                // state), matching the pre-0.16 record-level metadata of None.
-                metadata: None,
+                // The authoritative metadata (sender / tag / type) from the node's
+                // public record: what the provenance gates verify against.
+                metadata: Some(body.metadata),
             });
-            InputNoteRecord::new(details, attachments, None, state)
+            InputNoteRecord::new(body.details.clone(), body.attachments.clone(), None, state)
         };
 
-        // miden-client 0.15 discards the headers in sync_transactions. Recover the NoteIds
-        // captured before consumption so a restart does not turn every input into an
-        // unresolvable nullifier.
-        let nullifiers: Vec<Nullifier> = consumed_refs.keys().copied().collect();
-        let durable_ids = self.store.get_b2agg_note_ids(&nullifiers).await?;
+        let mut out = ResolvedInputs::default();
 
-        // Resolve every identity through the canonical node body. Headerless inputs with no
-        // persisted B2AGG identity are normally non-B2AGG bridge inputs; a hidden B2AGG still
-        // fails closed at the independent LET cardinality gate.
+        // Steps 1-3: identity.
+        let nullifiers: Vec<Nullifier> = consumed_refs.keys().copied().collect();
+        let durable_ids = self.store.get_note_identities(&nullifiers).await?;
         let mut refs = Vec::new();
         for (nullifier, cref) in consumed_refs {
             if let Some(note_id) = cref
@@ -1057,19 +1097,21 @@ impl SyntheticProjector {
             {
                 refs.push((nullifier, cref, note_id));
             } else {
-                metrics::counter!("synthetic_projector_b2agg_headerless_skip_total").increment(1);
+                metrics::counter!("synthetic_projector_input_unresolved_total").increment(1);
                 tracing::debug!(
                     nullifier = %nullifier.to_hex(),
                     block = cref.block,
-                    "projector: skipping headerless unmapped bridge consumption \
-                     (non-B2AGG — CLAIM/GER/genesis, covered by the store consumed feed)"
+                    "projector: bridge consumption has no recoverable identity (no header \
+                     reference, no ledger entry)"
                 );
+                out.unresolved.push((nullifier, cref));
             }
         }
         if refs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(out);
         }
 
+        // Step 4: exact bodies.
         let fetch_ids: Vec<NoteId> = refs
             .iter()
             .map(|(_, _, note_id)| *note_id)
@@ -1080,81 +1122,21 @@ impl SyntheticProjector {
             bodies,
             returned_ids,
         } = fetcher.fetch_public_bodies(&fetch_ids).await?;
-        let any_body_by_id: HashMap<NoteId, &FetchedBody> =
-            bodies.iter().map(|b| (b.id, b)).collect();
-        let body_by_id: HashMap<NoteId, &FetchedBody> = bodies
-            .iter()
-            .filter(|b| is_b2agg_note(&b.details))
-            .map(|b| (b.id, b))
-            .collect();
-        let mut recs = Vec::new();
+        let body_by_id: HashMap<NoteId, &FetchedBody> = bodies.iter().map(|b| (b.id, b)).collect();
         for (nullifier, cref, note_id) in &refs {
-            if let Some(body) = body_by_id.get(note_id) {
-                // BIND the fetched body to the consumption it was resolved for.
-                // The id can come from the transaction's (nullifier, note_id)
-                // refs, and upstream's `trusted_consumed_note_refs` only checks
-                // that the ref's NULLIFIER was consumed by this transaction —
-                // never that the paired id is the note that nullifier belongs
-                // to. Two refs with swapped ids both pass that filter, and
-                // since the id carries `within_tx_pos`, a swap would reorder
-                // BridgeEvents and shift deposit counts while every count
-                // stayed correct. The body's own nullifier settles it.
-                if body.nullifier != *nullifier {
-                    metrics::counter!("synthetic_projector_b2agg_ref_mismatch_total").increment(1);
-                    anyhow::bail!(
-                        "projector: note {} was resolved for consumed nullifier {} but its own \
-                         nullifier is {} — the node's (nullifier, note_id) reference is \
-                         inconsistent. Refusing to seal block {}: a mismatched reference \
-                         reorders bridge-outs and shifts deposit counts.",
-                        note_id.to_hex(),
-                        nullifier.to_hex(),
-                        body.nullifier.to_hex(),
-                        cref.block,
+            let Some(body) = body_by_id.get(note_id) else {
+                if returned_ids.contains(note_id) {
+                    // Node RETURNED it but it is PRIVATE: no body, and provably not an
+                    // event (B2AGG / CLAIM / UpdateGerNote are all public notes). Accounted
+                    // for; nothing to project.
+                    out.resolved_nullifiers.insert(*nullifier);
+                    tracing::debug!(
+                        note_id = %note_id.to_hex(),
+                        block = cref.block,
+                        "authoritative fetch: node returned a private note — not an event"
                     );
+                    continue;
                 }
-                within_tx_pos.insert(*note_id, cref.within_tx_pos);
-                resolved_nullifiers.insert(*nullifier);
-                recs.push((
-                    *note_id,
-                    build(body.details.clone(), body.attachments.clone(), cref),
-                ));
-                metrics::counter!("synthetic_projector_b2agg_authoritative_fetch_total")
-                    .increment(1);
-                tracing::info!(
-                    note_id = %note_id.to_hex(),
-                    block = cref.block,
-                    "projector: resolved B2AGG consumption by authoritative fetch"
-                );
-            } else if returned_ids.contains(note_id) {
-                // Node RETURNED it but it is non-public / non-b2agg — legit CLAIM/GER. Safe skip
-                // (must NOT fail-closed, or a legit consumption wedges the tip)...
-                // UNLESS the returned body's own nullifier is not the one this
-                // reference was resolved for: a CROSS-TYPE swap (a B2AGG
-                // nullifier paired with a CLAIM/GER id) would otherwise slip
-                // through this branch as a "legit CLAIM" and silently drop the
-                // bridge-out, leaving only the LET gate to notice (#167 review —
-                // this restores the deleted engine's cross-type refusal).
-                if let Some(body) = any_body_by_id.get(note_id)
-                    && body.nullifier != *nullifier
-                {
-                    metrics::counter!("synthetic_projector_b2agg_ref_mismatch_total").increment(1);
-                    anyhow::bail!(
-                        "projector: note {} (not a bridge-out) was resolved for consumed \
-                         nullifier {} but its own nullifier is {} — the node's (nullifier, \
-                         note_id) reference is inconsistent (cross-type swap). Refusing to \
-                         seal block {}.",
-                        note_id.to_hex(),
-                        nullifier.to_hex(),
-                        body.nullifier.to_hex(),
-                        cref.block,
-                    );
-                }
-                tracing::debug!(
-                    note_id = %note_id.to_hex(),
-                    block = cref.block,
-                    "authoritative fetch: node returned a non-b2agg note — safe skip (not an exit)"
-                );
-            } else {
                 metrics::counter!("synthetic_projector_b2agg_fetch_missing_total").increment(1);
                 tracing::error!(
                     nullifier = %nullifier.to_hex(),
@@ -1168,9 +1150,71 @@ impl SyntheticProjector {
                     note_id.to_hex(),
                     cref.block
                 );
+            };
+            // BIND the fetched body to the consumption it was resolved for — for EVERY
+            // kind. The id can come from the transaction's (nullifier, note_id) refs, and
+            // upstream's `trusted_consumed_note_refs` only checks that the ref's NULLIFIER
+            // was consumed by this transaction — never that the paired id is the note that
+            // nullifier belongs to. Two refs with swapped ids both pass that filter, and
+            // since the id carries `within_tx_pos`, a swap would reorder BridgeEvents and
+            // shift deposit counts while every count stayed correct; a cross-type swap
+            // (a B2AGG nullifier paired with a CLAIM id) would silently drop the exit.
+            // The body's own nullifier settles it.
+            if body.nullifier != *nullifier {
+                metrics::counter!("synthetic_projector_b2agg_ref_mismatch_total").increment(1);
+                anyhow::bail!(
+                    "projector: note {} was resolved for consumed nullifier {} but its own \
+                     nullifier is {} — the node's (nullifier, note_id) reference is \
+                     inconsistent{}. Refusing to seal block {}: a mismatched reference \
+                     reorders bridge-outs and shifts deposit counts.",
+                    note_id.to_hex(),
+                    nullifier.to_hex(),
+                    body.nullifier.to_hex(),
+                    if is_b2agg_note(&body.details) {
+                        ""
+                    } else {
+                        " (cross-type swap)"
+                    },
+                    cref.block,
+                );
+            }
+            out.resolved_nullifiers.insert(*nullifier);
+            match BridgeInputKind::classify(&body.details) {
+                BridgeInputKind::B2agg => {
+                    within_tx_pos.insert(*note_id, cref.within_tx_pos);
+                    out.b2agg.push((*note_id, build(body, cref)));
+                    metrics::counter!("synthetic_projector_b2agg_authoritative_fetch_total")
+                        .increment(1);
+                    tracing::info!(
+                        note_id = %note_id.to_hex(),
+                        block = cref.block,
+                        "projector: resolved B2AGG consumption by authoritative fetch"
+                    );
+                }
+                kind @ (BridgeInputKind::Claim | BridgeInputKind::Ger) => {
+                    out.events.push((*note_id, build(body, cref)));
+                    metrics::counter!(
+                        "synthetic_projector_event_authoritative_fetch_total",
+                        "kind" => kind.label()
+                    )
+                    .increment(1);
+                    tracing::debug!(
+                        note_id = %note_id.to_hex(),
+                        block = cref.block,
+                        kind = kind.label(),
+                        "projector: resolved bridge-consumed event note by authoritative fetch"
+                    );
+                }
+                BridgeInputKind::Other => {
+                    tracing::debug!(
+                        note_id = %note_id.to_hex(),
+                        block = cref.block,
+                        "authoritative fetch: bridge-consumed setup note — not an event"
+                    );
+                }
             }
         }
-        Ok(recs)
+        Ok(out)
     }
 
     /// Synthesized-claim CALLDATA BACKFILL — retroactive self-heal for derived-hash
@@ -1615,19 +1659,30 @@ impl SyntheticProjector {
                 "reconcile cursor is ahead of the Miden tip"
             );
         }
-        // Claim-calldata REPAIR runs EVERY tick — including at the tip — so a historical
-        // broken ClaimEvent (full calldata never stored: an older-build synthesis, or a crash
-        // between recording the note→hash link and persisting the envelope) heals on the very
-        // next tick, NOT only when new traffic advances the cursor past the tip. It therefore
-        // runs BEFORE the at-tip early return. The consumed feed it needs is also used by
-        // block projection and the completeness auditor below, so fetch it once here.
-        let consumed = client
-            .get_input_notes(NoteFilter::Consumed)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to get consumed input notes: {e}"))?;
-        if let Err(e) = self
-            .backfill_synthetic_claim_calldata(&consumed, cursor)
-            .await
+        let live = matches!(reconcile_patience, ReconcilePatience::LiveTick);
+        let restore_posture = self.restore_posture.load(Ordering::Acquire);
+        // Claim-calldata REPAIR (live ticks only) runs EVERY tick — including at the tip —
+        // so a historical broken ClaimEvent (full calldata never stored: an older-build
+        // synthesis, or a crash between recording the note→hash link and persisting the
+        // envelope) heals on the very next tick, NOT only when new traffic advances the
+        // cursor past the tip. It therefore runs BEFORE the at-tip early return. It reads
+        // the client store's consumed feed — an O(store) read that is a live SELF-HEAL
+        // concern, not projection: restore projects every ClaimEvent with its calldata
+        // inline (`projection::persist_synthetic_claim_tx`), so restore posture skips it
+        // and the whole-store read with it (issue #167 item 2: a genesis recovery stays
+        // O(window)). Projection itself no longer reads this feed in either posture.
+        let consumed: Vec<InputNoteRecord> = if live {
+            client
+                .get_input_notes(NoteFilter::Consumed)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to get consumed input notes: {e}"))?
+        } else {
+            Vec::new()
+        };
+        if live
+            && let Err(e) = self
+                .backfill_synthetic_claim_calldata(&consumed, cursor)
+                .await
         {
             tracing::warn!(
                 error = %format!("{e:#}"),
@@ -1637,55 +1692,18 @@ impl SyntheticProjector {
         if cursor >= tip {
             return Ok(cursor);
         }
-        // Output-note metadata (MA#28 GER provenance): our own minted notes carry the
-        // sender metadata that a bridge-consumed ConsumedExternal record drops.
-        let output_metadata: HashMap<[u8; 32], NoteMetadata> = client
-            .get_output_notes(NoteFilter::All)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to get output notes: {e}"))?
-            .into_iter()
-            .map(|rec| (rec.details_commitment().as_bytes(), *rec.metadata()))
-            .collect();
-        // Per-block consumption sourcing (docs/design/UNIFIED-PROJECTOR.md), routed by note
-        // kind because the three types surface their consumptions differently:
-        //
-        //   * CLAIM / UpdateGerNote — created and consumed by this proxy and sourced from
-        //     the local store's consumed feed.
-        //
-        //   * B2AGG bridge-out — sourced authoritatively from the bridge transaction feed
-        //     for the full projection window.
-        //
-        // A bridge transaction can consume any of the three; routing by kind (NOT forcing
-        // every bridge consumption through the B2AGG body path) is what keeps a GER/CLAIM
-        // consumption — whose body the authoritative feed reports before the store's B2AGG
-        // import frontier would have it — from wedging the tip.
-        // `consumed` was fetched above (before the at-tip early return, for the calldata
-        // backfill) and is reused here for block projection.
-        // CLAIM / GER from the store's consumed feed, at their finalized consumption block.
-        // B2AGG is skipped here — sourced authoritatively below (keeping the two sources
-        // disjoint keeps the reasoning clean; `is_note_processed` would dedup either way).
-        // Buckets carry the note's unique NoteId alongside the record. It is mandatory for
-        // authoritative B2AGG records; store-fed CLAIM/GER records in ConsumedExternal have
-        // lost their metadata and therefore use `None`.
-        let mut by_block: HashMap<u64, Vec<(Option<NoteId>, &InputNoteRecord)>> = HashMap::new();
-        for note in &consumed {
-            if is_b2agg_note(note.details()) {
-                continue;
-            }
-            if let Some(h) = note.state().consumed_block_height().map(|h| h.as_u64()) {
-                by_block.entry(h).or_default().push((note.id(), note));
-            }
-        }
-        // AUTHORITATIVE B2AGG: for each bridge-consumed nullifier in the window, resolve its
-        // note BODY and rebuild a ConsumedExternal record at the authoritative (block,
-        // tx_order). Because miden-client 0.15 strips input headers, the reconciler durably
-        // records the NoteId join before advancing its cursor; the body is then fetched from
-        // the node. A nullifier with no B2AGG identity is a normal CLAIM/GER input or an
-        // invisible exit; the LET gate distinguishes them fail-closed.
-        // Cantina #7 (part 1): NoteId → position within the consuming tx's
-        // ordered input_notes() (the on-chain LET append order), filled by
-        // `resolve_b2agg_consumptions` from the same authoritative feed the records come
-        // from. `project_block_notes` breaks same-tx sibling ties with it.
+        // RESOLVED-INPUT PIPELINE (issue #167 item 2, docs/design/UNIFIED-PROJECTOR.md):
+        // ONE bounded source for every event family. The bridge's transaction feed for
+        // the window attributes every consumption (CLAIM, UpdateGerNote, B2AGG, setup
+        // notes) to its finalized block, per-block transaction order and input position;
+        // `resolve_bridge_consumptions` recovers each input's exact NoteId and fetches
+        // its body + authoritative metadata from the node. The client store's consumed
+        // feed and output-note metadata are no longer projection sources — history is
+        // rebuilt identically whether it arrives one tick at a time or in a from-genesis
+        // catch-up, and per-pass memory is O(window), not O(history).
+        // Cantina #7 (part 1): NoteId → position within the consuming tx's ordered
+        // input_notes() (the on-chain LET append order), filled by the pipeline from the
+        // same authoritative feed; `project_block_notes` breaks same-tx sibling ties with it.
         let mut within_tx_pos: HashMap<NoteId, u32> = HashMap::new();
         let txs = self
             .node_rpc
@@ -1698,27 +1716,50 @@ impl SyntheticProjector {
             .map_err(|e| anyhow::anyhow!("sync_transactions({}..{}): {e}", cursor + 1, tip))?;
         let consumed_refs = bridge_consumed_nullifiers(&txs, self.bridge_id)?;
         let fetcher = RpcNoteFetcher(&*self.node_rpc);
-        let mut resolved_nullifiers: HashSet<Nullifier> = HashSet::new();
-        let mut auth_b2agg = self
-            .resolve_b2agg_consumptions(
-                &fetcher,
-                consumed_refs.clone(),
-                &mut within_tx_pos,
-                &mut resolved_nullifiers,
+        let resolved = self
+            .resolve_bridge_consumptions(&fetcher, consumed_refs, &mut within_tx_pos)
+            .await?;
+        // #167 — AUTHORITATIVE COVERAGE (restore posture): every bridge-consumed input in
+        // the window resolved to an exact identity (body fetched, or proven private), or
+        // the restore halts before anything seals. Live posture tolerates an unresolved
+        // input (a hidden B2AGG still fails closed at the LET cardinality gate below).
+        if restore_posture {
+            ensure_authoritative_coverage(&resolved.unresolved, cursor, tip)?;
+        }
+        let ResolvedInputs {
+            b2agg: mut auth_b2agg,
+            events,
+            ..
+        } = resolved;
+        // #167 item 5 — chain-derived BOOTSTRAP state through a normal primitive, run
+        // before the first dependent B2AGG / CLAIM projects: rebuild any faucet identity
+        // the bridge registers that the local registry lacks, fail-closed, and refuse to
+        // project a bridge-out whose faucet is still unknown (it would otherwise be
+        // quarantined as `UnknownFaucet` and the restore would "succeed" over a
+        // depositCount gap). Restore posture only — on a live proxy an unknown bridge
+        // faucet is a security signal (`faucet_registry_reconciler`), never adopted.
+        if restore_posture {
+            let report = crate::faucet_bootstrap::rebuild_missing_faucet_identities(
+                client,
+                &self.store,
+                self.bridge_id,
+                &self.network_rpcs,
             )
             .await?;
-        // #167 (review blocker) — AUTHORITATIVE COVERAGE GUARD (restore mode):
-        // every bridge-consumed input in the window must be accounted for —
-        // present in the client consumed feed OR resolved as an authoritative
-        // bridge-out — or the restore halts before anything seals.
-        if self.require_full_coverage.load(Ordering::Acquire) {
-            ensure_authoritative_coverage(
-                consumed.as_slice(),
-                &consumed_refs,
-                &resolved_nullifiers,
-                cursor,
-                tip,
-            )?;
+            self.faucet_identities_rebuilt
+                .fetch_add(report.rebuilt, Ordering::Relaxed);
+            ensure_faucet_identities_known(&*self.store, &auth_b2agg).await?;
+        }
+        // Every resolved record carries its own authoritative metadata, so the legacy
+        // output-note fallback map the projection unit still accepts is empty.
+        let output_metadata: HashMap<[u8; 32], NoteMetadata> = HashMap::new();
+        // Per-block buckets carry the note's unique NoteId alongside the record — known
+        // for every resolved input now, mandatory for B2AGG (LET reservation identity).
+        let mut by_block: HashMap<u64, Vec<(Option<NoteId>, &InputNoteRecord)>> = HashMap::new();
+        for (id, rec) in &events {
+            if let Some(h) = rec.state().consumed_block_height().map(|h| h.as_u64()) {
+                by_block.entry(h).or_default().push((Some(*id), rec));
+            }
         }
         // Same canonical comparator as every other projection sort (see
         // `projection_order`); the id here is always known (authoritative feed).
@@ -1849,10 +1890,13 @@ impl SyntheticProjector {
         // blocks. Reuses this tick's already-fetched `consumed` feed — zero extra queries.
         // Non-fatal by construction: an audit failure warns and retries next cycle, it never
         // blocks projection.
-        if self
-            .audit_tick_counter
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(AUDIT_EVERY_N_TICKS)
+        // Live posture only: detection over the client store's consumed feed (O(store)),
+        // meaningless while restore is still rebuilding history.
+        if live
+            && self
+                .audit_tick_counter
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(AUDIT_EVERY_N_TICKS)
             && let Err(e) = self.audit_completeness(&consumed, cursor).await
         {
             tracing::warn!(
@@ -1868,6 +1912,13 @@ impl SyntheticProjector {
             "synthetic projector tick: caught up to the Miden tip"
         );
         Ok(cursor)
+    }
+
+    /// Faucet-identity rows the restore-posture bootstrap rebuilt so far
+    /// (`faucet_bootstrap::rebuild_missing_faucet_identities`, run before every
+    /// restore pass). Report only; live posture never runs the bootstrap.
+    pub fn faucet_identities_rebuilt(&self) -> usize {
+        self.faucet_identities_rebuilt.load(Ordering::Relaxed)
     }
 
     /// Drain the cumulative per-kind emission counts (see `projection_totals`).
@@ -1936,7 +1987,7 @@ impl SyntheticProjector {
                 // bridge-consumed input the canonical path cannot account for
                 // halts the restore instead of silently diverging from live
                 // history.
-                self.require_full_coverage.store(true, Ordering::Release);
+                self.restore_posture.store(true, Ordering::Release);
                 self.drive_catch_up_to_tip(client, target_tip).await
             }
         }
@@ -2111,6 +2162,66 @@ pub(crate) struct FetchedBody {
     /// details conversion drops its metadata. Kept so a consumption can be
     /// bound to the body it claims — see the check in the resolve loop.
     pub nullifier: Nullifier,
+    /// The note's authoritative metadata (sender, type, tag, attachment) from
+    /// the node's public record — what the CLAIM / GER provenance gates verify
+    /// against (issue #167 item 2: no output-note fallback map needed).
+    pub metadata: NoteMetadata,
+}
+
+/// Kind of a bridge-consumed input, classified by note-script root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BridgeInputKind {
+    /// A bridge-out exit (B2AGG).
+    B2agg,
+    /// A `ClaimNote` (bridge-in) consumption.
+    Claim,
+    /// An `UpdateGerNote` consumption.
+    Ger,
+    /// A public note the bridge consumed that projects to nothing (setup / config notes).
+    Other,
+}
+
+impl BridgeInputKind {
+    pub(crate) fn classify(details: &NoteDetails) -> Self {
+        if is_b2agg_note(details) {
+            return Self::B2agg;
+        }
+        let root = details.script().root();
+        if root == miden_base_agglayer::ClaimNote::script().root() {
+            return Self::Claim;
+        }
+        if root == miden_base_agglayer::UpdateGerNote::script_root() {
+            return Self::Ger;
+        }
+        Self::Other
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::B2agg => "b2agg",
+            Self::Claim => "claim",
+            Self::Ger => "ger",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// One window's projection inputs, resolved from the authoritative feed
+/// ([`SyntheticProjector::resolve_bridge_consumptions`]).
+#[derive(Default)]
+pub(crate) struct ResolvedInputs {
+    /// Bridge-out exits, in feed order (the caller sorts canonically); their
+    /// within-transaction positions are recorded in the caller's map.
+    pub b2agg: Vec<(NoteId, InputNoteRecord)>,
+    /// CLAIM / UpdateGerNote consumptions, rebuilt from their authoritative
+    /// bodies with metadata.
+    pub events: Vec<(NoteId, InputNoteRecord)>,
+    /// Bridge-consumed inputs with NO recoverable identity (no header reference,
+    /// no ledger entry) — reported, never dropped silently.
+    pub unresolved: Vec<(Nullifier, ConsumedRef)>,
+    /// Every nullifier accounted for: resolved to a body of any kind, or proven
+    /// private (not an event).
+    pub resolved_nullifiers: HashSet<Nullifier>,
 }
 
 /// The result of an authoritative fetch: the decoded PUBLIC bodies AND the full set of ids
@@ -2158,12 +2269,14 @@ impl PublicNoteFetcher for RpcNoteFetcher<'_> {
             };
             let attachments = note.attachments().clone();
             let nullifier = note.nullifier();
+            let metadata = *note.metadata();
             let details: NoteDetails = note.into();
             bodies.push(FetchedBody {
                 id,
                 details,
                 attachments,
                 nullifier,
+                metadata,
             });
         }
         Ok(FetchedBodies {
@@ -2184,82 +2297,91 @@ impl PublicNoteFetcher for RpcNoteFetcher<'_> {
 /// (`consumer == bridge`). The account-id re-check is fail-closed defense in
 /// depth against a node that ignores the server-side filter. Pure (no I/O) so
 /// it is unit-testable directly.
-/// #167 (review blocker) — AUTHORITATIVE COVERAGE GUARD (pure, restore mode).
+/// #167 — AUTHORITATIVE COVERAGE GUARD (pure, restore posture).
 ///
-/// Every bridge-consumed input in the window must be accounted for before
-/// anything seals:
-///   * present in the client store's consumed feed (the normal CLAIM/GER
-///     source — the store was not wiped, or the sweep re-imported it), OR
-///   * authoritatively resolved as a bridge-out by exact body fetch
-///     (`resolved_nullifiers` — the ERASED-B2AGG recovery path).
-///
-/// Anything else is an unrecoverable input (same-block created-and-consumed
-/// on a wiped store, headerless, no durable identity) that would SILENTLY
-/// vanish from restored history. The issue's hard boundary for such notes:
-/// reconstruct exactly or fail before sealing — this fails, with the window
-/// and the first offender named so an operator knows where history diverges.
+/// The resolved-input pipeline accounts for every bridge-consumed input it can
+/// identify: a body fetched by exact id (any kind), or a private note the node
+/// returned (provably not an event). What remains is an input with NO
+/// recoverable identity — no transaction-header reference, no entry in the
+/// durable identity ledger the windowed sweep records for every public note in
+/// the bridge's tag space. Such an input is exactly the issue's ERASED-note
+/// boundary (created and consumed on a wiped store with nothing durable left,
+/// or a note created outside the sweep's reach): the available node APIs cannot
+/// reconstruct its body, so the restore fails deterministically BEFORE sealing,
+/// naming the block(s) and nullifier(s) so the node/protocol limitation is
+/// exposed instead of a silently divergent history. There is deliberately no
+/// heuristic override.
 fn ensure_authoritative_coverage(
-    consumed: &[InputNoteRecord],
-    consumed_refs: &HashMap<Nullifier, ConsumedRef>,
-    resolved_nullifiers: &HashSet<Nullifier>,
+    unresolved: &[(Nullifier, ConsumedRef)],
     window_from: u64,
     window_to: u64,
 ) -> anyhow::Result<()> {
-    // Required bridge consumptions per block: every consumed ref in the window
-    // that was NOT authoritatively resolved as a bridge-out body.
-    let mut required: HashMap<u64, usize> = HashMap::new();
-    for (nul, r) in consumed_refs {
-        if resolved_nullifiers.contains(nul) {
-            continue;
-        }
-        *required.entry(r.block).or_default() += 1;
-    }
-    if required.is_empty() {
+    if unresolved.is_empty() {
         return Ok(());
     }
-    // Local coverage per block: consumed-feed records at that block. Intentionally
-    // block-granular (not tx-order/nullifier): consumed records may carry neither
-    // metadata nor tx order, and this guard must not false-positive on metadata-less
-    // records — it is a safety net ON TOP of the LET cardinality gate.
-    let mut local: HashMap<u64, usize> = HashMap::new();
-    for n in consumed {
-        // A local B2AGG record is NOT coverage: projection deliberately skips
-        // B2AGG records from the consumed feed (`by_block` excludes them; only
-        // authoritative resolution projects a bridge-out), so counting one here
-        // would let a locally-visible B2AGG stand in for a MISSING CLAIM/GER at
-        // the same block — exactly the silent drop this guard exists to stop,
-        // and one the (B2AGG-only) LET gate cannot catch (#167 review).
-        if is_b2agg_note(n.details()) {
-            continue;
-        }
-        if let Some(h) = n.state().consumed_block_height() {
-            *local.entry(h.as_u64()).or_default() += 1;
-        }
-    }
-    let mut gaps: Vec<(u64, usize, usize)> = required
+    let mut offenders: Vec<(u64, Nullifier)> = unresolved
         .iter()
-        .filter_map(|(block, need)| {
-            let have = local.get(block).copied().unwrap_or(0);
-            (have < *need).then_some((*block, *need, have))
-        })
+        .map(|(nf, cref)| (cref.block, *nf))
         .collect();
-    if gaps.is_empty() {
-        return Ok(());
-    }
-    gaps.sort_unstable();
-    let (block, need, have) = gaps[0];
-    let total_missing: usize = gaps.iter().map(|(_, need, have)| need - have).sum();
+    offenders.sort_unstable_by_key(|(block, nf)| (*block, nf.to_hex()));
+    let first_block = offenders[0].0;
+    let listed: Vec<String> = offenders
+        .iter()
+        .take(8)
+        .map(|(block, nf)| format!("block {block}: {}", nf.to_hex()))
+        .collect();
     ::metrics::counter!("restore_authoritative_coverage_gaps_total").increment(1);
     anyhow::bail!(
-        "restore: bridge consumption(s) at block {block} have no recoverable identity — \
-         {need} bridge-consumed input(s) in that block, but the client store's consumed \
-         feed accounts for only {have}, and none resolves as an authoritative bridge-out \
-         (issue #167 ERASED-note boundary). {total_missing} input(s) unrecoverable across \
-         window {}..{} ({gaps:?}). Restore refuses to seal a divergent history; re-run \
-         against a node/archive that can serve the missing note(s).",
+        "restore: bridge consumption(s) at block {first_block} have no recoverable identity — \
+         {} bridge-consumed input(s) in window {}..{} carry no transaction-header note \
+         reference and no durable identity from the note sweep, so their bodies cannot be \
+         reconstructed from the node (issue #167 ERASED-note boundary). Restore refuses to \
+         seal a divergent history. Offenders: [{}]{}. Re-run against a node/archive that \
+         serves (nullifier, note_id) references or the notes' creation blocks.",
+        offenders.len(),
         window_from + 1,
-        window_to
+        window_to,
+        listed.join(", "),
+        if offenders.len() > listed.len() {
+            format!(" (+{} more)", offenders.len() - listed.len())
+        } else {
+            String::new()
+        }
     );
+}
+
+/// #167 item 5 — refuse to project a bridge-out whose faucet has no local
+/// identity even after the faucet bootstrap ran (restore posture). Without
+/// this the note would be quarantined as `UnknownFaucet`, the LET leaf would be
+/// reserved-but-unemitted, and the restore would "complete" over a
+/// `depositCount` gap that the emitted-frontier gate then refuses forever.
+async fn ensure_faucet_identities_known(
+    store: &dyn Store,
+    b2agg: &[(NoteId, InputNoteRecord)],
+) -> anyhow::Result<()> {
+    for (id, rec) in b2agg {
+        let Some(asset) = rec.details().assets().iter_fungible().next() else {
+            // No fungible asset: malformed, quarantined by the projection unit as
+            // `NoFungibleAsset` — not a faucet-identity question.
+            continue;
+        };
+        let faucet_id = asset.faucet_id();
+        if let Err(e) = crate::bridge_out::resolve_faucet_origin(faucet_id, store).await {
+            ::metrics::counter!("restore_unknown_faucet_halt_total").increment(1);
+            let block = rec
+                .state()
+                .consumed_block_height()
+                .map(|h| h.as_u64())
+                .unwrap_or(0);
+            anyhow::bail!(
+                "restore: bridge-out {} at block {block} is minted by faucet {faucet_id}, which \
+                 has no local identity and is not registered on the bridge's \
+                 faucet_metadata_map — refusing to quarantine history and continue: {e:#}",
+                id.to_hex()
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn bridge_consumed_nullifiers(
@@ -2448,6 +2570,14 @@ mod tests {
     const BRIDGE: &str = "0xaa0000000000bb110000cc000000dd";
     const GER_MANAGER: &str = "0xfa0000000000bb010000cc000000de";
     const SERVICE: &str = "0xbf0000000000cc010000dc000000ee";
+
+    /// Public-note metadata from the bridge, for fetched-body fixtures.
+    fn public_bridge_metadata() -> NoteMetadata {
+        NoteMetadata::new(
+            PartialNoteMetadata::new(aid(BRIDGE), NoteType::Public),
+            &NoteAttachments::default(),
+        )
+    }
 
     fn aid(hex: &str) -> AccountId {
         AccountId::from_hex(hex).expect("hex must decode")
@@ -2830,101 +2960,187 @@ mod tests {
         );
     }
 
-    /// ISSUE #167 (review blocker) — the AUTHORITATIVE COVERAGE GUARD, pinned
-    /// as a pure decision: every bridge-consumed input in a window must be
-    /// either in the local consumed feed or authoritatively resolved as a
-    /// bridge-out. An unrecoverable (ERASED) input halts the restore instead
-    /// of silently vanishing from restored history; fully covered windows
-    /// pass in both coverage shapes.
+    /// ISSUE #167 — the authoritative coverage guard, pinned as a pure decision:
+    /// the resolved-input pipeline accounts for every input it can identify, so
+    /// the guard's only input is what remains unresolved. Nothing unresolved
+    /// passes; anything unresolved halts the restore naming the first block and
+    /// the offending nullifiers (the ERASED-note boundary), never a silent drop.
     #[test]
-    fn coverage_guard_erased_input_halts_and_covered_windows_pass() {
-        let refs_at = |blocks: &[u64]| {
-            let mut m: HashMap<Nullifier, ConsumedRef> = HashMap::new();
-            for (i, b) in blocks.iter().enumerate() {
-                m.insert(
-                    nullifier(0x10 + i as u64),
-                    ConsumedRef {
-                        block: *b,
-                        order: 0,
-                        note_id: None,
-                        within_tx_pos: i as u32,
-                    },
-                );
-            }
-            m
-        };
-        let empty: HashSet<Nullifier> = HashSet::new();
+    fn coverage_guard_halts_on_unresolved_inputs_and_passes_when_none() {
+        ensure_authoritative_coverage(&[], 0, 10).expect("nothing unresolved must pass");
 
-        // ERASED gap: two bridge-consumed inputs at block 5, nothing covers
-        // them — the restore must refuse, naming the block.
-        let refs = refs_at(&[5, 5]);
-        let err = ensure_authoritative_coverage(&[], &refs, &empty, 0, 10)
-            .expect_err("an unrecoverable input must halt the restore");
+        let cref = |block: u64| ConsumedRef {
+            block,
+            order: 0,
+            note_id: None,
+            within_tx_pos: 0,
+        };
+        let unresolved = vec![(nullifier(0x77), cref(7)), (nullifier(0x33), cref(3))];
+        let err = ensure_authoritative_coverage(&unresolved, 0, 10)
+            .expect_err("an unresolved bridge-consumed input must halt the restore");
         let rendered = format!("{err:#}");
         assert!(
-            rendered.contains("at block 5") && rendered.contains("no recoverable identity"),
-            "error must name the first uncovered block: {rendered}"
+            rendered.contains("at block 3") && rendered.contains("no recoverable identity"),
+            "error must name the FIRST uncovered block: {rendered}"
         );
-
-        // LOCAL coverage: the client store's consumed feed has records at the
-        // block — covered, no error.
-        let local = vec![claim_note(5, Some(0)), claim_note(5, Some(1))];
-        ensure_authoritative_coverage(&local, &refs, &empty, 0, 10)
-            .expect("a locally-covered window must pass");
-
-        // AUTHORITATIVE coverage: one input resolved as a bridge-out, the
-        // other covered locally — covered.
-        let mut half_resolved: HashSet<Nullifier> = HashSet::new();
-        half_resolved.insert(nullifier(0x10));
-        let local_one = vec![claim_note(5, Some(0))];
-        ensure_authoritative_coverage(&local_one, &refs, &half_resolved, 0, 10)
-            .expect("resolved-as-B2AGG plus local coverage must pass");
-        // BOTH resolved (the erased-B2AGG path): covered with an empty feed.
-        let mut all_resolved: HashSet<Nullifier> = HashSet::new();
-        for k in refs.keys() {
-            all_resolved.insert(*k);
-        }
-        ensure_authoritative_coverage(&[], &refs, &all_resolved, 0, 10)
-            .expect("authoritative-only coverage must pass");
-
-        // MIXED: blocks 3 (covered locally) and 7 (gap) — the guard names 7.
-        let refs = refs_at(&[3, 7]);
-        let local = vec![claim_note(3, Some(0))];
-        let err = ensure_authoritative_coverage(&local, &refs, &empty, 0, 10)
-            .expect_err("the uncovered block must halt the restore");
         assert!(
-            format!("{err:#}").contains("at block 7"),
-            "error must name the uncovered block, not the covered one: {err:#}"
+            rendered.contains(&nullifier(0x77).to_hex())
+                && rendered.contains(&nullifier(0x33).to_hex()),
+            "error must list the offending nullifiers: {rendered}"
         );
-
-        // #167 review — a LOCAL B2AGG RECORD IS NOT COVERAGE. Projection never
-        // projects a B2AGG from the consumed feed (only authoritative
-        // resolution does), so a locally-visible B2AGG must not stand in for
-        // a missing CLAIM/GER at the same block. Block 5: one input resolved
-        // as a bridge-out, one CLAIM unaccounted for; the feed holds two
-        // B2AGG records at block 5 — the guard must still halt.
-        let refs = refs_at(&[5, 5]);
-        let mut one_resolved: HashSet<Nullifier> = HashSet::new();
-        one_resolved.insert(nullifier(0x10));
-        let b2agg_only = vec![b2agg_note(5, Some(0)), b2agg_note(5, Some(1))];
-        let err = ensure_authoritative_coverage(&b2agg_only, &refs, &one_resolved, 0, 10)
-            .expect_err("a local B2AGG record must not cover for a missing CLAIM/GER");
         assert!(
-            format!("{err:#}").contains("at block 5"),
-            "error must name the masked block: {err:#}"
+            rendered.contains("window 1..10"),
+            "error must name the window: {rendered}"
         );
-        // ...and an UNRESOLVED local B2AGG is itself a drop (projection skips
-        // it), so it cannot count either — even when it is the only input.
-        let refs = refs_at(&[5]);
-        let unresolved_b2agg = vec![b2agg_note(5, Some(0))];
-        ensure_authoritative_coverage(&unresolved_b2agg, &refs, &empty, 0, 10)
-            .expect_err("an unresolved local B2AGG must not count as coverage");
-        // The same block with a real CLAIM record alongside the resolved
-        // bridge-out passes: B2AGG excluded, CLAIM counted.
-        let refs = refs_at(&[5, 5]);
-        let mixed = vec![b2agg_note(5, Some(0)), claim_note(5, Some(1))];
-        ensure_authoritative_coverage(&mixed, &refs, &one_resolved, 0, 10)
-            .expect("resolved bridge-out + local CLAIM must pass");
+    }
+
+    /// ISSUE #167 items 2/3 — the resolved-input pipeline is kind-agnostic: a
+    /// CLAIM consumption resolves through the SAME identity + body path as a
+    /// bridge-out, into a `ConsumedExternal` record that carries the node's
+    /// authoritative metadata (so the provenance gates need no output-note
+    /// fallback), attributed to the bridge at its consumption block / order;
+    /// a private returned input is accounted for without a body; an input with
+    /// no identity is reported as unresolved, never dropped.
+    #[tokio::test]
+    async fn resolved_input_pipeline_covers_every_kind_and_reports_unresolved() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        let claim = claim_note(600, Some(0));
+        assert_eq!(
+            BridgeInputKind::classify(claim.details()),
+            BridgeInputKind::Claim
+        );
+        let claim_meta = public_bridge_metadata();
+        let claim_id = NoteId::new(claim.details_commitment(), &claim_meta);
+        let claim_nf = nullifier(0xc1);
+        let exit = b2agg_note(600, Some(1));
+        assert_eq!(
+            BridgeInputKind::classify(exit.details()),
+            BridgeInputKind::B2agg
+        );
+        let exit_id = NoteId::new(exit.details_commitment(), &public_bridge_metadata());
+        let exit_nf = nullifier(0xb2);
+        // Distinct details (a different amount) so the id cannot collide with the exit's.
+        let private_id = NoteId::new(
+            b2agg_note_with_amount(601, Some(0), 777).details_commitment(),
+            &public_bridge_metadata(),
+        );
+        assert_ne!(private_id, exit_id);
+        let private_nf = nullifier(0xaa);
+        let orphan_nf = nullifier(0x99);
+
+        let cref = |block: u64, order: u32, pos: u32, id: Option<NoteId>| ConsumedRef {
+            block,
+            order,
+            note_id: id,
+            within_tx_pos: pos,
+        };
+        let consumed_refs = HashMap::from([
+            (claim_nf, cref(600, 2, 0, Some(claim_id))),
+            (exit_nf, cref(600, 2, 1, Some(exit_id))),
+            (private_nf, cref(601, 0, 0, Some(private_id))),
+            (orphan_nf, cref(602, 0, 0, None)),
+        ]);
+        let fetcher = MockFetcher {
+            bodies: vec![
+                FetchedBody {
+                    id: claim_id,
+                    details: claim.details().clone(),
+                    attachments: NoteAttachments::default(),
+                    nullifier: claim_nf,
+                    metadata: claim_meta,
+                },
+                FetchedBody {
+                    id: exit_id,
+                    details: exit.details().clone(),
+                    attachments: NoteAttachments::default(),
+                    nullifier: exit_nf,
+                    metadata: public_bridge_metadata(),
+                },
+            ],
+            // Returned by the node, but private: no body.
+            also_returned: vec![private_id],
+        };
+
+        let mut within_tx_pos = HashMap::new();
+        let resolved = projector
+            .resolve_bridge_consumptions(&fetcher, consumed_refs, &mut within_tx_pos)
+            .await
+            .expect("every identified input resolves");
+
+        // The CLAIM became a projectable record with authoritative metadata.
+        assert_eq!(resolved.events.len(), 1, "one CLAIM event record");
+        let (id, rec) = &resolved.events[0];
+        assert_eq!(*id, claim_id);
+        assert_eq!(
+            rec.metadata().copied(),
+            Some(claim_meta),
+            "metadata from the body"
+        );
+        assert_eq!(
+            rec.id(),
+            Some(claim_id),
+            "the record's own id is recoverable"
+        );
+        assert_eq!(rec.consumer_account(), Some(aid(BRIDGE)));
+        assert_eq!(
+            rec.state().consumed_block_height().map(|h| h.as_u64()),
+            Some(600)
+        );
+        assert_eq!(rec.state().consumed_tx_order(), Some(2));
+        // CLAIM/GER never enter the within-tx map (their ordering key stays the
+        // canonical `None`-order shape — see `projection_order`).
+        assert!(!within_tx_pos.contains_key(&claim_id));
+
+        // The exit resolved as before, with its LET input position.
+        assert_eq!(resolved.b2agg.len(), 1);
+        assert_eq!(resolved.b2agg[0].0, exit_id);
+        assert_eq!(within_tx_pos.get(&exit_id), Some(&1));
+
+        // Accounted for: both bodies AND the private note; NOT the orphan.
+        assert!(resolved.resolved_nullifiers.contains(&claim_nf));
+        assert!(resolved.resolved_nullifiers.contains(&exit_nf));
+        assert!(resolved.resolved_nullifiers.contains(&private_nf));
+        assert!(!resolved.resolved_nullifiers.contains(&orphan_nf));
+        assert_eq!(resolved.unresolved.len(), 1);
+        assert_eq!(resolved.unresolved[0].0, orphan_nf);
+        assert_eq!(resolved.unresolved[0].1.block, 602);
+
+        // And the restore-posture guard turns that one orphan into a halt.
+        let err = ensure_authoritative_coverage(&resolved.unresolved, 599, 602)
+            .expect_err("an unresolved input halts restore");
+        assert!(format!("{err:#}").contains("at block 602"));
+    }
+
+    /// ISSUE #167 item 3 — the identity ledger is kind-agnostic: a CLAIM record
+    /// that once exposed its metadata is persisted, and its identity comes back
+    /// from the ledger for a headerless reference.
+    #[tokio::test]
+    async fn identity_ledger_persists_non_b2agg_kinds() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        let claim = claim_note(700, Some(0));
+        let meta = public_bridge_metadata();
+        let record = InputNoteRecord::new(
+            claim.details().clone(),
+            NoteAttachments::default(),
+            None,
+            ExpectedNoteState {
+                metadata: Some(meta),
+                after_block_num: BlockNumber::from(0u32),
+                tag: Some(meta.tag()),
+            }
+            .into(),
+        );
+        let (id, nf) = (record.id().unwrap(), record.nullifier().unwrap());
+        projector.persist_note_identities(&[record]).await.unwrap();
+
+        let found = store.get_note_identities(&[nf]).await.unwrap();
+        assert_eq!(found.get(&nf), Some(&id), "CLAIM identity must be durable");
     }
 
     /// ISSUE #167 — the restore catch-up driver's completion/stall contract,
@@ -3957,7 +4173,7 @@ mod tests {
         );
 
         first_process
-            .persist_b2agg_note_ids(&records)
+            .persist_note_identities(&records)
             .await
             .unwrap();
         drop(first_process);
@@ -3990,12 +4206,14 @@ mod tests {
                     details: details.clone(),
                     attachments: attachments.clone(),
                     nullifier: nf_a,
+                    metadata: metadata_a,
                 },
                 FetchedBody {
                     id: id_b,
                     details,
                     attachments,
                     nullifier: nf_b,
+                    metadata: metadata_b,
                 },
             ],
             ..Default::default()
@@ -4099,6 +4317,7 @@ mod tests {
                 details,
                 attachments: NoteAttachments::default(),
                 nullifier: other_nf,
+                metadata: public_bridge_metadata(),
             }],
             ..Default::default()
         };
@@ -4159,6 +4378,7 @@ mod tests {
                 details,
                 attachments: NoteAttachments::default(),
                 nullifier: claim_nf,
+                metadata: public_bridge_metadata(),
             }],
             ..Default::default()
         };
@@ -4243,6 +4463,7 @@ mod tests {
                 details: details.clone(),
                 attachments: NoteAttachments::default(),
                 nullifier: nf,
+                metadata: public_bridge_metadata(),
             }],
             ..Default::default()
         };
