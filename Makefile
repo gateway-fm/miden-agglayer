@@ -338,7 +338,26 @@ e2e-l2l2-up: e2e-clean-data gen-l2b-configs ## Bring up base stack + L2B overlay
 	# re-index network 2 now that rollup #2 + the L2B bridge/GER exist). NOT
 	# anvil-l2b (freshly-deployed in-memory L2B state) and NOT the base Miden
 	# bridge-service (indexes L1 + Miden, unaffected by rollup #2).
-	$(L2L2_COMPOSE) up -d --force-recreate --wait aggkit-l2b bridge-service-l2b
+	# `--wait` reports only a bare exit code, so a crash-looping service used to
+	# surface as "Error 1" with the REASON left in a container nobody printed.
+	# On failure, dump the tail of every non-running network-2 container before
+	# exiting, so the log that explains it is in the run output.
+	@$(L2L2_COMPOSE) up -d --force-recreate --wait aggkit-l2b bridge-service-l2b || { \
+		echo ""; \
+		echo "e2e-l2l2-up: network-2 services did not become healthy — diagnostics:"; \
+		proj=$$(docker compose ls --format json 2>/dev/null | grep -o '"Name":"[^"]*miden[^"]*"' | head -1 | cut -d'"' -f4); \
+		proj=$${proj:-$$(basename $$(pwd))}; \
+		for svc in aggkit-l2b bridge-service-l2b; do \
+			c="$$proj-$$svc-1"; \
+			st=$$(docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$$c" 2>/dev/null || echo "absent"); \
+			echo "──── $$c: $$st"; \
+			docker logs --tail 40 "$$c" 2>&1 | sed 's/^/    /' || echo "    (no logs)"; \
+		done; \
+		echo ""; \
+		echo "e2e-l2l2-up: if the L2B chain reports 'sovereign genesis already injected',"; \
+		echo "  a PREVIOUS l2l2 stack was still running: 'make e2e-down' only tears down the"; \
+		echo "  base compose file. Run 'make e2e-l2l2-down' before bringing the stack up."; \
+		exit 1; }
 
 .PHONY: e2e-l2l2
 e2e-l2l2: ## Run the L2<->L2 group (preflight + forward L2B->Miden + back Miden->L2B + evidence). Stack must be up (make e2e-l2l2-up).
