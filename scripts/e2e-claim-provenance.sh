@@ -296,11 +296,24 @@ while [[ "$ELAPSED" -lt "$GATE_TIMEOUT_SECS" ]]; do
 done
 echo ""
 if [[ "$NEW_FOREIGN_SKIPPED" -le "$BASE_FOREIGN_SKIPPED" ]]; then
+    # The LOAD-BEARING invariant is (b) no foreign ClaimEvent in synthetic_logs.
+    # Evaluate it BEFORE bailing on the counter: bailing first threw away the
+    # only evidence that distinguishes "gate unreachable" from "claim leaked",
+    # which are opposite verdicts. Leakage is reported as leakage, always.
+    LEAKED_NOW=$(pgq "SELECT COUNT(*) FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' AND lower(data) LIKE '0x${FOREIGN_GI_HEX}%';")
+    OWN_NOW=$(pgq "SELECT COUNT(*) FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' AND lower(data) NOT LIKE '0x${FOREIGN_GI_HEX}%';")
     warn "diagnostics: tip=$(l2_tip 2>/dev/null || echo '?') foreign_skipped=$NEW_FOREIGN_SKIPPED (base $BASE_FOREIGN_SKIPPED)"
-    warn "if the foreign CLAIM was consumed before the reconciler imported it, miden-client"
-    warn "drops the import (spent-before-import applies to B2AGG recovery only) — the gate"
-    warn "then never evaluates the note. Re-run against a quieter stack before treating as regression."
-    fail "provenance gate did not fire within ${GATE_TIMEOUT_SECS}s (claim_event_foreign_skipped_total stuck at $NEW_FOREIGN_SKIPPED)"
+    warn "  foreign ClaimEvent rows (must be 0): ${LEAKED_NOW:-?}"
+    warn "  own ClaimEvent rows (positive control, must be >=1): ${OWN_NOW:-?}"
+    if [[ "${LEAKED_NOW:-1}" != "0" ]]; then
+        fail "FOREIGN CLAIM LEAKED: ${LEAKED_NOW} ClaimEvent row(s) carry the foreign global index 0x${FOREIGN_GI_HEX} (and the skip counter never advanced)"
+    fi
+    warn "no leakage, but the projection-level gate never evaluated the note. Two mechanisms"
+    warn "can hold this invariant: (1) skip AT PROJECTION (counter advances), or (2) exclusion"
+    warn "AT INPUT RESOLUTION — issue #167 resolves inputs only from OUR bridge's transaction"
+    warn "feed (bridge_consumed_nullifiers/ordered_account_transactions), so a note consumed by"
+    warn "a FOREIGN bridge never enters the pipeline and project_claim_note is never called."
+    fail "provenance gate did not fire within ${GATE_TIMEOUT_SECS}s (claim_event_foreign_skipped_total stuck at $NEW_FOREIGN_SKIPPED); invariant (no leakage) HELD — see the mechanism note above"
 fi
 pass "gate fired: claim_event_foreign_skipped_total $BASE_FOREIGN_SKIPPED → $NEW_FOREIGN_SKIPPED"
 
