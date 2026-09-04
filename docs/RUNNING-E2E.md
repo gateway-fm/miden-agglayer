@@ -223,3 +223,57 @@ the local chain for later inspection.
 - If the proxy fails with a cross-device sqlite rename error, retain the bind
   mount and `TMPDIR=/var/lib/miden-agglayer-service/tmp` arrangement from the
   checked-in Compose file.
+
+## Full battery (`make e2e-battery`)
+
+`make e2e-battery ITERATIONS=4` runs the whole e2e surface repeatedly, so
+intermittent failures separate themselves from real ones. Everything lands under
+`e2e-results/<tag>-<UTC timestamp>/` (git-ignored).
+
+### Iteration order
+
+Each iteration starts from a clean stack (`make e2e-down` + `make
+e2e-clean-data`) and then runs:
+
+1. **`make test-e2e`** — the full suite, self-contained (brings the stack up,
+   tests, tears it down).
+2. **Every scenario target.** Targets that provision their own stack (they chain
+   to `e2e-up` → `e2e-clean-data`) each get a `make e2e-down` first — mandatory,
+   because `e2e-clean-data` hard-stops while a stack still mounts `node_data`.
+   Targets that require a stack **already up** run against a live one instead:
+   `e2e-claim-provenance` straight after `e2e-l1-to-l2`, and `e2e-l2l2` after
+   `e2e-l2l2-up`.
+3. **`scripts/e2e-full-db-loss-recovery.sh`** on a dedicated fixture
+   (`make e2e-l2-to-l1`), so the drill always has real round-trip state rather
+   than whatever the previous target happened to leave behind.
+4. **Load**: `N=30 scripts/e2e-bridge-loadtest-isolated.sh`, then
+   `scripts/verify-event-completeness.sh`.
+5. **Chaos**: `N=30 CHAOS_DURATION=300 GARBO_DURATION=300
+   scripts/e2e-chaos-soak.sh`, then the **full-DB-loss drill again** on the
+   post-chaos state — recovery from a messy history is the point.
+
+### Result semantics
+
+`results.tsv` is the raw record (one row per target execution) and
+`scripts/e2e-battery-matrix.py` regenerates `MATRIX.md` after **every** target,
+so the matrix is current mid-run.
+
+| Mark | Meaning |
+|---|---|
+| `PASS` | target succeeded |
+| `**FAIL**` | target failed; the log path is in `results.tsv` |
+| `**FLAKY**` | failed, then passed on a later execution **with no code change** — never recorded as a plain PASS |
+| `(re-run)` | the target was executed again in that iteration, after a fix or a retry |
+
+A failing target does not stop the battery: the run continues so ~30h of work
+still makes progress, and the failure is diagnosed and re-run out of band.
+
+### Snapshotting state
+
+Any scenario that fingerprints or **counts** proxy state must first source
+`scripts/lib-quiesce.sh` and call `quiesce_projection`, then bound its
+comparison to `projected_height()`. GER injection runs on the aggoracle's own
+timer, so a snapshot taken while the pipeline is advancing compares a moving
+system — that produced a spurious "#88 GER history was lost or duplicated" on a
+perfectly faithful restore. Wall-clock sleeps only narrow that window; quiesce on
+the observed frontier instead.

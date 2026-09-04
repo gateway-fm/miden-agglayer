@@ -548,6 +548,10 @@ test-e2e-coverage: ## Regression-protect all three production fixes (RD-862 GER 
 .PHONY: e2e
 e2e: test-e2e ## Alias for test-e2e (start, test, teardown)
 
+.PHONY: e2e-battery
+e2e-battery: ## Run the FULL e2e battery N times (ITERATIONS=4). Results + MATRIX.md under e2e-results/
+	ITERATIONS=$(or $(ITERATIONS),4) ./scripts/e2e-battery.sh
+
 .PHONY: e2e-down
 e2e-down: ## Stop E2E environment (base AND the l2l2 overlay — see below)
 	# Tear down with the l2l2 overlay too, and --remove-orphans. `$(E2E_COMPOSE)
