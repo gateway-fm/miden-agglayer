@@ -1,11 +1,21 @@
 # Local patches for the e2e node images
 
-**None applied as files.** The `miden-node` / `miden-validator` e2e images are
-built from a verified clone of `0xMiden/node` at the ref pinned in the
-`Makefile` (`MIDEN_NODE_GIT_REF`, commit-pinned via `MIDEN_NODE_GIT_COMMIT`),
-with one intentional in-place source edit applied by `run-all.sh`: the
-ntx-builder remote-prover timeout (10s -> 180s, verified post-apply). Removing
-that patch is tracked in issue #180.
+**None.** The `miden-node` / `miden-validator` / `miden-ntx-builder` /
+`miden-remote-prover` e2e images are built from a verified, UNMODIFIED clone of
+`0xMiden/node` at the ref pinned in the `Makefile` (`MIDEN_NODE_GIT_REF`,
+commit-pinned via `MIDEN_NODE_GIT_COMMIT`). `run-all.sh` refuses a dirty build
+worktree and refuses a node ref older than `v0.16.0-rc.4` (see below).
+
+## History (resolved at node `v0.16.0-rc.4`)
+
+- **ntx-builder remote-prover timeout `sed` patch** (10s -> 180s, applied
+   in-place by `run-all.sh`; issue #180) — upstream hardcoded
+   `DEFAULT_PROVER_TIMEOUT` with no flag, and bridge CLAIM-consumption proofs
+   routinely exceed 10s against a remote prover. **Fixed upstream at
+   `v0.16.0-rc.4`** (0xMiden/node#2527 / #2537): the timeout is the
+   `--tx-prover.timeout` flag, which `docker-compose.e2e.yml` sets to `180s`.
+   The remaining inline `from_secs(10)` in `actor/mod.rs` is inside a
+   `#[cfg(test)]` constructor and never runs in the binary.
 
 ## History (resolved at node `v0.15.0`)
 

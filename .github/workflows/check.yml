@@ -41,53 +41,29 @@ jobs:
         with:
           command: check licenses
 
-  # Blocks on an UNRESOLVED upstream API gap. It does NOT block on every vendor
-  # patch: the miden-agglayer one it was written for is RESOLVED (rc.6 restored
-  # read_let_num_leaves/is_ger_registered as public API and vendor/ is gone), so
-  # a blanket "any [patch.crates-io] fails" rule now only reports a stale fact.
-  #
-  # EXCEPTION (explicit, reviewed): the miden-client rc.3 vendor patch is
-  # permitted. It is a correctness fix, not an API un-gate — rc.3 routes
-  # submit_proven_transaction AND submit_proven_batch through call_with_retry,
-  # re-sending on ResourceExhausted | Unavailable. Proven-transaction
-  # submission is NOT idempotent (it consumes notes): if the node accepts and
-  # the response is lost, the silent retry resubmits the same transaction and
-  # double-spends. The vendor forces both submit endpoints to a single
-  # attempt, keeping transport failures indeterminate; every OTHER endpoint
-  # keeps its retries (they are reads). rc.3 (not rc.2) is vendored because it
-  # is the release wire-compatible with the miden-node v0.16.0-rc.3 e2e stack
-  # (storage-map proofs moved into a PartialSmt field the rc.2 client reads as
-  # an empty map, which the data_store then rejects). See the
-  # [patch.crates-io] comment in Cargo.toml; remove the patch and the vendor
-  # copy when upstream stops retrying submit (with #177), and drop it from the
-  # allow-list here.
+  # Fails on ANY [patch.crates-io] entry and on a re-vendored miden-agglayer.
+  # Every patch this repo ever carried was a stand-in for an upstream fix
+  # (miden-agglayer API un-gate -> resolved in protocol rc.6; miden-client
+  # submit-retry -> resolved in rust-sdk rc.5, #177), and each one silently
+  # outlived its reason once. A new patch must therefore be a reviewed change
+  # to this gate, not just a Cargo.toml edit.
   upstream-api-gate:
-    name: "upstream API gate (miden-client vendor exception active)"
+    name: "upstream API gate (no vendor patches)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: fail on an unresolved upstream API gap
+      - name: fail on any vendor patch
         run: |
           rc=0
-          if ls -d vendor/miden-agglayer-* >/dev/null 2>&1; then
-            echo "::error::miden-agglayer is vendored again — that patch exists only to un-gate"
-            echo "::error::read_let_num_leaves/is_ger_registered. Upstream restored them in rc.6;"
-            echo "::error::re-vendoring means the API regressed and this must not merge."
+          if [ -d vendor ] && [ -n "$(ls -A vendor 2>/dev/null)" ]; then
+            echo "::error::vendor/ is not empty — no crate is vendored on this branch; a new vendor needs a reviewed exception in this gate with its upstream tracking issue."
             rc=1
           fi
-          # Every patched crate must be on the allow-list below.
           patched="$(awk '/^\[patch\.crates-io\]/{f=1;next} /^\[/{f=0} f' Cargo.toml \
                      | sed -e 's/#.*//' -e '/^[[:space:]]*$/d' \
-                     | cut -d= -f1 | tr -d '[:space:]')"
+                     | cut -d= -f1 | tr -d ' \t')"
           for crate in $patched; do
-            case "$crate" in
-              miden-client)
-                echo "::notice::allowed vendor exception: $crate (rc.3 no-retry submit fix)"
-                ;;
-              *)
-                echo "::error::unreviewed [patch.crates-io] entry: $crate — add it to the allow-list in this gate, with justification, or remove the patch."
-                rc=1
-                ;;
-            esac
+            echo "::error::[patch.crates-io] entry for $crate — every past patch was a temporary stand-in for an upstream fix; add a reviewed exception here with the upstream tracking issue, or remove the patch."
+            rc=1
           done
           exit $rc
