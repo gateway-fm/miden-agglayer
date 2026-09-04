@@ -376,9 +376,17 @@ step "Phase 0 — pre-drop fingerprint (accumulated state is the fixture)"
 # The projector cursor is the exact frontier of what this store has projected;
 # blocks beyond it are precisely what a still-running pipeline may add while the
 # drill works. Bound every later comparison to it.
-SNAP_BLOCK=$(pgq "SELECT projector_cursor FROM service_state WHERE id=1")
+# QUIESCE FIRST, then bound. Quiescing alone is not enough (a note can land
+# between the last sample and the drop) and bounding alone is not enough (the
+# pre-drop store may not yet have projected everything at that height), so the
+# drill needs both: wait for the projector to catch up and the writer to drain,
+# then compare pre vs post at exactly that projected height.
+. "$PROJECT_DIR/scripts/lib-quiesce.sh"
+quiesce_projection "${QUIESCE_TIMEOUT_SECS:-180}" \
+    || fail "projection never quiesced — refusing to fingerprint a moving pipeline"
+SNAP_BLOCK=$(projected_height)
 [[ -n "$SNAP_BLOCK" && "$SNAP_BLOCK" =~ ^[0-9]+$ ]] || fail "could not read projector_cursor for the comparison window"
-say "comparison window: blocks <= $SNAP_BLOCK (projector cursor at snapshot)"
+say "comparison window: blocks <= $SNAP_BLOCK (quiesced projector cursor)"
 read -r NUHC0 NINJECTED0 NBR0 NCL0 <<<"$(counts)"
 read -r UHC0 INJ0 BR0 CL0 HCV0 <<<"$(fingerprint)"
 dump_rows '0x50178120' "/tmp/fdl-bridge-before-${RUN_SUFFIX}.txt"
