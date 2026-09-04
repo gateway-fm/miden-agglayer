@@ -258,6 +258,46 @@ pub fn init_metrics() {
          at 29 MB vs 71 MB of client store. A steady climb here predicts the \
          'deposits stop being claimed fast enough' symptom before users see it."
     );
+    describe_gauge!(
+        "miden_client_store_bytes",
+        "#173 — on-disk size of the miden-client store.sqlite3, sampled once per \
+         actor sync. sync_state cost scales with this (see \
+         miden_sync_state_duration_seconds), and through the sync cadence so does \
+         every queued write — the measured-bad deployment ran 354 MB with 91s queue \
+         waits. Alert on sustained growth; remediate with a retained-PostgreSQL + \
+         --reset-miden-store recovery window (docs/operations/runbook.md)."
+    );
+    describe_gauge!(
+        "miden_client_mailbox_depth",
+        "#173 — write requests admitted into the actor's mailbox but not yet \
+         picked up, sampled when the actor is between requests (during a long \
+         request the exported value is the depth observed at its start; reset \
+         to 0 on actor exit). Sustained growth means writers are outpacing the \
+         serialized actor, e.g. during long proofs or slow syncs. Backpressure \
+         (send awaiting) begins at the mailbox capacity."
+    );
+    describe_counter!(
+        "miden_sync_passes_failed_total",
+        "#173 — bounded actor sync passes that exhausted all retries without a \
+         successful sync_state. Non-zero during a Miden node outage is expected \
+         (requests are held and passes retry with backoff up to 60s); sustained \
+         growth with the node healthy means connectivity or RPC trouble."
+    );
+    describe_counter!(
+        "miden_commit_wait_probes_total",
+        "#174 — per-attempt commit probes made by MidenClient::await_transaction_commit \
+         (the out-of-actor wait used by GER inserts and CLAIM publishes), by outcome: \
+         committed / pending / sync_unavailable / timed_out. Each probe is one short \
+         mailbox request; sleeps between probes happen outside the actor, so writers \
+         interleave instead of queueing behind a whole commit wait."
+    );
+    describe_gauge!(
+        "miden_client_writes_held",
+        "#173 — 1 while the actor holds ALL MidenClient requests (writes and \
+         with()-routed reads) because its last sync pass exhausted its retries; \
+         0 once a sync succeeds or on actor exit. /health stays alive during a \
+         hold, so alert on this gauge for 'node unreachable, proxy frozen'."
+    );
     describe_counter!(
         "miden_client_build_errors_total",
         "Failed attempts to build Miden client connection"
