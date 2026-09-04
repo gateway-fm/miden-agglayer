@@ -549,8 +549,17 @@ test-e2e-coverage: ## Regression-protect all three production fixes (RD-862 GER 
 e2e: test-e2e ## Alias for test-e2e (start, test, teardown)
 
 .PHONY: e2e-down
-e2e-down: ## Stop E2E environment
-	$(E2E_COMPOSE) down -v
+e2e-down: ## Stop E2E environment (base AND the l2l2 overlay — see below)
+	# Tear down with the l2l2 overlay too, and --remove-orphans. `$(E2E_COMPOSE)
+	# down -v` covers only the services in docker-compose.e2e.yml, so after any
+	# l2l2 target the network-2 containers (anvil-l2b, aggkit-l2b,
+	# bridge-service-l2b, postgres-l2b) SURVIVED a "teardown". The next
+	# e2e-l2l2-up then reused that live L2B chain — setup-l2b.sh reported
+	# "L2B sovereign genesis already injected — skipping" and
+	# bridge-service-l2b exited(1) against the stale state.
+	# e2e-clean-data does not catch this: it guards the node_data volume, which
+	# the base teardown had already released.
+	$(L2L2_COMPOSE) down -v --remove-orphans
 
 .PHONY: e2e-l2l2-down
 e2e-l2l2-down: ## Stop the L2<->L2 stack (base + L2B overlay). --remove-orphans so anvil-l2b/aggkit-l2b/bridge-service don't linger on a reused (self-hosted) host
