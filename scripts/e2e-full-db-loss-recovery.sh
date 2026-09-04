@@ -186,7 +186,7 @@ log_digest() { # $1 = topic0 hex prefix
            array_to_string(topics, ',') || ':' ||
            transaction_index::text || ':' || removed::text || ':' || data,
            '|' ORDER BY block_number, array_to_string(topics, ','), data), '')) \
-         FROM synthetic_logs WHERE topics[1] LIKE '$1%'"
+         FROM synthetic_logs WHERE topics[1] LIKE '$1%' $(wb)"
 }
 # GER / UpdateHashChain content digest — deliberately EXCLUDES transaction_hash
 # and log_index, because neither can survive a full DB loss even when the
@@ -222,7 +222,7 @@ uhc_content_digest() {
            block_number || ':' || encode(block_hash,'hex') || ':' || address || ':' ||
            array_to_string(topics, ',') || ':' || removed::text || ':' || data,
            '|' ORDER BY block_number, array_to_string(topics, ',')), '')) \
-         FROM synthetic_logs WHERE topics[1] LIKE '0x65d3bf36%'"
+         FROM synthetic_logs WHERE topics[1] LIKE '0x65d3bf36%' $(wb)"
 }
 
 # Row-level dump for diagnosis. A digest tells you THAT something differs; this
@@ -335,18 +335,30 @@ fingerprint() {  # -> "uhc_d inj_d bridge_d claim_d hcv"  (digests, for identity
     local uhc inj bridge claim hcv
     uhc=$(uhc_content_digest)
     inj=$(pgq "SELECT md5(coalesce(string_agg(encode(ger_hash,'hex'), '|' ORDER BY ger_hash), '')) \
-               FROM ger_entries WHERE is_injected=true")
+               FROM ger_entries WHERE is_injected=true $(wb)")
     bridge=$(log_digest '0x50178120')
     claim=$(claim_content_digest)
     hcv=$(pgq "SELECT encode(hash_chain_value,'hex') FROM service_state WHERE id=1")
     echo "$uhc $inj $bridge $claim $hcv"
 }
+# WINDOW BOUND (see SNAP_BLOCK below): every comparison is restricted to blocks
+# the projector had already covered when the pre-drop fingerprint was taken.
+# Without it the drill compares a snapshot of a MOVING system against a restore
+# that reads the authoritative node LATER: GER injection runs on its own timer,
+# so a GER consumed after the snapshot legitimately appears in the rebuilt store
+# and the AFTER==BEFORE assertions fail on a PERFECTLY FAITHFUL restore.
+# Observed 2026-09-04: UHC and injected both 3 -> 4, Bridge/Claim unchanged,
+# eth_getLogs byte-identical — a live injection 13s after the snapshot.
+# Loss or duplication INSIDE the window still fails exactly as before.
+wb() { # window predicate for synthetic_logs / ger_entries
+    [[ -n "${SNAP_BLOCK:-}" ]] && echo "AND block_number <= $SNAP_BLOCK" || echo ""
+}
 counts() {  # -> "uhc inj bridge claim"  (integers, for logging + thinness gate)
-    local uhc inj bridge claim
-    uhc=$(pgq "SELECT count(*) FROM synthetic_logs WHERE topics[1] LIKE '0x65d3bf36%'")
-    inj=$(pgq "SELECT count(*) FROM ger_entries WHERE is_injected=true")
-    bridge=$(pgq "SELECT count(*) FROM synthetic_logs WHERE topics[1] LIKE '0x50178120%'")
-    claim=$(pgq "SELECT count(*) FROM synthetic_logs WHERE topics[1] LIKE '0x1df3f2a9%'")
+    local uhc inj bridge claim w; w=$(wb)
+    uhc=$(pgq "SELECT count(*) FROM synthetic_logs WHERE topics[1] LIKE '0x65d3bf36%' $w")
+    inj=$(pgq "SELECT count(*) FROM ger_entries WHERE is_injected=true $w")
+    bridge=$(pgq "SELECT count(*) FROM synthetic_logs WHERE topics[1] LIKE '0x50178120%' $w")
+    claim=$(pgq "SELECT count(*) FROM synthetic_logs WHERE topics[1] LIKE '0x1df3f2a9%' $w")
     echo "$uhc $inj $bridge $claim"
 }
 
@@ -361,6 +373,12 @@ wait_healthy() {
 
 # ── Phase 0: pre-drop fingerprint on the live, quiesced stack ────────────────
 step "Phase 0 — pre-drop fingerprint (accumulated state is the fixture)"
+# The projector cursor is the exact frontier of what this store has projected;
+# blocks beyond it are precisely what a still-running pipeline may add while the
+# drill works. Bound every later comparison to it.
+SNAP_BLOCK=$(pgq "SELECT projector_cursor FROM service_state WHERE id=1")
+[[ -n "$SNAP_BLOCK" && "$SNAP_BLOCK" =~ ^[0-9]+$ ]] || fail "could not read projector_cursor for the comparison window"
+say "comparison window: blocks <= $SNAP_BLOCK (projector cursor at snapshot)"
 read -r NUHC0 NINJECTED0 NBR0 NCL0 <<<"$(counts)"
 read -r UHC0 INJ0 BR0 CL0 HCV0 <<<"$(fingerprint)"
 dump_rows '0x50178120' "/tmp/fdl-bridge-before-${RUN_SUFFIX}.txt"
