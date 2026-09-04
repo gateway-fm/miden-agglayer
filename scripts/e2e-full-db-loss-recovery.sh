@@ -134,14 +134,11 @@ else
     echo "verified: proxy store target '$STORE_HOST' db '$STORE_DB' matches the drop target $PG_CONTAINER/agglayer_store"
 fi
 
-COMPOSE=(-f "$PROJECT_DIR/docker-compose.e2e.yml")
-[[ -f "$PROJECT_DIR/docker-compose.l2l2.yml" ]] && docker ps --format '{{.Names}}' | grep -q "^$PROJECT-anvil-l2b-1$" \
-    && COMPOSE+=(-f "$PROJECT_DIR/docker-compose.l2l2.yml")
-if docker ps --format '{{.Names}}' | grep -q "^$PROJECT-web3signer-1$"; then
-    COMPOSE+=(-f "$PROJECT_DIR/docker-compose.web3signer.yml")
-    # ${AGGLAYER_SIGNER_KEYS:?} is interpolated at compose parse time.
-    [[ -f "$PROJECT_DIR/fixtures/web3signer-keys.env" ]] && { set -a; . "$PROJECT_DIR/fixtures/web3signer-keys.env"; set +a; }
-fi
+# Shared resolver: the restore one-shot below MUST run under the same custody
+# overlay as the stack it is repairing, plus any site overlay (EXTRA_COMPOSE_FILES).
+. "$PROJECT_DIR/scripts/lib-compose.sh"
+compose_env_load
+mapfile -t COMPOSE < <(compose_files)
 
 L1_RPC="${L1_RPC:-http://localhost:8545}"
 L1_BRIDGE_ADDRESS="${L1_BRIDGE_ADDRESS:-0xC8cbEBf950B9Df44d987c8619f092beA980fF038}"

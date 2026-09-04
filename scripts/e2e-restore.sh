@@ -20,6 +20,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 FIXTURES_DIR="$PROJECT_DIR/fixtures"
 
+# The restore one-shot must run under the SAME custody overlay as the stack it
+# is repairing (local keystore vs remote signer), plus any site overlay.
+. "$PROJECT_DIR/scripts/lib-compose.sh"
+compose_env_load
+mapfile -t COMPOSE < <(compose_files)
+
 source "$FIXTURES_DIR/.env"
 
 # Required by docker-compose.e2e.yml's miden-node build args (`${VAR:?...}`).
@@ -138,12 +144,12 @@ echo ""
 step "Part 3: Running --restore inside the container..."
 
 # Stop the running service
-docker compose -f "$PROJECT_DIR/docker-compose.e2e.yml" --env-file "$FIXTURES_DIR/.env" \
+docker compose "${COMPOSE[@]}" --env-file "$FIXTURES_DIR/.env" \
     stop miden-agglayer >/dev/null 2>&1
 sleep 2
 
 # Run restore as a one-shot container (inherits volumes, env, network from compose)
-docker compose -f "$PROJECT_DIR/docker-compose.e2e.yml" --env-file "$FIXTURES_DIR/.env" \
+docker compose "${COMPOSE[@]}" --env-file "$FIXTURES_DIR/.env" \
     run --rm --no-deps miden-agglayer \
     --miden-node=http://miden-node:57291 \
     --miden-store-dir=/var/lib/miden-agglayer-service \
@@ -173,7 +179,7 @@ echo ""
 # PART 4: Restart miden-agglayer and verify it serves RPCs
 # ══════════════════════════════════════════════════════════════════════════════
 step "Part 4: Restarting miden-agglayer..."
-docker compose -f "$PROJECT_DIR/docker-compose.e2e.yml" --env-file "$FIXTURES_DIR/.env" \
+docker compose "${COMPOSE[@]}" --env-file "$FIXTURES_DIR/.env" \
     start miden-agglayer >/dev/null 2>&1
 
 wait_for "miden-agglayer healthy" \
@@ -205,7 +211,7 @@ echo ""
 step "Part 5: Running L2→L1 bridge-out on restored state..."
 
 # Restart dependent services to pick up the restored miden-agglayer
-docker compose -f "$PROJECT_DIR/docker-compose.e2e.yml" --env-file "$FIXTURES_DIR/.env" \
+docker compose "${COMPOSE[@]}" --env-file "$FIXTURES_DIR/.env" \
     restart bridge-service aggkit >/dev/null 2>&1
 sleep 10
 
