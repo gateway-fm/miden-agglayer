@@ -32,8 +32,8 @@ path = "src/bin/bridge_autoclaim.rs"
 [dev-dependencies]
 # testing exposes the generated proto types — the ONLY public construction
 # path for rpc TransactionRecord fixtures (consumed_note_refs is pub(crate)
-# upstream in rc.4).
-miden-client = { version = "=0.16.0-rc.4", features = ["testing", "tonic"] }
+# upstream in rc.5).
+miden-client = { version = "=0.16.0-rc.5", features = ["testing", "tonic"] }
 tempfile = "3.10"
 # test-util enables tokio's paused virtual clock (start_paused) — used by the
 # ger::poll_until_ready timing regression test to pin the exact sleep count
@@ -140,23 +140,24 @@ deadpool-postgres = { version = "0.14", optional = true }
 # pages, so it returns ALL matches with bounded memory. Only used on the pg path.
 futures-util = { version = "0.3", optional = true }
 
-# Release matrix (refreshed for #180 / node rc.5, 2026-09-03):
+# Release matrix (refreshed 2026-09-04: #180 node rc.5, #177 unvendor):
 #   - protocol crates (miden-protocol / miden-standards / miden-agglayer /
 #     miden-tx) = 0.16.0-rc.9, exact pins kept aligned (never mix protocol
-#     releases). rc.9 is what miden-node v0.16.0-rc.5 and miden-client rc.4
+#     releases). rc.9 is what miden-node v0.16.0-rc.5 and miden-client rc.5
 #     both build against, so the BURN/MINT/CLAIM/B2AGG MAST roots agree across
 #     the node/client boundary by construction. rc.7..rc.9 changed the bridge
 #     code commitment (priced fee policy, emergency pause, RBAC config notes)
 #     — see the protocol CHANGELOG; the e2e genesis is redeployed by the
 #     proxy's --init, so no committed account file needs regenerating.
-#   - miden-client = 0.16.0-rc.4, VENDORED (see [patch.crates-io] below). rc.4
-#     is tagged upstream (rust-sdk v0.16.0-rc.4, 2026-09-02) but NOT YET on
-#     crates.io, so both miden-client AND miden-client-sqlite-store are
-#     vendored from `cargo package` runs on that tag (byte-identical to what
-#     the publish will produce). The client copy carries the single-attempt
-#     submit patch; the sqlite-store copy is unmodified and exists only
-#     because its `^0.16.0-rc.4` client requirement cannot be met from the
-#     registry yet. Drop the sqlite-store vendor the moment rc.4 publishes.
+#   - miden-client / miden-client-sqlite-store = 0.16.0-rc.5, STOCK crates.io
+#     release, no [patch.crates-io], no vendor/ (closes #177). rc.5 ships the
+#     upstream fix for the submission retry (rust-sdk#2441 / #2489): the retry
+#     policy is endpoint-aware — SubmitProvenTx / SubmitProvenBatch no longer
+#     re-send on `Unavailable`, only on `ResourceExhausted` (the node's rate
+#     limiter rejects before the mempool sees the tx, so that re-send is
+#     safe). That is what the rc.1..rc.4 vendor patch existed to enforce; the
+#     caller-side backstop (`submit_is_indeterminate` in
+#     src/bin/bridge_out_tool.rs) stays.
 #   - VM train (miden-assembly / miden-core / miden-processor) = 0.29, lock
 #     cohort at 0.29.4 — protocol rc.9 still requires ^0.29.1; do not jump to
 #     0.30 (breaking train). The node rc.5 lock resolves 0.29.1.
@@ -195,13 +196,12 @@ miden-processor = { default-features = false, features = [
   "std",
 ], version = "0.29" }
 
-# miden-client 0.16.0-rc.4 — tagged in 0xMiden/rust-sdk, not yet published.
-# VENDORED (see [patch.crates-io] below): single-attempt submit. sqlite-store is
-# pinned in lockstep and vendored unmodified until the rc.4 publish lands.
+# miden-client 0.16.0-rc.5 — stock crates.io release (see the release matrix
+# above for why no patch is needed any more). sqlite-store pinned in lockstep.
 miden-client = { default-features = false, features = [
   "tonic",
-], version = "=0.16.0-rc.4" }
-miden-client-sqlite-store = { version = "=0.16.0-rc.4" }
+], version = "=0.16.0-rc.5" }
+miden-client-sqlite-store = { version = "=0.16.0-rc.5" }
 
 [features]
 default = []
@@ -216,46 +216,15 @@ postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:futures-util"]
 
 # RESOLVED (rc.6, verified 2026-08-18): upstream restored
 # `AggLayerBridge::read_let_num_leaves` + `is_ger_registered` as public API in
-# the ungated impl — the vendored miden-agglayer patch is gone. The
-# `upstream-api-gate` CI job now PASSES, with the miden-client vendor below as a
-# reviewed, allow-listed exception (see .github/workflows/check.yml).
-[patch.crates-io]
-# TEMPORARY vendor patch — miden-client rc.4 (like rc.3) routes `submit_proven_transaction`
-# AND `submit_proven_batch` through `call_with_retry`, which re-sends on
-# `ResourceExhausted | Unavailable`. Submitting a proven transaction (or batch)
-# is NOT idempotent (it consumes notes / may execute input notes), so if the
-# node ACCEPTS it and the response is then lost, the SAME submission is silently
-# re-sent. The retry reaches a node that has already spent the nullifier and
-# answers with an APPLICATION-level rejection — and only that second error ever
-# reaches the caller.
+# the ungated impl — the vendored miden-agglayer patch is gone.
 #
-# That destroys the distinction every safe caller depends on:
-#   transport failure, no endpoint_error -> the node MAY have processed it
-#   node answered with a rejection       -> it processed and refused; nothing landed
-# The retry silently falsifies the second premise. Our bridge-out tool, reasoning
-# correctly from it, concluded "nothing landed", minted a NEW B2AGG note, and
-# bridged the same assets twice. See `submit_is_indeterminate` in
-# src/bin/bridge_out_tool.rs — the caller-side backstop for exactly this.
+# RESOLVED (miden-client rc.5, 2026-09-04): the rc.1..rc.4 vendor patch that
+# forced single-attempt SubmitProvenTx / SubmitProvenBatch is gone — upstream
+# made the retry policy endpoint-aware (rust-sdk#2441, shipped in rc.5). Its
+# rationale, for the record: submitting a proven transaction is not idempotent,
+# so a transport-level retry after a lost response turned "the node may have
+# processed it" into an application-level rejection, and our bridge-out tool
+# once bridged the same assets twice on that false premise.
 #
-# The vendored copy is byte-identical to `cargo package` on the rust-sdk
-# v0.16.0-rc.4 tag (commit d25d79b38772f779c2bbae2b8ac99bcb6a02080d) except
-# that both submit endpoints are single-attempt; every OTHER endpoint keeps its retries
-# (they are reads, where a re-send is free).
-#
-# rc.1 additionally needed a `VaultFetch::Always` patch (an omitted "unchanged"
-# vault reconstructed as EMPTY and wedged every bridge-targeted transaction once
-# the bridge vault held a locked native asset). rc.2 fixed that upstream, and
-# better — it keeps the bandwidth optimisation and validates the rebuilt vault
-# against the header root, falling back to a root-only partial vault. That
-# patch is therefore still gone.
-#
-# Upstream tracking: https://github.com/0xMiden/rust-sdk/issues/2441 (fix
-# proposed in https://github.com/0xMiden/rust-sdk/pull/2442, unmerged as of
-# 2026-09-03). Remove this patch AND the vendor copy when that lands, or when
-# upstream otherwise stops retrying submit / makes submit idempotent.
-miden-client = { path = "vendor/miden-client-0.16.0-rc.4" }
-# UNMODIFIED vendor — exists only because miden-client-sqlite-store 0.16.0-rc.4
-# is not on crates.io yet (its `^0.16.0-rc.4` miden-client requirement must be
-# satisfiable). Delete this line and vendor/miden-client-sqlite-store-* as soon
-# as rust-sdk publishes rc.4; the client patch above is unaffected.
-miden-client-sqlite-store = { path = "vendor/miden-client-sqlite-store-0.16.0-rc.4" }
+# There is NO [patch.crates-io] section. The `upstream-api-gate` CI job fails
+# on any that appears, so re-vendoring anything is a reviewed decision again.

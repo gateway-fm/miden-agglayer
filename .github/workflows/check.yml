@@ -41,67 +41,29 @@ jobs:
         with:
           command: check licenses
 
-  # Blocks on an UNRESOLVED upstream API gap. It does NOT block on every vendor
-  # patch: the miden-agglayer one it was written for is RESOLVED (rc.6 restored
-  # read_let_num_leaves/is_ger_registered as public API and vendor/ is gone), so
-  # a blanket "any [patch.crates-io] fails" rule now only reports a stale fact.
-  #
-  # EXCEPTION (explicit, reviewed): the miden-client rc.4 vendor patch is
-  # permitted. It is a correctness fix, not an API un-gate — rc.4 routes
-  # submit_proven_transaction AND submit_proven_batch through call_with_retry,
-  # re-sending on ResourceExhausted | Unavailable. Proven-transaction
-  # submission is NOT idempotent (it consumes notes): if the node accepts and
-  # the response is lost, the silent retry resubmits the same transaction and
-  # double-spends. The vendor forces both submit endpoints to a single
-  # attempt, keeping transport failures indeterminate; every OTHER endpoint
-  # keeps its retries (they are reads). rc.4 is vendored because it is the
-  # client built against protocol rc.9, the release the miden-node v0.16.0-rc.5
-  # e2e stack runs. Upstream tracking: 0xMiden/rust-sdk#2441 (fix proposed in
-  # rust-sdk#2442). See the [patch.crates-io] comment in Cargo.toml; remove the
-  # patch and the vendor copy when that lands (with #177), and drop it from the
-  # allow-list here.
-  #
-  # SECOND, TEMPORARY EXCEPTION: miden-client-sqlite-store rc.4 is vendored
-  # UNMODIFIED because rust-sdk v0.16.0-rc.4 is tagged but not yet published to
-  # crates.io, so its `^0.16.0-rc.4` miden-client requirement cannot otherwise
-  # be met. The gate verifies it carries no local edits (no "VENDOR PATCH"
-  # marker). Drop the vendor and this allow-list entry the moment rc.4
-  # publishes.
+  # Fails on ANY [patch.crates-io] entry and on a re-vendored miden-agglayer.
+  # Every patch this repo ever carried was a stand-in for an upstream fix
+  # (miden-agglayer API un-gate -> resolved in protocol rc.6; miden-client
+  # submit-retry -> resolved in rust-sdk rc.5, #177), and each one silently
+  # outlived its reason once. A new patch must therefore be a reviewed change
+  # to this gate, not just a Cargo.toml edit.
   upstream-api-gate:
-    name: "upstream API gate (miden-client vendor exception active)"
+    name: "upstream API gate (no vendor patches)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: fail on an unresolved upstream API gap
+      - name: fail on any vendor patch
         run: |
           rc=0
-          if ls -d vendor/miden-agglayer-* >/dev/null 2>&1; then
-            echo "::error::miden-agglayer is vendored again — that patch exists only to un-gate"
-            echo "::error::read_let_num_leaves/is_ger_registered. Upstream restored them in rc.6;"
-            echo "::error::re-vendoring means the API regressed and this must not merge."
+          if [ -d vendor ] && [ -n "$(ls -A vendor 2>/dev/null)" ]; then
+            echo "::error::vendor/ is not empty — no crate is vendored on this branch; a new vendor needs a reviewed exception in this gate with its upstream tracking issue."
             rc=1
           fi
-          # Every patched crate must be on the allow-list below.
           patched="$(awk '/^\[patch\.crates-io\]/{f=1;next} /^\[/{f=0} f' Cargo.toml \
                      | sed -e 's/#.*//' -e '/^[[:space:]]*$/d' \
                      | cut -d= -f1 | tr -d ' \t')"
           for crate in $patched; do
-            case "$crate" in
-              miden-client)
-                echo "::notice::allowed vendor exception: $crate (rc.4 no-retry submit fix, rust-sdk#2441)"
-                ;;
-              miden-client-sqlite-store)
-                if grep -rq "VENDOR PATCH" vendor/miden-client-sqlite-store-*/src; then
-                  echo "::error::miden-client-sqlite-store vendor carries local edits — it is allow-listed ONLY as an unmodified stand-in for the unpublished rc.4 crate."
-                  rc=1
-                else
-                  echo "::notice::allowed vendor exception: $crate (unmodified rc.4 stand-in until rust-sdk publishes rc.4)"
-                fi
-                ;;
-              *)
-                echo "::error::unreviewed [patch.crates-io] entry: $crate — add it to the allow-list in this gate, with justification, or remove the patch."
-                rc=1
-                ;;
-            esac
+            echo "::error::[patch.crates-io] entry for $crate — every past patch was a temporary stand-in for an upstream fix; add a reviewed exception here with the upstream tracking issue, or remove the patch."
+            rc=1
           done
           exit $rc
