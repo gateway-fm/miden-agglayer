@@ -46,7 +46,7 @@ PG_PORT="${PG_PORT:-5434}"
 PG_USER="${PG_USER:-agglayer}"
 PG_PASS="${PG_PASS:-agglayer}"
 PG_DB="${PG_DB:-agglayer_store}"
-SYNC_WAIT_SECS="${SYNC_WAIT_SECS:-20}"
+SYNC_WAIT_SECS="${SYNC_WAIT_SECS:-90}"   # DEADLINE for the tick wait, not a fixed sleep
 CLAIM_EVENT_TOPIC="0x1df3f2a973a00d6635911755c260704e95e8a5876997546798770f76396fda4d"
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -177,8 +177,36 @@ HAS_AFTER_DELETE=$(pgq "SELECT EXISTS(SELECT 1 FROM claim_watcher_processed WHER
 log "  has_claim_event_for_global_index simulated → false ✓"
 
 # ── Step 5: Wait for watcher tick ─────────────────────────────────────────────
-step "Waiting ${SYNC_WAIT_SECS}s for watcher's on_post_sync to scan consumed notes and synthesise"
-sleep "${SYNC_WAIT_SECS}"
+# Bound by OBSERVED sync ticks, not wall-clock. The watcher synthesises from
+# `on_post_sync`, so what matters is that sync ticks actually happened after the
+# state was staged — a fixed sleep fails whenever a tick is slow (loaded host,
+# slow proof) and wastes time when ticks are fast.
+# `miden_sync_state_duration_seconds_count` is the histogram's sample count, so
+# it increments once per completed sync.
+sync_ticks() {
+    curl -sf --max-time 5 "${L2_RPC:-http://localhost:8546}/metrics" 2>/dev/null \
+        | awk '$1=="miden_sync_state_duration_seconds_count" {print $2; exit}'
+}
+TICKS_BASE=$(sync_ticks); TICKS_BASE=${TICKS_BASE:-}
+WANT_TICKS="${WANT_SYNC_TICKS:-2}"
+SYNC_DEADLINE="${SYNC_WAIT_SECS}"
+if [[ -z "$TICKS_BASE" ]]; then
+    step "sync-tick metric unavailable — falling back to a ${SYNC_DEADLINE}s wait"
+    sleep "${SYNC_DEADLINE}"
+else
+    step "Waiting for ${WANT_TICKS} observed Miden sync tick(s) (<=${SYNC_DEADLINE}s) so on_post_sync can synthesise"
+    _w=0
+    while (( _w < SYNC_DEADLINE )); do
+        sleep 3; _w=$((_w+3))
+        _now=$(sync_ticks); _now=${_now:-$TICKS_BASE}
+        # integer-compare the sample counts (awk handles the float rendering)
+        if awk -v a="$_now" -v b="$TICKS_BASE" -v n="$WANT_TICKS" 'BEGIN{exit !((a-b)>=n)}'; then
+            log "  observed $(awk -v a="$_now" -v b="$TICKS_BASE" 'BEGIN{printf "%d", a-b}') sync tick(s) after ${_w}s"
+            break
+        fi
+    done
+    (( _w >= SYNC_DEADLINE )) && log "  WARN: only $(awk -v a="$(sync_ticks)" -v b="$TICKS_BASE" 'BEGIN{printf "%d", a-b}') tick(s) in ${SYNC_DEADLINE}s — asserting anyway"
+fi
 
 # ── Step 6: Verify synthesis fired (DB state + log emission, NOT /metrics) ───
 step "Sampling /metrics + DB + proxy logs after synthesis window"
@@ -201,8 +229,9 @@ DELTA_UNRECOV=$((NEW_UNRECOV - BASE_UNRECOV))
 # of the known counter bug above.
 if [[ "$DELTA_LOG" -lt 1 ]]; then
     fail "watcher did NOT log a new synthesis (Δlog=${DELTA_LOG}). \
-The consumed CLAIM was lost from miden-client's sqlite or the sync tick \
-hasn't fired yet — try bumping SYNC_WAIT_SECS. Check: \
+The consumed CLAIM was lost from miden-client's sqlite, or on_post_sync ran \
+without observing it. Sync ticks ARE observed (see the tick count above), so a \
+longer wait is NOT the fix. Check: \
 docker logs miden-agglayer-miden-agglayer-1 2>&1 | grep claim_watcher | tail -20"
 fi
 
