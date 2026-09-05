@@ -111,16 +111,32 @@ and is the proxy image new enough to publish both?"
     fi
 
     # (b) store drained — nothing durably owed.
-    local pend prep parked
+    #
+    # PREPARED handoffs are split by whether their reclaim is DUE. A note handoff
+    # is reclaimable once `reconcile_cursor > prepared_expiration_block`
+    # (see PgStore's prepared-link reclaim); before that it is ordinary pending
+    # work and the right response is to keep waiting. After it, the row should
+    # have been swept and still being here is a stuck reclaim — a finding, not
+    # patience. Both block quiescence, but they mean different things and the
+    # timeout must say which.
+    local pend prep_live prep_expired parked
     pend=$(_q_int   "SELECT count(*) FROM transactions WHERE status='pending'")
-    prep=$(_q_int   "SELECT count(*) FROM tx_note_links WHERE handoff_state='prepared'")
+    prep_live=$(_q_int "SELECT count(*) FROM tx_note_links l, service_state s \
+                        WHERE l.handoff_state='prepared' AND s.id=1 \
+                          AND (l.prepared_expiration_block IS NULL \
+                               OR s.reconcile_cursor <= l.prepared_expiration_block)")
+    prep_expired=$(_q_int "SELECT count(*) FROM tx_note_links l, service_state s \
+                           WHERE l.handoff_state='prepared' AND s.id=1 \
+                             AND l.prepared_expiration_block IS NOT NULL \
+                             AND s.reconcile_cursor > l.prepared_expiration_block")
     parked=$(_q_int "SELECT count(*) FROM queued_txns")
-    if [[ -z "$pend" || -z "$prep" || -z "$parked" ]]; then
+    if [[ -z "$pend" || -z "$prep_live" || -z "$prep_expired" || -z "$parked" ]]; then
         _Q_WHY="(b) store: could not read the pending counters from postgres (proxy store down?)"
         return 1
     fi
-    if [[ "$pend" != "0" || "$prep" != "0" || "$parked" != "0" ]]; then
-        _Q_WHY="(b) store NOT drained: pending receipts=$pend PREPARED handoffs=$prep parked txns=$parked"
+    if [[ "$pend" != "0" || "$prep_live" != "0" || "$prep_expired" != "0" || "$parked" != "0" ]]; then
+        _Q_WHY="(b) store NOT drained: pending receipts=$pend PREPARED handoffs=$((prep_live + prep_expired)) \
+(live=$prep_live, past-expiry=$prep_expired) parked txns=$parked"
         return 1
     fi
 
@@ -166,6 +182,17 @@ the aggoracle had nothing left to inject."
     return 0
 }
 
+# _q_dump <label> <sql> — print rows on stderr, or nothing when there are none.
+# Never fails the caller: this runs on the failure path, where a psql error must
+# not replace the diagnosis it was called to produce.
+_q_dump() {
+    local label="$1" sql="$2" out
+    out=$(_q_pgq "$sql" 2>/dev/null) || out=""
+    [[ -n "${out//[[:space:]]/}" ]] || return 0
+    echo "  --- $label ---" >&2
+    printf '%s\n' "$out" | sed 's/^/    | /' >&2
+}
+
 # quiesce_projection [timeout_secs] [stable_samples]
 # Every condition must hold on `stable_samples` CONSECUTIVE samples 5s apart,
 # with the synthetic LOG COUNT identical across all of them. One settled
@@ -209,5 +236,26 @@ queue=$(_q_metric agglayer_writer_queue_depth) nonterminal=$(_q_metric agglayer_
 pending=$(_q_int "SELECT count(*) FROM transactions WHERE status='pending'") \
 prepared=$(_q_int "SELECT count(*) FROM tx_note_links WHERE handoff_state='prepared'") \
 parked=$(_q_int "SELECT count(*) FROM queued_txns") logs=$(_q_int "SELECT count(*) FROM synthetic_logs")" >&2
+    # WHICH rows. A count alone is not actionable, and the caller's stack is
+    # usually destroyed within seconds of this returning — a post-chaos drill
+    # blocked on "PREPARED handoffs=1" for 600s left nothing at all to look at.
+    _q_dump "pending receipts" \
+        "SELECT tx_hash || '  status=' || status || '  signer=' || signer \
+         || '  age=' || round(extract(epoch from now()-created_at))::text || 's' \
+         || coalesce('  err=' || error_message, '') \
+         FROM transactions WHERE status='pending' ORDER BY created_at LIMIT 10"
+    _q_dump "PREPARED note handoffs" \
+        "SELECT l.tx_hash || '  note=' || coalesce(l.note_id, l.note_commitment) \
+         || '  expires_at_block=' || coalesce(l.prepared_expiration_block::text, 'NULL') \
+         || '  reconcile_cursor=' || s.reconcile_cursor \
+         || '  reclaim_due=' || (l.prepared_expiration_block IS NOT NULL \
+                                 AND s.reconcile_cursor > l.prepared_expiration_block)::text \
+         || '  age=' || round(extract(epoch from now()-l.created_at))::text || 's' \
+         FROM tx_note_links l, service_state s \
+         WHERE l.handoff_state='prepared' AND s.id=1 ORDER BY l.created_at LIMIT 10"
+    _q_dump "parked future-nonce txns" \
+        "SELECT signer || '  nonce=' || nonce || '  tx=' || tx_hash \
+         || '  expires_at=' || expires_at || '  parked_during_recovery=' || parked_during_recovery::text \
+         FROM queued_txns ORDER BY created_at LIMIT 10"
     return 1
 }

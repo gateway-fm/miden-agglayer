@@ -24,7 +24,7 @@ export QUIESCE_SAMPLE_SECS=1
 . "$SCRIPT_DIR/lib-quiesce.sh"
 
 # ── Stub state. Defaults describe a fully quiesced stack. ────────────────────
-S_QUEUE=0 S_NONTERM=0 S_PENDING=0 S_PREPARED=0 S_PARKED=0
+S_QUEUE=0 S_NONTERM=0 S_PENDING=0 S_PREPARED=0 S_PREPARED_EXPIRED=0 S_PARKED=0
 S_CURSOR=155 S_TIP=155 S_LOGS=42 S_GER_MATCH=1
 S_L1GER="0x0c1926fbbdfff4759cfc9d479566e6baf1dbb61cf3d0be3cb6e875495544a9d8"
 S_LOGS_GROW=0   # when 1, the log count increments on every sample
@@ -33,7 +33,7 @@ S_LOGS_FILE="$(mktemp)"
 trap 'rm -f "$S_LOGS_FILE"' EXIT
 
 reset_stubs() {
-    S_QUEUE=0 S_NONTERM=0 S_PENDING=0 S_PREPARED=0 S_PARKED=0
+    S_QUEUE=0 S_NONTERM=0 S_PENDING=0 S_PREPARED=0 S_PREPARED_EXPIRED=0 S_PARKED=0
     S_CURSOR=155 S_TIP=155 S_LOGS=42 S_GER_MATCH=1 S_LOGS_GROW=0
     echo 42 > "$S_LOGS_FILE"
 }
@@ -50,7 +50,12 @@ _q_pgq() {
         *projector_cursor*)          echo "$S_CURSOR" ;;
         *latest_block_number*)       echo "$S_TIP" ;;
         *"status='pending'"*)        echo "$S_PENDING" ;;
-        *"handoff_state='prepared'"*) echo "$S_PREPARED" ;;
+        # Two prepared queries now: reclaim-not-yet-due (live) and past-expiry.
+        # They must be stubbed SEPARATELY or one value answers both and the
+        # reported total is double what the test set.
+        *"prepared_expiration_block IS NULL"*)     echo "$S_PREPARED" ;;
+        *"prepared_expiration_block IS NOT NULL"*) echo "$S_PREPARED_EXPIRED" ;;
+        *"handoff_state='prepared'"*)              echo "$S_PREPARED" ;;
         *queued_txns*)               echo "$S_PARKED" ;;
         *ger_entries*)               echo "$S_GER_MATCH" ;;
         # File-backed, not a shell variable: `_q_int` reads this through a
@@ -111,7 +116,10 @@ reset_stubs; S_PENDING=1
 expect_blocked "a pending receipt blocks" "(b) store NOT drained"
 
 reset_stubs; S_PREPARED=3
-expect_blocked "a PREPARED note handoff blocks" "PREPARED handoffs=3"
+expect_blocked "a PREPARED note handoff whose reclaim is not yet due blocks" "live=3"
+
+reset_stubs; S_PREPARED_EXPIRED=2
+expect_blocked "a PREPARED handoff PAST its expiry block blocks, and is named as such" "past-expiry=2"
 
 reset_stubs; S_PARKED=1
 expect_blocked "a parked future-nonce txn blocks" "parked txns=1"
