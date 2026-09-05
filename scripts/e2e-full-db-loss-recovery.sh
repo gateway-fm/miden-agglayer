@@ -279,7 +279,7 @@ claim_content_digest() {
            address || ':' || array_to_string(topics, ',') || ':' ||
            transaction_index::text || ':' || removed::text || ':' || data,
            '|' ORDER BY block_number, data), '')) \
-         FROM synthetic_logs WHERE topics[1] LIKE '0x1df3f2a9%'"
+         FROM synthetic_logs WHERE topics[1] LIKE '0x1df3f2a9%' $(wb)"
 }
 # CONSUMER-LEVEL capture: what an actual client sees via eth_getLogs, not what our
 # own SQL says. The SQL digests above read the table we wrote; this reads the JSON-RPC
@@ -335,8 +335,8 @@ getlogs_dump() { # $1 = output file
 fingerprint() {  # -> "uhc_d inj_d bridge_d claim_d hcv"  (digests, for identity assertion)
     local uhc inj bridge claim hcv
     uhc=$(uhc_content_digest)
-    inj=$(pgq "SELECT md5(coalesce(string_agg(encode(ger_hash,'hex'), '|' ORDER BY ger_hash), '')) \
-               FROM ger_entries WHERE is_injected=true $(wb)")
+    inj=$(pgq "SELECT md5(coalesce(string_agg(encode(g.ger_hash,'hex'), '|' ORDER BY g.ger_hash), '')) \
+               FROM ger_entries g WHERE g.is_injected=true $(wb_ger)")
     bridge=$(log_digest '0x50178120')
     claim=$(claim_content_digest)
     hcv=$(pgq "SELECT encode(hash_chain_value,'hex') FROM service_state WHERE id=1")
@@ -351,13 +351,40 @@ fingerprint() {  # -> "uhc_d inj_d bridge_d claim_d hcv"  (digests, for identity
 # Observed 2026-09-04: UHC and injected both 3 -> 4, Bridge/Claim unchanged,
 # eth_getLogs byte-identical — a live injection 13s after the snapshot.
 # Loss or duplication INSIDE the window still fails exactly as before.
-wb() { # window predicate for synthetic_logs / ger_entries
+wb() { # window predicate for synthetic_logs ONLY — MIDEN block space
     [[ -n "${SNAP_BLOCK:-}" ]] && echo "AND block_number <= $SNAP_BLOCK" || echo ""
+}
+# ── The GER window is a DIFFERENT BLOCK SPACE ────────────────────────────────
+# `SNAP_BLOCK` is the projector cursor: a MIDEN synthetic block height (~100).
+# `ger_entries.block_number` is the L1 block the GER was observed at (`INSERT
+# INTO ger_entries (... block_number ...)` is fed `l1_block_number`) and runs in
+# the hundreds-to-thousands on anvil. Applying `wb()` to ger_entries therefore
+# compared two unrelated counters and silently shrank the injected-GER set:
+# measured on this stack at SNAP_BLOCK=105, the L1-space bound selected 1 of the
+# 4 injected GERs the window actually contains, so the "#88: injected-GER set
+# differs across restore" digest was computed over a near-empty set and could
+# not have failed. Not a product dedup bug — the four GER VALUES are distinct
+# and each has exactly one UpdateHashChain log; the harness was measuring the
+# wrong thing. (It also explains why the pre-window run recorded UHC=3
+# injected=3 and the windowed runs recorded UHC=4 injected=1.)
+#
+# The correct bound is by the GER's OWN UpdateHashChain log, which lives in the
+# Miden block space: a GER is inside the window iff its UHC log is. topics[2] of
+# a UHC log is the GER value; `synthetic_logs.topics` is text[] holding
+# lowercase `0x…`, so it compares against `'0x' || encode(ger_hash,'hex')`.
+# An injected GER with NO UHC log is excluded here and caught by the separate
+# UHC count/content assertions, which is where that defect belongs.
+wb_ger() { # window predicate for ger_entries (alias `g`) — via the Miden-space UHC log
+    [[ -n "${SNAP_BLOCK:-}" ]] || { echo ""; return; }
+    echo "AND EXISTS (SELECT 1 FROM synthetic_logs l \
+                      WHERE l.topics[1] LIKE '0x65d3bf36%' \
+                        AND lower(l.topics[2]) = '0x' || encode(g.ger_hash,'hex') \
+                        AND l.block_number <= $SNAP_BLOCK)"
 }
 counts() {  # -> "uhc inj bridge claim"  (integers, for logging + thinness gate)
     local uhc inj bridge claim w; w=$(wb)
     uhc=$(pgq "SELECT count(*) FROM synthetic_logs WHERE topics[1] LIKE '0x65d3bf36%' $w")
-    inj=$(pgq "SELECT count(*) FROM ger_entries WHERE is_injected=true $w")
+    inj=$(pgq "SELECT count(*) FROM ger_entries g WHERE g.is_injected=true $(wb_ger)")
     bridge=$(pgq "SELECT count(*) FROM synthetic_logs WHERE topics[1] LIKE '0x50178120%' $w")
     claim=$(pgq "SELECT count(*) FROM synthetic_logs WHERE topics[1] LIKE '0x1df3f2a9%' $w")
     echo "$uhc $inj $bridge $claim"
