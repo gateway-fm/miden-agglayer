@@ -159,11 +159,22 @@ log "Step 3/5: Waiting for certificate settlement on AggLayer..."
 wait_for "certificate settled" \
     "docker logs --since $TEST_START_TIME $AGGKIT_CONTAINER 2>&1 | grep 'changed status.*Settled' | grep -vE 'NewLocalExitRoot: (0x0+,|0x27ae5ba08d7291c96c8cbddcc148bf48a6d68c7974b94356f53754ef6171d757)' | grep -q 'NewLocalExitRoot'" \
     900 10 \
-    "echo '--- aggkit: certificate lifecycle ---'; \
+    "echo '--- aggkit: L2 bridgesync (does aggsender have anything to certify?) ---'; \
      docker logs --since $TEST_START_TIME $AGGKIT_CONTAINER 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' \
-       | grep -aiE 'certificate|aggsender|changed status|error' | tail -30; \
-     echo '--- aggkit: last 15 lines ---'; \
-     docker logs --tail 15 $AGGKIT_CONTAINER 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g'; \
+       | grep -aiE 'bridgesync|block [0-9]+ processed|l2bridgesync' | tail -20; \
+     echo '--- aggkit: certificate lifecycle (build/send, not just the status checker) ---'; \
+     docker logs --since $TEST_START_TIME $AGGKIT_CONTAINER 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' \
+       | grep -aiE 'building certificate|sending certificate|certificate sent|changed status|no bridges|epoch' | tail -20; \
+     echo '--- aggkit: errors/warnings ---'; \
+     docker logs --since $TEST_START_TIME $AGGKIT_CONTAINER 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' \
+       | grep -aiE 'ERROR|WARN' | tail -20; \
+     echo '--- aggkit: restarts ---'; \
+     docker inspect -f 'RestartCount={{.RestartCount}} StartedAt={{.State.StartedAt}}' $AGGKIT_CONTAINER 2>&1; \
+     echo '--- proxy: projector cursors + tip (aggkit cannot sync past a stalled synthetic tip) ---'; \
+     docker exec ${COMPOSE_PROJECT_NAME:-miden-agglayer}-agglayer-postgres-1 psql -U agglayer -d agglayer_store -tAc \
+       'SELECT projector_cursor, reconcile_cursor, latest_block_number FROM service_state WHERE id=1' 2>&1; \
+     docker logs --tail 3000 ${COMPOSE_PROJECT_NAME:-miden-agglayer}-miden-agglayer-1 2>&1 \
+       | sed -E 's/\x1b\[[0-9;]*m//g' | grep -a 'synthetic projector tick' | tail -2; \
      echo '--- agglayer: errors + last 15 lines ---'; \
      docker logs --since $TEST_START_TIME ${COMPOSE_PROJECT_NAME:-miden-agglayer}-agglayer-1 2>&1 \
        | sed -E 's/\x1b\[[0-9;]*m//g' | grep -aiE 'error|reject|invalid|proof' | tail -20; \
