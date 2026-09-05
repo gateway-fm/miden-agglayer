@@ -35,6 +35,19 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# PREFLIGHT: the completeness verdict at the END of this run shells out to
+# bridge-out-tool. Verify it NOW — a missing binary used to surface only after
+# the full ~38 minutes of load had already passed 30/30, turning a 5-second
+# provisioning miss into a wasted run and a red that looked like a product
+# failure.
+_LT_TOOL="${TOOL_BIN:-$(cd "$SCRIPT_DIR/.." && pwd)/target/debug/bridge-out-tool}"
+if [[ ! -x "$_LT_TOOL" ]]; then
+    echo "FATAL: $_LT_TOOL not built — the completeness verdict at the end of this run"
+    echo "       would fail after the load completes. Build it first:"
+    echo "         cargo build --bin bridge-out-tool     (or pass TOOL_BIN=...)"
+    exit 1
+fi
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 FIXTURES_DIR="$PROJECT_DIR/fixtures"
 

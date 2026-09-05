@@ -9,6 +9,24 @@ TS="${BATTERY_TS:-$(date -u +%Y%m%dT%H%M%SZ)}"; R="e2e-results/${BATTERY_TAG:-16
 TSV="$R/results.tsv"; [[ -f "$TSV" ]] || printf 'iter\ttarget\tstatus\tsecs\tlog\n' > "$TSV"
 BASE_ENV=(env -u WITH_WEB3SIGNER -u EXTRA_COMPOSE_FILES)
 
+# ── Preflight: build-or-verify the completeness tool BEFORE any long run ─────
+# loadtest-N30 (38 min), verify-event-completeness and chaos-soak ALL end in the
+# same completeness verdict, which shells out to target/debug/bridge-out-tool.
+# When it is missing they each burn their full runtime and then die on
+#   "FAIL: .../target/debug/bridge-out-tool not built"
+# — the load itself having passed 30/30. Fail here instead, in seconds.
+TOOL="${TOOL_BIN:-target/debug/bridge-out-tool}"
+if [[ ! -x "$TOOL" ]]; then
+    echo "[preflight] $TOOL missing — building it before the battery starts"
+    if ! cargo build --bin bridge-out-tool >"$R/logs/preflight-tool-build.log" 2>&1; then
+        echo "[preflight] FATAL: cargo build --bin bridge-out-tool FAILED (see $R/logs/preflight-tool-build.log)" >&2
+        exit 1
+    fi
+fi
+[[ -x "$TOOL" ]] || { echo "[preflight] FATAL: $TOOL still not executable after build" >&2; exit 1; }
+echo "[preflight] completeness tool OK: $TOOL"
+
+
 matrix() { "$PWD/scripts/e2e-battery-matrix.py" "$TSV" > "$R/MATRIX.md" 2>/dev/null; }
 
 down() { "${BASE_ENV[@]}" make e2e-down >>"$R/logs/down.log" 2>&1; }
