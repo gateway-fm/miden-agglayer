@@ -35,6 +35,11 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib-l2l2.sh"
 
 CLAIM_EVENT_TOPIC="0x1df3f2a973a00d6635911755c260704e95e8a5876997546798770f76396fda4d"
+# Sub-logs and failure evidence go somewhere that outlives the stack: the
+# battery's results directory when it set one, else /tmp.
+R_EVIDENCE_DIR="${BATTERY_RESULTS_DIR:+$BATTERY_RESULTS_DIR/logs}"
+R_EVIDENCE_DIR="${R_EVIDENCE_DIR:-/tmp}"
+mkdir -p "$R_EVIDENCE_DIR" 2>/dev/null || R_EVIDENCE_DIR=/tmp
 E2E_COMPOSE=(docker compose -f "$PROJECT_DIR/docker-compose.e2e.yml" -f "$PROJECT_DIR/docker-compose.l2l2.yml" --env-file "$FIXTURES_DIR/.env")
 PG_CONTAINER="${PG_CONTAINER:-${COMPOSE_PROJECT_NAME}-agglayer-postgres-1}"
 BRIDGE_PG_CONTAINER="${BRIDGE_PG_CONTAINER:-${COMPOSE_PROJECT_NAME}-postgres-1}"
@@ -454,12 +459,57 @@ pass "4d. Consumer (bridge_db sync.claim) durably delivered the recovered claim'
 # the restart), and receipt-check its SettlementTxnHash on L1 (status 0x1, to == RollupManager)
 # — the on-chain proof that the aggsender -> agglayer -> L1 settlement pipeline resumed.
 step "4e: post-recovery Miden->L1 bridge-out (fresh LET leaf), then require a strictly-newer settled cert proven on-chain"
-if ! "$SCRIPT_DIR/e2e-l2-to-l1.sh" > "${TMPDIR:-/tmp}/rr-l2l1.$$.log" 2>&1; then
-    sed -E 's/\x1b\[[0-9;]*m//g' "${TMPDIR:-/tmp}/rr-l2l1.$$.log" 2>/dev/null | tail -6 | sed 's/^/  [l2-to-l1] /'
-    rm -f "${TMPDIR:-/tmp}/rr-l2l1.$$.log" 2>/dev/null || true
-    fail "#148: post-recovery Miden->L1 bridge-out (e2e-l2-to-l1.sh) failed — the recovered stack cannot produce a fresh outbound exit for a new certificate"
+# PRECONDITION: the projector must be AT the Miden tip before a fresh bridge-out
+# is timed. This recovery reset the Miden client store, so the proxy re-imports
+# from genesis; until the projector reaches the tip a brand-new B2AGG note
+# cannot be projected, and e2e-l2-to-l1's 120s "BridgeEvent in eth_getLogs"
+# window would be measured from a lagging cursor. Observed 2026-09-05
+# (iteration 2): the bridge-out landed, and at the moment of failure
+# `projector_cursor=90 reconcile_cursor=154` with the projector's last tick
+# line 3 minutes old — the note was never projected, so no wait on the event
+# side could have helped.
+#
+# This is a WAIT, not a waiver: if the projector never reaches the tip, that is
+# itself the finding and it fails here with the cursors, rather than 120s later
+# as a missing event.
+PROJ_DEADLINE=$(( $(date +%s) + ${RR_PROJECTOR_CATCHUP_SECS:-300} ))
+PROJ_CUR=""; PROJ_TIP=""
+while :; do
+    PROJ_CUR="$(pgq "SELECT projector_cursor FROM service_state WHERE id = 1" || echo "")"
+    PROJ_TIP="$(pgq "SELECT latest_block_number FROM service_state WHERE id = 1" || echo "")"
+    [[ "$PROJ_CUR" =~ ^[0-9]+$ && "$PROJ_CUR" == "$PROJ_TIP" ]] && break
+    [[ $(date +%s) -ge $PROJ_DEADLINE ]] && break
+    sleep 5
+done
+if [[ ! "$PROJ_CUR" =~ ^[0-9]+$ || "$PROJ_CUR" != "$PROJ_TIP" ]]; then
+    log "  --- projector state ---"
+    pgq "SELECT projector_cursor, reconcile_cursor, latest_block_number FROM service_state WHERE id=1" 2>&1 | sed 's/^/    | /'
+    log "  --- last projector tick lines ---"
+    { docker logs --tail 5000 "$AGGLAYER_CONTAINER" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' \
+        | grep -a 'synthetic projector tick' | tail -3 | sed 's/^/    | /'; } || true
+    fail "#148: the projector never reached the synthetic tip within ${RR_PROJECTOR_CATCHUP_SECS:-300}s after the \
+reset-Miden-store recovery (cursor='$PROJ_CUR' tip='$PROJ_TIP') — it is not lagging, it has stopped, and no \
+post-recovery bridge-out could be projected. Lines above give the last tick it logged."
 fi
-rm -f "${TMPDIR:-/tmp}/rr-l2l1.$$.log" 2>/dev/null || true
+log "  projector at the tip (cursor=$PROJ_CUR) — timing the fresh bridge-out from a caught-up state"
+
+RR_L2L1_LOG="$R_EVIDENCE_DIR/rr-post-recovery-l2-to-l1.log"
+if ! "$SCRIPT_DIR/e2e-l2-to-l1.sh" > "$RR_L2L1_LOG" 2>&1; then
+    sed -E 's/\x1b\[[0-9;]*m//g' "$RR_L2L1_LOG" 2>/dev/null | tail -20 | sed 's/^/  [l2-to-l1] /'
+    # The sub-log is KEPT (previously deleted on both paths, which is why an
+    # earlier failure here left nothing to diagnose), and the projector state is
+    # captured while the stack is still up.
+    log "  --- projector state at failure ---"
+    pgq "SELECT projector_cursor, reconcile_cursor, latest_block_number FROM service_state WHERE id=1" 2>&1 | sed 's/^/    | /'
+    log "  --- last projector tick lines ---"
+    { docker logs --tail 5000 "$AGGLAYER_CONTAINER" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' \
+        | grep -a 'synthetic projector tick' | tail -3 | sed 's/^/    | /'; } || true
+    log "  --- proxy warnings/errors since the recovery ---"
+    { docker logs --since "$RECREATE_SINCE" "$AGGLAYER_CONTAINER" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' \
+        | grep -aiE '\bWARN\b|\bERROR\b' | tail -20 | sed 's/^/    | /'; } || true
+    fail "#148: post-recovery Miden->L1 bridge-out (e2e-l2-to-l1.sh) failed — the recovered stack cannot \
+produce a fresh outbound exit for a new certificate. Full sub-log kept at $RR_L2L1_LOG"
+fi
 EMPTY_LER="0x27ae5ba08d7291c96c8cbddcc148bf48a6d68c7974b94356f53754ef6171d757"
 CERT_DEADLINE=$(( $(date +%s) + 300 )); NEW_CERT_HEIGHT=""; NEW_SETTLEMENT_TX=""
 while :; do
