@@ -46,9 +46,14 @@ pub fn install_prometheus_recorder() -> anyhow::Result<metrics_exporter_promethe
 }
 
 /// The exporter configuration (bucket sets) shared by the real installer and
-/// the rendering test, so a histogram that loses its buckets fails a test
+/// the rendering tests, so a histogram that loses its buckets fails a test
 /// instead of silently degrading to summary quantiles in production.
-fn prometheus_builder() -> anyhow::Result<metrics_exporter_prometheus::PrometheusBuilder> {
+///
+/// `pub(crate)` so other modules' tests can build a LOCAL recorder with the
+/// production configuration (see `writer_worker`'s drained-writer gauge
+/// regression) rather than asserting against the process-wide one.
+pub(crate) fn prometheus_builder() -> anyhow::Result<metrics_exporter_prometheus::PrometheusBuilder>
+{
     metrics_exporter_prometheus::PrometheusBuilder::new()
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Full("miden_proof_duration_seconds".to_string()),
@@ -536,7 +541,17 @@ pub fn init_metrics() {
     describe_gauge!(
         "agglayer_writer_inflight_jobs",
         "RD-940: WriteJobs in the in-flight DashMap (Queued + Submitting + \
-         not-yet-TTL'd terminal entries). Informational."
+         not-yet-TTL'd terminal entries). Informational — NOT a drain signal: \
+         terminal entries linger for tx_ttl + sweeper interval after the work \
+         finished. Use agglayer_writer_nonterminal_jobs for that."
+    );
+    describe_gauge!(
+        "agglayer_writer_nonterminal_jobs",
+        "WriteJobs the process still OWES: in-flight entries in Queued or \
+         Submitting state only. Reaches 0 the instant the last job goes \
+         terminal, so this (together with agglayer_writer_queue_depth == 0) \
+         is the writer-drained predicate an operator or a recovery drill \
+         should wait on."
     );
     describe_histogram!(
         "agglayer_writer_job_duration_seconds",

@@ -499,7 +499,7 @@ impl WriterWorkerHandle {
         // The inflight map is the source of truth for "have we accepted this
         // hash?". Insert first, send second; rollback on send failure.
         self.inflight.insert(hash, entry);
-        ::metrics::gauge!("agglayer_writer_inflight_jobs").set(self.inflight.len() as f64);
+        publish_inflight_gauges(&self.inflight);
 
         match self.sender.try_send(job) {
             Ok(()) => {
@@ -511,7 +511,7 @@ impl WriterWorkerHandle {
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.inflight.remove(&hash);
-                ::metrics::gauge!("agglayer_writer_inflight_jobs").set(self.inflight.len() as f64);
+                publish_inflight_gauges(&self.inflight);
                 ::metrics::counter!(
                     "agglayer_writer_queue_full_rejections_total",
                     "kind" => kind.as_str()
@@ -521,11 +521,28 @@ impl WriterWorkerHandle {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.inflight.remove(&hash);
-                ::metrics::gauge!("agglayer_writer_inflight_jobs").set(self.inflight.len() as f64);
+                publish_inflight_gauges(&self.inflight);
                 Err(TryEnqueueError::ShutDown)
             }
         }
     }
+}
+
+/// Publish BOTH in-flight gauges from a single place so they can never drift.
+///
+/// `agglayer_writer_inflight_jobs` counts EVERY tracked entry, including
+/// terminal ones that the TTL sweeper has not evicted yet — up to
+/// `tx_ttl + SWEEPER_INTERVAL` (5m30s by default) after the work finished. It
+/// is therefore useless as an "is the writer idle?" signal: after a burst it
+/// reads positive for minutes with nothing left to do.
+///
+/// `agglayer_writer_nonterminal_jobs` counts only `Queued` + `Submitting` —
+/// work this process still owes — so it reaches 0 the instant the last job
+/// goes terminal. That is the gauge a drain/quiesce check must read.
+fn publish_inflight_gauges(inflight: &DashMap<TxHash, InFlightEntry>) {
+    ::metrics::gauge!("agglayer_writer_inflight_jobs").set(inflight.len() as f64);
+    ::metrics::gauge!("agglayer_writer_nonterminal_jobs")
+        .set(inflight.iter().filter(|e| !e.state.is_terminal()).count() as f64);
 }
 
 // ─── Worker task ─────────────────────────────────────────────────────────────
@@ -610,6 +627,13 @@ impl WriterWorker {
     ) -> (WriterWorkerHandle, oneshot::Sender<()>) {
         let (tx, rx) = mpsc::channel::<WriteJob>(queue_depth);
         let inflight = Arc::new(DashMap::<TxHash, InFlightEntry>::new());
+
+        // Publish the empty state at boot so the series EXISTS before the first
+        // enqueue. A scraper that finds no `agglayer_writer_queue_depth` sample
+        // cannot distinguish "drained" from "proxy not reporting", and a drain
+        // check that treats a missing sample as 0 would pass vacuously.
+        ::metrics::gauge!("agglayer_writer_queue_depth").set(0.0);
+        publish_inflight_gauges(&inflight);
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
 
         let worker = WriterWorker {
@@ -699,8 +723,7 @@ impl WriterWorker {
                         inflight = sweeper_inflight.len(),
                         "writer_worker TTL sweeper evicted aged terminal entries"
                     );
-                    ::metrics::gauge!("agglayer_writer_inflight_jobs")
-                        .set(sweeper_inflight.len() as f64);
+                    publish_inflight_gauges(&sweeper_inflight);
                 }
             }
         });
@@ -734,6 +757,24 @@ impl WriterWorker {
                         );
                         break;
                     };
+                    // Republish the depth on every DEQUEUE, not only on
+                    // enqueue. `try_enqueue` is the only other writer of this
+                    // gauge, so without this the value froze at whatever fill
+                    // level the last successful enqueue observed — typically 1
+                    // — and never came back down. A drained writer reported
+                    // `agglayer_writer_queue_depth 1` forever (observed live
+                    // alongside `agglayer_writer_inflight_jobs 0` on a wholly
+                    // idle stack), which made every "wait for the writer to
+                    // drain" check unsatisfiable: the e2e full-DB-loss drill
+                    // aborted with "NOT quiesced after 180s
+                    // (projector_cursor=155 tip=155 queue=1)" on a pipeline
+                    // that had nothing left to do.
+                    //
+                    // `Receiver::len()` is the buffered-item count, the same
+                    // quantity `queue_depth - Sender::capacity()` computes on
+                    // the enqueue side, so the two publishers agree.
+                    ::metrics::gauge!("agglayer_writer_queue_depth")
+                        .set(self.receiver.len() as f64);
                     self.process(job).await;
                 }
             }
@@ -794,7 +835,7 @@ impl WriterWorker {
                     "outcome" => "pending",
                 )
                 .record(started.elapsed().as_secs_f64());
-                ::metrics::gauge!("agglayer_writer_inflight_jobs").set(self.inflight.len() as f64);
+                publish_inflight_gauges(&self.inflight);
                 return;
             }
             if let Some(mut entry) = self.inflight.get_mut(&hash) {
@@ -828,7 +869,7 @@ impl WriterWorker {
                 "outcome" => "failed",
             )
             .record(started.elapsed().as_secs_f64());
-            ::metrics::gauge!("agglayer_writer_inflight_jobs").set(self.inflight.len() as f64);
+            publish_inflight_gauges(&self.inflight);
             return;
         }
 
@@ -933,7 +974,7 @@ impl WriterWorker {
             "outcome" => outcome_label,
         )
         .record(elapsed);
-        ::metrics::gauge!("agglayer_writer_inflight_jobs").set(self.inflight.len() as f64);
+        publish_inflight_gauges(&self.inflight);
     }
 }
 
@@ -1545,5 +1586,86 @@ mod tests {
             0,
             "unknown signer must return 0"
         );
+    }
+    /// A DRAINED writer must report `agglayer_writer_queue_depth 0` and
+    /// `agglayer_writer_nonterminal_jobs 0`.
+    ///
+    /// Regression for the write-only-on-enqueue gauge: `try_enqueue` was the
+    /// SOLE publisher of `agglayer_writer_queue_depth`, so after the last
+    /// successful enqueue the value froze at the fill level observed at that
+    /// instant — 1 — and the worker dequeuing the job never brought it back
+    /// down. A wholly idle proxy served `agglayer_writer_queue_depth 1`
+    /// alongside `agglayer_writer_inflight_jobs 0` indefinitely, and the e2e
+    /// full-DB-loss drill aborted its pre-drop fingerprint with
+    /// "NOT quiesced after 180s (projector_cursor=155 tip=155 queue=1)"
+    /// against a pipeline that had nothing left to do.
+    ///
+    /// `agglayer_writer_inflight_jobs` is deliberately NOT asserted to be 0
+    /// here: it counts terminal entries until the TTL sweeper evicts them, so
+    /// it stays at 1 right after the job completes. That is exactly why the
+    /// separate non-terminal gauge exists.
+    ///
+    /// Plain `#[test]` with an explicit CURRENT-THREAD runtime, not
+    /// `#[tokio::test]`: `with_local_recorder` installs a THREAD-LOCAL
+    /// recorder, and only a current-thread runtime driven inside that scope
+    /// runs the spawned worker task on the same thread, so the worker's
+    /// emissions land in this test's recorder instead of being dropped.
+    #[test]
+    fn drained_writer_reports_zero_queue_depth_and_zero_nonterminal() {
+        let recorder = crate::metrics::prometheus_builder()
+            .expect("builder config must be valid")
+            .build_recorder();
+        let handle_m = recorder.handle();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let service = crate::test_helpers::create_test_service();
+                let (handle, _shutdown) =
+                    WriterWorker::spawn(service.clone(), 8, Duration::from_secs(60));
+
+                let calldata = crate::ger::insertGlobalExitRootCall {
+                    root: FixedBytes::from([0xCDu8; 32]),
+                }
+                .abi_encode();
+                let (env, signer, hash) = encode_legacy_envelope(calldata);
+                let job = DecodedWriteCall::Ger {
+                    ger_bytes: [0xCDu8; 32],
+                }
+                .into_job(env, signer, hash);
+                handle.try_enqueue(job).expect("enqueue must succeed");
+
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    if let Some(entry) = handle.get_inflight(&hash)
+                        && entry.state.is_terminal()
+                    {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() <= deadline,
+                        "worker did not finish within 10s"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                // The gauge is published by the worker task; yield until it
+                // has actually run past its post-dispatch publication point.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            });
+        });
+
+        let rendered = handle_m.render();
+        for want in [
+            "agglayer_writer_queue_depth 0",
+            "agglayer_writer_nonterminal_jobs 0",
+        ] {
+            assert!(
+                rendered.lines().any(|l| l == want),
+                "drained writer did not report `{want}`. Rendered:\n{rendered}"
+            );
+        }
     }
 }
