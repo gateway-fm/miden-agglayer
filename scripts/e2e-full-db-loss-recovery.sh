@@ -383,7 +383,12 @@ step "Phase 0 — pre-drop fingerprint (accumulated state is the fixture)"
 # drill needs both: wait for the projector to catch up and the writer to drain,
 # then compare pre vs post at exactly that projected height.
 . "$PROJECT_DIR/scripts/lib-quiesce.sh"
-quiesce_projection "${QUIESCE_TIMEOUT_SECS:-300}" \
+# 600s, not 180: quiescing is now a NO-PENDING-WORK gate (writer drained, store
+# drained, L1 GER injected, log count stable), and after a chaos storm or a 30-way
+# load run the pipeline legitimately needs minutes to get there. A ceiling that
+# expires while the system is still draining turns host load into a fake product
+# failure. On a quiet stack this costs nothing — it quiesces in ~10s.
+quiesce_projection "${QUIESCE_TIMEOUT_SECS:-600}" \
     || fail "projection never quiesced — refusing to fingerprint a moving pipeline"
 
 # BELT AND BRACES. Quiescing proves nothing is PENDING; it cannot stop the
