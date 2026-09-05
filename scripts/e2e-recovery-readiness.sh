@@ -128,9 +128,13 @@ docker exec "$PG_CONTAINER" pg_dump -U agglayer agglayer_store > "$BACKUP" 2>/de
 # exercised (review blocker 6). Take them down for the whole repair window; they
 # are brought back and asserted-settled only after /health flips to 200.
 MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" "${E2E_COMPOSE[@]}" stop miden-agglayer aggkit bridge-service bridge-autoclaim >/dev/null 2>&1
-for c in aggkit bridge-service bridge-autoclaim; do
+# The PROXY is in that stop list too and was the one service never verified.
+# If it kept running, its repair backlog is whatever it seeded at ITS boot —
+# empty — so /health answers 200 the instant we poll and the withhold assertion
+# fails against a proxy that was never restarted at all. Check it first.
+for c in miden-agglayer aggkit bridge-service bridge-autoclaim; do
     [[ "$(docker inspect -f '{{.State.Running}}' "${COMPOSE_PROJECT_NAME}-${c}-1" 2>/dev/null)" == "false" ]] \
-        || fail "#148: consumer '$c' is still running — it must be gated OFF during the calldata repair"
+        || fail "#148: '$c' is still running after \`compose stop\` — the repair window was never actually entered"
 done
 pass "Consumers gated OFF (aggkit, bridge-service, bridge-autoclaim stopped) for the repair window"
 # RETAIN Postgres; only remove the claim's calldata envelope (transaction_logs
@@ -175,13 +179,32 @@ pass "Miden store reset (as root, via shared mount): removed ${BASH_REMATCH[1]} 
     || fail "#148: the claim tx envelope should be gone"
 pass "Induced: claim envelope blanked (retained ClaimEvent), reconcile cursor reset, Miden store reset"
 
+# Mark the restart boundary so the boot evidence below reads only THIS boot's
+# log, never the pre-induce process's.
+PROXY_STARTED_BEFORE="$(docker inspect -f '{{.State.StartedAt}}' "$AGGLAYER_CONTAINER" 2>/dev/null || echo unknown)"
 MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" "${E2E_COMPOSE[@]}" start miden-agglayer >/dev/null 2>&1
+PROXY_STARTED_AFTER="$(docker inspect -f '{{.State.StartedAt}}' "$AGGLAYER_CONTAINER" 2>/dev/null || echo unknown)"
+[[ "$PROXY_STARTED_AFTER" != "$PROXY_STARTED_BEFORE" ]] \
+    || fail "#148: the proxy container did not restart (StartedAt unchanged at $PROXY_STARTED_BEFORE) — nothing re-seeded the repair backlog, so any /health reading is from the pre-induce process"
 # Wait for the HTTP server itself to be up (health responds at all, even 503),
 # so a connection-refused during boot is not mistaken for readiness.
 for _i in $(seq 1 90); do
     [[ "$(proxy_health_code)" != "000" ]] && break
     sleep 2
 done
+
+# BOOT EVIDENCE. main.rs seeds the durable repair backlog ONCE, before the HTTP
+# server can serve, and logs exactly one of two lines. Which one it logged
+# decides product-vs-test for every outcome below, so capture it before
+# asserting anything:
+#   "recovery readiness gated: ..."  claims_awaiting_calldata=N  (N>=1)
+#   "claim-calldata repair backlog empty — recovery readiness open"
+SEED_LOG="$(docker logs --since "$PROXY_STARTED_BEFORE" "$AGGLAYER_CONTAINER" 2>&1 \
+    | grep -E 'recovery readiness gated|claim-calldata repair backlog empty' | tail -1 || true)"
+SEEDED_BACKLOG="$(sed -n 's/.*claims_awaiting_calldata[= ]*\([0-9]\+\).*/\1/p' <<<"$SEED_LOG" | tail -1)"
+log "#148 boot evidence: seed log line: ${SEED_LOG:-<none captured>}"
+log "#148 boot evidence: backlog table now: $(pgi "SELECT COUNT(*) FROM claim_calldata_repair_pending" 2>/dev/null || echo '<unreadable>')"
+log "#148 boot evidence: /health right now: $(proxy_health_code) $(proxy_health_body)"
 
 # ── 1. Readiness is WITHHELD while the claim calldata is missing ──────────────
 # The gating PROPERTY: while any historical ClaimEvent still lacks its calldata, /health is
@@ -208,8 +231,19 @@ while [[ $(date +%s) -lt $RECOV_DEADLINE ]]; do
     fi
     sleep 0.3
 done
-[[ "$SAW_WITHHELD" == "1" ]] \
-    || fail "#148: never observed /health=503 with claims_awaiting_calldata>=1 — the readiness gate did NOT hold while calldata was missing"
+if [[ "$SAW_WITHHELD" != "1" ]]; then
+    log "#148 diagnosis: seed line was: ${SEED_LOG:-<none>}"
+    log "#148 diagnosis: seeded backlog was: ${SEEDED_BACKLOG:-<unparsed>}"
+    docker logs --since "$PROXY_STARTED_BEFORE" "$AGGLAYER_CONTAINER" 2>&1 | tail -40 | sed 's/^/    | /'
+    if [[ "${SEEDED_BACKLOG:-0}" -ge 1 ]]; then
+        fail "#148: the backlog WAS seeded (claims_awaiting_calldata=$SEEDED_BACKLOG) but /health was never \
+observed at 503 — either the repair closed the window before the socket accepted a poll, or the gate is \
+not wired to the seeded backlog. Boot log above decides which."
+    fi
+    fail "#148: never observed /health=503 with claims_awaiting_calldata>=1 — the readiness gate did NOT \
+hold while calldata was missing. The seed reported NO backlog at boot (line: ${SEED_LOG:-<none>}), so the \
+gate had nothing to gate: seeding, not serving, is where to look."
+fi
 pass "1. Readiness WITHHELD: /health=503 (claims_awaiting_calldata>=1) while the claim calldata was missing"
 [[ "$READY" == "1" ]] || fail "#148: /health never returned to 200 after the calldata repair (repair stalled?)"
 pass "1b. Readiness flipped to 200 once the calldata repair completed"
