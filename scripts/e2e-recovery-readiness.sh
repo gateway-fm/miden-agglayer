@@ -306,6 +306,10 @@ log "  pre-recovery snapshots: proxy served $CLAIM_TX_LC ${SERVES_BEFORE}x (incl
 docker exec "$BRIDGE_PG_CONTAINER" psql -U bridge_user -d bridge_db \
     -c "DROP SCHEMA IF EXISTS sync CASCADE; DROP SCHEMA IF EXISTS mt CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO bridge_user;" >/dev/null 2>&1 \
     || fail "#148: failed to drop bridge_db for the realistic resync (finding #65)"
+# Boundary for the serve-window count in 4c. `docker logs --since` needs an
+# instant that is definitely before the recreate and definitely after this
+# script's own step-2 read.
+RECREATE_SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" \
     "${E2E_COMPOSE[@]}" up -d --no-deps --force-recreate aggkit bridge-service bridge-autoclaim >/dev/null 2>&1
 # wait_for runs its predicate as a COMMAND (`"$@"` after `shift 3`), not an eval'd string,
@@ -376,16 +380,38 @@ pass "4b. aggkit's OWN L2BridgeSyncer re-processed the recovered claim from a FR
 # SERVES_BEFORE (incl. this script's own step-2 read) BEFORE the recreate, and now require a
 # STRICT increase — a serve that can ONLY be aggkit's post-reset re-fetch, never the test.
 # Correlated with 4b (aggkit demonstrably re-processed the claim's block), the new serve is its.
-SERVE_DEADLINE=$(( $(date +%s) + 240 )); SERVES_AFTER="$SERVES_BEFORE"
+# COUNT THE WINDOW, NOT A DELTA. The previous form compared two totals taken
+# from `docker logs --tail 20000`: once the proxy emits more than that many
+# lines — which it does under any real traffic — the window slides past the old
+# serve lines and the "after" total can hold or FALL while new serves are
+# arriving. A strict-increase test over a sliding tail is not a measurement of
+# anything. `--since` the recreate instant counts exactly the serves that
+# happened after it, so the assertion is >= 1 and cannot be defeated by log
+# volume.
+serve_count_since() {
+    docker logs --since "$1" "$PROXY_CONTAINER" 2>&1 \
+        | sed -E 's/\x1b\[[0-9;]*m//g' | grep -iF 'served stored tx' | grep -icF "$CLAIM_TX_LC" || true
+}
+SERVE_DEADLINE=$(( $(date +%s) + ${SERVE_WAIT_SECS:-240} )); SERVES_WINDOW=0
 while :; do
-    SERVES_AFTER="$(serve_count)"; SERVES_AFTER="${SERVES_AFTER:-0}"
-    [[ "$SERVES_AFTER" -gt "$SERVES_BEFORE" ]] && break
+    SERVES_WINDOW="$(serve_count_since "$RECREATE_SINCE")"; SERVES_WINDOW="${SERVES_WINDOW:-0}"
+    [[ "$SERVES_WINDOW" -ge 1 ]] && break
     [[ $(date +%s) -ge $SERVE_DEADLINE ]] && break
     sleep 5
 done
-[[ "$SERVES_AFTER" -gt "$SERVES_BEFORE" ]] \
-    || fail "#148: the proxy did NOT serve the exact recovered hash $CLAIM_TX_LC to aggkit after force-recreate (serve count stuck at $SERVES_BEFORE within 240s) — aggkit did not re-fetch THIS claim's calldata (only a block number advanced)"
-pass "4c. Proxy served the EXACT recovered hash to aggkit AFTER force-recreate (serve count $SERVES_BEFORE -> $SERVES_AFTER) — a genuinely NEW aggkit-driven fetch of THIS claim, not the test re-reading"
+if [[ "$SERVES_WINDOW" -lt 1 ]]; then
+    echo "  --- proxy serves since $RECREATE_SINCE (any hash) ---"
+    docker logs --since "$RECREATE_SINCE" "$PROXY_CONTAINER" 2>&1 \
+        | sed -E 's/\x1b\[[0-9;]*m//g' | grep -iF 'served stored tx' | tail -10 | sed 's/^/    | /'
+    echo "  --- aggkit bridgesync since the recreate ---"
+    docker logs --since "$RECREATE_SINCE" "$AGGKIT_CONTAINER" 2>&1 \
+        | sed -E 's/\x1b\[[0-9;]*m//g' | grep -aiE 'bridgesync|claim' | tail -10 | sed 's/^/    | /'
+    fail "#148: in the ${SERVE_WAIT_SECS:-240}s after the force-recreate the proxy served the recovered \
+hash $CLAIM_TX_LC ZERO times (whole-history serve total before the recreate: $SERVES_BEFORE; aggkit \
+re-processed to block $AGGKIT_MAXBLK >= $CLAIM_BLOCK). aggkit advanced past the claim's block without \
+re-fetching THIS claim's calldata — the lines above say whether it fetched anything at all."
+fi
+pass "4c. Proxy served the EXACT recovered hash to aggkit AFTER force-recreate ($SERVES_WINDOW serve(s) inside the post-recreate window; $SERVES_BEFORE over all prior history) — a genuinely NEW aggkit-driven fetch of THIS claim, not the test re-reading"
 
 # ── 4d. CONSUMER-SIDE exact global index (PR #151 round 3, gap 2) ────────────────────
 # The exact GI was bound INSIDE the proxy (ClaimEvent<->calldata, at PRE). Now require the
