@@ -59,6 +59,7 @@ fi
 PROJECT="${PROXY_CONTAINER%-miden-agglayer-1}"
 PG_CONTAINER="$PROJECT-agglayer-postgres-1"
 NTX_CONTAINER="$PROJECT-ntx-builder-1"
+AGGKIT_CONTAINER="$PROJECT-aggkit-1"
 export COMPOSE_PROJECT_NAME="$PROJECT"
 
 # Verify the postgres we are about to DROP is THIS proxy's configured store:
@@ -382,8 +383,42 @@ step "Phase 0 — pre-drop fingerprint (accumulated state is the fixture)"
 # drill needs both: wait for the projector to catch up and the writer to drain,
 # then compare pre vs post at exactly that projected height.
 . "$PROJECT_DIR/scripts/lib-quiesce.sh"
-quiesce_projection "${QUIESCE_TIMEOUT_SECS:-180}" \
+quiesce_projection "${QUIESCE_TIMEOUT_SECS:-300}" \
     || fail "projection never quiesced — refusing to fingerprint a moving pipeline"
+
+# BELT AND BRACES. Quiescing proves nothing is PENDING; it cannot stop the
+# aggoracle from starting something NEW one second later. With the pipeline
+# proven drained, freeze the source of unsolicited work for the whole
+# fingerprint window (Phase 0 capture through the Phase 3 comparison) so the
+# before/after pair provably covers the same history.
+#
+# ORDER MATTERS: quiesce FIRST, freeze SECOND. Freezing before quiescing would
+# strand any GER the aggoracle had accepted-but-not-yet-submitted, and
+# condition (c) — "L1's current root is already injected" — could then never
+# become true.
+FROZE_AGGKIT=0
+unfreeze_aggkit() {
+    [[ "$FROZE_AGGKIT" == "1" ]] || return 0
+    FROZE_AGGKIT=0
+    docker start "$AGGKIT_CONTAINER" >/dev/null 2>&1 \
+        && say "aggkit restarted" \
+        || echo "WARN: could not restart $AGGKIT_CONTAINER — the stack is left with aggkit DOWN" >&2
+}
+# Fires on fail()/set -e too: leaving another test's stack with aggkit stopped
+# would poison every scenario that runs after this one.
+trap unfreeze_aggkit EXIT
+if [[ "${FREEZE_AGGKIT:-1}" == "1" ]] && docker inspect "$AGGKIT_CONTAINER" >/dev/null 2>&1; then
+    docker stop "$AGGKIT_CONTAINER" >/dev/null && FROZE_AGGKIT=1 \
+        && say "aggkit frozen for the fingerprint window ($AGGKIT_CONTAINER)"
+    # Re-confirm on the frozen stack. Short: everything already held once, this
+    # only proves the freeze itself did not leave something half-done.
+    quiesce_projection 90 2 \
+        || fail "projection did not re-quiesce after freezing aggkit"
+else
+    say "aggkit NOT frozen (FREEZE_AGGKIT=${FREEZE_AGGKIT:-1}, container present: \
+$(docker inspect "$AGGKIT_CONTAINER" >/dev/null 2>&1 && echo yes || echo no))"
+fi
+
 SNAP_BLOCK=$(projected_height)
 [[ -n "$SNAP_BLOCK" && "$SNAP_BLOCK" =~ ^[0-9]+$ ]] || fail "could not read projector_cursor for the comparison window"
 say "comparison window: blocks <= $SNAP_BLOCK (quiesced projector cursor)"
@@ -559,6 +594,10 @@ pass "hash_chain_value identical (order-faithful replay)"
 [[ "$CL1" == "$CL0" ]] || fail_with_diff "#69/#136 ClaimEvent (all fields except tx_hash)" \
     "/tmp/fdl-claim-before-${RUN_SUFFIX}.txt" "/tmp/fdl-claim-after-${RUN_SUFFIX}.txt" "$CL0" "$CL1"
 pass "BridgeEvent (count $NBR1) + ClaimEvent (count $NCL1) rows identical"
+
+# The fingerprint window is closed: every before/after comparison is made.
+# Phase 4 needs the aggoracle running again (it asserts a NEW GER gets injected).
+unfreeze_aggkit
 
 # ── Phase 4: no poison minted, pipeline alive ────────────────────────────────
 step "Phase 4 — no ERR_GER_ALREADY_REGISTERED poison; pipeline processes NEW traffic"

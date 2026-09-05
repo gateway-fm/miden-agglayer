@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 #
-# Projection quiescence — the precondition for any scenario that fingerprints or
-# COUNTS proxy state.
+# Projection quiescence — the precondition for any scenario that fingerprints
+# or COUNTS proxy state.
 #
 # WHY THIS EXISTS
 #
@@ -14,17 +14,39 @@
 # unchanged, eth_getLogs byte-identical — one live injection 13s after the
 # snapshot.
 #
-# Wall-clock sleeps do not fix this; they only narrow the window. Quiesce on the
-# OBSERVED frontier instead: the projector must have caught up to the synthetic
-# tip and the writer queue must be drained, held stable across consecutive
-# samples so an in-flight note cannot land between the check and the snapshot.
+# WHAT "QUIESCED" MEANS HERE
+#
+# NO PENDING WORK ANYWHERE — not "the numbers stopped moving for a bit". Four
+# independent conditions, every one of which must hold on N consecutive
+# samples:
+#
+#   (a) WRITER DRAINED       queue depth 0 AND zero non-terminal writer jobs.
+#   (b) STORE DRAINED        no pending receipts, no PREPARED note handoffs,
+#                            no parked future-nonce txns.
+#   (c) NOTHING LEFT TO      L1's current global exit root is already present
+#       INJECT               in ger_entries with is_injected=true.
+#   (d) NOTHING LANDING      the synthetic LOG COUNT is unchanged across the
+#                            samples (and the projector has caught up to tip).
+#
+# An earlier revision of this file asserted only "cursor == tip and the writer
+# queue is not GROWING", justified by an observed non-zero FLOOR on
+# `agglayer_writer_queue_depth`. There was no floor: the gauge was published
+# only on enqueue and never on dequeue, so it froze at the last enqueue's fill
+# level (1) forever — the drill's "NOT quiesced after 180s
+# (projector_cursor=155 tip=155 queue=1)" was a stale metric on an idle
+# pipeline, not a stuck job. Fixed in the service; this file now demands a
+# genuine zero.
+#
+# (d) counts LOGS, not block height. Miden keeps producing empty blocks whether
+# or not the pipeline has work, so a stable block height proves nothing; a
+# stable log count is the actual statement "no new event was projected".
 #
 # Callers must define pgq() (psql -tAc against the proxy store) before sourcing,
 # or set PG_CONTAINER. Metrics come from ${L2_RPC:-http://localhost:8546}/metrics.
 #
 # Usage:
 #   . "$PROJECT_DIR/scripts/lib-quiesce.sh"
-#   quiesce_projection 180 || fail "pipeline never quiesced"
+#   quiesce_projection 300 || fail "pipeline never quiesced"
 #   SNAP_BLOCK=$(projected_height)     # bound every comparison to this
 
 _q_pgq() {
@@ -32,59 +54,160 @@ _q_pgq() {
     else docker exec "${PG_CONTAINER:-miden-agglayer-agglayer-postgres-1}" \
              psql -U agglayer -d agglayer_store -tAc "$1"; fi
 }
+_q_int() { local v; v=$(_q_pgq "$1" | tr -d '[:space:]'); echo "${v:-}"; }
 _q_metric() { # $1 = metric name -> value or empty
     curl -sf --max-time 5 "${L2_RPC:-http://localhost:8546}/metrics" 2>/dev/null \
         | awk -v m="$1" '$1==m {print $2; exit}'
 }
 
 # The frontier of what this store has actually projected.
-projected_height() { _q_pgq "SELECT projector_cursor FROM service_state WHERE id=1" | tr -d '[:space:]'; }
+projected_height() { _q_int "SELECT projector_cursor FROM service_state WHERE id=1"; }
 
-# True when the projector has caught up to the synthetic tip and nothing is
-# queued in the writer.
+# ── (c) helper: L1's current GER ─────────────────────────────────────────────
+# Resolved from the L1 BRIDGE contract's own `globalExitRootManager()` rather
+# than a hardcoded address, so a redeployed fixture cannot silently point this
+# check at a dead contract and make it vacuous.
+QUIESCE_L1_RPC="${QUIESCE_L1_RPC:-${L1_RPC:-http://localhost:8545}}"
+QUIESCE_L1_BRIDGE="${QUIESCE_L1_BRIDGE:-${L1_BRIDGE_ADDRESS:-${BRIDGE_ADDRESS:-0xC8cbEBf950B9Df44d987c8619f092beA980fF038}}}"
+_Q_GER_MANAGER=""
+_q_ger_manager() {
+    [[ -n "$_Q_GER_MANAGER" ]] && { echo "$_Q_GER_MANAGER"; return 0; }
+    command -v cast >/dev/null 2>&1 || return 1
+    _Q_GER_MANAGER=$(cast call --rpc-url "$QUIESCE_L1_RPC" "$QUIESCE_L1_BRIDGE" \
+        'globalExitRootManager()(address)' 2>/dev/null | tr -d '[:space:]')
+    [[ "$_Q_GER_MANAGER" =~ ^0x[0-9a-fA-F]{40}$ ]] || { _Q_GER_MANAGER=""; return 1; }
+    echo "$_Q_GER_MANAGER"
+}
+_q_l1_ger() {
+    local mgr; mgr=$(_q_ger_manager) || return 1
+    cast call --rpc-url "$QUIESCE_L1_RPC" "$mgr" 'getLastGlobalExitRoot()(bytes32)' 2>/dev/null \
+        | tr -d '[:space:]' | tr 'A-F' 'a-f'
+}
+
+# ── The predicate ────────────────────────────────────────────────────────────
+# Sets _Q_WHY to the FIRST unmet condition (so a timeout can name it) and
+# _Q_LOGS to the current synthetic log count (the caller compares it across
+# samples). Returns 0 only when (a),(b),(c) and cursor==tip all hold.
 _q_settled() {
-    local cur tip depth
-    cur=$(_q_pgq "SELECT projector_cursor FROM service_state WHERE id=1" | tr -d '[:space:]')
-    tip=$(_q_pgq "SELECT latest_block_number FROM service_state WHERE id=1" | tr -d '[:space:]')
-    depth=$(_q_metric agglayer_writer_queue_depth); depth=${depth:-0}
-    [[ -n "$cur" && -n "$tip" ]] || return 1
-    [[ "$cur" == "$tip" ]] || return 1
-    # NOT `depth == 0`: on a live stack this gauge has a non-zero FLOOR (observed
-    # steady at 1 for 180s with cursor == tip == 1098, which made quiescence
-    # unreachable and failed the drill with "projection never quiesced"). The
-    # aggoracle keeps injecting and Miden keeps producing, so "empty" is not a
-    # state this stack reaches. What matters is that the queue is not GROWING —
-    # a rising depth means work is still arriving for the projector.
-    _Q_DEPTH_NOW="${depth%.*}"
+    _Q_WHY=""
+
+    # (a) writer drained — a genuine zero on both gauges.
+    local depth nonterm
+    depth=$(_q_metric agglayer_writer_queue_depth)
+    nonterm=$(_q_metric agglayer_writer_nonterminal_jobs)
+    if [[ -z "$depth" || -z "$nonterm" ]]; then
+        # Refuse to treat an unscrapable /metrics as "drained": that is the
+        # false-green this whole check exists to prevent. A proxy built before
+        # the nonterminal gauge landed also lands here, loudly.
+        _Q_WHY="(a) writer: /metrics did not serve agglayer_writer_queue_depth ('${depth}') \
+and agglayer_writer_nonterminal_jobs ('${nonterm}') — is ${L2_RPC:-http://localhost:8546} up, \
+and is the proxy image new enough to publish both?"
+        return 1
+    fi
+    depth=${depth%.*}; nonterm=${nonterm%.*}
+    if [[ "$depth" != "0" || "$nonterm" != "0" ]]; then
+        _Q_WHY="(a) writer NOT drained: queue_depth=$depth nonterminal_jobs=$nonterm (both must be 0)"
+        return 1
+    fi
+
+    # (b) store drained — nothing durably owed.
+    local pend prep parked
+    pend=$(_q_int   "SELECT count(*) FROM transactions WHERE status='pending'")
+    prep=$(_q_int   "SELECT count(*) FROM tx_note_links WHERE handoff_state='prepared'")
+    parked=$(_q_int "SELECT count(*) FROM queued_txns")
+    if [[ -z "$pend" || -z "$prep" || -z "$parked" ]]; then
+        _Q_WHY="(b) store: could not read the pending counters from postgres (proxy store down?)"
+        return 1
+    fi
+    if [[ "$pend" != "0" || "$prep" != "0" || "$parked" != "0" ]]; then
+        _Q_WHY="(b) store NOT drained: pending receipts=$pend PREPARED handoffs=$prep parked txns=$parked"
+        return 1
+    fi
+
+    # (c) nothing left for the aggoracle to inject.
+    if [[ "${QUIESCE_SKIP_L1_GER:-0}" != "1" ]]; then
+        local l1ger have
+        l1ger=$(_q_l1_ger) || {
+            _Q_WHY="(c) L1 GER: could not read getLastGlobalExitRoot() via \
+${QUIESCE_L1_RPC} (bridge $QUIESCE_L1_BRIDGE). Is 'cast' installed and L1 reachable? \
+Set QUIESCE_SKIP_L1_GER=1 to run without this condition — the run then cannot claim \
+the aggoracle had nothing left to inject."
+            return 1
+        }
+        # Presence, not "is the newest row": ger_entries carries superseded
+        # roots too and same-block rows have no total order, so "the L1 root is
+        # already injected" is the exact statement of "the aggoracle owes
+        # nothing" and is the only one that is well-defined.
+        have=$(_q_int "SELECT count(*) FROM ger_entries \
+                       WHERE is_injected=true AND '0x'||encode(ger_hash,'hex') = '$l1ger'")
+        if [[ "$have" != "1" ]]; then
+            _Q_WHY="(c) L1 GER $l1ger is NOT yet injected on this proxy \
+(matching is_injected rows: ${have:-<read failed>}) — the aggoracle still has work"
+            return 1
+        fi
+    fi
+
+    # (d) prerequisite: the projector has reached the synthetic tip. The log
+    # count stability itself is checked by the caller across samples.
+    local cur tip
+    cur=$(projected_height)
+    tip=$(_q_int "SELECT latest_block_number FROM service_state WHERE id=1")
+    if [[ -z "$cur" || -z "$tip" ]]; then
+        _Q_WHY="(d) projector: could not read projector_cursor/latest_block_number"
+        return 1
+    fi
+    if [[ "$cur" != "$tip" ]]; then
+        _Q_WHY="(d) projector behind: cursor=$cur tip=$tip"
+        return 1
+    fi
+
+    _Q_LOGS=$(_q_int "SELECT count(*) FROM synthetic_logs")
+    [[ -n "$_Q_LOGS" ]] || { _Q_WHY="(d) could not count synthetic_logs"; return 1; }
     return 0
 }
 
 # quiesce_projection [timeout_secs] [stable_samples]
-# NOTE: "quiesced" here means STEADY, not IDLE. This stack never goes idle.
-# Requires the settled condition to hold on N CONSECUTIVE samples AND the
-# projected height to be unchanged across them — a single settled reading can be
-# a gap between two injections.
+# Every condition must hold on `stable_samples` CONSECUTIVE samples 5s apart,
+# with the synthetic LOG COUNT identical across all of them. One settled
+# reading can be the gap between two injections.
+# Seconds between samples. Only the predicate unit test moves this; a real run
+# wants a gap wide enough for a slow write to become visible. CLAMPED TO >= 1:
+# the loop charges this value against the timeout, so 0 would spin forever and
+# a "timeout" that never expires is a hang, not a check.
+_Q_SAMPLE_SECS="${QUIESCE_SAMPLE_SECS:-5}"
+[[ "$_Q_SAMPLE_SECS" =~ ^[0-9]+$ ]] && (( _Q_SAMPLE_SECS >= 1 )) || _Q_SAMPLE_SECS=1
+
 quiesce_projection() {
-    local timeout="${1:-180}" want="${2:-3}" waited=0 ok=0 prev="" h
+    local timeout="${1:-300}" want="${2:-3}" waited=0 ok=0 prev_logs="" h
+    _Q_WHY="(never sampled)"
     while (( waited < timeout )); do
         if _q_settled; then
-            h=$(projected_height)
-            # Both the projected height AND the queue depth must be unchanged
-            # across consecutive samples: height stable == nothing new projected,
-            # depth non-growing == nothing new queued. A steady non-zero depth is
-            # fine; a climbing one is not.
-            if [[ "$h" == "$prev" ]] && [[ "${_Q_DEPTH_NOW:-0}" -le "${prev_depth:-999999}" ]]; then
+            if [[ "$_Q_LOGS" == "$prev_logs" ]]; then
                 ok=$((ok+1))
             else
                 ok=1
             fi
-            prev="$h"; prev_depth="${_Q_DEPTH_NOW:-0}"
-            (( ok >= want )) && { echo "quiesced at projected height $h (writer depth ${_Q_DEPTH_NOW:-0}, steady)" >&2; return 0; }
+            prev_logs="$_Q_LOGS"
+            if (( ok >= want )); then
+                h=$(projected_height)
+                echo "quiesced: writer drained, store drained, L1 GER injected, \
+$_Q_LOGS synthetic logs stable over $want samples; projected height $h" >&2
+                return 0
+            fi
         else
-            ok=0; prev=""; prev_depth=""
+            ok=0; prev_logs=""
         fi
-        sleep 5; waited=$((waited+5))
+        sleep "$_Q_SAMPLE_SECS"; waited=$((waited+_Q_SAMPLE_SECS))
     done
-    echo "NOT quiesced after ${timeout}s (projector_cursor=$(projected_height) tip=$(_q_pgq "SELECT latest_block_number FROM service_state WHERE id=1") queue=$(_q_metric agglayer_writer_queue_depth))" >&2
+    echo "NOT quiesced after ${timeout}s — unmet condition: ${_Q_WHY:-(log count never stable: last=${prev_logs:-?})}" >&2
+    if [[ -z "$_Q_WHY" ]]; then
+        echo "  all four conditions held but the synthetic log count kept moving \
+(last stable-run length $ok/$want, last count ${prev_logs:-?}) — traffic is still arriving" >&2
+    fi
+    echo "  state: cursor=$(projected_height) tip=$(_q_int "SELECT latest_block_number FROM service_state WHERE id=1") \
+queue=$(_q_metric agglayer_writer_queue_depth) nonterminal=$(_q_metric agglayer_writer_nonterminal_jobs) \
+pending=$(_q_int "SELECT count(*) FROM transactions WHERE status='pending'") \
+prepared=$(_q_int "SELECT count(*) FROM tx_note_links WHERE handoff_state='prepared'") \
+parked=$(_q_int "SELECT count(*) FROM queued_txns") logs=$(_q_int "SELECT count(*) FROM synthetic_logs")" >&2
     return 1
 }

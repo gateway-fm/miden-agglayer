@@ -86,6 +86,14 @@ test-scripts: ## Syntax-check + run the shell guard test harnesses (no docker ne
 	# itself — so it runs here rather than only inside a docker-bound e2e.
 	bash -n scripts/test-chaos-verdict.sh
 	bash scripts/test-chaos-verdict.sh
+	# The gate in front of every recovery-drill fingerprint. Wrong-lax and it
+	# fingerprints a moving pipeline (spurious #88 data loss); wrong-strict and
+	# the drill never runs at all. Both have happened; both were invisible to
+	# `bash -n`.
+	bash -n scripts/lib-quiesce.sh
+	bash -n scripts/e2e-full-db-loss-recovery.sh
+	bash -n scripts/test-quiesce-predicate.sh
+	bash scripts/test-quiesce-predicate.sh
 
 .PHONY: test-e2e
 test-e2e: ## Spin up docker stack, run E2E tests, tear down (fully self-contained)
