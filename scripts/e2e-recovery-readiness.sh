@@ -310,6 +310,16 @@ docker exec "$BRIDGE_PG_CONTAINER" psql -U bridge_user -d bridge_db \
 # instant that is definitely before the recreate and definitely after this
 # script's own step-2 read.
 RECREATE_SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# How many eth_getTransactionByHash requests the proxy has ANSWERED so far, by
+# any branch. `served stored tx` only fires on the store-first branch, so a zero
+# serve-count is ambiguous between "aggkit never asked" and "aggkit asked and
+# the answer came from a different branch". This counter separates them.
+gettx_requests() {
+    curl -sf --max-time 5 "$L2_RPC/metrics" 2>/dev/null \
+        | awk -F'[ }]' '/^rpc_request_duration_seconds_count\{.*eth_getTransactionByHash/ {print $NF; exit}' \
+        | tr -d '[:space:]'
+}
+GETTX_BEFORE="$(gettx_requests)"; GETTX_BEFORE="${GETTX_BEFORE%.*}"; GETTX_BEFORE="${GETTX_BEFORE:-0}"
 MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" \
     "${E2E_COMPOSE[@]}" up -d --no-deps --force-recreate aggkit bridge-service bridge-autoclaim >/dev/null 2>&1
 # wait_for runs its predicate as a COMMAND (`"$@"` after `shift 3`), not an eval'd string,
@@ -400,15 +410,26 @@ while :; do
     sleep 5
 done
 if [[ "$SERVES_WINDOW" -lt 1 ]]; then
-    echo "  --- proxy serves since $RECREATE_SINCE (any hash) ---"
-    docker logs --since "$RECREATE_SINCE" "$PROXY_CONTAINER" 2>&1 \
-        | sed -E 's/\x1b\[[0-9;]*m//g' | grep -iF 'served stored tx' | tail -10 | sed 's/^/    | /'
+    # EVERY pipeline here ends in `|| true`. `set -euo pipefail` is on and a grep
+    # that matches nothing exits 1 — which is precisely the condition being
+    # diagnosed, so without this the diagnostic block kills the script before it
+    # prints anything. It did exactly that on iteration 1: the header line was
+    # the entire output.
+    GETTX_AFTER="$(gettx_requests)"; GETTX_AFTER="${GETTX_AFTER%.*}"; GETTX_AFTER="${GETTX_AFTER:-0}"
+    echo "  --- eth_getTransactionByHash requests answered by the proxy (any branch) ---"
+    echo "    | before recreate: $GETTX_BEFORE   now: $GETTX_AFTER   delta: $(( GETTX_AFTER - GETTX_BEFORE ))"
+    echo "    | delta 0 => aggkit never asked for ANY tx by hash; delta > 0 => it asked but the"
+    echo "    |            answer did not come from the store-first branch that logs 'served stored tx'."
+    echo "  --- proxy 'served stored tx' since $RECREATE_SINCE (ANY hash) ---"
+    { docker logs --since "$RECREATE_SINCE" "$PROXY_CONTAINER" 2>&1 \
+        | sed -E 's/\x1b\[[0-9;]*m//g' | grep -iF 'served stored tx' | tail -10 | sed 's/^/    | /'; } || true
     echo "  --- aggkit bridgesync since the recreate ---"
-    docker logs --since "$RECREATE_SINCE" "$AGGKIT_CONTAINER" 2>&1 \
-        | sed -E 's/\x1b\[[0-9;]*m//g' | grep -aiE 'bridgesync|claim' | tail -10 | sed 's/^/    | /'
+    { docker logs --since "$RECREATE_SINCE" "$AGGKIT_CONTAINER" 2>&1 \
+        | sed -E 's/\x1b\[[0-9;]*m//g' | grep -aiE 'bridgesync|claim' | tail -10 | sed 's/^/    | /'; } || true
     fail "#148: in the ${SERVE_WAIT_SECS:-240}s after the force-recreate the proxy served the recovered \
 hash $CLAIM_TX_LC ZERO times (whole-history serve total before the recreate: $SERVES_BEFORE; aggkit \
-re-processed to block $AGGKIT_MAXBLK >= $CLAIM_BLOCK). aggkit advanced past the claim's block without \
+re-processed to block $AGGKIT_MAXBLK >= $CLAIM_BLOCK; eth_getTransactionByHash requests answered in \
+that window: $(( ${GETTX_AFTER:-0} - GETTX_BEFORE ))). aggkit advanced past the claim's block without \
 re-fetching THIS claim's calldata — the lines above say whether it fetched anything at all."
 fi
 pass "4c. Proxy served the EXACT recovered hash to aggkit AFTER force-recreate ($SERVES_WINDOW serve(s) inside the post-recreate window; $SERVES_BEFORE over all prior history) — a genuinely NEW aggkit-driven fetch of THIS claim, not the test re-reading"
