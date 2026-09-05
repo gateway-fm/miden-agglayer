@@ -275,5 +275,32 @@ Any scenario that fingerprints or **counts** proxy state must first source
 comparison to `projected_height()`. GER injection runs on the aggoracle's own
 timer, so a snapshot taken while the pipeline is advancing compares a moving
 system — that produced a spurious "#88 GER history was lost or duplicated" on a
-perfectly faithful restore. Wall-clock sleeps only narrow that window; quiesce on
-the observed frontier instead.
+perfectly faithful restore. Wall-clock sleeps only narrow that window.
+
+"Quiesced" means **no pending work**, not "the numbers stopped moving". All four
+of these must hold on N consecutive samples, and the call fails closed — an
+unscrapable `/metrics`, an unreadable store or a missing `cast` blocks rather
+than counting as drained:
+
+| | Condition |
+|---|---|
+| (a) | `agglayer_writer_queue_depth == 0` **and** `agglayer_writer_nonterminal_jobs == 0` |
+| (b) | zero pending receipts, zero `prepared` note handoffs, zero parked future-nonce txns |
+| (c) | L1's `getLastGlobalExitRoot()` is already in `ger_entries` with `is_injected=true` |
+| (d) | the synthetic **log count** — not block height — unchanged across the samples |
+
+Use `agglayer_writer_nonterminal_jobs` (Queued + Submitting), never
+`agglayer_writer_inflight_jobs`: the latter counts terminal entries until the
+TTL sweeper evicts them, up to `tx_ttl + sweeper interval` (5m30s by default)
+after the work finished, so it is not a drain signal.
+
+`scripts/test-quiesce-predicate.sh` (wired into `make test-scripts`) drives the
+predicate on stubs with no docker, failing each condition in isolation.
+
+**Block spaces do not mix.** `SNAP_BLOCK` is the projector cursor, a Miden
+synthetic block height. `synthetic_logs.block_number` is in that space;
+`ger_entries.block_number` is an **L1** block height. Bounding `ger_entries` with
+the Miden-space predicate silently shrank the injected-GER set to a near-empty
+subset and made its digest assertion unfailable — see `wb_ger()` in
+`scripts/e2e-full-db-loss-recovery.sh`, which bounds a GER by its own
+UpdateHashChain log instead.
