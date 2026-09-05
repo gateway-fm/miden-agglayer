@@ -186,7 +186,23 @@ else
     warn "  no claim_watcher_processed row — watcher may not have ticked yet. Proceeding (only synthetic_logs needs deletion to trigger synthesis path)."
 fi
 
-# ── Step 4: Simulate the desync — delete both rows ────────────────────────────
+# ── Step 4: Simulate the desync — STOP the proxy, then delete both rows ───────
+# THE PROXY MUST BE DOWN FIRST. `service_state.projector_cursor` is owned by the
+# running projector — src/synthetic_projector.rs calls it "the single owner of
+# this cursor (SINGLE-PROCESS ONLY)" and persists an advance after every block.
+# Rewinding it from outside a live process is a race the live process wins: a
+# tick already in flight writes its own (higher) value back after the UPDATE,
+# the restart then loads THAT, block N is never re-projected, and the test sees
+# no synthesis with every watcher counter at 0 — observed exactly so
+# (cursor 79 -> 57, restart, cursor read back 83, Δlog=0, counters all 0).
+# Stopping first also makes this a faithful crash shape: the store is mutated
+# while nothing is serving from it.
+step "Stopping the proxy before mutating its store (the projector owns projector_cursor)"
+docker stop "$AGGLAYER_CONTAINER" >/dev/null || fail "could not stop $AGGLAYER_CONTAINER"
+[[ "$(docker inspect -f '{{.State.Running}}' "$AGGLAYER_CONTAINER" 2>/dev/null)" == "false" ]] \
+    || fail "$AGGLAYER_CONTAINER is still running after docker stop — refusing to rewind a cursor its owner may overwrite"
+log "  proxy stopped"
+
 step "Deleting synthetic_logs ClaimEvent row to simulate crash-recovery desync"
 # Fingerprint the row BEFORE deleting it. "A log line appeared" only proves the
 # projector wrote SOMETHING; the claim this test makes is that re-projection
@@ -224,14 +240,20 @@ log "  has_claim_event_for_global_index simulated → false ✓"
 # in that range carries its processed marker (claim_watcher_processed,
 # bridge_out_processed, ger_entries.is_injected) and is an idempotent no-op;
 # only THIS claim, whose marker the test deleted, is re-emitted.
-step "Rewinding projector_cursor to $((CLAIM_BLOCK - 1)) and restarting the proxy"
+step "Rewinding projector_cursor to $((CLAIM_BLOCK - 1)) and starting the proxy"
 CURSOR_BEFORE=$(pgq "SELECT projector_cursor FROM service_state WHERE id = 1;")
-log "  projector_cursor: ${CURSOR_BEFORE} -> $((CLAIM_BLOCK - 1))"
-pgq "UPDATE service_state SET projector_cursor = $((CLAIM_BLOCK - 1)) WHERE id = 1;" >/dev/null \
+REWIND_TO=$((CLAIM_BLOCK - 1))
+log "  projector_cursor: ${CURSOR_BEFORE} -> ${REWIND_TO}"
+pgq "UPDATE service_state SET projector_cursor = ${REWIND_TO} WHERE id = 1;" >/dev/null \
     || fail "could not rewind projector_cursor — the block would never be re-projected"
+# Read it back with the owner still down: this is the value the next boot loads.
+CURSOR_REWOUND=$(pgq "SELECT projector_cursor FROM service_state WHERE id = 1;")
+[[ "$CURSOR_REWOUND" == "$REWIND_TO" ]] \
+    || fail "projector_cursor read back as '${CURSOR_REWOUND}', not ${REWIND_TO} — something else is writing it"
 
-docker restart "$AGGLAYER_CONTAINER" >/dev/null \
-    || fail "could not restart $AGGLAYER_CONTAINER"
+START_SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+docker start "$AGGLAYER_CONTAINER" >/dev/null \
+    || fail "could not start $AGGLAYER_CONTAINER"
 # Wait for the process to be serving again before timing anything on it.
 _w=0
 while (( _w < 180 )); do
@@ -240,6 +262,19 @@ while (( _w < 180 )); do
 done
 (( _w < 180 )) || fail "proxy did not serve /health within 180s after the restart"
 log "  proxy back up after ${_w}s"
+
+# Close the race conclusively: the projector logs the cursor it LOADED at boot.
+# Without this, "cursor is at the tip" is equally consistent with "replayed
+# blocks ${REWIND_TO}+1.. " and "started at the tip and replayed nothing".
+BOOT_CURSOR=$(docker logs --since "$START_SINCE" "$AGGLAYER_CONTAINER" 2>&1 \
+    | sed -E 's/\x1b\[[0-9;]*m//g' \
+    | grep -a 'projection cursor loaded' | tail -1 \
+    | sed -nE 's/.*projector_cursor[:= ]+([0-9]+).*/\1/p')
+[[ "$BOOT_CURSOR" == "$REWIND_TO" ]] \
+    || fail "the projector booted with projector_cursor='${BOOT_CURSOR:-<not logged>}', not the rewound \
+${REWIND_TO} — block ${CLAIM_BLOCK} was never scheduled for re-projection, so nothing below would be a \
+test of the synthesis path. (If the value is empty the proxy image predates the boot-cursor log line.)"
+log "  projector booted at cursor ${BOOT_CURSOR} — block ${CLAIM_BLOCK} is scheduled for re-projection"
 
 step "Waiting (<=${SYNC_WAIT_SECS}s) for the projector to re-project block ${CLAIM_BLOCK}"
 _w=0; CURSOR_NOW=""
