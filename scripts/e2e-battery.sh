@@ -76,7 +76,14 @@ for iter in $(seq 1 "${ITERATIONS:-4}"); do
 
   # (e) chaos, then the drill again on the messy post-chaos state
   run "$iter" "chaos-soak" keep env N=30 CHAOS_DURATION=300 GARBO_DURATION=300 ./scripts/e2e-chaos-soak.sh
-  run "$iter" "full-db-loss-recovery-postchaos" keep ./scripts/e2e-full-db-loss-recovery.sh
+  # The post-chaos drill runs on a store that ALREADY carries the output of the
+  # pre-chaos drill, so `nonce_ledger_rebuilt` is set and the baseline-provenance
+  # guard would refuse it. Accept that explicitly: this run is a recovery from a
+  # MESSY history (a restore, then 30 bridges of load, then chaos), and the
+  # guard's own warning about restore-vs-restore idempotence is printed into the
+  # log so the verdict is never read as a fresh fidelity comparison. The
+  # fidelity claim is made by `full-db-loss-recovery` above, on a live baseline.
+  run "$iter" "full-db-loss-recovery-postchaos" keep env ALLOW_RESTORED_BASELINE=1 ./scripts/e2e-full-db-loss-recovery.sh
 
   echo "=== ITERATION $iter done $(date -u +%FT%TZ) ===" | tee -a "$R/battery.log"
 done
