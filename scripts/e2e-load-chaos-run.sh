@@ -25,9 +25,18 @@ TSV="$R/results.tsv"; [[ -f "$TSV" ]] || printf 'iter\ttarget\tstatus\tsecs\tlog
 record() { printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" >> "$TSV"
            ./scripts/e2e-battery-matrix.py "$TSV" > "$R/MATRIX.md" 2>/dev/null; }
 
+# ONLY="chaos-soak full-db-loss-recovery-postchaos" runs just those targets, so a
+# harness fix can be re-proven without repeating the 38-minute loadtest in front
+# of it. Unset runs the whole tail.
+ONLY="${ONLY:-}"
+
 # run <target> <command...>
 run() {
     local target="$1"; shift
+    if [[ -n "$ONLY" && " $ONLY " != *" $target "* ]]; then
+        echo "  $target: skipped (ONLY='$ONLY')" | tee -a "$R/load-chaos.log"
+        return 0
+    fi
     local log="$R/logs/${PREFIX}${ITER}-${target}.log" t0=$SECONDS st
     echo "=== $target start $(date -u +%FT%TZ) ===" | tee -a "$R/load-chaos.log"
     if "$@" >"$log" 2>&1; then st=PASS; else st=FAIL; fi
