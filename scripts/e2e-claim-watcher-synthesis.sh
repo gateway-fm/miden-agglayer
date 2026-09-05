@@ -27,13 +27,38 @@
 #   4. DELETE both rows — this simulates the crash-recovery / desync state
 #      where the CLAIM is consumed on Miden but the proxy's store has no
 #      record of the ClaimEvent.
-#   5. Wait for the next Miden sync tick (~15s) — the watcher's `on_post_sync`
-#      enumerates Consumed notes, sees the CLAIM still consumed on-chain
-#      (miden-client sqlite tracks consumed-state independently of our PG),
-#      decodes its storage, finds no ClaimEvent record, and synthesises one.
-#   6. Verify `claim_watcher_synthesised_total` went up by >=1, the ClaimEvent
-#      is recoverable via `has_claim_event_for_global_index`, and no
-#      decode/unrecoverable counters fired.
+#   5. Rewind the persisted projector cursor to just before the claim's
+#      consumption block and RESTART the proxy, which is how that block gets
+#      re-projected (see "WHY A REWIND" below).
+#   6. Verify a ClaimEvent was re-synthesised, BYTE-IDENTICAL to the row that
+#      was deleted, is recoverable via `has_claim_event_for_global_index`, and
+#      that no decode/unrecoverable counters fired.
+#
+# WHY A REWIND, NOT A SYNC-TICK WAIT
+#
+# This test used to delete the rows and wait for the next Miden sync tick, on
+# the premise that a live `ClaimWatcher` SyncListener re-enumerated consumed
+# notes every tick and re-synthesised anything missing from the store. That
+# listener no longer exists: the synthetic-indexer redesign made the
+# SyntheticProjector the SOLE synthetic-event producer (see the module header
+# of src/claim_watcher.rs), and the projector is CURSOR-DRIVEN and FORWARD-ONLY
+# — `tick_pass` projects blocks strictly above an in-memory cursor. A row
+# deleted behind that cursor is never revisited, BY DESIGN: emitting into a
+# sealed block would break eth_getLogs immutability, which is why the
+# completeness auditor alarms on a miss and explicitly never heals it late.
+#
+# So the old wait was unsatisfiable, and it failed for a second reason too: it
+# waited on `miden_sync_state_duration_seconds_count`, a histogram recorded only
+# on the commit-wait hot path, which does not move at all when the test
+# generates no traffic. It observed "only 0 tick(s) in 90s" and then failed with
+# "Sync ticks ARE observed ... so a longer wait is NOT the fix" — a message that
+# contradicted its own measurement.
+#
+# Re-projection is what heals this state, and it needs the cursor moved back.
+# The cursor is an AtomicU64 cached in the projector and loaded once in `new()`,
+# so rewinding the persisted value requires a process restart to take effect —
+# rewind-then-restart IS the operator recovery action, and that is what this
+# test now exercises.
 #
 # Usage:
 #   make e2e-l1-to-l2 && make e2e-claim-watcher && bash scripts/e2e-claim-watcher-synthesis.sh
@@ -46,7 +71,8 @@ PG_PORT="${PG_PORT:-5434}"
 PG_USER="${PG_USER:-agglayer}"
 PG_PASS="${PG_PASS:-agglayer}"
 PG_DB="${PG_DB:-agglayer_store}"
-SYNC_WAIT_SECS="${SYNC_WAIT_SECS:-90}"   # DEADLINE for the tick wait, not a fixed sleep
+SYNC_WAIT_SECS="${SYNC_WAIT_SECS:-90}"   # DEADLINE for the re-projection wait, not a fixed sleep
+AGGLAYER_CONTAINER="${AGGLAYER_CONTAINER:-miden-agglayer-miden-agglayer-1}"
 CLAIM_EVENT_TOPIC="0x1df3f2a973a00d6635911755c260704e95e8a5876997546798770f76396fda4d"
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -139,7 +165,7 @@ BASE_ALREADY=$(counter claim_watcher_already_recorded_total)
 BASE_DECODE=$(counter claim_watcher_storage_decode_total)
 BASE_UNRECOV=$(counter claim_watcher_unrecoverable_total)
 log "  baseline /metrics: synthesised=${BASE_SYNTH} already=${BASE_ALREADY} decode_err=${BASE_DECODE} unrecov=${BASE_UNRECOV}"
-LOG_OFFSET=$(docker logs miden-agglayer-miden-agglayer-1 2>&1 | grep -c "synthesised ClaimEvent" || true)
+LOG_OFFSET=$(docker logs "$AGGLAYER_CONTAINER" 2>&1 | grep -c "synthesised ClaimEvent" || true)
 log "  baseline synthesised log lines: ${LOG_OFFSET}"
 
 # ── Step 2: Locate the ClaimEvent in synthetic_logs ───────────────────────────
@@ -162,6 +188,20 @@ fi
 
 # ── Step 4: Simulate the desync — delete both rows ────────────────────────────
 step "Deleting synthetic_logs ClaimEvent row to simulate crash-recovery desync"
+# Fingerprint the row BEFORE deleting it. "A log line appeared" only proves the
+# projector wrote SOMETHING; the claim this test makes is that re-projection
+# reproduces the SAME event, so capture every field a consumer reads and
+# compare it back at the end.
+CLAIM_ROW_BEFORE=$(pgq "SELECT block_number || '|' || transaction_hash || '|' || encode(block_hash,'hex') \
+    || '|' || address || '|' || array_to_string(topics, ',') || '|' || transaction_index \
+    || '|' || removed || '|' || data \
+    FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' AND data LIKE '0x${GI_HEX}%' \
+    ORDER BY block_number DESC LIMIT 1;")
+[[ -n "$CLAIM_ROW_BEFORE" ]] || fail "could not fingerprint the ClaimEvent row before deleting it"
+CLAIM_BLOCK="${CLAIM_ROW_BEFORE%%|*}"
+[[ "$CLAIM_BLOCK" =~ ^[0-9]+$ ]] || fail "could not read the ClaimEvent's block_number (got '$CLAIM_BLOCK')"
+log "  ClaimEvent is at Miden block ${CLAIM_BLOCK}"
+
 DEL_LOGS=$(pgq "DELETE FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' AND data LIKE '0x${GI_HEX}%' RETURNING block_number;")
 log "  deleted synthetic_logs rows: $(echo "$DEL_LOGS" | wc -l)"
 
@@ -176,37 +216,45 @@ HAS_AFTER_DELETE=$(pgq "SELECT EXISTS(SELECT 1 FROM claim_watcher_processed WHER
 [[ "$HAS_AFTER_DELETE" != "f" ]] && fail "ClaimEvent state still recoverable after delete (got '$HAS_AFTER_DELETE') — test setup broken; check schema"
 log "  has_claim_event_for_global_index simulated → false ✓"
 
-# ── Step 5: Wait for watcher tick ─────────────────────────────────────────────
-# Bound by OBSERVED sync ticks, not wall-clock. The watcher synthesises from
-# `on_post_sync`, so what matters is that sync ticks actually happened after the
-# state was staged — a fixed sleep fails whenever a tick is slow (loaded host,
-# slow proof) and wastes time when ticks are fast.
-# `miden_sync_state_duration_seconds_count` is the histogram's sample count, so
-# it increments once per completed sync.
-sync_ticks() {
-    curl -sf --max-time 5 "${L2_RPC:-http://localhost:8546}/metrics" 2>/dev/null \
-        | awk '$1=="miden_sync_state_duration_seconds_count" {print $2; exit}'
-}
-TICKS_BASE=$(sync_ticks); TICKS_BASE=${TICKS_BASE:-}
-WANT_TICKS="${WANT_SYNC_TICKS:-2}"
-SYNC_DEADLINE="${SYNC_WAIT_SECS}"
-if [[ -z "$TICKS_BASE" ]]; then
-    step "sync-tick metric unavailable — falling back to a ${SYNC_DEADLINE}s wait"
-    sleep "${SYNC_DEADLINE}"
-else
-    step "Waiting for ${WANT_TICKS} observed Miden sync tick(s) (<=${SYNC_DEADLINE}s) so on_post_sync can synthesise"
-    _w=0
-    while (( _w < SYNC_DEADLINE )); do
-        sleep 3; _w=$((_w+3))
-        _now=$(sync_ticks); _now=${_now:-$TICKS_BASE}
-        # integer-compare the sample counts (awk handles the float rendering)
-        if awk -v a="$_now" -v b="$TICKS_BASE" -v n="$WANT_TICKS" 'BEGIN{exit !((a-b)>=n)}'; then
-            log "  observed $(awk -v a="$_now" -v b="$TICKS_BASE" 'BEGIN{printf "%d", a-b}') sync tick(s) after ${_w}s"
-            break
-        fi
-    done
-    (( _w >= SYNC_DEADLINE )) && log "  WARN: only $(awk -v a="$(sync_ticks)" -v b="$TICKS_BASE" 'BEGIN{printf "%d", a-b}') tick(s) in ${SYNC_DEADLINE}s — asserting anyway"
-fi
+# ── Step 5: Rewind the projector cursor and restart, so the block re-projects ─
+# The projector caches its cursor in memory (loaded in `new()`), so the
+# persisted rewind only takes effect on the next boot. Rewind to CLAIM_BLOCK-1:
+# the minimum window that contains the deleted event. Re-projecting the blocks
+# above it is safe and is the documented crash-recovery shape — every other note
+# in that range carries its processed marker (claim_watcher_processed,
+# bridge_out_processed, ger_entries.is_injected) and is an idempotent no-op;
+# only THIS claim, whose marker the test deleted, is re-emitted.
+step "Rewinding projector_cursor to $((CLAIM_BLOCK - 1)) and restarting the proxy"
+CURSOR_BEFORE=$(pgq "SELECT projector_cursor FROM service_state WHERE id = 1;")
+log "  projector_cursor: ${CURSOR_BEFORE} -> $((CLAIM_BLOCK - 1))"
+pgq "UPDATE service_state SET projector_cursor = $((CLAIM_BLOCK - 1)) WHERE id = 1;" >/dev/null \
+    || fail "could not rewind projector_cursor — the block would never be re-projected"
+
+docker restart "$AGGLAYER_CONTAINER" >/dev/null \
+    || fail "could not restart $AGGLAYER_CONTAINER"
+# Wait for the process to be serving again before timing anything on it.
+_w=0
+while (( _w < 180 )); do
+    [[ "$(curl -s -m5 -o /dev/null -w '%{http_code}' "${L2_RPC}/health" 2>/dev/null)" != "000" ]] && break
+    sleep 3; _w=$((_w+3))
+done
+(( _w < 180 )) || fail "proxy did not serve /health within 180s after the restart"
+log "  proxy back up after ${_w}s"
+
+step "Waiting (<=${SYNC_WAIT_SECS}s) for the projector to re-project block ${CLAIM_BLOCK}"
+_w=0; CURSOR_NOW=""
+while (( _w < SYNC_WAIT_SECS )); do
+    CURSOR_NOW=$(pgq "SELECT projector_cursor FROM service_state WHERE id = 1;" || echo "")
+    if [[ "$CURSOR_NOW" =~ ^[0-9]+$ ]] && (( CURSOR_NOW >= CLAIM_BLOCK )); then
+        log "  projector_cursor reached ${CURSOR_NOW} (>= ${CLAIM_BLOCK}) after ${_w}s"
+        break
+    fi
+    sleep 3; _w=$((_w+3))
+done
+[[ "$CURSOR_NOW" =~ ^[0-9]+$ ]] && (( CURSOR_NOW >= CLAIM_BLOCK )) \
+    || fail "projector_cursor stalled at '${CURSOR_NOW}' (needed >= ${CLAIM_BLOCK}) within ${SYNC_WAIT_SECS}s — \
+the projector never re-reached the claim's block, so nothing could have re-synthesised. \
+Check: docker logs ${AGGLAYER_CONTAINER} 2>&1 | grep -i 'projector' | tail -20"
 
 # ── Step 6: Verify synthesis fired (DB state + log emission, NOT /metrics) ───
 step "Sampling /metrics + DB + proxy logs after synthesis window"
@@ -214,7 +262,7 @@ NEW_SYNTH=$(counter claim_watcher_synthesised_total)
 NEW_ALREADY=$(counter claim_watcher_already_recorded_total)
 NEW_DECODE=$(counter claim_watcher_storage_decode_total)
 NEW_UNRECOV=$(counter claim_watcher_unrecoverable_total)
-LOG_NEW=$(docker logs miden-agglayer-miden-agglayer-1 2>&1 | grep -c "synthesised ClaimEvent" || true)
+LOG_NEW=$(docker logs "$AGGLAYER_CONTAINER" 2>&1 | grep -c "synthesised ClaimEvent" || true)
 log "  after    /metrics: synthesised=${NEW_SYNTH} already=${NEW_ALREADY} decode_err=${NEW_DECODE} unrecov=${NEW_UNRECOV}"
 log "  after    synthesised log lines: ${LOG_NEW} (was ${LOG_OFFSET})"
 
@@ -228,11 +276,11 @@ DELTA_UNRECOV=$((NEW_UNRECOV - BASE_UNRECOV))
 # row post-test is fresh). /metrics counter delta is informational-only because
 # of the known counter bug above.
 if [[ "$DELTA_LOG" -lt 1 ]]; then
-    fail "watcher did NOT log a new synthesis (Δlog=${DELTA_LOG}). \
-The consumed CLAIM was lost from miden-client's sqlite, or on_post_sync ran \
-without observing it. Sync ticks ARE observed (see the tick count above), so a \
-longer wait is NOT the fix. Check: \
-docker logs miden-agglayer-miden-agglayer-1 2>&1 | grep claim_watcher | tail -20"
+    docker logs "$AGGLAYER_CONTAINER" 2>&1 | grep -iE 'restore::claims|project_claim|fail-closed' | tail -20 | sed 's/^/    | /'
+    fail "the projector re-reached block ${CLAIM_BLOCK} (cursor ${CURSOR_NOW}) but did NOT log a new \
+synthesis (Δlog=${DELTA_LOG}). Re-projection ran, so this is not a timing problem: either the consumed \
+CLAIM note is no longer in miden-client's sqlite for the projector to decode, or project_claim_note \
+skipped/fail-closed on it. The proxy lines above say which."
 fi
 
 if [[ "$DELTA_DECODE" -gt 0 ]]; then
@@ -246,6 +294,23 @@ fi
 # watcher uses to dedup. Either watcher-emitted row OR synthetic_logs match.
 HAS_RECOVERED=$(pgq "SELECT EXISTS(SELECT 1 FROM claim_watcher_processed WHERE global_index = decode('${GI_HEX}', 'hex')) OR EXISTS(SELECT 1 FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' AND lower(data) LIKE '0x${GI_HEX}%');")
 [[ "$HAS_RECOVERED" != "t" ]] && fail "synthesis log fired but ClaimEvent still not recoverable (got '$HAS_RECOVERED') — atomic commit may be broken"
+
+# The load-bearing claim: re-projection reproduced the SAME event, not merely
+# "an" event. Every field a consumer reads — block identity, tx hash, address,
+# topics, tx index, removal flag, data — must come back byte-identical.
+CLAIM_ROW_AFTER=$(pgq "SELECT block_number || '|' || transaction_hash || '|' || encode(block_hash,'hex') \
+    || '|' || address || '|' || array_to_string(topics, ',') || '|' || transaction_index \
+    || '|' || removed || '|' || data \
+    FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' AND data LIKE '0x${GI_HEX}%' \
+    ORDER BY block_number DESC LIMIT 1;")
+if [[ "$CLAIM_ROW_AFTER" != "$CLAIM_ROW_BEFORE" ]]; then
+    echo "  before: $CLAIM_ROW_BEFORE"
+    echo "  after : $CLAIM_ROW_AFTER"
+    fail "the re-synthesised ClaimEvent is NOT byte-identical to the one that was deleted \
+(fields in order: block|tx_hash|block_hash|address|topics|tx_index|removed|data) — a consumer \
+replaying eth_getLogs across the recovery would see a DIFFERENT event"
+fi
+log "  re-synthesised ClaimEvent is byte-identical to the deleted row ✓"
 
 # Sanity: at least one fresh row in claim_watcher_processed for this gi.
 FRESH_WATCHER_ROW=$(pgq "SELECT COUNT(*) FROM claim_watcher_processed WHERE global_index = decode('${GI_HEX}', 'hex');")
