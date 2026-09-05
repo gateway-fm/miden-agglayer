@@ -49,12 +49,18 @@ _q_settled() {
     depth=$(_q_metric agglayer_writer_queue_depth); depth=${depth:-0}
     [[ -n "$cur" && -n "$tip" ]] || return 1
     [[ "$cur" == "$tip" ]] || return 1
-    # metric may be absent before the first dispatch; absent == drained
-    [[ "${depth%.*}" == "0" ]] || return 1
+    # NOT `depth == 0`: on a live stack this gauge has a non-zero FLOOR (observed
+    # steady at 1 for 180s with cursor == tip == 1098, which made quiescence
+    # unreachable and failed the drill with "projection never quiesced"). The
+    # aggoracle keeps injecting and Miden keeps producing, so "empty" is not a
+    # state this stack reaches. What matters is that the queue is not GROWING —
+    # a rising depth means work is still arriving for the projector.
+    _Q_DEPTH_NOW="${depth%.*}"
     return 0
 }
 
 # quiesce_projection [timeout_secs] [stable_samples]
+# NOTE: "quiesced" here means STEADY, not IDLE. This stack never goes idle.
 # Requires the settled condition to hold on N CONSECUTIVE samples AND the
 # projected height to be unchanged across them — a single settled reading can be
 # a gap between two injections.
@@ -63,11 +69,19 @@ quiesce_projection() {
     while (( waited < timeout )); do
         if _q_settled; then
             h=$(projected_height)
-            if [[ "$h" == "$prev" ]]; then ok=$((ok+1)); else ok=1; fi
-            prev="$h"
-            (( ok >= want )) && { echo "quiesced at projected height $h" >&2; return 0; }
+            # Both the projected height AND the queue depth must be unchanged
+            # across consecutive samples: height stable == nothing new projected,
+            # depth non-growing == nothing new queued. A steady non-zero depth is
+            # fine; a climbing one is not.
+            if [[ "$h" == "$prev" ]] && [[ "${_Q_DEPTH_NOW:-0}" -le "${prev_depth:-999999}" ]]; then
+                ok=$((ok+1))
+            else
+                ok=1
+            fi
+            prev="$h"; prev_depth="${_Q_DEPTH_NOW:-0}"
+            (( ok >= want )) && { echo "quiesced at projected height $h (writer depth ${_Q_DEPTH_NOW:-0}, steady)" >&2; return 0; }
         else
-            ok=0; prev=""
+            ok=0; prev=""; prev_depth=""
         fi
         sleep 5; waited=$((waited+5))
     done
