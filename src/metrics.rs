@@ -546,6 +546,21 @@ pub fn init_metrics() {
          finished. Use agglayer_writer_nonterminal_jobs for that."
     );
     describe_gauge!(
+        "stranded_prepared_handoffs",
+        "PREPARED note handoffs past their Miden expiration block whose owning \
+         transaction is NOT pending. Such a row is unreachable by the recovery \
+         sweep (which starts from pending transactions) and by the admission \
+         path (which needs the same tx hash re-submitted), so before the \
+         sweep in orphan_recovery it leaked permanently. Steady state 0; a \
+         persistent positive value means the clear is being refused — check for \
+         a LANDED claim on that tx."
+    );
+    describe_counter!(
+        "stranded_prepared_handoffs_cleared_total",
+        "Stranded PREPARED note handoffs reclaimed by the recovery sweep. Every \
+         increment is a link that no other code path would ever have freed."
+    );
+    describe_gauge!(
         "agglayer_writer_nonterminal_jobs",
         "WriteJobs the process still OWES: in-flight entries in Queued or \
          Submitting state only. Reaches 0 the instant the last job goes \

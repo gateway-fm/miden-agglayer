@@ -766,6 +766,38 @@ impl Store for PgStore {
         Ok(rows.len() as u64)
     }
 
+    async fn stranded_prepared_note_handoffs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let client = self.pool.get().await?;
+        let limit_i = i64::try_from(limit).unwrap_or(i64::MAX);
+        // Same expiry fence as `clear_expired_prepared_note_handoff`
+        // (reconcile_cursor strictly past the expiration block), plus the
+        // condition that makes the row unreachable: no `pending` transaction
+        // owns it, so `recoverable_pending_txns` will never surface it.
+        // Oldest first — a LIMIT should keep the longest-stranded rows.
+        let rows = client
+            .query(
+                "SELECT l.tx_hash, l.note_commitment
+                 FROM tx_note_links l, service_state s
+                 WHERE l.handoff_state = 'prepared'
+                   AND l.prepared_expiration_block IS NOT NULL
+                   AND s.id = 1 AND s.reconcile_cursor > l.prepared_expiration_block
+                   AND NOT EXISTS (
+                       SELECT 1 FROM transactions t
+                       WHERE t.tx_hash = l.tx_hash AND t.status = 'pending')
+                 ORDER BY l.created_at ASC
+                 LIMIT $1",
+                &[&limit_i],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
     async fn clear_expired_prepared_note_handoff(
         &self,
         tx_hash: &str,

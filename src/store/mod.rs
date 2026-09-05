@@ -719,6 +719,32 @@ pub trait Store: Send + Sync + 'static {
         note_commitment: &str,
     ) -> anyhow::Result<bool>;
 
+    /// STRANDED prepared handoffs: `handoff_state='prepared'`, past their Miden
+    /// expiration block per the authoritative reconcile cursor, and whose owning
+    /// transaction is NOT `pending`.
+    ///
+    /// The recovery sweep reaches a prepared handoff only through
+    /// [`Self::recoverable_pending_txns`], which filters `WHERE t.status =
+    /// 'pending'`. Once the owning row goes terminal — or was never there — the
+    /// link is visited by NOTHING: not the sweep, and not the public admission
+    /// path, which only re-examines a handoff when the SAME tx hash is
+    /// re-submitted. It then sits in `tx_note_links` forever, holding a note
+    /// identity reserved against first-writer-wins `prepare_note_handoff`.
+    ///
+    /// Observed live 2026-09-05: a post-chaos stack reported
+    /// `pending receipts=0 PREPARED handoffs=1` unchanged for 600s, which is
+    /// exactly this shape — no pending transaction existed for any sweep to
+    /// start from.
+    ///
+    /// Returns `(tx_hash, note_commitment)` pairs for
+    /// [`Self::clear_expired_prepared_note_handoff`], which applies the same
+    /// expiry fence again and refuses a LANDED claim, so this listing is a
+    /// candidate set and never an authorisation.
+    async fn stranded_prepared_note_handoffs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, String)>>;
+
     // === Synthetic logs ===
     async fn add_log(&self, log: SyntheticLog) -> anyhow::Result<()>;
     async fn get_logs(

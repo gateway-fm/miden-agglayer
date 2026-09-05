@@ -880,6 +880,37 @@ impl Store for InMemoryStore {
         Ok(confirmed)
     }
 
+    async fn stranded_prepared_note_handoffs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let cursor = *self.reconcile_cursor.read();
+        let links = self.tx_note_links.read();
+        let txns = self.transactions.lock();
+        // "Pending" is `result.is_none()` here, the same predicate
+        // `recoverable_pending_txns` uses above — and an ABSENT receipt is not
+        // pending either, so those links are the most stranded of all.
+        Ok(links
+            .iter()
+            .filter(|(tx_hash, link)| {
+                link.state == NoteHandoffState::Prepared
+                    && link
+                        .expiration_block
+                        .is_some_and(|expiration| cursor > expiration)
+                    && !tx_hash
+                        .parse::<TxHash>()
+                        .ok()
+                        .and_then(|h| txns.peek(&h))
+                        .is_some_and(|r| r.result.is_none())
+            })
+            .map(|(tx_hash, link)| (tx_hash.clone(), link.note_commitment.clone()))
+            .take(limit)
+            .collect())
+    }
+
     async fn clear_expired_prepared_note_handoff(
         &self,
         tx_hash: &str,
