@@ -86,6 +86,14 @@ test-scripts: ## Syntax-check + run the shell guard test harnesses (no docker ne
 	# itself — so it runs here rather than only inside a docker-bound e2e.
 	bash -n scripts/test-chaos-verdict.sh
 	bash scripts/test-chaos-verdict.sh
+	# The gate in front of every recovery-drill fingerprint. Wrong-lax and it
+	# fingerprints a moving pipeline (spurious #88 data loss); wrong-strict and
+	# the drill never runs at all. Both have happened; both were invisible to
+	# `bash -n`.
+	bash -n scripts/lib-quiesce.sh
+	bash -n scripts/e2e-full-db-loss-recovery.sh
+	bash -n scripts/test-quiesce-predicate.sh
+	bash scripts/test-quiesce-predicate.sh
 
 .PHONY: test-e2e
 test-e2e: ## Spin up docker stack, run E2E tests, tear down (fully self-contained)
@@ -237,7 +245,16 @@ MIDEN_NODE_GIT_REF := v0.16.0-rc.5
 # shadow the tag. Bump BOTH together.
 MIDEN_NODE_GIT_COMMIT := 461ac961951c19543b3b2e6db99a0bf82349dbde
 
-E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
+# Remote-custody overlay. Applies to the BASE e2e stack too, not just l2l2:
+# without it `make e2e-up` can only run local-keystore custody, and every
+# recovery one-shot the scripts launch would use a different custody than the
+# stack it is repairing (issue #167 validation).
+WEB3SIGNER_COMPOSE_EXTRA := $(if $(WITH_WEB3SIGNER),-f docker-compose.web3signer.yml,)
+# Site overlay escape hatch, e.g. cloud-KMS credentials for the signer.
+# `?=` so it can be set from the environment as well as the command line.
+EXTRA_COMPOSE_FILES ?=
+
+E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml $(WEB3SIGNER_COMPOSE_EXTRA) $(EXTRA_COMPOSE_FILES) --env-file fixtures/.env
 
 # L2<->L2 overlay (task #25): base stack + the second-rollup overlay. The
 # generated configs it mounts must be produced by `make gen-l2b-configs` first.
@@ -245,8 +262,7 @@ E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MID
 # invocation (up/registration/down all inherit it). The caller must provision
 # keys (scripts/gen-web3signer-keys.sh) and export fixtures/web3signer-keys.env
 # BEFORE `make e2e-l2l2-up` — the overlay interpolates AGGLAYER_SIGNER_KEYS.
-WEB3SIGNER_COMPOSE_EXTRA := $(if $(WITH_WEB3SIGNER),-f docker-compose.web3signer.yml,)
-L2L2_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml $(WEB3SIGNER_COMPOSE_EXTRA) --env-file fixtures/.env
+L2L2_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml $(WEB3SIGNER_COMPOSE_EXTRA) $(EXTRA_COMPOSE_FILES) --env-file fixtures/.env
 
 .PHONY: miden-node-image-coords
 miden-node-image-coords: ## Print the git URL + ref + commit the miden-node image is built from
@@ -330,7 +346,26 @@ e2e-l2l2-up: e2e-clean-data gen-l2b-configs ## Bring up base stack + L2B overlay
 	# re-index network 2 now that rollup #2 + the L2B bridge/GER exist). NOT
 	# anvil-l2b (freshly-deployed in-memory L2B state) and NOT the base Miden
 	# bridge-service (indexes L1 + Miden, unaffected by rollup #2).
-	$(L2L2_COMPOSE) up -d --force-recreate --wait aggkit-l2b bridge-service-l2b
+	# `--wait` reports only a bare exit code, so a crash-looping service used to
+	# surface as "Error 1" with the REASON left in a container nobody printed.
+	# On failure, dump the tail of every non-running network-2 container before
+	# exiting, so the log that explains it is in the run output.
+	@$(L2L2_COMPOSE) up -d --force-recreate --wait aggkit-l2b bridge-service-l2b || { \
+		echo ""; \
+		echo "e2e-l2l2-up: network-2 services did not become healthy — diagnostics:"; \
+		proj=$$(docker compose ls --format json 2>/dev/null | grep -o '"Name":"[^"]*miden[^"]*"' | head -1 | cut -d'"' -f4); \
+		proj=$${proj:-$$(basename $$(pwd))}; \
+		for svc in aggkit-l2b bridge-service-l2b; do \
+			c="$$proj-$$svc-1"; \
+			st=$$(docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$$c" 2>/dev/null || echo "absent"); \
+			echo "──── $$c: $$st"; \
+			docker logs --tail 40 "$$c" 2>&1 | sed 's/^/    /' || echo "    (no logs)"; \
+		done; \
+		echo ""; \
+		echo "e2e-l2l2-up: if the L2B chain reports 'sovereign genesis already injected',"; \
+		echo "  a PREVIOUS l2l2 stack was still running: 'make e2e-down' only tears down the"; \
+		echo "  base compose file. Run 'make e2e-l2l2-down' before bringing the stack up."; \
+		exit 1; }
 
 .PHONY: e2e-l2l2
 e2e-l2l2: ## Run the L2<->L2 group (preflight + forward L2B->Miden + back Miden->L2B + evidence). Stack must be up (make e2e-l2l2-up).
@@ -521,9 +556,22 @@ test-e2e-coverage: ## Regression-protect all three production fixes (RD-862 GER 
 .PHONY: e2e
 e2e: test-e2e ## Alias for test-e2e (start, test, teardown)
 
+.PHONY: e2e-battery
+e2e-battery: ## Run the FULL e2e battery N times (ITERATIONS=4). Results + MATRIX.md under e2e-results/
+	ITERATIONS=$(or $(ITERATIONS),4) ./scripts/e2e-battery.sh
+
 .PHONY: e2e-down
-e2e-down: ## Stop E2E environment
-	$(E2E_COMPOSE) down -v
+e2e-down: ## Stop E2E environment (base AND the l2l2 overlay — see below)
+	# Tear down with the l2l2 overlay too, and --remove-orphans. `$(E2E_COMPOSE)
+	# down -v` covers only the services in docker-compose.e2e.yml, so after any
+	# l2l2 target the network-2 containers (anvil-l2b, aggkit-l2b,
+	# bridge-service-l2b, postgres-l2b) SURVIVED a "teardown". The next
+	# e2e-l2l2-up then reused that live L2B chain — setup-l2b.sh reported
+	# "L2B sovereign genesis already injected — skipping" and
+	# bridge-service-l2b exited(1) against the stale state.
+	# e2e-clean-data does not catch this: it guards the node_data volume, which
+	# the base teardown had already released.
+	$(L2L2_COMPOSE) down -v --remove-orphans
 
 .PHONY: e2e-l2l2-down
 e2e-l2l2-down: ## Stop the L2<->L2 stack (base + L2B overlay). --remove-orphans so anvil-l2b/aggkit-l2b/bridge-service don't linger on a reused (self-hosted) host

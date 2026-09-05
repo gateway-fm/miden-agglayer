@@ -139,7 +139,7 @@ pub struct InMemoryStore {
     // quarantined/deferred/self-targeted classes — they occupy a LET leaf with no event);
     // the atomic commit reuses the reservation and flips emitted=true.
     processed_notes: RwLock<HashMap<String, (u32, bool)>>,
-    b2agg_note_ids: RwLock<HashMap<Nullifier, NoteId>>,
+    note_identities: RwLock<HashMap<Nullifier, NoteId>>,
     // Explicit upgrade offset for legacy LET leaves not in deposit_counter.
     let_gate_baseline: RwLock<u64>,
     deposit_counter: RwLock<u32>,
@@ -272,7 +272,7 @@ impl InMemoryStore {
             unbridgeable_bridge_outs: RwLock::new(HashMap::new()),
             address_mappings: RwLock::new(HashMap::new()),
             processed_notes: RwLock::new(HashMap::new()),
-            b2agg_note_ids: RwLock::new(HashMap::new()),
+            note_identities: RwLock::new(HashMap::new()),
             let_gate_baseline: RwLock::new(0),
             deposit_counter: RwLock::new(0),
             claim_watcher_processed: RwLock::new(HashMap::new()),
@@ -486,6 +486,12 @@ impl Store for InMemoryStore {
 
     async fn set_reconcile_cursor(&self, block: u64) -> anyhow::Result<()> {
         *self.reconcile_cursor.write() = block;
+        Ok(())
+    }
+
+    async fn reset_cursors_to_genesis(&self) -> anyhow::Result<()> {
+        *self.projector_cursor.write() = 0;
+        *self.reconcile_cursor.write() = 0;
         Ok(())
     }
 
@@ -872,6 +878,37 @@ impl Store for InMemoryStore {
             confirmed += u64::from(self.confirm_note_handoff(&tx_hash, &commitment).await?);
         }
         Ok(confirmed)
+    }
+
+    async fn stranded_prepared_note_handoffs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let cursor = *self.reconcile_cursor.read();
+        let links = self.tx_note_links.read();
+        let txns = self.transactions.lock();
+        // "Pending" is `result.is_none()` here, the same predicate
+        // `recoverable_pending_txns` uses above — and an ABSENT receipt is not
+        // pending either, so those links are the most stranded of all.
+        Ok(links
+            .iter()
+            .filter(|(tx_hash, link)| {
+                link.state == NoteHandoffState::Prepared
+                    && link
+                        .expiration_block
+                        .is_some_and(|expiration| cursor > expiration)
+                    && !tx_hash
+                        .parse::<TxHash>()
+                        .ok()
+                        .and_then(|h| txns.peek(&h))
+                        .is_some_and(|r| r.result.is_none())
+            })
+            .map(|(tx_hash, link)| (tx_hash.clone(), link.note_commitment.clone()))
+            .take(limit)
+            .collect())
     }
 
     async fn clear_expired_prepared_note_handoff(
@@ -2147,19 +2184,19 @@ impl Store for InMemoryStore {
             .collect())
     }
 
-    async fn put_b2agg_note_ids(&self, entries: &[(Nullifier, NoteId)]) -> anyhow::Result<()> {
-        let mut stored = self.b2agg_note_ids.write();
+    async fn put_note_identities(&self, entries: &[(Nullifier, NoteId)]) -> anyhow::Result<()> {
+        let mut stored = self.note_identities.write();
         for (nullifier, note_id) in entries {
             stored.entry(*nullifier).or_insert(*note_id);
         }
         Ok(())
     }
 
-    async fn get_b2agg_note_ids(
+    async fn get_note_identities(
         &self,
         nullifiers: &[Nullifier],
     ) -> anyhow::Result<HashMap<Nullifier, NoteId>> {
-        let cached = self.b2agg_note_ids.read();
+        let cached = self.note_identities.read();
         Ok(nullifiers
             .iter()
             .filter_map(|nullifier| cached.get(nullifier).map(|id| (*nullifier, *id)))

@@ -249,6 +249,18 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn reset_cursors_to_genesis(&self) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "UPDATE service_state SET projector_cursor = 0, reconcile_cursor = 0, \
+                 updated_at = now() WHERE id = 1",
+                &[],
+            )
+            .await?;
+        Ok(())
+    }
+
     // ── #90: nonce-ledger rebuild marker ─────────────────────────────────────
 
     async fn is_nonce_ledger_rebuilt(&self) -> anyhow::Result<bool> {
@@ -752,6 +764,38 @@ impl Store for PgStore {
         }
         txn.commit().await?;
         Ok(rows.len() as u64)
+    }
+
+    async fn stranded_prepared_note_handoffs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let client = self.pool.get().await?;
+        let limit_i = i64::try_from(limit).unwrap_or(i64::MAX);
+        // Same expiry fence as `clear_expired_prepared_note_handoff`
+        // (reconcile_cursor strictly past the expiration block), plus the
+        // condition that makes the row unreachable: no `pending` transaction
+        // owns it, so `recoverable_pending_txns` will never surface it.
+        // Oldest first — a LIMIT should keep the longest-stranded rows.
+        let rows = client
+            .query(
+                "SELECT l.tx_hash, l.note_commitment
+                 FROM tx_note_links l, service_state s
+                 WHERE l.handoff_state = 'prepared'
+                   AND l.prepared_expiration_block IS NOT NULL
+                   AND s.id = 1 AND s.reconcile_cursor > l.prepared_expiration_block
+                   AND NOT EXISTS (
+                       SELECT 1 FROM transactions t
+                       WHERE t.tx_hash = l.tx_hash AND t.status = 'pending')
+                 ORDER BY l.created_at ASC
+                 LIMIT $1",
+                &[&limit_i],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
     async fn clear_expired_prepared_note_handoff(
@@ -3011,7 +3055,7 @@ impl Store for PgStore {
             .collect()
     }
 
-    async fn put_b2agg_note_ids(&self, entries: &[(Nullifier, NoteId)]) -> anyhow::Result<()> {
+    async fn put_note_identities(&self, entries: &[(Nullifier, NoteId)]) -> anyhow::Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -3020,7 +3064,7 @@ impl Store for PgStore {
         let client = self.pool.get().await?;
         client
             .execute(
-                "INSERT INTO bridge_b2agg_note_ids (nullifier, note_id)
+                "INSERT INTO bridge_note_ids (nullifier, note_id)
                  SELECT * FROM unnest($1::text[], $2::text[])
                  ON CONFLICT (nullifier) DO NOTHING",
                 &[&nullifiers, &note_ids],
@@ -3029,7 +3073,7 @@ impl Store for PgStore {
         Ok(())
     }
 
-    async fn get_b2agg_note_ids(
+    async fn get_note_identities(
         &self,
         nullifiers: &[Nullifier],
     ) -> anyhow::Result<std::collections::HashMap<Nullifier, NoteId>> {
@@ -3041,7 +3085,7 @@ impl Store for PgStore {
         let rows = client
             .query(
                 "SELECT nullifier, note_id
-                 FROM bridge_b2agg_note_ids
+                 FROM bridge_note_ids
                  WHERE nullifier = ANY($1::text[])",
                 &[&keys],
             )

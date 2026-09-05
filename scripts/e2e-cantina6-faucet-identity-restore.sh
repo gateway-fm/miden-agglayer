@@ -43,6 +43,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 FIXTURES_DIR="$PROJECT_DIR/fixtures"
 
+# The restore one-shot must run under the SAME custody overlay as the stack it
+# is repairing (local keystore vs remote signer), plus any site overlay.
+. "$PROJECT_DIR/scripts/lib-compose.sh"
+compose_env_load
+mapfile -t COMPOSE < <(compose_files)
+
 source "$FIXTURES_DIR/.env"
 
 # Required by docker-compose.e2e.yml's build args (interpolated even for a
@@ -214,10 +220,10 @@ pass "TT faucet_registry row deleted (identity lost)"
 # PART 4: --restore (one-shot container), then assert the row is rebuilt
 # ══════════════════════════════════════════════════════════════════════════════
 step "Part 4: Running --restore..."
-docker compose -f "$PROJECT_DIR/docker-compose.e2e.yml" --env-file "$FIXTURES_DIR/.env" \
+docker compose "${COMPOSE[@]}" --env-file "$FIXTURES_DIR/.env" \
     stop miden-agglayer >/dev/null 2>&1
 sleep 2
-docker compose -f "$PROJECT_DIR/docker-compose.e2e.yml" --env-file "$FIXTURES_DIR/.env" \
+docker compose "${COMPOSE[@]}" --env-file "$FIXTURES_DIR/.env" \
     run --rm --no-deps miden-agglayer \
     --miden-node=http://miden-node:57291 \
     --miden-store-dir=/var/lib/miden-agglayer-service \
@@ -247,7 +253,7 @@ pass "Cantina #6: row rebuilt with SAME identity (faucet_id/origin/scale), no sp
 # PART 5: Restart, then a SECOND bridge-out must RESOLVE + emit (not skip)
 # ══════════════════════════════════════════════════════════════════════════════
 step "Part 5: Restart miden-agglayer + a fresh bridge-out of TT..."
-docker compose -f "$PROJECT_DIR/docker-compose.e2e.yml" --env-file "$FIXTURES_DIR/.env" \
+docker compose "${COMPOSE[@]}" --env-file "$FIXTURES_DIR/.env" \
     start miden-agglayer >/dev/null 2>&1
 wait_for "miden-agglayer healthy" \
     "curl -sf $L2_RPC -X POST -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"method\":\"eth_chainId\",\"params\":[],\"id\":1}'" \

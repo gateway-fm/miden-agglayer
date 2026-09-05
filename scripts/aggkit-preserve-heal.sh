@@ -43,12 +43,12 @@ FORCE="${FORCE:-0}"                    # 1 = heal without the wedge precheck
 # once so every later reference is safe and "unset" means "no exact target".
 WEDGE_TX="${WEDGE_TX:-}"
 
-COMPOSE=(-f "$PROJECT_DIR/docker-compose.e2e.yml")
-[[ -f "$PROJECT_DIR/docker-compose.l2l2.yml" ]] && COMPOSE+=(-f "$PROJECT_DIR/docker-compose.l2l2.yml")
-[[ -f "$PROJECT_DIR/docker-compose.web3signer.yml" ]] \
-    && docker ps --format '{{.Names}}' | grep -q "^$PROJECT-web3signer-1$" \
-    && { COMPOSE+=(-f "$PROJECT_DIR/docker-compose.web3signer.yml")
-         [[ -f "$PROJECT_DIR/fixtures/web3signer-keys.env" ]] && { set -a; . "$PROJECT_DIR/fixtures/web3signer-keys.env"; set +a; } }
+# This healer FORCE-RECREATES a container, so it must carry every overlay the
+# stack was brought up with — dropping the custody overlay here would recreate
+# a service without its signer wiring.
+. "$PROJECT_DIR/scripts/lib-compose.sh"
+compose_env_load
+mapfile -t COMPOSE < <(compose_files)
 
 log() { echo "[$(date '+%H:%M:%S')] preserve-heal($SVC): $*"; }
 

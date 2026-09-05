@@ -46,9 +46,14 @@ pub fn install_prometheus_recorder() -> anyhow::Result<metrics_exporter_promethe
 }
 
 /// The exporter configuration (bucket sets) shared by the real installer and
-/// the rendering test, so a histogram that loses its buckets fails a test
+/// the rendering tests, so a histogram that loses its buckets fails a test
 /// instead of silently degrading to summary quantiles in production.
-fn prometheus_builder() -> anyhow::Result<metrics_exporter_prometheus::PrometheusBuilder> {
+///
+/// `pub(crate)` so other modules' tests can build a LOCAL recorder with the
+/// production configuration (see `writer_worker`'s drained-writer gauge
+/// regression) rather than asserting against the process-wide one.
+pub(crate) fn prometheus_builder() -> anyhow::Result<metrics_exporter_prometheus::PrometheusBuilder>
+{
     metrics_exporter_prometheus::PrometheusBuilder::new()
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Full("miden_proof_duration_seconds".to_string()),
@@ -445,26 +450,17 @@ pub fn init_metrics() {
          (crash recovery or foreign-CLAIM observation)."
     );
     describe_counter!(
-        "restore_b2agg_same_details_multiplicity_quarantined_total",
-        "restore FAIL-CLOSED: B2AGG exits quarantined because the authoritative feed shows ≥2 \
-         distinct on-chain consumptions sharing a details_commitment that the commitment-keyed \
-         client store cannot disambiguate — quarantined rather than emit a wrong/collapsed \
-         BridgeEvent (review). MUST be rare; each is an operator-recoverable exit."
-    );
-    describe_counter!(
         "synthetic_claim_calldata_finalized_pending_total",
         "synthesized-claim calldata rows found PENDING (txn_begin ran, txn_commit did not — a \
          crash between them) and finalized by a later persist pass, rather than being stranded \
          pending forever (review blocker 3)."
     );
     describe_counter!(
-        "restore_b2agg_authoritative_attributed_total",
-        "restore Phase 2 (task #56): consumed B2AGG notes whose consumer the LOCAL store did \
-         not know (consumer_account=None — NTX-consumed, the normal bridge path, observed \
-         after a store rebuild) but that the bridge's on-chain sync_transactions feed \
-         authoritatively attributes to the bridge — rebuilt and re-projected instead of \
-         fail-closed skipped. Without this, restore ERASED already-settled BridgeEvents \
-         (getLogs-immutability break) and halted aggkit's L2BridgeSyncer."
+        "restore_authoritative_coverage_gaps_total",
+        "#167 — restore catch-ups halted because a bridge-consumed input had NO recoverable \
+         identity (absent from the client consumed feed and not resolvable as a bridge-out: \
+         the ERASED-note boundary). Each increment is a restore that REFUSED to seal a \
+         divergent history; the node/protocol cannot serve that body."
     );
     describe_counter!(
         "synthetic_claim_calldata_persisted_total",
@@ -545,7 +541,32 @@ pub fn init_metrics() {
     describe_gauge!(
         "agglayer_writer_inflight_jobs",
         "RD-940: WriteJobs in the in-flight DashMap (Queued + Submitting + \
-         not-yet-TTL'd terminal entries). Informational."
+         not-yet-TTL'd terminal entries). Informational — NOT a drain signal: \
+         terminal entries linger for tx_ttl + sweeper interval after the work \
+         finished. Use agglayer_writer_nonterminal_jobs for that."
+    );
+    describe_gauge!(
+        "stranded_prepared_handoffs",
+        "PREPARED note handoffs past their Miden expiration block whose owning \
+         transaction is NOT pending. Such a row is unreachable by the recovery \
+         sweep (which starts from pending transactions) and by the admission \
+         path (which needs the same tx hash re-submitted), so before the \
+         sweep in orphan_recovery it leaked permanently. Steady state 0; a \
+         persistent positive value means the clear is being refused — check for \
+         a LANDED claim on that tx."
+    );
+    describe_counter!(
+        "stranded_prepared_handoffs_cleared_total",
+        "Stranded PREPARED note handoffs reclaimed by the recovery sweep. Every \
+         increment is a link that no other code path would ever have freed."
+    );
+    describe_gauge!(
+        "agglayer_writer_nonterminal_jobs",
+        "WriteJobs the process still OWES: in-flight entries in Queued or \
+         Submitting state only. Reaches 0 the instant the last job goes \
+         terminal, so this (together with agglayer_writer_queue_depth == 0) \
+         is the writer-drained predicate an operator or a recovery drill \
+         should wait on."
     );
     describe_histogram!(
         "agglayer_writer_job_duration_seconds",

@@ -30,15 +30,30 @@ pass() { echo -e "${GREEN}[$(date +%H:%M:%S)] PASS:${NC} $*"; }
 
 TEST_START_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
+# wait_for <desc> <cmd> <timeout> [interval] [on_timeout_cmd]
+#
+# `on_timeout_cmd` runs immediately BEFORE the failure, while the stack is still
+# up. `make test-e2e` tears the stack down the instant this script exits, so a
+# bare "Timed out: certificate settled" after a 15-minute wait leaves nothing to
+# diagnose from — the aggkit and agglayer logs that would say WHY are deleted
+# seconds later. Observed 2026-09-05, iteration 1.
 wait_for() {
-    local desc="$1" cmd="$2" timeout="$3" interval="${4:-5}"
+    local desc="$1" cmd="$2" timeout="$3" interval="${4:-5}" on_timeout="${5:-}"
     local elapsed=0
     log "Waiting: $desc (timeout: ${timeout}s)..."
     # Subshell with pipefail off — see e2e-dynamic-erc20.sh for the SIGPIPE
     # rationale.
     while ! ( set +o pipefail; eval "$cmd" ) 2>/dev/null; do
         elapsed=$((elapsed + interval))
-        [[ $elapsed -ge $timeout ]] && fail "Timed out: $desc"
+        if [[ $elapsed -ge $timeout ]]; then
+            if [[ -n "$on_timeout" ]]; then
+                echo ""
+                echo "── diagnostics for '$desc' (captured before teardown) ──"
+                ( set +o pipefail; eval "$on_timeout" ) 2>&1 | sed 's/^/  | /' || true
+                echo "── end diagnostics ──"
+            fi
+            fail "Timed out: $desc"
+        fi
         echo -n "."
         sleep "$interval"
     done
@@ -137,9 +152,22 @@ log "Step 3/5: Waiting for certificate settlement on AggLayer..."
 # proof of a fresh `make test-e2e` run (circuit compile + load). Warm reruns
 # settle in ~20s, well inside the original window. Keep the timeout wide so
 # cold first-runs don't trip a regression false alarm.
+# On timeout, dump what the two services actually said. A settlement stall is
+# almost always one of: aggsender never built a cert, agglayer rejected the
+# proof, or the settlement tx never mined — and each has a distinct signature
+# in these lines.
 wait_for "certificate settled" \
     "docker logs --since $TEST_START_TIME $AGGKIT_CONTAINER 2>&1 | grep 'changed status.*Settled' | grep -vE 'NewLocalExitRoot: (0x0+,|0x27ae5ba08d7291c96c8cbddcc148bf48a6d68c7974b94356f53754ef6171d757)' | grep -q 'NewLocalExitRoot'" \
-    900 10
+    900 10 \
+    "echo '--- aggkit: certificate lifecycle ---'; \
+     docker logs --since $TEST_START_TIME $AGGKIT_CONTAINER 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' \
+       | grep -aiE 'certificate|aggsender|changed status|error' | tail -30; \
+     echo '--- aggkit: last 15 lines ---'; \
+     docker logs --tail 15 $AGGKIT_CONTAINER 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g'; \
+     echo '--- agglayer: errors + last 15 lines ---'; \
+     docker logs --since $TEST_START_TIME ${COMPOSE_PROJECT_NAME:-miden-agglayer}-agglayer-1 2>&1 \
+       | sed -E 's/\x1b\[[0-9;]*m//g' | grep -aiE 'error|reject|invalid|proof' | tail -20; \
+     docker logs --tail 15 ${COMPOSE_PROJECT_NAME:-miden-agglayer}-agglayer-1 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g'"
 pass "Certificate settled on L1!"
 
 # ── Step 4: Wait for deposit to appear in bridge-service ──────────────────────
