@@ -182,6 +182,74 @@ the aggoracle had nothing left to inject."
     return 0
 }
 
+# Where a timeout writes its durable evidence. The caller's stack is usually
+# destroyed within a minute of a failure — battery iteration 1's post-chaos
+# drill blocked on "PREPARED handoffs=1" and the containers were recreated with
+# `down -v` 46 SECONDS later, taking the postgres volume and the row's identity
+# with them. Stderr alone is not enough: it only survives if the caller happened
+# to redirect it into a file that outlives the run.
+QUIESCE_EVIDENCE_DIR="${QUIESCE_EVIDENCE_DIR:-}"
+
+# _q_evidence — write the full offending state to a file under
+# QUIESCE_EVIDENCE_DIR. Best-effort by construction: this runs on the failure
+# path, where a psql error or an unwritable directory must not replace the
+# diagnosis it was called to produce. Echoes the path it wrote.
+_q_evidence() { # $1 = the unmet condition
+    [[ -n "$QUIESCE_EVIDENCE_DIR" ]] || return 0
+    mkdir -p "$QUIESCE_EVIDENCE_DIR" 2>/dev/null || return 0
+    local f="$QUIESCE_EVIDENCE_DIR/quiesce-timeout-$(date -u +%Y%m%dT%H%M%SZ).txt"
+    {
+        echo "quiesce timeout $(date -u +%FT%TZ)"
+        echo "unmet condition: $1"
+        echo
+        echo "── cursors ──"
+        echo "projector_cursor    : $(_q_int "SELECT projector_cursor FROM service_state WHERE id=1")"
+        echo "reconcile_cursor    : $(_q_int "SELECT reconcile_cursor FROM service_state WHERE id=1")"
+        echo "latest_block_number : $(_q_int "SELECT latest_block_number FROM service_state WHERE id=1")  (synthetic tip)"
+        # The MIDEN tip is not a store column; the projector prints it on every
+        # tick, which is the only place it is observable from here.
+        if [[ -n "${PROXY_CONTAINER:-}" ]]; then
+            echo "miden tip (last projector tick):"
+            docker logs --tail 4000 "$PROXY_CONTAINER" 2>&1 \
+                | sed -E 's/\x1b\[[0-9;]*m//g' | grep -a 'synthetic projector tick' | tail -1 \
+                | sed 's/^/  /' || echo "  (no tick line found)"
+        fi
+        echo
+        echo "── writer ──"
+        echo "agglayer_writer_queue_depth       : $(_q_metric agglayer_writer_queue_depth)"
+        echo "agglayer_writer_nonterminal_jobs  : $(_q_metric agglayer_writer_nonterminal_jobs)"
+        echo "agglayer_writer_inflight_jobs     : $(_q_metric agglayer_writer_inflight_jobs)"
+        echo "stranded_prepared_handoffs        : $(_q_metric stranded_prepared_handoffs)"
+        echo
+        echo "── PREPARED note handoffs (ALL, with reclaim-due) ──"
+        _q_pgq "SELECT l.tx_hash, coalesce(l.note_id,'<null>') AS note_id, l.note_commitment, \
+                       coalesce(l.prepared_expiration_block::text,'NULL') AS expires_at_block, \
+                       s.reconcile_cursor, \
+                       (l.prepared_expiration_block IS NOT NULL \
+                        AND s.reconcile_cursor > l.prepared_expiration_block) AS reclaim_due, \
+                       coalesce(t.status,'<no tx row>') AS owner_tx_status, \
+                       round(extract(epoch from now()-l.created_at))::text AS age_secs \
+                FROM tx_note_links l \
+                JOIN service_state s ON s.id = 1 \
+                LEFT JOIN transactions t ON t.tx_hash = l.tx_hash \
+                WHERE l.handoff_state = 'prepared' ORDER BY l.created_at" 2>&1
+        echo
+        echo "── pending receipts ──"
+        _q_pgq "SELECT tx_hash, status, signer, coalesce(error_message,'') AS err, \
+                       round(extract(epoch from now()-created_at))::text AS age_secs \
+                FROM transactions WHERE status='pending' ORDER BY created_at" 2>&1
+        echo
+        echo "── parked future-nonce txns ──"
+        _q_pgq "SELECT signer, nonce, tx_hash, expires_at, parked_during_recovery \
+                FROM queued_txns ORDER BY created_at" 2>&1
+        echo
+        echo "── synthetic log counts by family ──"
+        _q_pgq "SELECT substring(topics[1] from 1 for 10) AS topic0, count(*) \
+                FROM synthetic_logs GROUP BY 1 ORDER BY 2 DESC" 2>&1
+    } > "$f" 2>/dev/null || return 0
+    echo "$f"
+}
+
 # _q_dump <label> <sql> — print rows on stderr, or nothing when there are none.
 # Never fails the caller: this runs on the failure path, where a psql error must
 # not replace the diagnosis it was called to produce.
@@ -257,5 +325,10 @@ parked=$(_q_int "SELECT count(*) FROM queued_txns") logs=$(_q_int "SELECT count(
         "SELECT signer || '  nonce=' || nonce || '  tx=' || tx_hash \
          || '  expires_at=' || expires_at || '  parked_during_recovery=' || parked_during_recovery::text \
          FROM queued_txns ORDER BY created_at LIMIT 10"
+    # Durable copy, written BEFORE returning — the caller may be torn down
+    # seconds later and stderr only survives if it was redirected somewhere
+    # that outlives the run.
+    local ev; ev="$(_q_evidence "${_Q_WHY:-log count never stable}")"
+    [[ -n "$ev" ]] && echo "  evidence written to $ev" >&2
     return 1
 }

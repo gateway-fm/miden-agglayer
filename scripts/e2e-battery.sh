@@ -17,7 +17,55 @@ preflight_bridge_out_tool "$R/logs" || exit 1
 
 matrix() { "$PWD/scripts/e2e-battery-matrix.py" "$TSV" > "$R/MATRIX.md" 2>/dev/null; }
 
+# Scenarios that write durable failure evidence put it here (see
+# lib-quiesce.sh's QUIESCE_EVIDENCE_DIR).
+export BATTERY_RESULTS_DIR="$PWD/$R"
+
 down() { "${BASE_ENV[@]}" make e2e-down >>"$R/logs/down.log" 2>&1; }
+
+# POST-MORTEM — run on EVERY failure, while the stack is still up.
+#
+# `make e2e-down` is `docker compose down -v`: it deletes the postgres volume,
+# and with it every row that could explain what happened. Iteration 1's
+# post-chaos drill failed on "PREPARED handoffs=1" at 17:35:29 and the
+# containers were recreated at 17:36:15 — 46 seconds — so the handoff's tx
+# hash, note id, expiration block and owner status were gone before anyone
+# could look. This runs BEFORE the next teardown, unconditionally, and is
+# entirely best-effort: a dead stack must produce a short file, never an error
+# that masks the failure being recorded.
+post_mortem() { # $1 = iteration, $2 = label
+    local out="$R/logs/i${1}-${2}-postmortem.txt"
+    local proxy pg
+    proxy="$(docker ps --format '{{.Names}}' | grep -E -- '-miden-agglayer-1$' | head -1)"
+    pg="${proxy%-miden-agglayer-1}-agglayer-postgres-1"
+    {
+        echo "post-mortem for i$1 $2 — $(date -u +%FT%TZ)"
+        echo; echo "== containers =="
+        docker ps -a --format '{{.Names}}\t{{.Status}}' | grep -E '^miden-agglayer-' || true
+        if [[ -z "$proxy" ]]; then
+            echo; echo "(no proxy container running — nothing further to capture)"
+        else
+            echo; echo "== service_state =="
+            docker exec "$pg" psql -U agglayer -d agglayer_store -c \
+                "SELECT projector_cursor, reconcile_cursor, latest_block_number, nonce_ledger_rebuilt FROM service_state WHERE id=1" 2>&1 || true
+            echo; echo "== prepared handoffs =="
+            docker exec "$pg" psql -U agglayer -d agglayer_store -c \
+                "SELECT l.tx_hash, l.note_id, l.prepared_expiration_block, s.reconcile_cursor, coalesce(t.status,'<no tx row>') AS owner_tx_status, round(extract(epoch from now()-l.created_at)) AS age_secs FROM tx_note_links l JOIN service_state s ON s.id=1 LEFT JOIN transactions t ON t.tx_hash = l.tx_hash WHERE l.handoff_state='prepared' ORDER BY l.created_at" 2>&1 || true
+            echo; echo "== pending receipts =="
+            docker exec "$pg" psql -U agglayer -d agglayer_store -c \
+                "SELECT tx_hash, status, error_message FROM transactions WHERE status='pending' ORDER BY created_at" 2>&1 || true
+            echo; echo "== parked txns =="
+            docker exec "$pg" psql -U agglayer -d agglayer_store -c \
+                "SELECT signer, nonce, tx_hash FROM queued_txns ORDER BY created_at" 2>&1 || true
+            echo; echo "== proxy /metrics (writer + recovery) =="
+            curl -sf --max-time 5 http://localhost:8546/metrics 2>/dev/null \
+                | grep -E '^(agglayer_writer_|pending_unlinked|stranded_prepared)' || true
+            echo; echo "== proxy log tail =="
+            docker logs --tail 200 "$proxy" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' || true
+        fi
+    } > "$out" 2>&1
+    echo "  post-mortem: $out" | tee -a "$R/battery.log"
+}
 
 # run <iter> <label> <keep|fresh> <command...>
 run() {
@@ -32,6 +80,10 @@ run() {
     printf '%s\t%s\t%s\t%s\t%s\n' "$iter" "$label" "$st" "$((t1-t0))" "$log" >> "$TSV"
     matrix
     echo "[$(date -u +%H:%M:%SZ)] i$iter $label $st rc=$rc ($((t1-t0))s)" | tee -a "$R/battery.log"
+    # Capture state BEFORE anything tears it down. The very next `run` with
+    # mode=fresh calls `down`, which is `compose down -v`.
+    [[ "$st" == FAIL ]] && post_mortem "$iter" "$label"
+    return 0
 }
 
 # scenario targets that provision their own stack (need a teardown first)

@@ -409,6 +409,12 @@ step "Phase 0 — pre-drop fingerprint (accumulated state is the fixture)"
 # pre-drop store may not yet have projected everything at that height), so the
 # drill needs both: wait for the projector to catch up and the writer to drain,
 # then compare pre vs post at exactly that projected height.
+# Durable timeout evidence. Defaults into the battery's results directory when
+# the battery set one; otherwise /tmp. Either way it must land somewhere that
+# outlives the stack — a quiesce failure was lost once because the containers
+# were recreated 46 seconds later.
+export QUIESCE_EVIDENCE_DIR="${QUIESCE_EVIDENCE_DIR:-${BATTERY_RESULTS_DIR:+$BATTERY_RESULTS_DIR/logs}}"
+export QUIESCE_EVIDENCE_DIR="${QUIESCE_EVIDENCE_DIR:-/tmp}"
 . "$PROJECT_DIR/scripts/lib-quiesce.sh"
 # 600s, not 180: quiescing is now a NO-PENDING-WORK gate (writer drained, store
 # drained, L1 GER injected, log count stable), and after a chaos storm or a 30-way
