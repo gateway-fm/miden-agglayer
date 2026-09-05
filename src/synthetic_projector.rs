@@ -472,6 +472,17 @@ impl SyntheticProjector {
             "note reconciler: sweep cursor loaded — next sweep window starts at block {}",
             start_reconcile + 1
         );
+        // The projection cursor was NOT logged at boot, only the reconciler's.
+        // After a restart there was then no way to see where projection
+        // resumed from — the first observable is a tick line reporting a cursor
+        // already at the tip, which is equally consistent with "replayed the
+        // range" and "started at the tip and replayed nothing". Both matter to
+        // an operator diagnosing missing history.
+        tracing::info!(
+            projector_cursor = start_cursor,
+            "synthetic projector: projection cursor loaded — next block projected is {}",
+            start_cursor + 1
+        );
         Ok(Self {
             store,
             block_state,

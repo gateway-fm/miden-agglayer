@@ -276,11 +276,33 @@ DELTA_UNRECOV=$((NEW_UNRECOV - BASE_UNRECOV))
 # row post-test is fresh). /metrics counter delta is informational-only because
 # of the known counter bug above.
 if [[ "$DELTA_LOG" -lt 1 ]]; then
-    docker logs "$AGGLAYER_CONTAINER" 2>&1 | grep -iE 'restore::claims|project_claim|fail-closed' | tail -20 | sed 's/^/    | /'
+    # Which of the three possibilities actually happened:
+    #   (i)   the projector never resumed from the rewound cursor  -> boot line
+    #   (ii)  it resumed but block N carried no CLAIM note in its resolved feed
+    #                                                              -> no project_claim_note trace
+    #   (iii) it reached project_claim_note and a dedup/fail-closed gate skipped
+    #                                                              -> counters move
+    # (ii) and (iii) are distinguishable only from the counters, because both
+    # dedup returns in project_claim_note are silent.
+    echo "  --- projector boot + tick lines ---"
+    docker logs "$AGGLAYER_CONTAINER" 2>&1 \
+        | grep -aiE 'projection cursor loaded|sweep cursor loaded|synthetic projector tick' \
+        | tail -8 | sed 's/^/    | /'
+    echo "  --- claim projection lines ---"
+    docker logs "$AGGLAYER_CONTAINER" 2>&1 \
+        | grep -aiE 'restore::claims|project_claim|fail-closed|coverage' | tail -12 | sed 's/^/    | /'
+    echo "  --- post-restart counters (all zero == project_claim_note was never reached for this note) ---"
+    printf '    | synthesised=%s already_recorded=%s decode_err=%s unrecoverable=%s\n' \
+        "$NEW_SYNTH" "$NEW_ALREADY" "$NEW_DECODE" "$NEW_UNRECOV"
+    printf '    | claim_watcher_processed rows for this gi: %s\n' \
+        "$(pgq "SELECT COUNT(*) FROM claim_watcher_processed WHERE global_index = decode('${GI_HEX}', 'hex');")"
+    printf '    | synthetic_logs ClaimEvent rows for this gi: %s\n' \
+        "$(pgq "SELECT COUNT(*) FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' AND lower(data) LIKE '0x${GI_HEX}%';")"
     fail "the projector re-reached block ${CLAIM_BLOCK} (cursor ${CURSOR_NOW}) but did NOT log a new \
-synthesis (Δlog=${DELTA_LOG}). Re-projection ran, so this is not a timing problem: either the consumed \
-CLAIM note is no longer in miden-client's sqlite for the projector to decode, or project_claim_note \
-skipped/fail-closed on it. The proxy lines above say which."
+synthesis (Δlog=${DELTA_LOG}). Re-projection ran, so this is not a timing problem — read the three \
+blocks above in order: the boot line says whether projection actually resumed from the rewound cursor, \
+and all-zero counters say project_claim_note was never reached for this note (its resolved feed did not \
+carry it) rather than reached-and-skipped."
 fi
 
 if [[ "$DELTA_DECODE" -gt 0 ]]; then
