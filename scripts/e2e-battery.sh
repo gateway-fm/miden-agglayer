@@ -97,7 +97,9 @@ FRESH_TARGETS=(
   e2e-rd913-restart-burn-collision e2e-rd940
 )
 
-for iter in $(seq 1 "${ITERATIONS:-4}"); do
+# ITER_START lets a stopped battery resume without renumbering: the matrix keys
+# on the iteration id, so restarting at 1 would overwrite completed columns.
+for iter in $(seq "${ITER_START:-1}" "${ITERATIONS:-4}"); do
   echo "=== ITERATION $iter start $(date -u +%FT%TZ) ===" | tee -a "$R/battery.log"
   down; "${BASE_ENV[@]}" make e2e-clean-data >>"$R/logs/down.log" 2>&1
 
