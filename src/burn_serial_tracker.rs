@@ -54,10 +54,11 @@ pub const DEFAULT_CACHE_CAPACITY: usize = 100_000;
 /// Tracks observed BURN note serial numbers and reports collisions.
 /// See module docs for the persistence + caching design.
 pub struct BurnSerialTracker {
-    /// LRU cache of (serial → ()) — presence means "we've observed and
-    /// persisted this serial in this process's lifetime". Wrapped in a
+    /// LRU cache of (serial → owning note id). Presence means "we've observed
+    /// and persisted this serial in this process's lifetime"; the VALUE is what
+    /// distinguishes a re-observation from a genuine collision. Wrapped in a
     /// `Mutex` because `LruCache::get` mutates the LRU order.
-    cache: Mutex<LruCache<[u8; 32], ()>>,
+    cache: Mutex<LruCache<[u8; 32], [u8; 32]>>,
     store: Arc<dyn Store>,
 }
 
@@ -85,44 +86,57 @@ impl BurnSerialTracker {
         }
     }
 
-    /// Record an observed BURN serial. Returns `Outcome::Duplicate` on a
-    /// collision (caller alerts), `Outcome::New` on first observation.
+    /// Record an observed BURN serial together with the note that carries it.
     ///
-    /// The DB row is the source of truth. The cache is consulted ONLY to
-    /// short-circuit known-new serials we've already observed this run —
-    /// a cache hit means "we previously inserted this and the DB has the
-    /// row", so the next observation of the same serial is a Duplicate.
-    /// A cache miss falls through to the store, which either inserts
-    /// (returns `true` → New, populate cache) or hits the existing row
-    /// (returns `false` → Duplicate).
-    pub async fn record(&self, serial: [u8; 32]) -> anyhow::Result<Outcome> {
-        // Cache hit: serial is already persisted from a previous call in
-        // this process; this is the second observation → Duplicate.
-        // `LruCache::get` updates recency, hence the Mutex.
+    /// `Outcome::Duplicate` means a DIFFERENT note already holds this serial —
+    /// the Cantina #5 attack, and the only case worth paging on.
+    /// `Outcome::New` covers both a first sighting and the same note observed
+    /// again.
+    ///
+    /// WHY THE NOTE ID IS REQUIRED
+    ///
+    /// Keying on the serial alone made every RE-OBSERVATION indistinguishable
+    /// from an attack, and `bridge_out::on_post_sync` re-scans the ENTIRE
+    /// consumed-note history on every sync tick
+    /// (`get_input_notes(NoteFilter::Consumed)`). So after the first tick every
+    /// historical burn reported a collision, once per tick, forever. Measured
+    /// live on a growing chain: 504 collision lines in 3 minutes from 14
+    /// distinct serials, each repeated 36 times — one per 5-second tick, and
+    /// growing with history. An alarm that fires continuously for legitimate
+    /// traffic cannot surface the real thing, which is precisely what this
+    /// monitor exists to do.
+    ///
+    /// The cache therefore holds `serial -> owning note`, and a cache hit is a
+    /// collision only when the note differs.
+    pub async fn record(&self, serial: [u8; 32], note_id: [u8; 32]) -> anyhow::Result<Outcome> {
         {
             let mut cache = self.cache.lock();
-            if cache.get(&serial).is_some() {
-                return Ok(Outcome::Duplicate);
+            if let Some(owner) = cache.get(&serial) {
+                return Ok(if *owner == note_id {
+                    Outcome::New
+                } else {
+                    Outcome::Duplicate
+                });
             }
         }
 
-        // Cache miss: ask the store. The store INSERT … ON CONFLICT path
-        // is atomic; concurrent first observations from two threads have
-        // exactly one INSERT win.
-        let inserted = self.store.burn_serial_observe(&serial).await?;
-        if inserted {
-            // Newly inserted: cache it so subsequent observations short-
-            // circuit to the cache-hit branch above.
-            self.cache.lock().put(serial, ());
-            Ok(Outcome::New)
+        // Cache miss: the store is authoritative and decides atomically.
+        // `true` = benign (first sighting, same note again, or a legacy
+        // pre-027 row adopting this observer); `false` = a different note
+        // already owns the serial.
+        let benign = self
+            .store
+            .burn_serial_observe_for_note(&serial, &note_id)
+            .await?;
+        // Cache the OWNER either way: on the benign path so re-observations are
+        // cheap, and on the collision path so the alarm is not re-raised on
+        // every subsequent tick for the same pair.
+        self.cache.lock().put(serial, note_id);
+        Ok(if benign {
+            Outcome::New
         } else {
-            // The row existed before our INSERT (either a previous-life
-            // observation that survived restart, or a concurrent insert
-            // from another worker). Either way: Duplicate.
-            // Populate the cache so the next observation is a cheap hit.
-            self.cache.lock().put(serial, ());
-            Ok(Outcome::Duplicate)
-        }
+            Outcome::Duplicate
+        })
     }
 
     /// Distinct serials observed since startup (cache-resident only).
@@ -144,73 +158,117 @@ mod tests {
         Arc::new(InMemoryStore::new())
     }
 
-    /// Cantina #5 — repro+regression. A reused B2AGG serial + same-asset
-    /// produces two BURN notes with the same NoteId AND same nullifier.
+    /// Cantina #5 — repro+regression. The attack is a reused B2AGG serial
+    /// producing two DISTINCT BURN notes that collide on NoteId and nullifier.
     /// The tracker must:
     /// - return `New` on first observation
-    /// - return `Duplicate` on the EXACT same serial seen again
+    /// - return `Duplicate` when a DIFFERENT note carries the same serial
     /// - keep distinct serials independent (no false-positive collisions)
     #[tokio::test]
     async fn cantina_5_burn_serial_tracker_detects_duplicate() {
         let t = BurnSerialTracker::new(store());
         let s1 = [0xAAu8; 32];
         let s2 = [0xBBu8; 32];
+        let note_a = [0x01u8; 32];
+        let note_b = [0x02u8; 32];
 
-        assert_eq!(t.record(s1).await.unwrap(), Outcome::New);
+        assert_eq!(t.record(s1, note_a).await.unwrap(), Outcome::New);
         assert_eq!(t.cache_size(), 1);
 
         // Distinct serial — independent, also New.
-        assert_eq!(t.record(s2).await.unwrap(), Outcome::New);
+        assert_eq!(t.record(s2, note_a).await.unwrap(), Outcome::New);
         assert_eq!(t.cache_size(), 2);
 
-        // Re-observe s1 — Cantina #5 collision signature.
-        assert_eq!(t.record(s1).await.unwrap(), Outcome::Duplicate);
+        // A DIFFERENT note carrying s1 — the Cantina #5 collision signature.
+        assert_eq!(t.record(s1, note_b).await.unwrap(), Outcome::Duplicate);
         assert_eq!(t.cache_size(), 2);
 
-        // Re-re-observe s1 — still Duplicate.
-        assert_eq!(t.record(s1).await.unwrap(), Outcome::Duplicate);
+        // Still a collision on re-check.
+        assert_eq!(t.record(s1, note_b).await.unwrap(), Outcome::Duplicate);
         assert_eq!(t.cache_size(), 2);
+    }
+
+    /// THE regression for the false-positive storm: observing the SAME note
+    /// again is benign, however many times it happens.
+    ///
+    /// `bridge_out::on_post_sync` re-scans the ENTIRE consumed-note history on
+    /// every sync tick (`get_input_notes(NoteFilter::Consumed)`), so once a
+    /// burn is in history it is re-observed forever. With the tracker keyed on
+    /// the serial alone, every one of those re-observations paged as a
+    /// collision. Measured live on a growing chain: 504 collision lines in
+    /// 3 minutes from 14 distinct serials, each repeated 36 times — one per
+    /// 5-second tick, and rising with history. An alarm that fires constantly
+    /// for legitimate traffic cannot surface the attack it exists to catch.
+    #[tokio::test]
+    async fn re_observing_the_same_note_is_never_a_collision() {
+        let t = BurnSerialTracker::new(store());
+        let serial = [0xC5u8; 32];
+        let note = [0x77u8; 32];
+
+        assert_eq!(t.record(serial, note).await.unwrap(), Outcome::New);
+        for tick in 0..50 {
+            assert_eq!(
+                t.record(serial, note).await.unwrap(),
+                Outcome::New,
+                "tick {tick}: the same burn re-observed by the every-tick full-history scan \
+                 must never page as a Cantina #5 collision"
+            );
+        }
+        // …and a genuinely different note reusing that serial still does.
+        assert_eq!(
+            t.record(serial, [0x78u8; 32]).await.unwrap(),
+            Outcome::Duplicate
+        );
     }
 
     /// Boundary: zero-bytes is a legitimate serial.
     #[tokio::test]
     async fn cantina_5_zero_serial_treated_like_any_other() {
         let t = BurnSerialTracker::new(store());
-        assert_eq!(t.record([0u8; 32]).await.unwrap(), Outcome::New);
-        assert_eq!(t.record([0u8; 32]).await.unwrap(), Outcome::Duplicate);
+        assert_eq!(
+            t.record([0u8; 32], [0x01u8; 32]).await.unwrap(),
+            Outcome::New
+        );
+        assert_eq!(
+            t.record([0u8; 32], [0x02u8; 32]).await.unwrap(),
+            Outcome::Duplicate
+        );
     }
 
-    /// RD-913 Bug A — restart simulation. The tracker observes a serial,
-    /// is dropped (the process exits), a NEW tracker is constructed against
-    /// the SAME store (the pod restarted, postgres survives), and the
-    /// previously-observed serial must be reported as Duplicate on its next
-    /// observation. Pre-fix this returned `New` and silently let the
-    /// Cantina #5 collision through.
+    /// RD-913 Bug A — restart simulation. The tracker observes a serial, is
+    /// dropped (the process exits), a NEW tracker is constructed against the
+    /// SAME store (the pod restarted, postgres survives), and a DIFFERENT note
+    /// carrying that serial must still be reported as Duplicate. Pre-RD-913
+    /// this returned `New` and silently let the collision through.
     #[tokio::test]
     async fn rd913_restart_survives_observation() {
         let store: Arc<dyn Store> = store();
         let serial = [0x42u8; 32];
 
-        // Pre-restart tracker observes the serial.
+        // Pre-restart tracker observes the serial under note A.
         let t1 = BurnSerialTracker::new(store.clone());
-        assert_eq!(t1.record(serial).await.unwrap(), Outcome::New);
+        assert_eq!(t1.record(serial, [0x0Au8; 32]).await.unwrap(), Outcome::New);
         drop(t1);
 
-        // Restart: brand-new tracker, no warm cache. The store still has
-        // the row from the previous tracker, so the next observation must
-        // be Duplicate.
+        // Restart: brand-new tracker, no warm cache. The store still owns the
+        // row, so an attacker's SECOND note with that serial must be caught.
         let t2 = BurnSerialTracker::new(store.clone());
         // Empty cache by construction.
         assert_eq!(t2.cache_size(), 0);
-        assert_eq!(t2.record(serial).await.unwrap(), Outcome::Duplicate);
+        assert_eq!(
+            t2.record(serial, [0x0Bu8; 32]).await.unwrap(),
+            Outcome::Duplicate
+        );
         // After the store roundtrip the cache is populated.
         assert_eq!(t2.cache_size(), 1);
+        // The ORIGINAL note is still benign across the restart.
+        let t3 = BurnSerialTracker::new(store.clone());
+        assert_eq!(t3.record(serial, [0x0Au8; 32]).await.unwrap(), Outcome::New);
     }
 
-    /// RD-913 — cache eviction safety. With a tiny capacity (1), the
-    /// eviction policy must NOT cause a false `New` on re-observation:
-    /// the evicted entry is still in the store, so the store roundtrip
-    /// returns `false` (already exists) → Duplicate.
+    /// RD-913 — cache eviction safety. With a tiny capacity (1), the eviction
+    /// policy must NOT cause a false `New` for a DIFFERENT note: the evicted
+    /// entry is still in the store, so the roundtrip still detects it.
     #[tokio::test]
     async fn rd913_eviction_does_not_lose_collisions() {
         let store: Arc<dyn Store> = store();
@@ -218,21 +276,25 @@ mod tests {
         let s1 = [0x11u8; 32];
         let s2 = [0x22u8; 32];
 
-        assert_eq!(t.record(s1).await.unwrap(), Outcome::New);
+        assert_eq!(t.record(s1, [0xA1u8; 32]).await.unwrap(), Outcome::New);
         // Observing s2 evicts s1 from the cache (capacity 1).
-        assert_eq!(t.record(s2).await.unwrap(), Outcome::New);
+        assert_eq!(t.record(s2, [0xA2u8; 32]).await.unwrap(), Outcome::New);
         assert_eq!(t.cache_size(), 1);
 
-        // Re-observe s1 — cache miss, but the DB row is still there.
-        // MUST be Duplicate. A bug where the cache shadowed the store
+        // A DIFFERENT note carrying s1 — cache miss, but the DB row is still
+        // there. MUST be Duplicate. A bug where the cache shadowed the store
         // would return New here and Cantina #5 would slip through.
-        assert_eq!(t.record(s1).await.unwrap(), Outcome::Duplicate);
+        assert_eq!(
+            t.record(s1, [0xB1u8; 32]).await.unwrap(),
+            Outcome::Duplicate
+        );
     }
 
     /// Concurrent observation of the same serial from many tasks must
     /// produce exactly one `New` and `n-1` `Duplicate`s — the store's
-    /// INSERT … ON CONFLICT atomicity guarantees this regardless of cache
-    /// race conditions.
+    /// single-statement upsert guarantees this regardless of cache race
+    /// conditions. Each task uses a DISTINCT note id, so every one of them is
+    /// a genuine competing claim on the serial rather than a re-observation.
     #[tokio::test]
     async fn cantina_5_tracker_serialises_concurrent_inserts() {
         let store: Arc<dyn Store> = store();
@@ -241,9 +303,11 @@ mod tests {
         let serial = [0x42u8; 32];
 
         let handles: Vec<_> = (0..n_tasks)
-            .map(|_| {
+            .map(|i| {
                 let t = t.clone();
-                tokio::spawn(async move { t.record(serial).await.unwrap() })
+                let mut note = [0u8; 32];
+                note[0] = i as u8 + 1;
+                tokio::spawn(async move { t.record(serial, note).await.unwrap() })
             })
             .collect();
         let mut outcomes = Vec::new();

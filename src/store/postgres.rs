@@ -3483,20 +3483,37 @@ impl Store for PgStore {
         Ok(!rows.is_empty())
     }
 
-    async fn burn_serial_observe(&self, serial: &[u8; 32]) -> anyhow::Result<bool> {
+    async fn burn_serial_observe_for_note(
+        &self,
+        serial: &[u8; 32],
+        note_id: &[u8; 32],
+    ) -> anyhow::Result<bool> {
         let client = self.pool.get().await?;
-        // ON CONFLICT DO NOTHING with RETURNING tells us atomically whether
-        // we inserted a new row or hit an existing one. The serial primary
-        // key handles the race between two concurrent observations of the
-        // same serial — exactly one INSERT wins.
+        // One statement, so two concurrent observations of the same serial
+        // cannot both read "absent" and both decide they are first.
+        //
+        //  * no row            -> INSERT, benign (first sighting)
+        //  * row, same note_id -> re-observation, benign. `on_post_sync`
+        //                         re-scans all history every tick, so this is
+        //                         the overwhelmingly common case.
+        //  * row, NULL note_id -> written before migration 027 and unattributable;
+        //                         ADOPT this observer rather than alarm forever
+        //                         on every legacy serial. A different note
+        //                         reusing it afterwards still alarms.
+        //  * row, other note   -> the Cantina #5 attack. Not benign.
         let rows = client
             .query(
-                "INSERT INTO monitor_burn_serials (serial) VALUES ($1) \
-                 ON CONFLICT (serial) DO NOTHING RETURNING serial",
-                &[&serial.as_slice()],
+                "INSERT INTO monitor_burn_serials (serial, note_id) VALUES ($1, $2) \
+                 ON CONFLICT (serial) DO UPDATE \
+                     SET note_id = COALESCE(monitor_burn_serials.note_id, EXCLUDED.note_id) \
+                 RETURNING note_id = $2 AS benign",
+                &[&serial.as_slice(), &note_id.as_slice()],
             )
             .await?;
-        Ok(!rows.is_empty())
+        Ok(rows
+            .first()
+            .map(|r| r.get::<_, bool>("benign"))
+            .unwrap_or(false))
     }
 
     async fn twin_note_commitments(&self, note_id: &[u8; 32]) -> anyhow::Result<Vec<[u8; 32]>> {

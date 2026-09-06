@@ -164,7 +164,9 @@ pub struct InMemoryStore {
     // monitor_twin_notes, monitor_expected_mints. With InMemoryStore the
     // mirror IS the source of truth; with PgStore the DB is and these
     // structures live inside the tracker's LRU cache instead.
-    monitor_burn_serials: RwLock<HashSet<[u8; 32]>>,
+    // serial -> the note that owns it (migration 027): a re-observation of the
+    // SAME note is benign; a different note holding the serial is the attack.
+    monitor_burn_serials: RwLock<HashMap<[u8; 32], [u8; 32]>>,
     monitor_twin_notes: RwLock<HashMap<[u8; 32], Vec<[u8; 32]>>>,
     monitor_expected_mints: RwLock<HashMap<[u8; 32], MonitorExpectedMintRow>>,
     // Cantina #4 — permanent claim→expected-MINT-IDENTITY reconciliation
@@ -279,7 +281,7 @@ impl InMemoryStore {
             #[cfg(test)]
             test_land_after_next_has_claim_miss: RwLock::new(None),
             faucets: RwLock::new(Vec::new()),
-            monitor_burn_serials: RwLock::new(HashSet::new()),
+            monitor_burn_serials: RwLock::new(HashMap::new()),
             monitor_twin_notes: RwLock::new(HashMap::new()),
             monitor_expected_mints: RwLock::new(HashMap::new()),
             monitor_claim_mint_serials: RwLock::new(HashMap::new()),
@@ -2502,12 +2504,26 @@ impl Store for InMemoryStore {
     // ── Monitor trackers (RD-913) ────────────────────────────────
 
     async fn burn_serial_seen(&self, serial: &[u8; 32]) -> anyhow::Result<bool> {
-        Ok(self.monitor_burn_serials.read().contains(serial))
+        Ok(self.monitor_burn_serials.read().contains_key(serial))
     }
 
-    async fn burn_serial_observe(&self, serial: &[u8; 32]) -> anyhow::Result<bool> {
-        let mut set = self.monitor_burn_serials.write();
-        Ok(set.insert(*serial))
+    async fn burn_serial_observe_for_note(
+        &self,
+        serial: &[u8; 32],
+        note_id: &[u8; 32],
+    ) -> anyhow::Result<bool> {
+        let mut map = self.monitor_burn_serials.write();
+        match map.get(serial) {
+            // Same note seen again — benign, and the common case: the monitor
+            // re-scans all of history on every sync tick.
+            Some(owner) if owner == note_id => Ok(true),
+            // A DIFFERENT note holding this serial: the Cantina #5 attack.
+            Some(_) => Ok(false),
+            None => {
+                map.insert(*serial, *note_id);
+                Ok(true)
+            }
+        }
     }
 
     async fn twin_note_commitments(&self, note_id: &[u8; 32]) -> anyhow::Result<Vec<[u8; 32]>> {

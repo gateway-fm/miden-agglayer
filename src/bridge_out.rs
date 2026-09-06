@@ -1079,7 +1079,11 @@ impl BridgeOutScanner {
                 // the legacy BURN monitor's behavior or persistence model.
                 MonitoredNoteKind::Burn if note.commitment().is_some() => {
                     let serial = note.details().recipient().serial_num();
-                    match self.burn_serials.record(serial.as_bytes()).await {
+                    // The note's own identity: a collision is two DIFFERENT
+                    // notes sharing a serial, never the same note re-observed
+                    // by the every-tick full-history scan above.
+                    let owner: [u8; 32] = note.details_commitment().as_bytes();
+                    match self.burn_serials.record(serial.as_bytes(), owner).await {
                         Ok(crate::burn_serial_tracker::Outcome::Duplicate) => {
                             metrics::counter!("bridge_burn_serial_collision_total").increment(1);
                             tracing::error!(

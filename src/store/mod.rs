@@ -1131,7 +1131,21 @@ pub trait Store: Send + Sync + 'static {
     /// Record an observed BURN serial. Returns `true` if newly inserted
     /// (caller treats this as `New`); `false` if it already existed
     /// (caller treats this as `Duplicate` and fires the Cantina #5 alert).
-    async fn burn_serial_observe(&self, _serial: &[u8; 32]) -> anyhow::Result<bool> {
+    /// Record a BURN serial together with the note it belongs to.
+    ///
+    /// Returns `true` when this observation is BENIGN — a first sighting, or
+    /// the SAME note seen again — and `false` only when the serial is already
+    /// held by a DIFFERENT note, which is the Cantina #5 attack.
+    ///
+    /// Keying on the serial alone made every re-observation look like an
+    /// attack, and `on_post_sync` re-scans the whole consumed-note history on
+    /// every tick: 504 collision lines in 3 minutes from 14 distinct serials,
+    /// each once per 5s tick, measured on a growing chain.
+    async fn burn_serial_observe_for_note(
+        &self,
+        _serial: &[u8; 32],
+        _note_id: &[u8; 32],
+    ) -> anyhow::Result<bool> {
         Ok(true)
     }
 
