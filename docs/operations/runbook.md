@@ -274,6 +274,69 @@ complete log fingerprint before starting the normal service. `--restore`
 replays synthetic events during this offline reconstruction; the
 `SyntheticProjector` remains the sole producer in normal live operation.
 
+### The post-restore sequence — all three steps, in order
+
+A restore is not finished when the one-shot exits. Aggkit keeps its own
+transaction-manager state, which the restore cannot reach, and that state must
+be reset too. This is an ordinary part of the recovery playbook, not a defect —
+but it is **mandatory**, and skipping it leaves the bridge silently one-way:
+outbound (L2→L1) still works, while every inbound (L1→L2) deposit stops
+reaching `ready_for_claim`, indefinitely.
+
+**1. `--restore`** — as above, with the service stopped. It rebuilds the
+synthetic store and the nonce ledger, and drops every `nonce_reservations` row.
+Both halves matter: `nonces` and `nonce_reservations` describe one ledger
+between them, and a rebuilt (empty) `nonces` alongside surviving reservations
+makes the proxy reject the aggoracle's next injection —
+
+```
+ERROR rpc::error: nonce 0 for 0x… is reserved by a different tx 0x…
+      (concurrent submission at the same nonce slot); this tx must not execute
+```
+
+Confirm from the restore log:
+
+```
+Phase 4: nonce ledger is EMPTY after restore — flagged for first-contact
+bootstrap (#90) and stale nonce reservations dropped, cleared_reservations: N
+```
+
+**2. Reset aggkit's tx-manager / monitoring DB.**
+
+```bash
+PROJECT=<compose-project> ./scripts/aggkit-preserve-heal.sh aggkit
+```
+
+Aggkit's aggoracle may hold a monitored GER-inject transaction that the proxy
+never durably admitted; its deterministic tx-ID dedup then blocks any re-send
+forever and the injector loops on:
+
+```
+aggoracle: inject GER transaction already exists in monitoring DB with ID: 0x…
+```
+
+Use this script rather than a plain `restart` (which preserves
+`/tmp/ethtxmanager-aggoracle.sqlite`) or a blanket `--force-recreate` (which
+also destroys aggsender's cert lineage and the bridgesync cursors). Exit codes:
+`0` healed and an injection was observed, `2` no wedge to heal, `3` healed but
+unproven, anything else needs a look.
+
+**3. Verify GER injection actually resumed.** Neither step alone is sufficient
+— step 1 removes the proxy's veto, step 2 lets aggkit re-send — so verify the
+end state rather than either command's exit code:
+
+```bash
+L1_GER=$(cast call --rpc-url "$L1_RPC_URL" "$GER_MANAGER" \
+           'getLastGlobalExitRoot()(bytes32)')
+psql "$DATABASE_URL" -tAc "SELECT count(*) FROM ger_entries
+     WHERE is_injected AND '0x'||encode(ger_hash,'hex') = '$L1_GER'"
+```
+
+`1` means L1's current global exit root has been injected and consumed on Miden
+— the inbound pipeline is live. `0`, persisting over a few minutes while the
+aggoracle keeps logging, means the sequence has not completed: re-check step 1's
+`cleared_reservations` line and step 2's exit code before sending traffic.
+
 ### What a restore preserves — and the one field it cannot
 
 A restore reconstructs synthetic history from authoritative Miden state. Every
