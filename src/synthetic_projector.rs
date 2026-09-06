@@ -1275,6 +1275,76 @@ impl SyntheticProjector {
         Ok(())
     }
 
+    /// Read the bridge account for the LET gate, re-importing it from the node
+    /// once if the local miden-client store does not have it.
+    ///
+    /// WHY THE HEAL EXISTS
+    ///
+    /// `--reset-miden-store` recovery (#148: retained Postgres, wiped client
+    /// sqlite) can leave the client store without the bridge account. The gate
+    /// then fails, and because `tick_pass` returns early while `cursor >= tip`
+    /// the failure is INVISIBLE until the first block that actually needs
+    /// projecting — at which point EVERY tick errors and the cursor never
+    /// advances again. Observed live 2026-09-06 on the #148 recovery path: the
+    /// projector logged "caught up to the Miden tip" at cursor 92, a bridge-out
+    /// landed, and then
+    ///
+    ///     ERROR MidenClient sync listener error:
+    ///           LET gate: bridge account 0xd09f96bd… is unavailable
+    ///
+    /// repeated every 5s while `reconcile_cursor` ran on to 149 and
+    /// `projector_cursor` stayed at 92. No BridgeEvent was ever emitted, so the
+    /// recovered stack could not produce a fresh outbound exit at all.
+    ///
+    /// A missing public account is exactly what `import_account_by_id` is for —
+    /// `heal_bridge_after_executor_failure` and `account_recovery::reimport_account`
+    /// already use it for the same class of staleness. The gate had no such
+    /// path, so a recoverable condition halted projection permanently.
+    ///
+    /// Still FAIL-CLOSED: if the re-import does not produce the account, the
+    /// original error is returned and the tick refuses to seal. The heal only
+    /// removes the case where the account was one node fetch away.
+    async fn bridge_account_for_let_gate(
+        &self,
+        client: &mut MidenClientLib,
+    ) -> anyhow::Result<miden_client::account::Account> {
+        let bridge_id = self.bridge_id;
+        if let Some(account) = client
+            .get_account(bridge_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("LET gate: get_account({bridge_id}): {e}"))?
+        {
+            return Ok(account);
+        }
+        tracing::warn!(
+            target: "synthetic_projector",
+            bridge = %self.bridge_id.to_hex(),
+            "LET gate: bridge account absent from the local client store (a \
+             --reset-miden-store recovery leaves it so); re-importing from the node \
+             before failing the tick"
+        );
+        ::metrics::counter!("let_gate_bridge_account_reimports_total").increment(1);
+        if let Err(err) = client.import_account_by_id(bridge_id).await {
+            tracing::warn!(
+                target: "synthetic_projector",
+                bridge = %bridge_id.to_hex(), error = ?err,
+                "LET gate: re-import of the bridge account failed"
+            );
+        }
+        client
+            .get_account(bridge_id)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("LET gate: get_account({bridge_id}) after re-import: {e}")
+            })?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "LET gate: bridge account {bridge_id} is unavailable even after a re-import \
+                     from the node — projection cannot seal without its on-chain LET leaf count"
+                )
+            })
+    }
+
     /// COMPLETENESS AUDITOR — in-proxy early detection of missed BridgeEvents (the
     /// productionized `scripts/verify-event-completeness.sh`), detection ONLY: getLogs
     /// immutability forbids emitting into a sealed block, so a miss is alarmed loudly
@@ -1726,13 +1796,7 @@ impl SyntheticProjector {
         // restore pass leaves beyond `pass_tip` are legitimately not yet
         // reserved; the equality gate therefore runs on the final pass only.
         // The prefix checks are window-local and always run.
-        let bridge_account = client
-            .get_account(self.bridge_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("LET gate: get_account({}): {e}", self.bridge_id))?
-            .ok_or_else(|| {
-                anyhow::anyhow!("LET gate: bridge account {} is unavailable", self.bridge_id)
-            })?;
+        let bridge_account = self.bridge_account_for_let_gate(client).await?;
         let on_chain = miden_base_agglayer::AggLayerBridge::read_let_num_leaves(&bridge_account);
         let accounted = self.store.get_accounted_deposit_count().await?;
         let note_keys: Vec<String> = auth_b2agg.iter().map(|(id, _)| id.to_hex()).collect();
@@ -3043,6 +3107,46 @@ mod tests {
         let fresh = test_projector(&store, &block_state).await;
         assert_eq!(fresh.reconcile_cursor.load(Ordering::Acquire), 0);
         assert_eq!(fresh.cursor.load(Ordering::Acquire), 0);
+    }
+
+    /// The LET gate must ATTEMPT a re-import before failing, and must still
+    /// fail closed when the account is genuinely unobtainable.
+    ///
+    /// Regression for a permanent projection halt on the #148 recovery path
+    /// (retained Postgres + `--reset-miden-store`). The client store comes back
+    /// without the bridge account; `tick_pass` returns early while
+    /// `cursor >= tip`, so nothing notices until the first block that actually
+    /// needs projecting — and from then on EVERY tick errors:
+    ///
+    ///     ERROR MidenClient sync listener error:
+    ///           LET gate: bridge account 0xd09f96bd… is unavailable
+    ///
+    /// observed every 5s while projector_cursor stayed at 92 and
+    /// reconcile_cursor ran to 149. No BridgeEvent was emitted again, so the
+    /// recovered stack could not produce a fresh outbound exit at all.
+    ///
+    /// An offline client cannot satisfy the re-import, so the assertion here is
+    /// the fail-closed half: the error must name the re-import that was tried,
+    /// which is also what tells an operator the difference between "we never
+    /// looked" and "the node does not have it either".
+    #[tokio::test]
+    async fn let_gate_missing_bridge_account_reimports_then_fails_closed() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+        let mut client = crate::test_helpers::offline_miden_client_lib().await;
+
+        let err = projector
+            .bridge_account_for_let_gate(&mut client)
+            .await
+            .expect_err("an offline client cannot produce the bridge account");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("even after a re-import"),
+            "the gate must say it TRIED to heal before failing — otherwise a recoverable \
+             missing-account halts projection forever with no hint that a re-import is the \
+             fix. Got: {rendered}"
+        );
     }
 
     /// A dead node must fail the restore with the discovery cause, not hang
