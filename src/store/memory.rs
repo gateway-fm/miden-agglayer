@@ -503,6 +503,13 @@ impl Store for InMemoryStore {
         Ok(*self.nonce_ledger_rebuilt.read())
     }
 
+    async fn clear_nonce_reservations(&self) -> anyhow::Result<u64> {
+        let mut r = self.nonce_reservations.write();
+        let n = r.len() as u64;
+        r.clear();
+        Ok(n)
+    }
+
     async fn set_nonce_ledger_rebuilt(&self, rebuilt: bool) -> anyhow::Result<()> {
         *self.nonce_ledger_rebuilt.write() = rebuilt;
         *self.nonce_ledger_rebuilt_at.write() = rebuilt.then(|| {

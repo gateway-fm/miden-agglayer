@@ -567,6 +567,18 @@ pub trait Store: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Drop every `nonce_reservations` row. `--restore` calls this alongside the
+    /// nonce-ledger rebuild: `nonces` and `nonce_reservations` are ONE ledger,
+    /// and rebuilding only the first leaves reservations describing pre-restore
+    /// work the rebuilt ledger knows nothing about — which then veto the very
+    /// first transaction the #90 first-contact bootstrap exists to admit.
+    ///
+    /// Safe by construction: restore is a one-shot with the serving proxy
+    /// stopped, so there is no live reservation to steal.
+    async fn clear_nonce_reservations(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
     /// #90 — seed a signer's nonce baseline iff it has NO row yet. Insert-if-absent,
     /// so it is atomic and idempotent across replicas: exactly one caller seeds and
     /// every later call is a no-op. Returns `true` iff this call created the row.

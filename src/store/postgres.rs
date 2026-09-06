@@ -274,6 +274,14 @@ impl Store for PgStore {
         Ok(row.get::<_, bool>(0))
     }
 
+    async fn clear_nonce_reservations(&self) -> anyhow::Result<u64> {
+        let client = self.pool.get().await?;
+        let n = client
+            .execute("DELETE FROM nonce_reservations", &[])
+            .await?;
+        Ok(n)
+    }
+
     async fn set_nonce_ledger_rebuilt(&self, rebuilt: bool) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
         // Stamp WHEN the rebuild happened so the bootstrap window is durable and

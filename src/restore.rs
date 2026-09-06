@@ -234,9 +234,32 @@ pub(crate) async fn finalize_restore_cursors(
     // adopt each signer's first observed nonce as its baseline instead of
     // demanding 0.
     store.set_nonce_ledger_rebuilt(true).await?;
+    // …and drop the OTHER half of that ledger. `nonces` and `nonce_reservations`
+    // describe one thing between them; rebuilding only `nonces` leaves per-nonce
+    // reservations from before the restore, and the admission path then refuses
+    // the first tx the #90 bootstrap was meant to accept:
+    //
+    //   ERROR rpc::error: nonce 0 for 0x0b68058e…a332a7c is reserved by a
+    //         different tx 0xabb296fb… (concurrent submission at the same nonce
+    //         slot); this tx must not execute
+    //
+    // Observed live 2026-09-06 after `e2e-restore`: `nonces` empty (so the
+    // signer's next nonce is 0) while `nonce_reservations` still held rows 0..9
+    // for the aggoracle signer, all `released_success`, created ~45 minutes
+    // earlier. The aggoracle re-sent at nonce 0, the proxy vetoed it against the
+    // stale row, aggkit's dedup blocked producing a different tx, and GER
+    // injection froze permanently — every L1→L2 deposit on the restored stack
+    // stopped reaching ready_for_claim.
+    //
+    // The full-DB-loss drill never saw this because it DROPS the database, so
+    // the reservations went with it. A partial restore — the realistic operator
+    // shape — keeps them.
+    let cleared = store.clear_nonce_reservations().await?;
     tracing::warn!(
+        cleared_reservations = cleared,
         "Phase 4: nonce ledger is EMPTY after restore — flagged for first-contact \
-         bootstrap (#90); ordinary R4 ordering resumes per signer once seeded"
+         bootstrap (#90) and stale nonce reservations dropped; ordinary R4 ordering \
+         resumes per signer once seeded"
     );
 
     match swept_to {
@@ -374,6 +397,70 @@ mod tests {
             logs_created: 6,
         };
         assert_eq!(r.claims_restored, 2);
+    }
+
+    /// Restore must clear `nonce_reservations`, not just rebuild `nonces`.
+    ///
+    /// They are ONE ledger. Rebuilding only `nonces` leaves per-nonce
+    /// reservations from before the restore, and admission then vetoes the very
+    /// first transaction the #90 first-contact bootstrap exists to accept:
+    ///
+    ///     ERROR rpc::error: nonce 0 for 0x0b68058e…a332a7c is reserved by a
+    ///           different tx 0xabb296fb… (concurrent submission at the same
+    ///           nonce slot); this tx must not execute
+    ///
+    /// Observed live 2026-09-06 after `e2e-restore`: `nonces` empty while
+    /// `nonce_reservations` still held rows 0..9 for the aggoracle signer,
+    /// created ~45 minutes earlier. The aggoracle re-sent at nonce 0, the proxy
+    /// vetoed it against the stale row, aggkit's dedup blocked producing a
+    /// different tx, and GER injection froze permanently — every L1→L2 deposit
+    /// on the restored stack stopped reaching ready_for_claim.
+    ///
+    /// The full-DB-loss drill never caught it because it DROPS the database, so
+    /// the reservations went too. A partial restore keeps them.
+    #[tokio::test]
+    async fn restore_clears_stale_nonce_reservations() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let signer = "0x0b68058e5b2592b1f472adfe106305295a332a7c";
+        let lease = std::time::Duration::from_secs(90);
+
+        // Pre-restore in-flight work holds nonces 0 and 1.
+        for (nonce, byte) in [(0u64, 0xAAu8), (1u64, 0xBBu8)] {
+            store
+                .reserve_nonce(
+                    signer,
+                    nonce,
+                    alloy::primitives::TxHash::from([byte; 32]),
+                    lease,
+                )
+                .await
+                .unwrap();
+        }
+
+        finalize_restore_cursors(&store, 130_000, Some(130_000))
+            .await
+            .unwrap();
+
+        assert!(
+            store.is_nonce_ledger_rebuilt().await.unwrap(),
+            "#90 marker must still be set"
+        );
+        // A DIFFERENT transaction must now be admissible at nonce 0 — that is
+        // exactly the aggoracle's next GER injection after a restore.
+        let after = store
+            .reserve_nonce(
+                signer,
+                0,
+                alloy::primitives::TxHash::from([0xCCu8; 32]),
+                lease,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !matches!(after, crate::store::NonceReservation::HeldByOther(_)),
+            "a stale pre-restore reservation must not veto the first post-restore \
+             transaction at that nonce; got {after:?}"
+        );
     }
 
     /// Regression lock for the prod restart-resync incident: when discovery
