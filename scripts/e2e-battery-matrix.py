@@ -13,13 +13,15 @@
 #   gN  growing chain   an iteration of the ONE-chain battery: a single genesis
 #                       for the whole run, so every target and every drill acts
 #                       on accumulated history
+#   vN  VOID            a run kept for the record but NOT evidence — the stack
+#                       was known-broken or hand-modified partway through
 #
 # Phases sort in that order, so the matrix reads left to right as the run
 # actually happened.
 """Regenerate MATRIX.md (target x iteration) from results.tsv."""
 import sys, collections
 
-PHASES = {'p': (0, 'pre'), 'h': (1, 'harness'), 'g': (3, 'grow')}
+PHASES = {'p': (0, 'pre'), 'h': (1, 'harness'), 'v': (4, 'void'), 'g': (3, 'grow')}
 
 def parse_iter(s):
     """-> (phase_rank, number). 'p3' < 'h1' < '2'."""
@@ -43,7 +45,7 @@ for it,tgt,st,secs,log in rows:
     else:
         res[tgt][key_it]=(st, secs, log, False)
 its=sorted(iters) or [(1,1)]
-RANK_LABEL = {0: 'pre', 1: 'harness', 2: 'iter', 3: 'grow'}
+RANK_LABEL = {0: 'pre', 1: 'harness', 2: 'iter', 3: 'grow', 4: 'VOID'}
 def header(k):
     rank, n = k
     return f"{RANK_LABEL[rank]} {n}"
@@ -61,6 +63,11 @@ if any(k[0] == 0 for k in its):
           "history. They predate the quiesce rewrite, the writer queue-depth fix and the "
           "bridge-out-tool preflight, so their reds are not evidence about the current "
           "harness — and their greens are not evidence about it either.\n")
+if any(k[0] == 4 for k in its):
+    print("`VOID N` columns are NOT evidence. That run's stack was known-broken or hand-modified "
+          "partway through, so its later results measure the damage rather than the code. Kept "
+          "visible rather than deleted, because a run that happened and was discarded is part of "
+          "the record.\n")
 if any(k[0] == 3 for k in its):
     print("`grow N` columns are the GROWING-CHAIN battery: one genesis, one node_data "
           "volume, one anvil L1 and the same bridge/faucet accounts for the whole run, so "
@@ -79,7 +86,7 @@ for tgt,per in res.items():
     print(f"| `{tgt}` | " + " | ".join(cell(per.get(i)) for i in its) + " |")
 def totals(rank):
     return collections.Counter(v[0] for per in res.values() for k,v in per.items() if k[0]==rank)
-grow, bat, harn, pre = totals(3), totals(2), totals(1), totals(0)
+void, grow, bat, harn, pre = totals(4), totals(3), totals(2), totals(1), totals(0)
 if grow:
     print("\n**Totals (growing chain):** " + ", ".join(f"{k}={v}" for k,v in sorted(grow.items())))
 print("\n**Totals (fresh-chain battery):** " + (", ".join(f"{k}={v}" for k,v in sorted(bat.items())) or "no runs yet"))
@@ -87,3 +94,5 @@ if harn:
     print("\n**Totals (harness proof):** " + ", ".join(f"{k}={v}" for k,v in sorted(harn.items())))
 if pre:
     print("\n**Totals (pre-hardening, history only):** " + ", ".join(f"{k}={v}" for k,v in sorted(pre.items())))
+if void:
+    print("\n**Totals (VOID — not evidence):** " + ", ".join(f"{k}={v}" for k,v in sorted(void.items())))
