@@ -21,7 +21,43 @@ matrix() { "$PWD/scripts/e2e-battery-matrix.py" "$TSV" > "$R/MATRIX.md" 2>/dev/n
 # lib-quiesce.sh's QUIESCE_EVIDENCE_DIR).
 export BATTERY_RESULTS_DIR="$PWD/$R"
 
-down() { "${BASE_ENV[@]}" make e2e-down >>"$R/logs/down.log" 2>&1; }
+# GROWING CHAIN (default). One genesis for the whole battery: every target runs
+# against the accumulated history, so the from-genesis restores rebuild an
+# ever-larger chain and the drills are actually testing scale. Set
+# KEEP_CHAIN=0 to go back to wiping genesis before every target.
+KEEP_CHAIN="${KEEP_CHAIN:-1}"
+export KEEP_CHAIN
+BASE_ENV+=("KEEP_CHAIN=$KEEP_CHAIN")
+
+# `make e2e-down` is `compose down -v` — it deletes the node_data volume and
+# with it the chain. Under KEEP_CHAIN it must never run: `e2e-clean-data` no
+# longer touches the volume, so the teardown that used to be required before it
+# is required no longer.
+down() {
+    if [[ "$KEEP_CHAIN" == "1" ]]; then
+        echo "[$(date -u +%H:%M:%SZ)] (teardown skipped — KEEP_CHAIN=1)" >>"$R/logs/down.log"
+        return 0
+    fi
+    "${BASE_ENV[@]}" make e2e-down >>"$R/logs/down.log" 2>&1
+}
+
+# Chain growth is the point of the run, so it is recorded, not assumed. Called
+# at every drill and at each iteration boundary.
+chain_mark() { # $1 = label
+    local pg proxy line
+    proxy="$(docker ps --format '{{.Names}}' | grep -E -- '-miden-agglayer-1$' | head -1)"
+    [[ -n "$proxy" ]] || { echo -e "$1\t(no proxy running)" >> "$R/chain-growth.tsv"; return 0; }
+    pg="${proxy%-miden-agglayer-1}-agglayer-postgres-1"
+    line="$(docker exec "$pg" psql -U agglayer -d agglayer_store -tAc \
+        "SELECT (SELECT latest_block_number FROM service_state WHERE id=1) || E'\t' ||
+                (SELECT count(*) FROM synthetic_logs WHERE topics[1] LIKE '0x65d3bf36%') || E'\t' ||
+                (SELECT count(*) FROM synthetic_logs WHERE topics[1] LIKE '0x50178120%') || E'\t' ||
+                (SELECT count(*) FROM synthetic_logs WHERE topics[1] LIKE '0x1df3f2a9%')" 2>/dev/null | tr -d '\r')"
+    [[ -n "$line" ]] || line=$'\t\t\t'
+    printf '%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$1" "$line" >> "$R/chain-growth.tsv"
+    echo "  chain: $1 -> tip/UHC/Bridge/Claim = $(tr '\t' '/' <<<"$line")" | tee -a "$R/battery.log"
+}
+[[ -f "$R/chain-growth.tsv" ]] || printf 'when\tmark\tsynthetic_tip\tUHC\tBridge\tClaim\n' > "$R/chain-growth.tsv"
 
 # POST-MORTEM — run on EVERY failure, while the stack is still up.
 #
@@ -99,9 +135,19 @@ FRESH_TARGETS=(
 
 # ITER_START lets a stopped battery resume without renumbering: the matrix keys
 # on the iteration id, so restarting at 1 would overwrite completed columns.
+# THE ONLY WIPE IN THE RUN. Everything after this shares one genesis, one
+# node_data volume, one anvil L1 and the same bridge/faucet accounts.
+if [[ "${ITER_START:-1}" == "1" ]]; then
+  echo "=== one-time genesis wipe before iteration 1 ===" | tee -a "$R/battery.log"
+  WIPE_ENV=(env -u WITH_WEB3SIGNER -u EXTRA_COMPOSE_FILES KEEP_CHAIN=0)
+  "${WIPE_ENV[@]}" make e2e-down       >>"$R/logs/down.log" 2>&1 || true
+  "${WIPE_ENV[@]}" make e2e-clean-data >>"$R/logs/down.log" 2>&1
+else
+  echo "=== resuming at iteration ${ITER_START} — chain preserved, no wipe ===" | tee -a "$R/battery.log"
+fi
+
 for iter in $(seq "${ITER_START:-1}" "${ITERATIONS:-4}"); do
   echo "=== ITERATION $iter start $(date -u +%FT%TZ) ===" | tee -a "$R/battery.log"
-  down; "${BASE_ENV[@]}" make e2e-clean-data >>"$R/logs/down.log" 2>&1
 
   # (a) full suite — self-contained (brings up, tests, tears down)
   run "$iter" "test-e2e" fresh make test-e2e
@@ -122,7 +168,9 @@ for iter in $(seq "${ITER_START:-1}" "${ITERATIONS:-4}"); do
 
   # (c) full-DB-loss drill on a stack carrying real round-trip state
   run "$iter" "fixture-l2-to-l1" fresh make e2e-l2-to-l1
+  chain_mark "i$iter before full-db-loss-recovery"
   run "$iter" "full-db-loss-recovery" keep ./scripts/e2e-full-db-loss-recovery.sh
+  chain_mark "i$iter after full-db-loss-recovery"
 
   # (d) load + completeness on that stack
   run "$iter" "loadtest-N30" keep env N=30 ./scripts/e2e-bridge-loadtest-isolated.sh
@@ -137,8 +185,11 @@ for iter in $(seq "${ITER_START:-1}" "${ITERATIONS:-4}"); do
   # guard's own warning about restore-vs-restore idempotence is printed into the
   # log so the verdict is never read as a fresh fidelity comparison. The
   # fidelity claim is made by `full-db-loss-recovery` above, on a live baseline.
+  chain_mark "i$iter before full-db-loss-recovery-postchaos"
   run "$iter" "full-db-loss-recovery-postchaos" keep env ALLOW_RESTORED_BASELINE=1 ./scripts/e2e-full-db-loss-recovery.sh
+  chain_mark "i$iter after full-db-loss-recovery-postchaos"
 
+  chain_mark "i$iter END"
   echo "=== ITERATION $iter done $(date -u +%FT%TZ) ===" | tee -a "$R/battery.log"
 done
 echo "BATTERY COMPLETE $(date -u +%FT%TZ)" | tee -a "$R/battery.log"
