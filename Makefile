@@ -108,8 +108,12 @@ test-e2e: ## Spin up docker stack, run E2E tests, tear down (fully self-containe
 	@echo ""
 	./scripts/e2e-test.sh; EXIT_CODE=$$?; \
 		echo ""; \
-		echo "Tearing down stack..."; \
-		$(E2E_COMPOSE) down -v; \
+		if [ "$${KEEP_CHAIN:-0}" = "1" ]; then \
+			echo "KEEP_CHAIN=1 — leaving the stack UP (the chain must survive this target)"; \
+		else \
+			echo "Tearing down stack..."; \
+			$(E2E_COMPOSE) down -v; \
+		fi; \
 		exit $$EXIT_CODE
 
 .PHONY: test-nextest
@@ -300,17 +304,52 @@ e2e-clean-data: ## Wipe .miden-agglayer-data/ + .b2agg-store/ + node_data volume
 	#  (3) The node_data volume rm distinguishes "absent" (fine) from "in use"
 	#      (a live container still mounts it ⇒ `make e2e-down` was not run ⇒
 	#      stale node state would survive under a "fresh" stack — hard stop).
-	rm -rf .miden-agglayer-data .b2agg-store 2>/dev/null || \
-		docker run --rm -v "$(CURDIR):/work" alpine sh -c 'rm -rf /work/.miden-agglayer-data /work/.b2agg-store'
-	@if [ -e .miden-agglayer-data ] || [ -e .b2agg-store ]; then \
-		echo "e2e-clean-data: WIPE FAILED — leftover state would poison the fresh stack:"; \
-		ls -la .miden-agglayer-data .b2agg-store 2>/dev/null; exit 1; fi
-	mkdir -p .miden-agglayer-data/tmp
-	@project="$${COMPOSE_PROJECT_NAME:-$(notdir $(CURDIR))}"; \
-	volume="$${project}_node_data"; \
-	out=$$(docker volume rm "$$volume" 2>&1) || { \
-		echo "$$out" | grep -qi "no such volume" || { \
-			echo "e2e-clean-data: cannot remove $$volume (stack still up? run 'make e2e-down'): $$out"; exit 1; }; }
+	#
+	# KEEP_CHAIN=1 — the GROWING-CHAIN battery. One genesis, one node_data
+	# volume, one anvil L1 and the SAME bridge/faucet accounts for the whole
+	# run, so every drill and scenario acts on accumulated history and the
+	# from-genesis restores rebuild an ever-larger chain. That is the property
+	# under test; wiping between targets measures a fresh chain N times and says
+	# nothing about scale. The wipe still runs ONCE before the first iteration.
+	#
+	# Note the isolated-store rule in (1) above is respected, not bypassed: the
+	# hazard is a `.b2agg-store` outliving its CHAIN and carrying a stale genesis
+	# commitment in its gRPC Accept header. Under KEEP_CHAIN the chain does not
+	# change, so the store stays valid by construction.
+	#
+	# KEEP_CHAIN=1 — the GROWING-CHAIN battery. One genesis, one node_data
+	# volume, one anvil L1 and the SAME bridge/faucet accounts for the whole
+	# run, so every drill and scenario acts on accumulated history and the
+	# from-genesis restores rebuild an ever-larger chain. That is the property
+	# under test; wiping between targets measures a fresh chain N times and says
+	# nothing about scale. The wipe still runs ONCE before the first iteration.
+	#
+	# The isolated-store rule in (1) is respected, not bypassed: the hazard is a
+	# `.b2agg-store` outliving its CHAIN and carrying a stale genesis commitment
+	# in its gRPC Accept header. Under KEEP_CHAIN the chain does not change, so
+	# those stores stay valid by construction.
+	#
+	# ONE shell block, deliberately. As separate recipe lines an `exit 0` in the
+	# guard ends only that line's subshell and make runs the wipe anyway — which
+	# it did, silently, on the first attempt at this.
+	@set -e; \
+	if [ "$${KEEP_CHAIN:-0}" = "1" ]; then \
+		echo "e2e-clean-data: KEEP_CHAIN=1 — preserving node_data, anvil L1, proxy store and .b2agg-store (growing chain)"; \
+		mkdir -p .miden-agglayer-data/tmp; \
+	else \
+		rm -rf .miden-agglayer-data .b2agg-store 2>/dev/null || \
+			docker run --rm -v "$(CURDIR):/work" alpine sh -c 'rm -rf /work/.miden-agglayer-data /work/.b2agg-store'; \
+		if [ -e .miden-agglayer-data ] || [ -e .b2agg-store ]; then \
+			echo "e2e-clean-data: WIPE FAILED — leftover state would poison the fresh stack:"; \
+			ls -la .miden-agglayer-data .b2agg-store 2>/dev/null; exit 1; \
+		fi; \
+		mkdir -p .miden-agglayer-data/tmp; \
+		project="$${COMPOSE_PROJECT_NAME:-$(notdir $(CURDIR))}"; \
+		volume="$${project}_node_data"; \
+		out=$$(docker volume rm "$$volume" 2>&1) || { \
+			echo "$$out" | grep -qi "no such volume" || { \
+				echo "e2e-clean-data: cannot remove $$volume (stack still up? run 'make e2e-down'): $$out"; exit 1; }; }; \
+	fi
 
 .PHONY: e2e-up
 e2e-up: e2e-clean-data ## Start full E2E environment (cleans data dir first)
