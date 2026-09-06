@@ -9,14 +9,17 @@
 #
 #   pN  pre-hardening   the previous session's driver, before any fix below
 #   hN  harness proof   out-of-band runs that PROVED a harness fix, pre-battery
-#   N   battery         an iteration of the four-iteration battery
+#   N   battery         a fresh-chain iteration (genesis wiped before each target)
+#   gN  growing chain   an iteration of the ONE-chain battery: a single genesis
+#                       for the whole run, so every target and every drill acts
+#                       on accumulated history
 #
 # Phases sort in that order, so the matrix reads left to right as the run
 # actually happened.
 """Regenerate MATRIX.md (target x iteration) from results.tsv."""
 import sys, collections
 
-PHASES = {'p': (0, 'pre'), 'h': (1, 'harness')}
+PHASES = {'p': (0, 'pre'), 'h': (1, 'harness'), 'g': (3, 'grow')}
 
 def parse_iter(s):
     """-> (phase_rank, number). 'p3' < 'h1' < '2'."""
@@ -40,7 +43,7 @@ for it,tgt,st,secs,log in rows:
     else:
         res[tgt][key_it]=(st, secs, log, False)
 its=sorted(iters) or [(1,1)]
-RANK_LABEL = {0: 'pre', 1: 'harness', 2: 'iter'}
+RANK_LABEL = {0: 'pre', 1: 'harness', 2: 'iter', 3: 'grow'}
 def header(k):
     rank, n = k
     return f"{RANK_LABEL[rank]} {n}"
@@ -58,6 +61,13 @@ if any(k[0] == 0 for k in its):
           "history. They predate the quiesce rewrite, the writer queue-depth fix and the "
           "bridge-out-tool preflight, so their reds are not evidence about the current "
           "harness — and their greens are not evidence about it either.\n")
+if any(k[0] == 3 for k in its):
+    print("`grow N` columns are the GROWING-CHAIN battery: one genesis, one node_data "
+          "volume, one anvil L1 and the same bridge/faucet accounts for the whole run, so "
+          "each iteration's drills restore an ever-larger chain. `iter N` columns are the "
+          "earlier fresh-chain shape, where genesis was wiped before every target — kept "
+          "because they are honest evidence about the harness, but they say nothing about "
+          "scale.\n")
 if any(k[0] == 1 for k in its):
     print("`harness N` columns are the out-of-band runs that PROVED a harness fix before the "
           "battery was committed to: three back-to-back full-DB-loss drills on fresh live "
@@ -69,8 +79,10 @@ for tgt,per in res.items():
     print(f"| `{tgt}` | " + " | ".join(cell(per.get(i)) for i in its) + " |")
 def totals(rank):
     return collections.Counter(v[0] for per in res.values() for k,v in per.items() if k[0]==rank)
-bat, harn, pre = totals(2), totals(1), totals(0)
-print("\n**Totals (battery):** " + (", ".join(f"{k}={v}" for k,v in sorted(bat.items())) or "no runs yet"))
+grow, bat, harn, pre = totals(3), totals(2), totals(1), totals(0)
+if grow:
+    print("\n**Totals (growing chain):** " + ", ".join(f"{k}={v}" for k,v in sorted(grow.items())))
+print("\n**Totals (fresh-chain battery):** " + (", ".join(f"{k}={v}" for k,v in sorted(bat.items())) or "no runs yet"))
 if harn:
     print("\n**Totals (harness proof):** " + ", ".join(f"{k}={v}" for k,v in sorted(harn.items())))
 if pre:

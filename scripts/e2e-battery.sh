@@ -26,6 +26,12 @@ export BATTERY_RESULTS_DIR="$PWD/$R"
 # ever-larger chain and the drills are actually testing scale. Set
 # KEEP_CHAIN=0 to go back to wiping genesis before every target.
 KEEP_CHAIN="${KEEP_CHAIN:-1}"
+# Matrix phase label. The growing-chain run is a DIFFERENT experiment from the
+# per-target-fresh-chain iterations that came before it, so it gets its own
+# columns ("grow N") rather than overwriting evidence that was honestly
+# collected under the old shape. Defaults to the growing-chain prefix because
+# that is now the driver's default mode.
+ITER_PREFIX="${ITER_PREFIX:-g}"
 export KEEP_CHAIN
 BASE_ENV+=("KEEP_CHAIN=$KEEP_CHAIN")
 
@@ -70,7 +76,7 @@ chain_mark() { # $1 = label
 # entirely best-effort: a dead stack must produce a short file, never an error
 # that masks the failure being recorded.
 post_mortem() { # $1 = iteration, $2 = label
-    local out="$R/logs/i${1}-${2}-postmortem.txt"
+    local out="$R/logs/${ITER_PREFIX:-i}${1}-${2}-postmortem.txt"
     local proxy pg
     proxy="$(docker ps --format '{{.Names}}' | grep -E -- '-miden-agglayer-1$' | head -1)"
     pg="${proxy%-miden-agglayer-1}-agglayer-postgres-1"
@@ -106,16 +112,16 @@ post_mortem() { # $1 = iteration, $2 = label
 # run <iter> <label> <keep|fresh> <command...>
 run() {
     local iter="$1" label="$2" mode="$3"; shift 3
-    local log="$R/logs/i${iter}-${label}.log" t0 t1 rc
+    local log="$R/logs/${ITER_PREFIX:-i}${iter}-${label}.log" t0 t1 rc
     [[ "$mode" == fresh ]] && down
-    echo "[$(date -u +%H:%M:%SZ)] i$iter $label START" | tee -a "$R/battery.log"
+    echo "[$(date -u +%H:%M:%SZ)] ${ITER_PREFIX:-i}$iter $label START" | tee -a "$R/battery.log"
     t0=$(date +%s)
     "${BASE_ENV[@]}" "$@" > "$log" 2>&1; rc=$?
     t1=$(date +%s)
     local st=PASS; (( rc != 0 )) && st=FAIL
-    printf '%s\t%s\t%s\t%s\t%s\n' "$iter" "$label" "$st" "$((t1-t0))" "$log" >> "$TSV"
+    printf '%s\t%s\t%s\t%s\t%s\n' "${ITER_PREFIX:-}$iter" "$label" "$st" "$((t1-t0))" "$log" >> "$TSV"
     matrix
-    echo "[$(date -u +%H:%M:%SZ)] i$iter $label $st rc=$rc ($((t1-t0))s)" | tee -a "$R/battery.log"
+    echo "[$(date -u +%H:%M:%SZ)] ${ITER_PREFIX:-i}$iter $label $st rc=$rc ($((t1-t0))s)" | tee -a "$R/battery.log"
     # Capture state BEFORE anything tears it down. The very next `run` with
     # mode=fresh calls `down`, which is `compose down -v`.
     [[ "$st" == FAIL ]] && post_mortem "$iter" "$label"
