@@ -591,6 +591,40 @@ _l2l2_stack_ready() {
     return 0
 }
 
+# _l2l2_wait_settled <container> [timeout] — wait until a container is STABLY
+# running: status `running` AND an unchanged RestartCount across 3 consecutive
+# samples. A single `running` sample is not enough — it can be the gap between
+# two restarts, which is exactly how `aggkit-l2b` fails a preflight:
+#
+#   FAIL container aggkit-l2b (miden-agglayer-aggkit-l2b-1): restarting
+#   FAIL: PREFLIGHT FAILED — 1 check(s) failed; refusing to run l2l2 tests
+#         against a half-configured stack
+#
+# …4 seconds after Leg 0 declared the overlay ready, on a run whose very next
+# check ("aggkit-l2b aggoracle alive") PASSED. aggkit-l2b is started in the same
+# `up -d` as anvil-l2b and restart-loops until L1, agglayer and rollup #2 are all
+# reachable; Leg 0 waited for anvil-l2b and the L2B bridge-service and never for
+# it. Cost: the chaos soak's mixed loadtest aborted in its preflight 10s into a
+# 300s storm, so the storm ran with no traffic and the run was scored on it.
+_l2l2_wait_settled() {
+    local c="$1" timeout="${2:-180}" want=3 ok=0 prev="" waited=0 status count
+    while (( waited < timeout )); do
+        status=$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || echo missing)
+        count=$(docker inspect -f '{{.RestartCount}}' "$c" 2>/dev/null || echo -1)
+        if [[ "$status" == running && "$count" == "$prev" ]]; then
+            ok=$((ok+1))
+            (( ok >= want )) && { log "  $c settled (running, RestartCount stable at $count)"; return 0; }
+        else
+            ok=1
+        fi
+        prev="$count"
+        sleep 5; waited=$((waited+5))
+    done
+    fail "$c never settled within ${timeout}s (last status='$status' RestartCount=$count) — \
+starting l2l2 traffic now would run against a service that is still restart-looping. \
+Check: docker logs $c 2>&1 | tail -40"
+}
+
 # l2l2_ensure_stack — idempotent leg 0. If the L2B overlay is already up (e.g. a
 # reused stack) it SKIPS; otherwise it generates configs, brings up the overlay
 # under the current compose project, registers rollup #2 and funds the L2B claim
@@ -598,6 +632,9 @@ _l2l2_stack_ready() {
 l2l2_ensure_stack() {
     if _l2l2_stack_ready; then
         log "L2B overlay already up (project=$COMPOSE_PROJECT_NAME, rollup #2 registered) — reusing"
+        # Still settle-check: "already up" is decided from RPC/HTTP reachability,
+        # which says nothing about whether aggkit-l2b is mid-restart.
+        _l2l2_wait_settled "${COMPOSE_PROJECT_NAME}-aggkit-l2b-1" "${L2L2_SETTLE_TIMEOUT:-180}"
         return 0
     fi
     step "Leg 0: bringing up the L2B overlay + registering rollup #2"
@@ -621,6 +658,9 @@ l2l2_ensure_stack() {
         --env-file "$REPO/fixtures/.env" up -d --force-recreate bridge-service-l2b
     wait_for "L2B bridge-service HTTP API up (post-recreate)" 120 3 \
         _pred_http_ok "$L2B_BRIDGE_SERVICE_URL/bridges/0x0000000000000000000000000000000000000000"
+    # aggkit-l2b is the last service to settle: it restart-loops until L1,
+    # agglayer and rollup #2 are all reachable, and nothing above waits on it.
+    _l2l2_wait_settled "${COMPOSE_PROJECT_NAME}-aggkit-l2b-1" "${L2L2_SETTLE_TIMEOUT:-180}"
     pass "Leg 0 done: rollup #2 registered, L2B bridge/GER live, isolated Miden + L2B bridge-services indexing"
 }
 

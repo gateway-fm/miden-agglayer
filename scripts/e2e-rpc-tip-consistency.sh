@@ -23,16 +23,40 @@ rpc() { curl -sf "$L2_RPC" -H 'Content-Type: application/json' \
         -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":$2}" \
         | python3 -c "import json,sys;r=json.load(sys.stdin);v=r.get('result');print(int(v if isinstance(v,str) else v['number'],16))"; }
 
+# BRACKET THE SAMPLE, do not merely tolerate skew. The two tips are read by two
+# SEQUENTIAL RPC calls, so any block produced between them shows up as a
+# divergence that is pure measurement artefact. A flat "±2 blocks" allowance is
+# calibrated for steady-state ~5s block time and is wrong exactly when the node
+# is bursting — right after a bootstrap, catching up. Observed on a freshly
+# wiped stack:
+#
+#   sample 1: eth_blockNumber=26 latest.number=26 diff=0
+#   sample 2: eth_blockNumber=26 latest.number=26 diff=0
+#   sample 3: eth_blockNumber=27 latest.number=31 diff=4
+#   FAIL: coherence — tip sources diverged by 4 blocks (quick fail)
+#
+# Four blocks between two back-to-back curls is ~20 seconds of steady-state
+# block time, so this was a burst, not incoherence.
+#
+# Reading eth_blockNumber BEFORE and AFTER the `latest` call brackets it: a
+# coherent mirror must land inside [before-1, after+1], however fast blocks
+# arrive, because `latest` was served at some instant between the two reads.
+# This does NOT weaken the regression it guards — the 2026-07-04 frozen mirror
+# served 659 against a synthetic tip of 2702 and would sit far outside the
+# bracket, and the liveness check below still catches a tip that never moves.
 first=""; last=""; fail=0
 for i in $(seq 1 "$SAMPLES"); do
-    bn=$(rpc eth_blockNumber '[]') || { echo "FAIL: eth_blockNumber unreachable"; exit 1; }
+    bn0=$(rpc eth_blockNumber '[]') || { echo "FAIL: eth_blockNumber unreachable"; exit 1; }
     lt=$(rpc eth_getBlockByNumber '["latest", false]') || { echo "FAIL: eth_getBlockByNumber(latest) unreachable"; exit 1; }
-    diff=$(( bn > lt ? bn - lt : lt - bn ))
-    echo "sample $i: eth_blockNumber=$bn latest.number=$lt diff=$diff"
-    if [[ $diff -gt 2 ]]; then
+    bn1=$(rpc eth_blockNumber '[]') || { echo "FAIL: eth_blockNumber unreachable"; exit 1; }
+    lo=$(( bn0 - 1 )); hi=$(( bn1 + 1 ))
+    bn=$bn1
+    echo "sample $i: eth_blockNumber=$bn0..$bn1 latest.number=$lt (coherent window [$lo,$hi])"
+    if [[ $lt -lt $lo || $lt -gt $hi ]]; then
         # QUICK FAIL: divergence is deterministic (a frozen mirror never
         # heals) — no point sampling further, fail the suite immediately.
-        echo "FAIL: coherence — tip sources diverged by $diff blocks (quick fail)"
+        echo "FAIL: coherence — latest.number=$lt is OUTSIDE the eth_blockNumber bracket [$lo,$hi]; \
+the two tip sources disagree by more than in-flight block production can explain (quick fail)"
         exit 1
     fi
     [[ -z "$first" ]] && first=$bn

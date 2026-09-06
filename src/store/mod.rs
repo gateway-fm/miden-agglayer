@@ -540,6 +540,12 @@ pub trait Store: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Reset both cursors atomically: a torn reset (one at genesis, the other
+    /// at the old height) would make projection skip history the re-sweep
+    /// rediscovers. Required per backend so that contract cannot be defaulted
+    /// away.
+    async fn reset_cursors_to_genesis(&self) -> anyhow::Result<()>;
+
     /// #90 — did a restore rebuild this store, leaving the `nonces` table empty?
     ///
     /// The expected nonce is proxy-local bookkeeping of accepted L2 transactions
@@ -559,6 +565,18 @@ pub trait Store: Send + Sync + 'static {
     /// Mark that this store's nonce ledger was rebuilt from nothing (restore).
     async fn set_nonce_ledger_rebuilt(&self, _rebuilt: bool) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Drop every `nonce_reservations` row. `--restore` calls this alongside the
+    /// nonce-ledger rebuild: `nonces` and `nonce_reservations` are ONE ledger,
+    /// and rebuilding only the first leaves reservations describing pre-restore
+    /// work the rebuilt ledger knows nothing about — which then veto the very
+    /// first transaction the #90 first-contact bootstrap exists to admit.
+    ///
+    /// Safe by construction: restore is a one-shot with the serving proxy
+    /// stopped, so there is no live reservation to steal.
+    async fn clear_nonce_reservations(&self) -> anyhow::Result<u64> {
+        Ok(0)
     }
 
     /// #90 — seed a signer's nonce baseline iff it has NO row yet. Insert-if-absent,
@@ -581,7 +599,7 @@ pub trait Store: Send + Sync + 'static {
     /// retained-PostgreSQL + reset-Miden-store recovery, where the ClaimEvent
     /// rows are retained but their tx envelopes were lost, until the genesis
     /// reconciler re-observes each historical CLAIM note and backfills its
-    /// calldata (`restore::persist_synthetic_claim_tx`). Readiness gates on this
+    /// calldata (`projection::persist_synthetic_claim_tx`). Readiness gates on this
     /// reaching 0 so consumers are never released while `eth_getTransactionByHash`
     /// would serve an empty-input claim (aggkit's bridgesync parser stalls on it).
     /// Default 0 — stores that do not track claim calldata report themselves ready.
@@ -712,6 +730,32 @@ pub trait Store: Send + Sync + 'static {
         tx_hash: &str,
         note_commitment: &str,
     ) -> anyhow::Result<bool>;
+
+    /// STRANDED prepared handoffs: `handoff_state='prepared'`, past their Miden
+    /// expiration block per the authoritative reconcile cursor, and whose owning
+    /// transaction is NOT `pending`.
+    ///
+    /// The recovery sweep reaches a prepared handoff only through
+    /// [`Self::recoverable_pending_txns`], which filters `WHERE t.status =
+    /// 'pending'`. Once the owning row goes terminal — or was never there — the
+    /// link is visited by NOTHING: not the sweep, and not the public admission
+    /// path, which only re-examines a handoff when the SAME tx hash is
+    /// re-submitted. It then sits in `tx_note_links` forever, holding a note
+    /// identity reserved against first-writer-wins `prepare_note_handoff`.
+    ///
+    /// Observed live 2026-09-05: a post-chaos stack reported
+    /// `pending receipts=0 PREPARED handoffs=1` unchanged for 600s, which is
+    /// exactly this shape — no pending transaction existed for any sweep to
+    /// start from.
+    ///
+    /// Returns `(tx_hash, note_commitment)` pairs for
+    /// [`Self::clear_expired_prepared_note_handoff`], which applies the same
+    /// expiry fence again and refuses a LANDED claim, so this listing is a
+    /// candidate set and never an authorisation.
+    async fn stranded_prepared_note_handoffs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, String)>>;
 
     // === Synthetic logs ===
     async fn add_log(&self, log: SyntheticLog) -> anyhow::Result<()>;
@@ -1099,7 +1143,21 @@ pub trait Store: Send + Sync + 'static {
     /// Record an observed BURN serial. Returns `true` if newly inserted
     /// (caller treats this as `New`); `false` if it already existed
     /// (caller treats this as `Duplicate` and fires the Cantina #5 alert).
-    async fn burn_serial_observe(&self, _serial: &[u8; 32]) -> anyhow::Result<bool> {
+    /// Record a BURN serial together with the note it belongs to.
+    ///
+    /// Returns `true` when this observation is BENIGN — a first sighting, or
+    /// the SAME note seen again — and `false` only when the serial is already
+    /// held by a DIFFERENT note, which is the Cantina #5 attack.
+    ///
+    /// Keying on the serial alone made every re-observation look like an
+    /// attack, and `on_post_sync` re-scans the whole consumed-note history on
+    /// every tick: 504 collision lines in 3 minutes from 14 distinct serials,
+    /// each once per 5s tick, measured on a growing chain.
+    async fn burn_serial_observe_for_note(
+        &self,
+        _serial: &[u8; 32],
+        _note_id: &[u8; 32],
+    ) -> anyhow::Result<bool> {
         Ok(true)
     }
 
@@ -1205,10 +1263,11 @@ pub trait Store: Send + Sync + 'static {
         note_keys: &[String],
     ) -> anyhow::Result<std::collections::HashMap<String, u32>>;
 
-    /// Append to the durable identity ledger used to resolve headerless B2AGG
-    /// consumptions after restart. Existing nullifier mappings are immutable.
-    async fn put_b2agg_note_ids(&self, entries: &[(Nullifier, NoteId)]) -> anyhow::Result<()>;
-    async fn get_b2agg_note_ids(
+    /// Durable `nullifier -> NoteId` for every public note the sweep sees, of
+    /// any kind: it is how a consumed input with no header reference is still
+    /// resolvable after a client-store loss. Existing mappings are immutable.
+    async fn put_note_identities(&self, entries: &[(Nullifier, NoteId)]) -> anyhow::Result<()>;
+    async fn get_note_identities(
         &self,
         nullifiers: &[Nullifier],
     ) -> anyhow::Result<std::collections::HashMap<Nullifier, NoteId>>;

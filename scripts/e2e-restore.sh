@@ -20,6 +20,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 FIXTURES_DIR="$PROJECT_DIR/fixtures"
 
+# The restore one-shot must run under the SAME custody overlay as the stack it
+# is repairing (local keystore vs remote signer), plus any site overlay.
+. "$PROJECT_DIR/scripts/lib-compose.sh"
+compose_env_load
+mapfile -t COMPOSE < <(compose_files)
+
 source "$FIXTURES_DIR/.env"
 
 # Required by docker-compose.e2e.yml's miden-node build args (`${VAR:?...}`).
@@ -138,12 +144,12 @@ echo ""
 step "Part 3: Running --restore inside the container..."
 
 # Stop the running service
-docker compose -f "$PROJECT_DIR/docker-compose.e2e.yml" --env-file "$FIXTURES_DIR/.env" \
+docker compose "${COMPOSE[@]}" --env-file "$FIXTURES_DIR/.env" \
     stop miden-agglayer >/dev/null 2>&1
 sleep 2
 
 # Run restore as a one-shot container (inherits volumes, env, network from compose)
-docker compose -f "$PROJECT_DIR/docker-compose.e2e.yml" --env-file "$FIXTURES_DIR/.env" \
+docker compose "${COMPOSE[@]}" --env-file "$FIXTURES_DIR/.env" \
     run --rm --no-deps miden-agglayer \
     --miden-node=http://miden-node:57291 \
     --miden-store-dir=/var/lib/miden-agglayer-service \
@@ -173,7 +179,7 @@ echo ""
 # PART 4: Restart miden-agglayer and verify it serves RPCs
 # ══════════════════════════════════════════════════════════════════════════════
 step "Part 4: Restarting miden-agglayer..."
-docker compose -f "$PROJECT_DIR/docker-compose.e2e.yml" --env-file "$FIXTURES_DIR/.env" \
+docker compose "${COMPOSE[@]}" --env-file "$FIXTURES_DIR/.env" \
     start miden-agglayer >/dev/null 2>&1
 
 wait_for "miden-agglayer healthy" \
@@ -204,8 +210,10 @@ echo ""
 # ══════════════════════════════════════════════════════════════════════════════
 step "Part 5: Running L2→L1 bridge-out on restored state..."
 
-# Restart dependent services to pick up the restored miden-agglayer
-docker compose -f "$PROJECT_DIR/docker-compose.e2e.yml" --env-file "$FIXTURES_DIR/.env" \
+# Restart dependent services to pick up the restored miden-agglayer.
+# NOTE: this restart does NOT clear aggkit's ethtxmanager monitoring DB, so it
+# cannot heal a lost GER-inject tx — see the heal at the end of this script.
+docker compose "${COMPOSE[@]}" --env-file "$FIXTURES_DIR/.env" \
     restart bridge-service aggkit >/dev/null 2>&1
 sleep 10
 
@@ -222,3 +230,40 @@ log "  Pre-wipe:  claims=$PRE_CLAIMS logs=$PRE_LOGS gers=$PRE_GERS block=$PRE_BL
 log "  Restored:  claims=$RST_CLAIMS logs=$RST_LOGS gers=$RST_GERS block=$RST_BLOCK"
 log "  L2→L1 bridge-out succeeded on restored state"
 log "======================================================================"
+
+# ── Leave the stack USABLE: heal the aggoracle GER-inject wedge ───────────────
+# A proxy restart can lose an aggoracle GER-inject tx in transit: aggkit's
+# ethtxmanager DB marks it sent, the proxy never durably admitted it, and
+# aggkit's deterministic tx-ID dedup blocks any re-send FOREVER. GER injection
+# then freezes — exactly what `scripts/aggkit-preserve-heal.sh` exists for
+# (#70/#89/#113), and what the full-DB-loss drill and the chaos soak already run.
+#
+# A plain `compose restart aggkit` does NOT clear it: the poisoned file is
+# /tmp/ethtxmanager-aggoracle.sqlite inside the container, which a restart
+# preserves. Observed on the growing chain, after this script had passed:
+#
+#   aggoracle: inject GER transaction already exists in monitoring DB with ID:
+#              0x6da2526e… GER: 0xffa19c22…            (every 2s, forever)
+#   ger_entries: every row blocks 6785-6914 is_injected=false
+#
+# This scenario's own L2->L1 leg still passed — a bridge-OUT needs no GER — so
+# the wedge was invisible here and broke the NEXT three targets instead, each
+# timing out waiting for a deposit to become ready_for_claim. On the old
+# per-target-fresh-chain battery the damage was hidden because the next target
+# wiped the stack; on one growing chain a scenario must leave behind a stack the
+# next one can use.
+if [[ -x "$SCRIPT_DIR/aggkit-preserve-heal.sh" ]]; then
+    log "healing the aggoracle ethtxmanager wedge so the next scenario inherits a live GER pipeline"
+    if PROJECT="$COMPOSE_PROJECT_NAME" "$SCRIPT_DIR/aggkit-preserve-heal.sh" aggkit; then
+        log "  aggkit heal: injection observed — GER pipeline confirmed live"
+    else
+        rc=$?
+        case $rc in
+            2) log "  aggkit heal: no wedge to heal (no-op)" ;;
+            3) log "  aggkit heal: healed and running, injection not yet observed" ;;
+            *) log "  aggkit heal returned $rc — the next scenario may inherit a frozen GER pipeline" ;;
+        esac
+    fi
+else
+    log "WARN: scripts/aggkit-preserve-heal.sh missing — cannot heal the aggoracle wedge"
+fi

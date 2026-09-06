@@ -139,7 +139,7 @@ pub struct InMemoryStore {
     // quarantined/deferred/self-targeted classes — they occupy a LET leaf with no event);
     // the atomic commit reuses the reservation and flips emitted=true.
     processed_notes: RwLock<HashMap<String, (u32, bool)>>,
-    b2agg_note_ids: RwLock<HashMap<Nullifier, NoteId>>,
+    note_identities: RwLock<HashMap<Nullifier, NoteId>>,
     // Explicit upgrade offset for legacy LET leaves not in deposit_counter.
     let_gate_baseline: RwLock<u64>,
     deposit_counter: RwLock<u32>,
@@ -164,7 +164,9 @@ pub struct InMemoryStore {
     // monitor_twin_notes, monitor_expected_mints. With InMemoryStore the
     // mirror IS the source of truth; with PgStore the DB is and these
     // structures live inside the tracker's LRU cache instead.
-    monitor_burn_serials: RwLock<HashSet<[u8; 32]>>,
+    // serial -> the note that owns it (migration 027): a re-observation of the
+    // SAME note is benign; a different note holding the serial is the attack.
+    monitor_burn_serials: RwLock<HashMap<[u8; 32], [u8; 32]>>,
     monitor_twin_notes: RwLock<HashMap<[u8; 32], Vec<[u8; 32]>>>,
     monitor_expected_mints: RwLock<HashMap<[u8; 32], MonitorExpectedMintRow>>,
     // Cantina #4 — permanent claim→expected-MINT-IDENTITY reconciliation
@@ -272,14 +274,14 @@ impl InMemoryStore {
             unbridgeable_bridge_outs: RwLock::new(HashMap::new()),
             address_mappings: RwLock::new(HashMap::new()),
             processed_notes: RwLock::new(HashMap::new()),
-            b2agg_note_ids: RwLock::new(HashMap::new()),
+            note_identities: RwLock::new(HashMap::new()),
             let_gate_baseline: RwLock::new(0),
             deposit_counter: RwLock::new(0),
             claim_watcher_processed: RwLock::new(HashMap::new()),
             #[cfg(test)]
             test_land_after_next_has_claim_miss: RwLock::new(None),
             faucets: RwLock::new(Vec::new()),
-            monitor_burn_serials: RwLock::new(HashSet::new()),
+            monitor_burn_serials: RwLock::new(HashMap::new()),
             monitor_twin_notes: RwLock::new(HashMap::new()),
             monitor_expected_mints: RwLock::new(HashMap::new()),
             monitor_claim_mint_serials: RwLock::new(HashMap::new()),
@@ -489,10 +491,23 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
+    async fn reset_cursors_to_genesis(&self) -> anyhow::Result<()> {
+        *self.projector_cursor.write() = 0;
+        *self.reconcile_cursor.write() = 0;
+        Ok(())
+    }
+
     // ── #90: nonce-ledger rebuild marker ─────────────────────────────────────
 
     async fn is_nonce_ledger_rebuilt(&self) -> anyhow::Result<bool> {
         Ok(*self.nonce_ledger_rebuilt.read())
+    }
+
+    async fn clear_nonce_reservations(&self) -> anyhow::Result<u64> {
+        let mut r = self.nonce_reservations.write();
+        let n = r.len() as u64;
+        r.clear();
+        Ok(n)
     }
 
     async fn set_nonce_ledger_rebuilt(&self, rebuilt: bool) -> anyhow::Result<()> {
@@ -872,6 +887,37 @@ impl Store for InMemoryStore {
             confirmed += u64::from(self.confirm_note_handoff(&tx_hash, &commitment).await?);
         }
         Ok(confirmed)
+    }
+
+    async fn stranded_prepared_note_handoffs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let cursor = *self.reconcile_cursor.read();
+        let links = self.tx_note_links.read();
+        let txns = self.transactions.lock();
+        // "Pending" is `result.is_none()` here, the same predicate
+        // `recoverable_pending_txns` uses above — and an ABSENT receipt is not
+        // pending either, so those links are the most stranded of all.
+        Ok(links
+            .iter()
+            .filter(|(tx_hash, link)| {
+                link.state == NoteHandoffState::Prepared
+                    && link
+                        .expiration_block
+                        .is_some_and(|expiration| cursor > expiration)
+                    && !tx_hash
+                        .parse::<TxHash>()
+                        .ok()
+                        .and_then(|h| txns.peek(&h))
+                        .is_some_and(|r| r.result.is_none())
+            })
+            .map(|(tx_hash, link)| (tx_hash.clone(), link.note_commitment.clone()))
+            .take(limit)
+            .collect())
     }
 
     async fn clear_expired_prepared_note_handoff(
@@ -2147,19 +2193,19 @@ impl Store for InMemoryStore {
             .collect())
     }
 
-    async fn put_b2agg_note_ids(&self, entries: &[(Nullifier, NoteId)]) -> anyhow::Result<()> {
-        let mut stored = self.b2agg_note_ids.write();
+    async fn put_note_identities(&self, entries: &[(Nullifier, NoteId)]) -> anyhow::Result<()> {
+        let mut stored = self.note_identities.write();
         for (nullifier, note_id) in entries {
             stored.entry(*nullifier).or_insert(*note_id);
         }
         Ok(())
     }
 
-    async fn get_b2agg_note_ids(
+    async fn get_note_identities(
         &self,
         nullifiers: &[Nullifier],
     ) -> anyhow::Result<HashMap<Nullifier, NoteId>> {
-        let cached = self.b2agg_note_ids.read();
+        let cached = self.note_identities.read();
         Ok(nullifiers
             .iter()
             .filter_map(|nullifier| cached.get(nullifier).map(|id| (*nullifier, *id)))
@@ -2465,12 +2511,26 @@ impl Store for InMemoryStore {
     // ── Monitor trackers (RD-913) ────────────────────────────────
 
     async fn burn_serial_seen(&self, serial: &[u8; 32]) -> anyhow::Result<bool> {
-        Ok(self.monitor_burn_serials.read().contains(serial))
+        Ok(self.monitor_burn_serials.read().contains_key(serial))
     }
 
-    async fn burn_serial_observe(&self, serial: &[u8; 32]) -> anyhow::Result<bool> {
-        let mut set = self.monitor_burn_serials.write();
-        Ok(set.insert(*serial))
+    async fn burn_serial_observe_for_note(
+        &self,
+        serial: &[u8; 32],
+        note_id: &[u8; 32],
+    ) -> anyhow::Result<bool> {
+        let mut map = self.monitor_burn_serials.write();
+        match map.get(serial) {
+            // Same note seen again — benign, and the common case: the monitor
+            // re-scans all of history on every sync tick.
+            Some(owner) if owner == note_id => Ok(true),
+            // A DIFFERENT note holding this serial: the Cantina #5 attack.
+            Some(_) => Ok(false),
+            None => {
+                map.insert(*serial, *note_id);
+                Ok(true)
+            }
+        }
     }
 
     async fn twin_note_commitments(&self, note_id: &[u8; 32]) -> anyhow::Result<Vec<[u8; 32]>> {

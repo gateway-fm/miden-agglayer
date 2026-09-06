@@ -30,7 +30,24 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-PROJECT="${COMPOSE_PROJECT_NAME:-gate55}"
+# Derive the compose project from the environment, else from the RUNNING stack
+# (docker compose ls), else the repo directory name — which is what docker
+# compose itself defaults to. A hardcoded fallback silently targeted a project
+# that does not exist on this host, so every container lookup missed.
+_detect_compose_project() {
+    if [[ -n "${COMPOSE_PROJECT_NAME:-}" ]]; then printf '%s' "$COMPOSE_PROJECT_NAME"; return; fi
+    local p
+    p=$(docker compose ls --format json 2>/dev/null \
+        | python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+for e in d:
+    n=e.get("Name","")
+    if any(k in n for k in ("miden-agglayer","gate")): print(n); break' 2>/dev/null)
+    [[ -n "$p" ]] && { printf '%s' "$p"; return; }
+    basename "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+}
+PROJECT="$(_detect_compose_project)"
 L2_RPC="${L2_RPC:-http://localhost:8546}"
 NODE="${MIDEN_NODE_CONTAINER:-${PROJECT}-miden-node-1}"
 PROXY="${AGGLAYER_CONTAINER:-${PROJECT}-miden-agglayer-1}"

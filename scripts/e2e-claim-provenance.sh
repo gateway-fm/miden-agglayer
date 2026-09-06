@@ -40,9 +40,9 @@
 #      must skip it.
 #
 # Assertions:
-#   (a) claim_event_foreign_skipped_total >= baseline+1 on /metrics — the gate
-#       fired. (Also exercises the /metrics second-runtime fix on this branch:
-#       the counter is emitted from the MidenClient runtime thread.)
+#   (a) MECHANISM (informational): either the projection-level gate fires
+#       (claim_event_foreign_skipped_total advances) or, since #167, the foreign
+#       consumption is excluded at input resolution and never reaches the gate.
 #   (b) ZERO synthetic_logs ClaimEvent rows carry the foreign claim's global
 #       index (PG, topic 0x1df3f2a9...).
 #   (c) Our OWN claim still emits: >= 1 ClaimEvent row exists for a non-foreign
@@ -295,14 +295,27 @@ while [[ "$ELAPSED" -lt "$GATE_TIMEOUT_SECS" ]]; do
     sleep 5; ELAPSED=$((ELAPSED + 5)); echo -n "."
 done
 echo ""
-if [[ "$NEW_FOREIGN_SKIPPED" -le "$BASE_FOREIGN_SKIPPED" ]]; then
-    warn "diagnostics: tip=$(l2_tip 2>/dev/null || echo '?') foreign_skipped=$NEW_FOREIGN_SKIPPED (base $BASE_FOREIGN_SKIPPED)"
-    warn "if the foreign CLAIM was consumed before the reconciler imported it, miden-client"
-    warn "drops the import (spent-before-import applies to B2AGG recovery only) — the gate"
-    warn "then never evaluates the note. Re-run against a quieter stack before treating as regression."
-    fail "provenance gate did not fire within ${GATE_TIMEOUT_SECS}s (claim_event_foreign_skipped_total stuck at $NEW_FOREIGN_SKIPPED)"
+# The load-bearing invariant is (b): no foreign ClaimEvent in synthetic_logs.
+# Assert it FIRST and unconditionally — it is what this test exists to prove,
+# and it is the assertion that still catches a real leak.
+LEAKED_NOW=$(pgq "SELECT COUNT(*) FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' AND lower(data) LIKE '0x${FOREIGN_GI_HEX}%';")
+[[ "${LEAKED_NOW:-1}" == "0" ]] \
+    || fail "FOREIGN CLAIM LEAKED: ${LEAKED_NOW} ClaimEvent row(s) carry the foreign global index 0x${FOREIGN_GI_HEX}"
+pass "zero ClaimEvent rows for the foreign global index (invariant)"
+
+if [[ "$NEW_FOREIGN_SKIPPED" -gt "$BASE_FOREIGN_SKIPPED" ]]; then
+    pass "mechanism: SKIP AT PROJECTION — claim_event_foreign_skipped_total $BASE_FOREIGN_SKIPPED → $NEW_FOREIGN_SKIPPED"
+else
+    # Not a failure: issue #167 resolves inputs ONLY from our own bridge account's
+    # transaction feed (bridge_consumed_nullifiers -> ordered_account_transactions),
+    # so a note consumed by a FOREIGN bridge never enters the pipeline and
+    # project_claim_note — where the gate lives — is never called. The invariant is
+    # upheld EARLIER, by exclusion at input resolution. Verified on this branch:
+    # foreign rows 0, own rows intact, counter 0.
+    # A regression that let foreign notes back into the pipeline without skipping
+    # them still fails above, on (b).
+    log "mechanism: EXCLUSION AT INPUT RESOLUTION — counter stayed at $NEW_FOREIGN_SKIPPED (#167); gate not reached because the foreign consumption is not in our bridge's tx feed"
 fi
-pass "gate fired: claim_event_foreign_skipped_total $BASE_FOREIGN_SKIPPED → $NEW_FOREIGN_SKIPPED"
 
 # ── Step 7: PG assertions — the load-bearing state checks ────────────────────
 step "Asserting synthetic_logs state"

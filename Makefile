@@ -86,6 +86,14 @@ test-scripts: ## Syntax-check + run the shell guard test harnesses (no docker ne
 	# itself — so it runs here rather than only inside a docker-bound e2e.
 	bash -n scripts/test-chaos-verdict.sh
 	bash scripts/test-chaos-verdict.sh
+	# The gate in front of every recovery-drill fingerprint. Wrong-lax and it
+	# fingerprints a moving pipeline (spurious #88 data loss); wrong-strict and
+	# the drill never runs at all. Both have happened; both were invisible to
+	# `bash -n`.
+	bash -n scripts/lib-quiesce.sh
+	bash -n scripts/e2e-full-db-loss-recovery.sh
+	bash -n scripts/test-quiesce-predicate.sh
+	bash scripts/test-quiesce-predicate.sh
 
 .PHONY: test-e2e
 test-e2e: ## Spin up docker stack, run E2E tests, tear down (fully self-contained)
@@ -100,8 +108,12 @@ test-e2e: ## Spin up docker stack, run E2E tests, tear down (fully self-containe
 	@echo ""
 	./scripts/e2e-test.sh; EXIT_CODE=$$?; \
 		echo ""; \
-		echo "Tearing down stack..."; \
-		$(E2E_COMPOSE) down -v; \
+		if [ "$${KEEP_CHAIN:-0}" = "1" ]; then \
+			echo "KEEP_CHAIN=1 — leaving the stack UP (the chain must survive this target)"; \
+		else \
+			echo "Tearing down stack..."; \
+			$(E2E_COMPOSE) down -v; \
+		fi; \
 		exit $$EXIT_CODE
 
 .PHONY: test-nextest
@@ -237,7 +249,16 @@ MIDEN_NODE_GIT_REF := v0.16.0-rc.5
 # shadow the tag. Bump BOTH together.
 MIDEN_NODE_GIT_COMMIT := 461ac961951c19543b3b2e6db99a0bf82349dbde
 
-E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml --env-file fixtures/.env
+# Remote-custody overlay. Applies to the BASE e2e stack too, not just l2l2:
+# without it `make e2e-up` can only run local-keystore custody, and every
+# recovery one-shot the scripts launch would use a different custody than the
+# stack it is repairing (issue #167 validation).
+WEB3SIGNER_COMPOSE_EXTRA := $(if $(WITH_WEB3SIGNER),-f docker-compose.web3signer.yml,)
+# Site overlay escape hatch, e.g. cloud-KMS credentials for the signer.
+# `?=` so it can be set from the environment as well as the command line.
+EXTRA_COMPOSE_FILES ?=
+
+E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml $(WEB3SIGNER_COMPOSE_EXTRA) $(EXTRA_COMPOSE_FILES) --env-file fixtures/.env
 
 # L2<->L2 overlay (task #25): base stack + the second-rollup overlay. The
 # generated configs it mounts must be produced by `make gen-l2b-configs` first.
@@ -245,8 +266,7 @@ E2E_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MID
 # invocation (up/registration/down all inherit it). The caller must provision
 # keys (scripts/gen-web3signer-keys.sh) and export fixtures/web3signer-keys.env
 # BEFORE `make e2e-l2l2-up` — the overlay interpolates AGGLAYER_SIGNER_KEYS.
-WEB3SIGNER_COMPOSE_EXTRA := $(if $(WITH_WEB3SIGNER),-f docker-compose.web3signer.yml,)
-L2L2_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml $(WEB3SIGNER_COMPOSE_EXTRA) --env-file fixtures/.env
+L2L2_COMPOSE := MIDEN_NODE_GIT_URL=$(MIDEN_NODE_GIT_URL) MIDEN_NODE_GIT_REF=$(MIDEN_NODE_GIT_REF) docker compose -f docker-compose.e2e.yml -f docker-compose.l2l2.yml $(WEB3SIGNER_COMPOSE_EXTRA) $(EXTRA_COMPOSE_FILES) --env-file fixtures/.env
 
 .PHONY: miden-node-image-coords
 miden-node-image-coords: ## Print the git URL + ref + commit the miden-node image is built from
@@ -284,17 +304,52 @@ e2e-clean-data: ## Wipe .miden-agglayer-data/ + .b2agg-store/ + node_data volume
 	#  (3) The node_data volume rm distinguishes "absent" (fine) from "in use"
 	#      (a live container still mounts it ⇒ `make e2e-down` was not run ⇒
 	#      stale node state would survive under a "fresh" stack — hard stop).
-	rm -rf .miden-agglayer-data .b2agg-store 2>/dev/null || \
-		docker run --rm -v "$(CURDIR):/work" alpine sh -c 'rm -rf /work/.miden-agglayer-data /work/.b2agg-store'
-	@if [ -e .miden-agglayer-data ] || [ -e .b2agg-store ]; then \
-		echo "e2e-clean-data: WIPE FAILED — leftover state would poison the fresh stack:"; \
-		ls -la .miden-agglayer-data .b2agg-store 2>/dev/null; exit 1; fi
-	mkdir -p .miden-agglayer-data/tmp
-	@project="$${COMPOSE_PROJECT_NAME:-$(notdir $(CURDIR))}"; \
-	volume="$${project}_node_data"; \
-	out=$$(docker volume rm "$$volume" 2>&1) || { \
-		echo "$$out" | grep -qi "no such volume" || { \
-			echo "e2e-clean-data: cannot remove $$volume (stack still up? run 'make e2e-down'): $$out"; exit 1; }; }
+	#
+	# KEEP_CHAIN=1 — the GROWING-CHAIN battery. One genesis, one node_data
+	# volume, one anvil L1 and the SAME bridge/faucet accounts for the whole
+	# run, so every drill and scenario acts on accumulated history and the
+	# from-genesis restores rebuild an ever-larger chain. That is the property
+	# under test; wiping between targets measures a fresh chain N times and says
+	# nothing about scale. The wipe still runs ONCE before the first iteration.
+	#
+	# Note the isolated-store rule in (1) above is respected, not bypassed: the
+	# hazard is a `.b2agg-store` outliving its CHAIN and carrying a stale genesis
+	# commitment in its gRPC Accept header. Under KEEP_CHAIN the chain does not
+	# change, so the store stays valid by construction.
+	#
+	# KEEP_CHAIN=1 — the GROWING-CHAIN battery. One genesis, one node_data
+	# volume, one anvil L1 and the SAME bridge/faucet accounts for the whole
+	# run, so every drill and scenario acts on accumulated history and the
+	# from-genesis restores rebuild an ever-larger chain. That is the property
+	# under test; wiping between targets measures a fresh chain N times and says
+	# nothing about scale. The wipe still runs ONCE before the first iteration.
+	#
+	# The isolated-store rule in (1) is respected, not bypassed: the hazard is a
+	# `.b2agg-store` outliving its CHAIN and carrying a stale genesis commitment
+	# in its gRPC Accept header. Under KEEP_CHAIN the chain does not change, so
+	# those stores stay valid by construction.
+	#
+	# ONE shell block, deliberately. As separate recipe lines an `exit 0` in the
+	# guard ends only that line's subshell and make runs the wipe anyway — which
+	# it did, silently, on the first attempt at this.
+	@set -e; \
+	if [ "$${KEEP_CHAIN:-0}" = "1" ]; then \
+		echo "e2e-clean-data: KEEP_CHAIN=1 — preserving node_data, anvil L1, proxy store and .b2agg-store (growing chain)"; \
+		mkdir -p .miden-agglayer-data/tmp; \
+	else \
+		rm -rf .miden-agglayer-data .b2agg-store 2>/dev/null || \
+			docker run --rm -v "$(CURDIR):/work" alpine sh -c 'rm -rf /work/.miden-agglayer-data /work/.b2agg-store'; \
+		if [ -e .miden-agglayer-data ] || [ -e .b2agg-store ]; then \
+			echo "e2e-clean-data: WIPE FAILED — leftover state would poison the fresh stack:"; \
+			ls -la .miden-agglayer-data .b2agg-store 2>/dev/null; exit 1; \
+		fi; \
+		mkdir -p .miden-agglayer-data/tmp; \
+		project="$${COMPOSE_PROJECT_NAME:-$(notdir $(CURDIR))}"; \
+		volume="$${project}_node_data"; \
+		out=$$(docker volume rm "$$volume" 2>&1) || { \
+			echo "$$out" | grep -qi "no such volume" || { \
+				echo "e2e-clean-data: cannot remove $$volume (stack still up? run 'make e2e-down'): $$out"; exit 1; }; }; \
+	fi
 
 .PHONY: e2e-up
 e2e-up: e2e-clean-data ## Start full E2E environment (cleans data dir first)
@@ -330,7 +385,26 @@ e2e-l2l2-up: e2e-clean-data gen-l2b-configs ## Bring up base stack + L2B overlay
 	# re-index network 2 now that rollup #2 + the L2B bridge/GER exist). NOT
 	# anvil-l2b (freshly-deployed in-memory L2B state) and NOT the base Miden
 	# bridge-service (indexes L1 + Miden, unaffected by rollup #2).
-	$(L2L2_COMPOSE) up -d --force-recreate --wait aggkit-l2b bridge-service-l2b
+	# `--wait` reports only a bare exit code, so a crash-looping service used to
+	# surface as "Error 1" with the REASON left in a container nobody printed.
+	# On failure, dump the tail of every non-running network-2 container before
+	# exiting, so the log that explains it is in the run output.
+	@$(L2L2_COMPOSE) up -d --force-recreate --wait aggkit-l2b bridge-service-l2b || { \
+		echo ""; \
+		echo "e2e-l2l2-up: network-2 services did not become healthy — diagnostics:"; \
+		proj=$$(docker compose ls --format json 2>/dev/null | grep -o '"Name":"[^"]*miden[^"]*"' | head -1 | cut -d'"' -f4); \
+		proj=$${proj:-$$(basename $$(pwd))}; \
+		for svc in aggkit-l2b bridge-service-l2b; do \
+			c="$$proj-$$svc-1"; \
+			st=$$(docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$$c" 2>/dev/null || echo "absent"); \
+			echo "──── $$c: $$st"; \
+			docker logs --tail 40 "$$c" 2>&1 | sed 's/^/    /' || echo "    (no logs)"; \
+		done; \
+		echo ""; \
+		echo "e2e-l2l2-up: if the L2B chain reports 'sovereign genesis already injected',"; \
+		echo "  a PREVIOUS l2l2 stack was still running: 'make e2e-down' only tears down the"; \
+		echo "  base compose file. Run 'make e2e-l2l2-down' before bringing the stack up."; \
+		exit 1; }
 
 .PHONY: e2e-l2l2
 e2e-l2l2: ## Run the L2<->L2 group (preflight + forward L2B->Miden + back Miden->L2B + evidence). Stack must be up (make e2e-l2l2-up).
@@ -521,9 +595,22 @@ test-e2e-coverage: ## Regression-protect all three production fixes (RD-862 GER 
 .PHONY: e2e
 e2e: test-e2e ## Alias for test-e2e (start, test, teardown)
 
+.PHONY: e2e-battery
+e2e-battery: ## Run the FULL e2e battery N times (ITERATIONS=4). Results + MATRIX.md under e2e-results/
+	ITERATIONS=$(or $(ITERATIONS),4) ./scripts/e2e-battery.sh
+
 .PHONY: e2e-down
-e2e-down: ## Stop E2E environment
-	$(E2E_COMPOSE) down -v
+e2e-down: ## Stop E2E environment (base AND the l2l2 overlay — see below)
+	# Tear down with the l2l2 overlay too, and --remove-orphans. `$(E2E_COMPOSE)
+	# down -v` covers only the services in docker-compose.e2e.yml, so after any
+	# l2l2 target the network-2 containers (anvil-l2b, aggkit-l2b,
+	# bridge-service-l2b, postgres-l2b) SURVIVED a "teardown". The next
+	# e2e-l2l2-up then reused that live L2B chain — setup-l2b.sh reported
+	# "L2B sovereign genesis already injected — skipping" and
+	# bridge-service-l2b exited(1) against the stale state.
+	# e2e-clean-data does not catch this: it guards the node_data volume, which
+	# the base teardown had already released.
+	$(L2L2_COMPOSE) down -v --remove-orphans
 
 .PHONY: e2e-l2l2-down
 e2e-l2l2-down: ## Stop the L2<->L2 stack (base + L2B overlay). --remove-orphans so anvil-l2b/aggkit-l2b/bridge-service don't linger on a reused (self-hosted) host

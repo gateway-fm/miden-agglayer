@@ -218,7 +218,7 @@ pub fn classify_b2agg_consumer(
 //
 // The MINT/BURN/CLAIM/B2AGG note scripts are deployment-independent (identical
 // bytes across every agglayer instance on a chain), so — exactly like
-// [`crate::restore::classify_claim_note`] — a script-root match alone cannot
+// [`crate::projection::classify_claim_note`] — a script-root match alone cannot
 // tell OUR deployment's notes from a foreign deployment sharing the chain. The
 // bridge MASM emits its MINT/BURN output notes with the DEFAULT (0) tag
 // (`bridge_in_output.masm` / `bridge_out.masm` both `push.DEFAULT_TAG`), the
@@ -1079,7 +1079,11 @@ impl BridgeOutScanner {
                 // the legacy BURN monitor's behavior or persistence model.
                 MonitoredNoteKind::Burn if note.commitment().is_some() => {
                     let serial = note.details().recipient().serial_num();
-                    match self.burn_serials.record(serial.as_bytes()).await {
+                    // The note's own identity: a collision is two DIFFERENT
+                    // notes sharing a serial, never the same note re-observed
+                    // by the every-tick full-history scan above.
+                    let owner: [u8; 32] = note.details_commitment().as_bytes();
+                    match self.burn_serials.record(serial.as_bytes(), owner).await {
                         Ok(crate::burn_serial_tracker::Outcome::Duplicate) => {
                             metrics::counter!("bridge_burn_serial_collision_total").increment(1);
                             tracing::error!(
@@ -3660,7 +3664,7 @@ mod tests {
     }
 
     /// Run a consumed B2AGG note through the PRODUCTION derivation
-    /// (`restore::project_b2agg_note`, what the SyntheticProjector uses) and map
+    /// (`projection::project_b2agg_note`, what the SyntheticProjector uses) and map
     /// its outcome to the legacy `project_b2agg_note` bool (Emitted == "advanced").
     /// `local_network_id = 7`; every note built here targets destination-network 0,
     /// so the Cantina #13 self-target gate never fires (that gate has its own test).
@@ -3686,7 +3690,7 @@ mod tests {
         bridge_id: AccountId,
         block: u64,
     ) -> bool {
-        crate::restore::project_b2agg_note(
+        crate::projection::project_b2agg_note(
             store,
             note,
             test_b2agg_note_id(note, bridge_id),
@@ -3700,7 +3704,7 @@ mod tests {
         )
         .await
         .unwrap()
-            == crate::restore::B2AggRestoreOutcome::Emitted
+            == crate::projection::B2AggRestoreOutcome::Emitted
     }
 
     /// Cantina #13 Layer 2 — FAIL-CLOSED (no tombstone). A bridge-consumed ERC-20
@@ -3741,7 +3745,7 @@ mod tests {
         let note_id = test_b2agg_note_id(&note, bridge_id).to_hex();
 
         // No client → bridge metadata hash unreadable → Unrecoverable → FAIL CLOSED (Err).
-        let outcome = crate::restore::project_b2agg_note(
+        let outcome = crate::projection::project_b2agg_note(
             &store,
             &note,
             test_b2agg_note_id(&note, bridge_id),

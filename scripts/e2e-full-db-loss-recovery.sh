@@ -59,6 +59,7 @@ fi
 PROJECT="${PROXY_CONTAINER%-miden-agglayer-1}"
 PG_CONTAINER="$PROJECT-agglayer-postgres-1"
 NTX_CONTAINER="$PROJECT-ntx-builder-1"
+AGGKIT_CONTAINER="$PROJECT-aggkit-1"
 export COMPOSE_PROJECT_NAME="$PROJECT"
 
 # Verify the postgres we are about to DROP is THIS proxy's configured store:
@@ -134,14 +135,11 @@ else
     echo "verified: proxy store target '$STORE_HOST' db '$STORE_DB' matches the drop target $PG_CONTAINER/agglayer_store"
 fi
 
-COMPOSE=(-f "$PROJECT_DIR/docker-compose.e2e.yml")
-[[ -f "$PROJECT_DIR/docker-compose.l2l2.yml" ]] && docker ps --format '{{.Names}}' | grep -q "^$PROJECT-anvil-l2b-1$" \
-    && COMPOSE+=(-f "$PROJECT_DIR/docker-compose.l2l2.yml")
-if docker ps --format '{{.Names}}' | grep -q "^$PROJECT-web3signer-1$"; then
-    COMPOSE+=(-f "$PROJECT_DIR/docker-compose.web3signer.yml")
-    # ${AGGLAYER_SIGNER_KEYS:?} is interpolated at compose parse time.
-    [[ -f "$PROJECT_DIR/fixtures/web3signer-keys.env" ]] && { set -a; . "$PROJECT_DIR/fixtures/web3signer-keys.env"; set +a; }
-fi
+# Shared resolver: the restore one-shot below MUST run under the same custody
+# overlay as the stack it is repairing, plus any site overlay (EXTRA_COMPOSE_FILES).
+. "$PROJECT_DIR/scripts/lib-compose.sh"
+compose_env_load
+mapfile -t COMPOSE < <(compose_files)
 
 L1_RPC="${L1_RPC:-http://localhost:8545}"
 L1_BRIDGE_ADDRESS="${L1_BRIDGE_ADDRESS:-0xC8cbEBf950B9Df44d987c8619f092beA980fF038}"
@@ -189,7 +187,7 @@ log_digest() { # $1 = topic0 hex prefix
            array_to_string(topics, ',') || ':' ||
            transaction_index::text || ':' || removed::text || ':' || data,
            '|' ORDER BY block_number, array_to_string(topics, ','), data), '')) \
-         FROM synthetic_logs WHERE topics[1] LIKE '$1%'"
+         FROM synthetic_logs WHERE topics[1] LIKE '$1%' $(wb)"
 }
 # GER / UpdateHashChain content digest — deliberately EXCLUDES transaction_hash
 # and log_index, because neither can survive a full DB loss even when the
@@ -225,7 +223,7 @@ uhc_content_digest() {
            block_number || ':' || encode(block_hash,'hex') || ':' || address || ':' ||
            array_to_string(topics, ',') || ':' || removed::text || ':' || data,
            '|' ORDER BY block_number, array_to_string(topics, ',')), '')) \
-         FROM synthetic_logs WHERE topics[1] LIKE '0x65d3bf36%'"
+         FROM synthetic_logs WHERE topics[1] LIKE '0x65d3bf36%' $(wb)"
 }
 
 # Row-level dump for diagnosis. A digest tells you THAT something differs; this
@@ -281,7 +279,7 @@ claim_content_digest() {
            address || ':' || array_to_string(topics, ',') || ':' ||
            transaction_index::text || ':' || removed::text || ':' || data,
            '|' ORDER BY block_number, data), '')) \
-         FROM synthetic_logs WHERE topics[1] LIKE '0x1df3f2a9%'"
+         FROM synthetic_logs WHERE topics[1] LIKE '0x1df3f2a9%' $(wb)"
 }
 # CONSUMER-LEVEL capture: what an actual client sees via eth_getLogs, not what our
 # own SQL says. The SQL digests above read the table we wrote; this reads the JSON-RPC
@@ -337,19 +335,58 @@ getlogs_dump() { # $1 = output file
 fingerprint() {  # -> "uhc_d inj_d bridge_d claim_d hcv"  (digests, for identity assertion)
     local uhc inj bridge claim hcv
     uhc=$(uhc_content_digest)
-    inj=$(pgq "SELECT md5(coalesce(string_agg(encode(ger_hash,'hex'), '|' ORDER BY ger_hash), '')) \
-               FROM ger_entries WHERE is_injected=true")
+    inj=$(pgq "SELECT md5(coalesce(string_agg(encode(g.ger_hash,'hex'), '|' ORDER BY g.ger_hash), '')) \
+               FROM ger_entries g WHERE g.is_injected=true $(wb_ger)")
     bridge=$(log_digest '0x50178120')
     claim=$(claim_content_digest)
     hcv=$(pgq "SELECT encode(hash_chain_value,'hex') FROM service_state WHERE id=1")
     echo "$uhc $inj $bridge $claim $hcv"
 }
+# WINDOW BOUND (see SNAP_BLOCK below): every comparison is restricted to blocks
+# the projector had already covered when the pre-drop fingerprint was taken.
+# Without it the drill compares a snapshot of a MOVING system against a restore
+# that reads the authoritative node LATER: GER injection runs on its own timer,
+# so a GER consumed after the snapshot legitimately appears in the rebuilt store
+# and the AFTER==BEFORE assertions fail on a PERFECTLY FAITHFUL restore.
+# Observed 2026-09-04: UHC and injected both 3 -> 4, Bridge/Claim unchanged,
+# eth_getLogs byte-identical — a live injection 13s after the snapshot.
+# Loss or duplication INSIDE the window still fails exactly as before.
+wb() { # window predicate for synthetic_logs ONLY — MIDEN block space
+    [[ -n "${SNAP_BLOCK:-}" ]] && echo "AND block_number <= $SNAP_BLOCK" || echo ""
+}
+# ── The GER window is a DIFFERENT BLOCK SPACE ────────────────────────────────
+# `SNAP_BLOCK` is the projector cursor: a MIDEN synthetic block height (~100).
+# `ger_entries.block_number` is the L1 block the GER was observed at (`INSERT
+# INTO ger_entries (... block_number ...)` is fed `l1_block_number`) and runs in
+# the hundreds-to-thousands on anvil. Applying `wb()` to ger_entries therefore
+# compared two unrelated counters and silently shrank the injected-GER set:
+# measured on this stack at SNAP_BLOCK=105, the L1-space bound selected 1 of the
+# 4 injected GERs the window actually contains, so the "#88: injected-GER set
+# differs across restore" digest was computed over a near-empty set and could
+# not have failed. Not a product dedup bug — the four GER VALUES are distinct
+# and each has exactly one UpdateHashChain log; the harness was measuring the
+# wrong thing. (It also explains why the pre-window run recorded UHC=3
+# injected=3 and the windowed runs recorded UHC=4 injected=1.)
+#
+# The correct bound is by the GER's OWN UpdateHashChain log, which lives in the
+# Miden block space: a GER is inside the window iff its UHC log is. topics[2] of
+# a UHC log is the GER value; `synthetic_logs.topics` is text[] holding
+# lowercase `0x…`, so it compares against `'0x' || encode(ger_hash,'hex')`.
+# An injected GER with NO UHC log is excluded here and caught by the separate
+# UHC count/content assertions, which is where that defect belongs.
+wb_ger() { # window predicate for ger_entries (alias `g`) — via the Miden-space UHC log
+    [[ -n "${SNAP_BLOCK:-}" ]] || { echo ""; return; }
+    echo "AND EXISTS (SELECT 1 FROM synthetic_logs l \
+                      WHERE l.topics[1] LIKE '0x65d3bf36%' \
+                        AND lower(l.topics[2]) = '0x' || encode(g.ger_hash,'hex') \
+                        AND l.block_number <= $SNAP_BLOCK)"
+}
 counts() {  # -> "uhc inj bridge claim"  (integers, for logging + thinness gate)
-    local uhc inj bridge claim
-    uhc=$(pgq "SELECT count(*) FROM synthetic_logs WHERE topics[1] LIKE '0x65d3bf36%'")
-    inj=$(pgq "SELECT count(*) FROM ger_entries WHERE is_injected=true")
-    bridge=$(pgq "SELECT count(*) FROM synthetic_logs WHERE topics[1] LIKE '0x50178120%'")
-    claim=$(pgq "SELECT count(*) FROM synthetic_logs WHERE topics[1] LIKE '0x1df3f2a9%'")
+    local uhc inj bridge claim w; w=$(wb)
+    uhc=$(pgq "SELECT count(*) FROM synthetic_logs WHERE topics[1] LIKE '0x65d3bf36%' $w")
+    inj=$(pgq "SELECT count(*) FROM ger_entries g WHERE g.is_injected=true $(wb_ger)")
+    bridge=$(pgq "SELECT count(*) FROM synthetic_logs WHERE topics[1] LIKE '0x50178120%' $w")
+    claim=$(pgq "SELECT count(*) FROM synthetic_logs WHERE topics[1] LIKE '0x1df3f2a9%' $w")
     echo "$uhc $inj $bridge $claim"
 }
 
@@ -364,6 +401,65 @@ wait_healthy() {
 
 # ── Phase 0: pre-drop fingerprint on the live, quiesced stack ────────────────
 step "Phase 0 — pre-drop fingerprint (accumulated state is the fixture)"
+# The projector cursor is the exact frontier of what this store has projected;
+# blocks beyond it are precisely what a still-running pipeline may add while the
+# drill works. Bound every later comparison to it.
+# QUIESCE FIRST, then bound. Quiescing alone is not enough (a note can land
+# between the last sample and the drop) and bounding alone is not enough (the
+# pre-drop store may not yet have projected everything at that height), so the
+# drill needs both: wait for the projector to catch up and the writer to drain,
+# then compare pre vs post at exactly that projected height.
+# Durable timeout evidence. Defaults into the battery's results directory when
+# the battery set one; otherwise /tmp. Either way it must land somewhere that
+# outlives the stack — a quiesce failure was lost once because the containers
+# were recreated 46 seconds later.
+export QUIESCE_EVIDENCE_DIR="${QUIESCE_EVIDENCE_DIR:-${BATTERY_RESULTS_DIR:+$BATTERY_RESULTS_DIR/logs}}"
+export QUIESCE_EVIDENCE_DIR="${QUIESCE_EVIDENCE_DIR:-/tmp}"
+. "$PROJECT_DIR/scripts/lib-quiesce.sh"
+# 600s, not 180: quiescing is now a NO-PENDING-WORK gate (writer drained, store
+# drained, L1 GER injected, log count stable), and after a chaos storm or a 30-way
+# load run the pipeline legitimately needs minutes to get there. A ceiling that
+# expires while the system is still draining turns host load into a fake product
+# failure. On a quiet stack this costs nothing — it quiesces in ~10s.
+quiesce_projection "${QUIESCE_TIMEOUT_SECS:-600}" \
+    || fail "projection never quiesced — refusing to fingerprint a moving pipeline"
+
+# BELT AND BRACES. Quiescing proves nothing is PENDING; it cannot stop the
+# aggoracle from starting something NEW one second later. With the pipeline
+# proven drained, freeze the source of unsolicited work for the whole
+# fingerprint window (Phase 0 capture through the Phase 3 comparison) so the
+# before/after pair provably covers the same history.
+#
+# ORDER MATTERS: quiesce FIRST, freeze SECOND. Freezing before quiescing would
+# strand any GER the aggoracle had accepted-but-not-yet-submitted, and
+# condition (c) — "L1's current root is already injected" — could then never
+# become true.
+FROZE_AGGKIT=0
+unfreeze_aggkit() {
+    [[ "$FROZE_AGGKIT" == "1" ]] || return 0
+    FROZE_AGGKIT=0
+    docker start "$AGGKIT_CONTAINER" >/dev/null 2>&1 \
+        && say "aggkit restarted" \
+        || echo "WARN: could not restart $AGGKIT_CONTAINER — the stack is left with aggkit DOWN" >&2
+}
+# Fires on fail()/set -e too: leaving another test's stack with aggkit stopped
+# would poison every scenario that runs after this one.
+trap unfreeze_aggkit EXIT
+if [[ "${FREEZE_AGGKIT:-1}" == "1" ]] && docker inspect "$AGGKIT_CONTAINER" >/dev/null 2>&1; then
+    docker stop "$AGGKIT_CONTAINER" >/dev/null && FROZE_AGGKIT=1 \
+        && say "aggkit frozen for the fingerprint window ($AGGKIT_CONTAINER)"
+    # Re-confirm on the frozen stack. Short: everything already held once, this
+    # only proves the freeze itself did not leave something half-done.
+    quiesce_projection 90 2 \
+        || fail "projection did not re-quiesce after freezing aggkit"
+else
+    say "aggkit NOT frozen (FREEZE_AGGKIT=${FREEZE_AGGKIT:-1}, container present: \
+$(docker inspect "$AGGKIT_CONTAINER" >/dev/null 2>&1 && echo yes || echo no))"
+fi
+
+SNAP_BLOCK=$(projected_height)
+[[ -n "$SNAP_BLOCK" && "$SNAP_BLOCK" =~ ^[0-9]+$ ]] || fail "could not read projector_cursor for the comparison window"
+say "comparison window: blocks <= $SNAP_BLOCK (quiesced projector cursor)"
 read -r NUHC0 NINJECTED0 NBR0 NCL0 <<<"$(counts)"
 read -r UHC0 INJ0 BR0 CL0 HCV0 <<<"$(fingerprint)"
 dump_rows '0x50178120' "/tmp/fdl-bridge-before-${RUN_SUFFIX}.txt"
@@ -536,6 +632,10 @@ pass "hash_chain_value identical (order-faithful replay)"
 [[ "$CL1" == "$CL0" ]] || fail_with_diff "#69/#136 ClaimEvent (all fields except tx_hash)" \
     "/tmp/fdl-claim-before-${RUN_SUFFIX}.txt" "/tmp/fdl-claim-after-${RUN_SUFFIX}.txt" "$CL0" "$CL1"
 pass "BridgeEvent (count $NBR1) + ClaimEvent (count $NCL1) rows identical"
+
+# The fingerprint window is closed: every before/after comparison is made.
+# Phase 4 needs the aggoracle running again (it asserts a NEW GER gets injected).
+unfreeze_aggkit
 
 # ── Phase 4: no poison minted, pipeline alive ────────────────────────────────
 step "Phase 4 — no ERR_GER_ALREADY_REGISTERED poison; pipeline processes NEW traffic"

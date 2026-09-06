@@ -536,7 +536,73 @@ async fn defer_with_backoff(service: &ServiceState, tx: &RecoverablePendingTxn, 
 /// self-deadlock. Different signers are independent. Best-effort and bounded: a
 /// failure on one row or one signer never blocks startup or the recovery of
 /// unrelated signers. Runs at startup and on the periodic sweep.
+/// Clear PREPARED note handoffs that no other path can reach.
+///
+/// The state machine above only ever sees a prepared handoff through
+/// `recoverable_pending_txns`, which filters `WHERE t.status = 'pending'`. Once
+/// the owning transaction goes terminal — or never existed — the link is visited
+/// by nothing: not this sweep, and not `service_send_raw_txn`, which re-examines
+/// a handoff only when the SAME tx hash is re-submitted. The row then sits in
+/// `tx_note_links` forever holding a note identity reserved against
+/// first-writer-wins `prepare_note_handoff`.
+///
+/// Observed live 2026-09-05 on a post-chaos stack: `pending receipts=0
+/// PREPARED handoffs=1`, unchanged across 600 seconds. With no pending
+/// transaction there was no sweep candidate to start from, so no amount of
+/// waiting could have cleared it.
+///
+/// Only rows PAST their Miden expiration block per the authoritative reconcile
+/// cursor are touched, and each is cleared through
+/// `clear_expired_prepared_note_handoff`, which re-applies that fence itself and
+/// refuses when the claim has LANDED. A live note is never disturbed.
+async fn clear_stranded_prepared_handoffs(service: &ServiceState) -> anyhow::Result<()> {
+    let stranded = service
+        .store
+        .stranded_prepared_note_handoffs(RECOVERY_SCAN_LIMIT)
+        .await?;
+    ::metrics::gauge!("stranded_prepared_handoffs").set(stranded.len() as f64);
+    if stranded.is_empty() {
+        return Ok(());
+    }
+    let mut cleared = 0u64;
+    for (tx_hash, commitment) in &stranded {
+        match service
+            .store
+            .clear_expired_prepared_note_handoff(tx_hash, commitment)
+            .await
+        {
+            Ok(true) => {
+                cleared += 1;
+                tracing::warn!(
+                    target: "recovery", %tx_hash, note_commitment = %commitment,
+                    "recovery: cleared a STRANDED expired prepared note handoff — its owning \
+                     transaction is not pending, so no sweep or admission path would ever \
+                     have reached it"
+                );
+            }
+            // Refused by the landed-claim fence, or the row moved underneath us.
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                target: "recovery", %tx_hash, error = %format!("{error:#}"),
+                "recovery: failed to clear a stranded prepared note handoff; retrying next sweep"
+            ),
+        }
+    }
+    ::metrics::counter!("stranded_prepared_handoffs_cleared_total").increment(cleared);
+    Ok(())
+}
+
 pub async fn recover_orphaned_pending_txns(service: &ServiceState) -> anyhow::Result<()> {
+    // Runs FIRST and unconditionally: the stranded set is by definition disjoint
+    // from the pending set, so the early return below would otherwise skip it on
+    // exactly the stacks where it matters (no pending work, a leaked link).
+    if let Err(error) = clear_stranded_prepared_handoffs(service).await {
+        tracing::warn!(
+            target: "recovery", error = %format!("{error:#}"),
+            "recovery: stranded prepared-handoff sweep failed; retrying next sweep"
+        );
+    }
+
     let pending = service
         .store
         .recoverable_pending_txns(RECOVERY_SCAN_LIMIT)
@@ -1025,6 +1091,123 @@ mod tests {
             expires_at: None,
             logs: vec![],
         }
+    }
+
+    /// A PREPARED handoff whose owning transaction is NOT pending is reachable
+    /// by NOTHING and leaked forever.
+    ///
+    /// `recoverable_pending_txns` — the sweep's only entry point — filters
+    /// `WHERE t.status = 'pending'`, and the admission path re-examines a
+    /// handoff only when the SAME tx hash is re-submitted. So once the owning
+    /// transaction goes terminal, the link sits in `tx_note_links` holding a
+    /// note identity reserved against first-writer-wins `prepare_note_handoff`,
+    /// and no periodic path ever frees it.
+    ///
+    /// Observed live 2026-09-05: a post-chaos stack reported
+    /// `pending receipts=0 PREPARED handoffs=1` unchanged for 600s, which
+    /// blocked the full-DB-loss drill's quiesce gate. With zero pending
+    /// transactions the sweep's candidate set was empty, so waiting could not
+    /// have helped.
+    ///
+    /// The fixture is exactly that shape: an expired prepared handoff on a
+    /// COMMITTED transaction, with the reconcile cursor past its expiration
+    /// block.
+    #[tokio::test]
+    async fn stranded_expired_prepared_handoff_on_a_terminal_tx_is_cleared() {
+        let concrete = Arc::new(InMemoryStore::new());
+        let store: Arc<dyn Store> = concrete.clone();
+        let key = PrivateKeySigner::random();
+        let (env, hash, _ger, signer) = signed_ger_tx(&key, 0, 0xE1);
+        install_orphan(&store, &env, hash, signer, 0).await;
+        let tx_key = format!("{hash:#x}");
+        store
+            .prepare_note_handoff(&tx_key, "0xcommit", "0xnote", 100)
+            .await
+            .unwrap();
+        // The transaction reaches a TERMINAL state while the handoff is still
+        // prepared. `txn_commit_confirmed_duplicate` is used for the same reason
+        // the helpers above use it: plain `txn_commit` no-ops when a note handoff
+        // exists, which is precisely the row we are leaving behind.
+        store
+            .txn_commit_confirmed_duplicate(hash, Ok(()), 7)
+            .await
+            .unwrap();
+        // Authoritative sync is strictly past the note's expiration block, so the
+        // note is provably dead.
+        store.set_reconcile_cursor(101).await.unwrap();
+
+        // Precondition: this is the observed shape — nothing pending, one prepared.
+        assert!(
+            store.recoverable_pending_txns(10).await.unwrap().is_empty(),
+            "fixture must have NO pending transaction — that is what strands the link"
+        );
+        assert_eq!(
+            store
+                .stranded_prepared_note_handoffs(10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the expired prepared handoff must be visible as stranded"
+        );
+
+        let service = with_writer(store.clone(), 64);
+        recover_orphaned_pending_txns(&service).await.unwrap();
+
+        assert!(
+            store
+                .stranded_prepared_note_handoffs(10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the recovery sweep must clear a stranded expired prepared handoff; it is the \
+             only path that can, and before this sweep existed the row leaked permanently"
+        );
+    }
+
+    /// The fence still holds: an expired-but-NOT-stranded handoff (its
+    /// transaction is still pending) is left to the state machine above, which
+    /// clears it AND re-drives a fresh note — and an unexpired handoff is not
+    /// touched by either path, because the note may yet be consumed.
+    #[tokio::test]
+    async fn unexpired_prepared_handoff_is_never_reported_stranded() {
+        let concrete = Arc::new(InMemoryStore::new());
+        let store: Arc<dyn Store> = concrete.clone();
+        let key = PrivateKeySigner::random();
+        let (env, hash, _ger, signer) = signed_ger_tx(&key, 0, 0xE2);
+        install_orphan(&store, &env, hash, signer, 0).await;
+        let tx_key = format!("{hash:#x}");
+        store
+            .prepare_note_handoff(&tx_key, "0xcommit", "0xnote", 100)
+            .await
+            .unwrap();
+        store
+            .txn_commit_confirmed_duplicate(hash, Ok(()), 7)
+            .await
+            .unwrap();
+        // Cursor has NOT passed the expiration block: the note may still land.
+        store.set_reconcile_cursor(100).await.unwrap();
+
+        assert!(
+            store
+                .stranded_prepared_note_handoffs(10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a handoff whose note can still be consumed must never be reported stranded — \
+             clearing it would free an identity Miden may yet use"
+        );
+        let service = with_writer(store.clone(), 64);
+        recover_orphaned_pending_txns(&service).await.unwrap();
+        assert_eq!(
+            store
+                .stranded_prepared_note_handoffs(10)
+                .await
+                .unwrap()
+                .len(),
+            0,
+            "and the sweep must not have created one either"
+        );
     }
 
     /// #156 — a CONFIRMED (`Submitted`) handoff whose effect is not yet observed
