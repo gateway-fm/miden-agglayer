@@ -47,6 +47,67 @@ down() {
     "${BASE_ENV[@]}" make e2e-down >>"$R/logs/down.log" 2>&1
 }
 
+# THE NONCE-GAP GATE — run before every target, because on a growing chain one
+# lost nonce silently converts into "L1->L2 timed out" three targets later.
+#
+# Quoting the failures it explains, all from the g1-g4 growing-chain iterations
+# (2026-09-06), all three previously logged as unrelated delivery timeouts:
+#   g4-e2e-rd940              parked 158 rows, signer 0x6352…, nonces 6..
+#   g4-e2e-recovery-readiness parked 158 rows, same signer, same run
+#   g4-e2e-l1-to-l2           parked 140 rows, same signer, same run
+# One absent nonce 5 parked every later injection from the GER signer, and the
+# queue GREW across targets (140 -> 158) — so each target after the first was
+# doomed before it started, and each reported its own innocent-looking timeout.
+#
+# #15 (27abb30, 16b8f7e) fixes this in the PRODUCT: admission adopts the parked
+# floor after GAP_ADOPT_STALL_BLOCKS=120 blocks. Both landed 2026-09-07, AFTER
+# g1-g4 ran, so those iterations never had the fix. This gate therefore does NOT
+# heal anything itself — healing here would mask the product fix. It WAITS for
+# the product to self-heal and, if it does not, names the wedge as its own row
+# in the matrix instead of letting three targets absorb the blame.
+nonce_gate() { # $1 = iteration, $2 = next target label
+    local pg proxy parked t0 waited=0 budget="${NONCE_GATE_BUDGET:-900}"
+    proxy="$(docker ps --format '{{.Names}}' | grep -E -- '-miden-agglayer-1$' | head -1)"
+    [[ -n "$proxy" ]] || return 0
+    pg="${proxy%-miden-agglayer-1}-agglayer-postgres-1"
+    parked=$(docker exec "$pg" psql -U agglayer -d agglayer_store -tAc \
+        "SELECT count(*) FROM queued_txns" 2>/dev/null || echo 0)
+    [[ "${parked:-0}" =~ ^[0-9]+$ ]] || return 0
+    (( parked == 0 )) && return 0
+
+    echo "[$(date -u +%H:%M:%SZ)] nonce-gap gate: $parked parked txn(s) before $2 — \
+waiting up to ${budget}s for #15 gap adoption" | tee -a "$R/battery.log"
+    docker exec "$pg" psql -U agglayer -d agglayer_store -c \
+        "SELECT signer, min(nonce) AS lowest_parked, max(nonce) AS highest, count(*) \
+         FROM queued_txns GROUP BY signer ORDER BY signer" \
+        >> "$R/battery.log" 2>&1 || true
+
+    t0=$(date +%s)
+    while (( waited < budget )); do
+        sleep 15
+        waited=$(( $(date +%s) - t0 ))
+        parked=$(docker exec "$pg" psql -U agglayer -d agglayer_store -tAc \
+            "SELECT count(*) FROM queued_txns" 2>/dev/null || echo "$parked")
+        [[ "${parked:-1}" == "0" ]] && {
+            echo "[$(date -u +%H:%M:%SZ)] nonce-gap gate: cleared after ${waited}s \
+(#15 gap adoption self-healed it)" | tee -a "$R/battery.log"
+            printf '%s\t%s\t%s\t%s\t%s\n' "${ITER_PREFIX:-}$1" "nonce-gap-selfhealed-before-$2" \
+                "PASS" "$waited" "$R/battery.log" >> "$TSV"
+            matrix
+            return 0
+        }
+    done
+
+    echo "[$(date -u +%H:%M:%SZ)] nonce-gap gate: STILL $parked parked after ${budget}s — \
+#15 gap adoption did NOT fire. Every L1->L2 target after this point is expected to \
+time out; the wedge is the cause, not those targets." | tee -a "$R/battery.log"
+    printf '%s\t%s\t%s\t%s\t%s\n' "${ITER_PREFIX:-}$1" "nonce-gap-wedge-before-$2" \
+        "FAIL" "$budget" "$R/battery.log" >> "$TSV"
+    matrix
+    post_mortem "$1" "nonce-gap-wedge-before-$2"
+    return 0
+}
+
 # Chain growth is the point of the run, so it is recorded, not assumed. Called
 # at every drill and at each iteration boundary.
 chain_mark() { # $1 = label
@@ -114,6 +175,7 @@ run() {
     local iter="$1" label="$2" mode="$3"; shift 3
     local log="$R/logs/${ITER_PREFIX:-i}${iter}-${label}.log" t0 t1 rc
     [[ "$mode" == fresh ]] && down
+    nonce_gate "$iter" "$label"
     echo "[$(date -u +%H:%M:%SZ)] ${ITER_PREFIX:-i}$iter $label START" | tee -a "$R/battery.log"
     t0=$(date +%s)
     "${BASE_ENV[@]}" "$@" > "$log" 2>&1; rc=$?
