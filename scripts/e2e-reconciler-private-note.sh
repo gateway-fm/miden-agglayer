@@ -210,14 +210,54 @@ else
     STATUS=$(printf '%s\n' "$TX" | awk '$1=="status"{print $2; exit}')
     [[ "$STATUS" == "1" ]] || fail "L1 deposit tx failed (status=$STATUS)"
     log "L1 deposit sent; waiting for auto-claim + P2ID delivery..."
-    for attempt in $(seq 1 24); do
+    # DEPTH-AWARE BUDGET. The old form was a flat 24x10s = 240s, calibrated on a
+    # fresh chain, and it split the record exactly along chain depth:
+    #   fresh-chain runs   PASS 7/7 (358-375s total)
+    #   growing-chain runs FAIL 7/7 (v3-v7, g1, m1; all abort at ~325s)
+    # In m1 the claim tx COMMITTED at 20:03:40 — two seconds AFTER the 240s
+    # deadline fired at 20:03:38 — with writer queue depth 0, zero parked txns and
+    # the writer job finishing successfully in 18.2s. Nothing was stuck; proving
+    # and sync simply take longer against a deeper chain, which is the property
+    # this battery exists to exercise. A fixed budget turns "deeper" into "broken".
+    FUND_WAIT_SECS="${FUND_WAIT_SECS:-$(
+        tip=$(curl -sf --max-time 5 -X POST -H 'content-type: application/json' \
+                --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
+                "$L2_RPC" 2>/dev/null | sed -E 's/.*"result":"0x([0-9a-f]*)".*/\1/')
+        tip=$((16#${tip:-0} + 0)) 2>/dev/null || tip=0
+        budget=$(( 240 + tip / 8 ))
+        (( budget > 900 )) && budget=900
+        echo "$budget"
+    )}"
+    FUND_ATTEMPTS=$(( FUND_WAIT_SECS / 10 )); (( FUND_ATTEMPTS < 24 )) && FUND_ATTEMPTS=24
+    log "funding budget: ${FUND_WAIT_SECS}s (${FUND_ATTEMPTS} x 10s), scaled to chain depth"
+    for attempt in $(seq 1 "$FUND_ATTEMPTS"); do
         sleep 10
         BAL=$(iso_wallet_balance "$BRIDGE_ID" "$FAUCET_ID")
         BAL="${BAL:-0}"
-        log "  attempt $attempt/24: balance = $BAL"
+        log "  attempt $attempt/$FUND_ATTEMPTS: balance = $BAL"
         [[ "$BAL" -gt 0 ]] && break
     done
-    [[ "$BAL" -gt 0 ]] || fail "wallet not funded after 240s"
+    if [[ "$BAL" -le 0 ]]; then
+        # SLOW vs WEDGED. Raising a timeout is only honest if a genuine wedge can
+        # still be told apart afterwards, so say which one this was rather than
+        # leaving the next reader to re-derive it from container logs.
+        _pg="${COMPOSE_PROJECT_NAME:-miden-agglayer}-agglayer-postgres-1"
+        _proxy="${COMPOSE_PROJECT_NAME:-miden-agglayer}-miden-agglayer-1"
+        _parked=$(docker exec "$_pg" psql -U agglayer -d agglayer_store -tAc \
+                    "SELECT count(*) FROM queued_txns" 2>/dev/null || echo '?')
+        _qdepth=$(curl -sf --max-time 5 "$L2_RPC/metrics" 2>/dev/null \
+                    | awk '/^agglayer_writer_queue_depth /{print $2; exit}')
+        _recent=$(docker logs --since 90s "$_proxy" 2>&1 \
+                    | sed -E 's/\x1b\[[0-9;]*m//g' | grep -ac 'committed to block' || true)
+        echo "  --- slow or wedged? ---"
+        echo "    | parked txns: ${_parked}   writer queue depth: ${_qdepth:-?}"
+        echo "    | claim txs committed in the last 90s: ${_recent}"
+        echo "    | parked > 0            => the #15 nonce wedge (see nonce_gate in e2e-battery.sh)"
+        echo "    | parked 0, recent > 0  => STILL MOVING, the budget was too tight — raise"
+        echo "    |                          FUND_WAIT_SECS, do not read this as a regression"
+        echo "    | parked 0, recent 0    => genuinely stalled; this one IS a product wedge"
+        fail "wallet not funded after ${FUND_WAIT_SECS}s (budget scaled to chain depth)"
+    fi
 fi
 pass "isolated wallet funded (balance $BAL)"
 
