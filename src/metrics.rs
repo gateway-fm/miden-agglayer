@@ -114,6 +114,15 @@ pub fn init_metrics() {
          claim front-running, not a bug."
     );
     describe_counter!(
+        "claim_unclaimable_reverted_total",
+        "#185 EVM-revert semantics: a claimAsset whose destination has no Miden AccountId \
+         (unresolvable) was recorded in unclaimable_claims and ACCEPTED with a reverted \
+         (status 0x0) receipt and NO ClaimEvent — matching how an unappliable claim behaves on \
+         EVM. Retry suppression comes from isClaimed reading the unclaimable record as claimed. \
+         Compare against unclaimable_claims rows to see funds truly stranded on L1; a steady \
+         climb means many claims target unmapped destinations."
+    );
+    describe_counter!(
         "claim_inflight_dedup_total",
         "#55 third dedup window: a claimAsset arrived for a globalIndex whose winning claim was \
          SUBMITTED but had not LANDED yet (claim lock held, no ClaimEvent, within TTL) — the \
