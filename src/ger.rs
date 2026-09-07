@@ -673,7 +673,7 @@ mod tests {
     /// Minimal signed legacy envelope + signer for `insert_ger` calls (the H6
     /// gate runs before Miden submission, so the stub client never executes the
     /// envelope — only its shape/signer matter). Keyed to `tx_hash` so the
-    /// handoff records the real linked hash. Mirrors `restore::test_ger_envelope`.
+    /// handoff records the real linked hash. Mirrors `projection::tests::test_ger_envelope`.
     fn h6_test_envelope(tx_hash: TxHash) -> (TxEnvelope, Address) {
         use alloy::consensus::{Signed, TxLegacy};
         use alloy::primitives::Signature;

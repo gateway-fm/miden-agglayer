@@ -32,7 +32,6 @@ AGGLAYER_CONTAINER="${AGGLAYER_CONTAINER:-miden-agglayer-miden-agglayer-1}"
 PG_HOST="${PG_HOST:-localhost}"; PG_PORT="${PG_PORT:-5434}"
 PG_USER="${PG_USER:-agglayer}"; PG_PASS="${PG_PASS:-agglayer}"; PG_DB="${PG_DB:-agglayer_store}"
 ALLOW_LATE="${ALLOW_LATE:-0}"
-TOOL_BIN="${TOOL_BIN:-$PROJECT_DIR/target/debug/bridge-out-tool}"
 
 TMP="$(mktemp -d)"
 # The client-store snapshot below briefly PAUSES the proxy; the trap guarantees
@@ -50,7 +49,9 @@ cleanup() {
 trap cleanup EXIT
 
 # 1. Canonical script roots from the same crates the proxy is built from.
-[[ -x "$TOOL_BIN" ]] || { echo "FAIL: $TOOL_BIN not built (cargo build --bin bridge-out-tool)"; exit 1; }
+# shellcheck source=scripts/lib-tool-preflight.sh
+. "$SCRIPT_DIR/lib-tool-preflight.sh"
+preflight_bridge_out_tool || exit 1
 "$TOOL_BIN" --print-script-roots --store-dir /tmp --node-url http://x > "$TMP/roots" \
     || { echo "FAIL: --print-script-roots failed"; exit 1; }
 B2AGG_ROOT=$(awk -F= '$1=="b2agg"{print $2}' "$TMP/roots")

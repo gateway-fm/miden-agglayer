@@ -26,10 +26,6 @@ case "$test_filter" in
         # 2026-07-04 frozen-eth_blockNumber regression). Quick-fails the suite.
         "$SCRIPT_DIR/e2e-rpc-tip-consistency.sh"
         echo ""
-        # #146 — future-nonce mempool: park + promote out-of-order submissions.
-        # A cheap, self-contained RPC-contract test on a throwaway signer.
-        "$SCRIPT_DIR/e2e-future-nonce-mempool.sh"
-        echo ""
         "$SCRIPT_DIR/e2e-l1-to-l2.sh"
         echo ""
         "$SCRIPT_DIR/e2e-l2-to-l1.sh"
@@ -157,6 +153,35 @@ case "$test_filter" in
         # process repeatedly to prove acknowledged work self-heals with at most a
         # proxy restart. Running it earlier would disrupt every later test.
         "$SCRIPT_DIR/e2e-orphan-recovery-chaos.sh"
+        # #146 — future-nonce mempool: park + promote out-of-order submissions.
+        # A cheap, self-contained RPC-contract test on a throwaway signer.
+        #
+        # RUNS LAST, AND MUST. Its vehicle is `claimAsset` with a destination
+        # that "only needs to be a plausible target" — i.e. an UNRESOLVABLE one,
+        # chosen because claimAsset is not preflighted and so reaches the park
+        # decision. That lands on RD-860's swallow path
+        # (src/service_send_raw_txn.rs:3004): the claim is recorded in
+        # `unclaimable_claims` and a synthetic ClaimEvent is emitted "so aggkit
+        # stops retrying".
+        #
+        # aggkit reads that event as a claim with an unclaim and STOPS
+        # CERTIFYING at it, permanently:
+        #
+        #   WARN flows/flow_base.go:670  found claim with unclaim after later
+        #        unfinalized claim at block 37, cutting certificate at block 36
+        #   INFO flows/builder_flow_pp.go:103  PPFlow - no bridges or claims
+        #        found for range: 1 - 36, so no certificate will be built
+        #
+        # At position 2 that wedged every later tier's settlement: `test-e2e`
+        # failed "Timed out: certificate settled" after 900s in 2 of 3 battery
+        # iterations, while the same bridge-out passed standalone every time.
+        # Bisected to this script alone (scripts/e2e-settlement-bisect.sh arm C).
+        # Nothing depends on it running early — it is self-contained and uses a
+        # throwaway signer — so it goes after every tier that needs a
+        # certificate. The PRODUCT interaction it exposes is a separate,
+        # pre-existing finding and is NOT fixed by this ordering.
+        "$SCRIPT_DIR/e2e-future-nonce-mempool.sh"
+        echo ""
         ;;
     chaos)
         "$SCRIPT_DIR/e2e-orphan-recovery-chaos.sh"

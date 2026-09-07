@@ -35,6 +35,11 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib-l2l2.sh"
 
 CLAIM_EVENT_TOPIC="0x1df3f2a973a00d6635911755c260704e95e8a5876997546798770f76396fda4d"
+# Sub-logs and failure evidence go somewhere that outlives the stack: the
+# battery's results directory when it set one, else /tmp.
+R_EVIDENCE_DIR="${BATTERY_RESULTS_DIR:+$BATTERY_RESULTS_DIR/logs}"
+R_EVIDENCE_DIR="${R_EVIDENCE_DIR:-/tmp}"
+mkdir -p "$R_EVIDENCE_DIR" 2>/dev/null || R_EVIDENCE_DIR=/tmp
 E2E_COMPOSE=(docker compose -f "$PROJECT_DIR/docker-compose.e2e.yml" -f "$PROJECT_DIR/docker-compose.l2l2.yml" --env-file "$FIXTURES_DIR/.env")
 PG_CONTAINER="${PG_CONTAINER:-${COMPOSE_PROJECT_NAME}-agglayer-postgres-1}"
 BRIDGE_PG_CONTAINER="${BRIDGE_PG_CONTAINER:-${COMPOSE_PROJECT_NAME}-postgres-1}"
@@ -128,9 +133,13 @@ docker exec "$PG_CONTAINER" pg_dump -U agglayer agglayer_store > "$BACKUP" 2>/de
 # exercised (review blocker 6). Take them down for the whole repair window; they
 # are brought back and asserted-settled only after /health flips to 200.
 MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" "${E2E_COMPOSE[@]}" stop miden-agglayer aggkit bridge-service bridge-autoclaim >/dev/null 2>&1
-for c in aggkit bridge-service bridge-autoclaim; do
+# The PROXY is in that stop list too and was the one service never verified.
+# If it kept running, its repair backlog is whatever it seeded at ITS boot —
+# empty — so /health answers 200 the instant we poll and the withhold assertion
+# fails against a proxy that was never restarted at all. Check it first.
+for c in miden-agglayer aggkit bridge-service bridge-autoclaim; do
     [[ "$(docker inspect -f '{{.State.Running}}' "${COMPOSE_PROJECT_NAME}-${c}-1" 2>/dev/null)" == "false" ]] \
-        || fail "#148: consumer '$c' is still running — it must be gated OFF during the calldata repair"
+        || fail "#148: '$c' is still running after \`compose stop\` — the repair window was never actually entered"
 done
 pass "Consumers gated OFF (aggkit, bridge-service, bridge-autoclaim stopped) for the repair window"
 # RETAIN Postgres; only remove the claim's calldata envelope (transaction_logs
@@ -175,13 +184,32 @@ pass "Miden store reset (as root, via shared mount): removed ${BASH_REMATCH[1]} 
     || fail "#148: the claim tx envelope should be gone"
 pass "Induced: claim envelope blanked (retained ClaimEvent), reconcile cursor reset, Miden store reset"
 
+# Mark the restart boundary so the boot evidence below reads only THIS boot's
+# log, never the pre-induce process's.
+PROXY_STARTED_BEFORE="$(docker inspect -f '{{.State.StartedAt}}' "$AGGLAYER_CONTAINER" 2>/dev/null || echo unknown)"
 MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" "${E2E_COMPOSE[@]}" start miden-agglayer >/dev/null 2>&1
+PROXY_STARTED_AFTER="$(docker inspect -f '{{.State.StartedAt}}' "$AGGLAYER_CONTAINER" 2>/dev/null || echo unknown)"
+[[ "$PROXY_STARTED_AFTER" != "$PROXY_STARTED_BEFORE" ]] \
+    || fail "#148: the proxy container did not restart (StartedAt unchanged at $PROXY_STARTED_BEFORE) — nothing re-seeded the repair backlog, so any /health reading is from the pre-induce process"
 # Wait for the HTTP server itself to be up (health responds at all, even 503),
 # so a connection-refused during boot is not mistaken for readiness.
 for _i in $(seq 1 90); do
     [[ "$(proxy_health_code)" != "000" ]] && break
     sleep 2
 done
+
+# BOOT EVIDENCE. main.rs seeds the durable repair backlog ONCE, before the HTTP
+# server can serve, and logs exactly one of two lines. Which one it logged
+# decides product-vs-test for every outcome below, so capture it before
+# asserting anything:
+#   "recovery readiness gated: ..."  claims_awaiting_calldata=N  (N>=1)
+#   "claim-calldata repair backlog empty — recovery readiness open"
+SEED_LOG="$(docker logs --since "$PROXY_STARTED_BEFORE" "$AGGLAYER_CONTAINER" 2>&1 \
+    | grep -E 'recovery readiness gated|claim-calldata repair backlog empty' | tail -1 || true)"
+SEEDED_BACKLOG="$(sed -n 's/.*claims_awaiting_calldata[= ]*\([0-9]\+\).*/\1/p' <<<"$SEED_LOG" | tail -1)"
+log "#148 boot evidence: seed log line: ${SEED_LOG:-<none captured>}"
+log "#148 boot evidence: backlog table now: $(pgi "SELECT COUNT(*) FROM claim_calldata_repair_pending" 2>/dev/null || echo '<unreadable>')"
+log "#148 boot evidence: /health right now: $(proxy_health_code) $(proxy_health_body)"
 
 # ── 1. Readiness is WITHHELD while the claim calldata is missing ──────────────
 # The gating PROPERTY: while any historical ClaimEvent still lacks its calldata, /health is
@@ -208,8 +236,19 @@ while [[ $(date +%s) -lt $RECOV_DEADLINE ]]; do
     fi
     sleep 0.3
 done
-[[ "$SAW_WITHHELD" == "1" ]] \
-    || fail "#148: never observed /health=503 with claims_awaiting_calldata>=1 — the readiness gate did NOT hold while calldata was missing"
+if [[ "$SAW_WITHHELD" != "1" ]]; then
+    log "#148 diagnosis: seed line was: ${SEED_LOG:-<none>}"
+    log "#148 diagnosis: seeded backlog was: ${SEEDED_BACKLOG:-<unparsed>}"
+    docker logs --since "$PROXY_STARTED_BEFORE" "$AGGLAYER_CONTAINER" 2>&1 | tail -40 | sed 's/^/    | /'
+    if [[ "${SEEDED_BACKLOG:-0}" -ge 1 ]]; then
+        fail "#148: the backlog WAS seeded (claims_awaiting_calldata=$SEEDED_BACKLOG) but /health was never \
+observed at 503 — either the repair closed the window before the socket accepted a poll, or the gate is \
+not wired to the seeded backlog. Boot log above decides which."
+    fi
+    fail "#148: never observed /health=503 with claims_awaiting_calldata>=1 — the readiness gate did NOT \
+hold while calldata was missing. The seed reported NO backlog at boot (line: ${SEED_LOG:-<none>}), so the \
+gate had nothing to gate: seeding, not serving, is where to look."
+fi
 pass "1. Readiness WITHHELD: /health=503 (claims_awaiting_calldata>=1) while the claim calldata was missing"
 [[ "$READY" == "1" ]] || fail "#148: /health never returned to 200 after the calldata repair (repair stalled?)"
 pass "1b. Readiness flipped to 200 once the calldata repair completed"
@@ -236,10 +275,21 @@ pass "3. No foreign/spurious ClaimEvent across recovery (count stable at $CLAIM_
 PROXY_CONTAINER="${AGGLAYER_CONTAINER:-${COMPOSE_PROJECT_NAME}-miden-agglayer-1}"
 AGGKIT_CONTAINER="${AGGKIT_CONTAINER:-${COMPOSE_PROJECT_NAME}-aggkit-1}"
 CLAIM_TX_LC="$(echo "$CLAIM_TX" | tr 'A-F' 'a-f')"
-# serve_count: how many times the (un-reset) proxy has served eth_getTransactionByHash for
-# THIS exact hash (src/service.rs logs "served stored tx <hash>"). It INCLUDES this script's
-# own reads (step 2) — step 4c requires a STRICT increase, so only a genuinely new (aggkit-
-# driven) fetch can pass, never the test re-reading.
+# serve_count: how many times the (un-reset) proxy has served THIS exact hash from its
+# durable store, on EITHER serving branch. It INCLUDES this script's own reads (step 2) —
+# step 4c counts a post-recreate window, so only a genuinely new (aggkit-driven) fetch can
+# pass, never the test re-reading.
+#
+# WHICH BRANCH ACTUALLY ANSWERS (this is what step 4c got wrong for four iterations):
+# aggkit reads a CLAIM's calldata with `debug_traceTransaction`, never with
+# `eth_getTransactionByHash` — `bridgesync/downloader.go:435` calls `extractCallData` ->
+# `extractRootCall` (`:743`), which issues `debug_traceTransaction`; `eth_getTransactionByHash`
+# is used only by `ExtractTxnAddresses` for a bridgeLeafTypeMessage BRIDGE event (`:170`).
+# The old form grepped a line emitted ONLY by the eth_getTransactionByHash handler
+# (`src/service.rs:566`), so it could never observe a claim re-fetch and reported ZERO while
+# the proxy was serving correctly. `src/service_debug.rs` now logs the same
+# "served stored tx <hash>" shape on the trace branch, and the grep below matches BOTH
+# ("eth_getTransactionByHash: served stored tx" / "debug_traceTransaction: served stored tx").
 serve_count() {
     docker logs --tail "${PROXY_LOG_TAIL:-20000}" "$PROXY_CONTAINER" 2>&1 \
         | sed -E 's/\x1b\[[0-9;]*m//g' | grep -iF 'served stored tx' | grep -icF "$CLAIM_TX_LC" || true
@@ -272,6 +322,24 @@ log "  pre-recovery snapshots: proxy served $CLAIM_TX_LC ${SERVES_BEFORE}x (incl
 docker exec "$BRIDGE_PG_CONTAINER" psql -U bridge_user -d bridge_db \
     -c "DROP SCHEMA IF EXISTS sync CASCADE; DROP SCHEMA IF EXISTS mt CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO bridge_user;" >/dev/null 2>&1 \
     || fail "#148: failed to drop bridge_db for the realistic resync (finding #65)"
+# Boundary for the serve-window count in 4c. `docker logs --since` needs an
+# instant that is definitely before the recreate and definitely after this
+# script's own step-2 read.
+RECREATE_SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# How many requests of each kind the proxy has ANSWERED so far, by any branch.
+# A zero serve-count is ambiguous between "aggkit never asked" and "aggkit asked and the
+# answer came from a branch that does not log". These counters separate the two, and the
+# TRACE one is the meaningful half: it is the RPC aggkit uses to read claim calldata.
+rpc_requests() { # $1 = method label
+    curl -sf --max-time 5 "$L2_RPC/metrics" 2>/dev/null \
+        | awk -F'[ }]' -v m="$1" \
+            '$0 ~ ("^rpc_request_duration_seconds_count\\{.*" m) {print $NF; exit}' \
+        | tr -d '[:space:]'
+}
+gettx_requests() { rpc_requests 'eth_getTransactionByHash'; }
+trace_requests() { rpc_requests 'debug_traceTransaction'; }
+GETTX_BEFORE="$(gettx_requests)"; GETTX_BEFORE="${GETTX_BEFORE%.*}"; GETTX_BEFORE="${GETTX_BEFORE:-0}"
+TRACE_BEFORE="$(trace_requests)"; TRACE_BEFORE="${TRACE_BEFORE%.*}"; TRACE_BEFORE="${TRACE_BEFORE:-0}"
 MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" \
     "${E2E_COMPOSE[@]}" up -d --no-deps --force-recreate aggkit bridge-service bridge-autoclaim >/dev/null 2>&1
 # wait_for runs its predicate as a COMMAND (`"$@"` after `shift 3`), not an eval'd string,
@@ -342,16 +410,58 @@ pass "4b. aggkit's OWN L2BridgeSyncer re-processed the recovered claim from a FR
 # SERVES_BEFORE (incl. this script's own step-2 read) BEFORE the recreate, and now require a
 # STRICT increase — a serve that can ONLY be aggkit's post-reset re-fetch, never the test.
 # Correlated with 4b (aggkit demonstrably re-processed the claim's block), the new serve is its.
-SERVE_DEADLINE=$(( $(date +%s) + 240 )); SERVES_AFTER="$SERVES_BEFORE"
+# COUNT THE WINDOW, NOT A DELTA. The previous form compared two totals taken
+# from `docker logs --tail 20000`: once the proxy emits more than that many
+# lines — which it does under any real traffic — the window slides past the old
+# serve lines and the "after" total can hold or FALL while new serves are
+# arriving. A strict-increase test over a sliding tail is not a measurement of
+# anything. `--since` the recreate instant counts exactly the serves that
+# happened after it, so the assertion is >= 1 and cannot be defeated by log
+# volume.
+serve_count_since() {
+    docker logs --since "$1" "$PROXY_CONTAINER" 2>&1 \
+        | sed -E 's/\x1b\[[0-9;]*m//g' | grep -iF 'served stored tx' | grep -icF "$CLAIM_TX_LC" || true
+}
+SERVE_DEADLINE=$(( $(date +%s) + ${SERVE_WAIT_SECS:-240} )); SERVES_WINDOW=0
 while :; do
-    SERVES_AFTER="$(serve_count)"; SERVES_AFTER="${SERVES_AFTER:-0}"
-    [[ "$SERVES_AFTER" -gt "$SERVES_BEFORE" ]] && break
+    SERVES_WINDOW="$(serve_count_since "$RECREATE_SINCE")"; SERVES_WINDOW="${SERVES_WINDOW:-0}"
+    [[ "$SERVES_WINDOW" -ge 1 ]] && break
     [[ $(date +%s) -ge $SERVE_DEADLINE ]] && break
     sleep 5
 done
-[[ "$SERVES_AFTER" -gt "$SERVES_BEFORE" ]] \
-    || fail "#148: the proxy did NOT serve the exact recovered hash $CLAIM_TX_LC to aggkit after force-recreate (serve count stuck at $SERVES_BEFORE within 240s) — aggkit did not re-fetch THIS claim's calldata (only a block number advanced)"
-pass "4c. Proxy served the EXACT recovered hash to aggkit AFTER force-recreate (serve count $SERVES_BEFORE -> $SERVES_AFTER) — a genuinely NEW aggkit-driven fetch of THIS claim, not the test re-reading"
+if [[ "$SERVES_WINDOW" -lt 1 ]]; then
+    # EVERY pipeline here ends in `|| true`. `set -euo pipefail` is on and a grep
+    # that matches nothing exits 1 — which is precisely the condition being
+    # diagnosed, so without this the diagnostic block kills the script before it
+    # prints anything. It did exactly that on iteration 1: the header line was
+    # the entire output.
+    GETTX_AFTER="$(gettx_requests)"; GETTX_AFTER="${GETTX_AFTER%.*}"; GETTX_AFTER="${GETTX_AFTER:-0}"
+    TRACE_AFTER="$(trace_requests)"; TRACE_AFTER="${TRACE_AFTER%.*}"; TRACE_AFTER="${TRACE_AFTER:-0}"
+    echo "  --- requests answered by the proxy since the recreate (any branch) ---"
+    echo "    | debug_traceTransaction   before: $TRACE_BEFORE  now: $TRACE_AFTER  delta: $(( TRACE_AFTER - TRACE_BEFORE ))"
+    echo "    | eth_getTransactionByHash before: $GETTX_BEFORE  now: $GETTX_AFTER  delta: $(( GETTX_AFTER - GETTX_BEFORE ))"
+    echo "    | debug_traceTransaction is THE call aggkit uses for claim calldata"
+    echo "    | (bridgesync/downloader.go:435 -> extractRootCall:743). Read it first:"
+    echo "    |   trace delta 0 => aggkit never re-fetched this claim at all (a resync/trigger"
+    echo "    |                    problem, not a serving problem);"
+    echo "    |   trace delta > 0 but no serve line => it asked and the store-first branch in"
+    echo "    |                    src/service_debug.rs did not answer — that IS a product bug."
+    echo "    | eth_getTransactionByHash is expected to stay near 0: aggkit uses it only for"
+    echo "    | bridgeLeafTypeMessage BRIDGE events (downloader.go:170), never for claims."
+    echo "  --- proxy 'served stored tx' since $RECREATE_SINCE (ANY hash) ---"
+    { docker logs --since "$RECREATE_SINCE" "$PROXY_CONTAINER" 2>&1 \
+        | sed -E 's/\x1b\[[0-9;]*m//g' | grep -iF 'served stored tx' | tail -10 | sed 's/^/    | /'; } || true
+    echo "  --- aggkit bridgesync since the recreate ---"
+    { docker logs --since "$RECREATE_SINCE" "$AGGKIT_CONTAINER" 2>&1 \
+        | sed -E 's/\x1b\[[0-9;]*m//g' | grep -aiE 'bridgesync|claim' | tail -10 | sed 's/^/    | /'; } || true
+    fail "#148: in the ${SERVE_WAIT_SECS:-240}s after the force-recreate the proxy served the recovered \
+hash $CLAIM_TX_LC ZERO times (whole-history serve total before the recreate: $SERVES_BEFORE; aggkit \
+re-processed to block $AGGKIT_MAXBLK >= $CLAIM_BLOCK; debug_traceTransaction requests answered in \
+that window: $(( ${TRACE_AFTER:-0} - TRACE_BEFORE )), eth_getTransactionByHash: \
+$(( ${GETTX_AFTER:-0} - GETTX_BEFORE ))). aggkit advanced past the claim's block without being \
+served THIS claim's calldata — the lines above say whether it fetched anything at all."
+fi
+pass "4c. Proxy served the EXACT recovered hash to aggkit AFTER force-recreate ($SERVES_WINDOW serve(s) inside the post-recreate window, on either serving branch; $SERVES_BEFORE over all prior history) — a genuinely NEW aggkit-driven fetch of THIS claim, not the test re-reading"
 
 # ── 4d. CONSUMER-SIDE exact global index (PR #151 round 3, gap 2) ────────────────────
 # The exact GI was bound INSIDE the proxy (ClaimEvent<->calldata, at PRE). Now require the
@@ -373,12 +483,57 @@ pass "4d. Consumer (bridge_db sync.claim) durably delivered the recovered claim'
 # the restart), and receipt-check its SettlementTxnHash on L1 (status 0x1, to == RollupManager)
 # — the on-chain proof that the aggsender -> agglayer -> L1 settlement pipeline resumed.
 step "4e: post-recovery Miden->L1 bridge-out (fresh LET leaf), then require a strictly-newer settled cert proven on-chain"
-if ! "$SCRIPT_DIR/e2e-l2-to-l1.sh" > "${TMPDIR:-/tmp}/rr-l2l1.$$.log" 2>&1; then
-    sed -E 's/\x1b\[[0-9;]*m//g' "${TMPDIR:-/tmp}/rr-l2l1.$$.log" 2>/dev/null | tail -6 | sed 's/^/  [l2-to-l1] /'
-    rm -f "${TMPDIR:-/tmp}/rr-l2l1.$$.log" 2>/dev/null || true
-    fail "#148: post-recovery Miden->L1 bridge-out (e2e-l2-to-l1.sh) failed — the recovered stack cannot produce a fresh outbound exit for a new certificate"
+# PRECONDITION: the projector must be AT the Miden tip before a fresh bridge-out
+# is timed. This recovery reset the Miden client store, so the proxy re-imports
+# from genesis; until the projector reaches the tip a brand-new B2AGG note
+# cannot be projected, and e2e-l2-to-l1's 120s "BridgeEvent in eth_getLogs"
+# window would be measured from a lagging cursor. Observed 2026-09-05
+# (iteration 2): the bridge-out landed, and at the moment of failure
+# `projector_cursor=90 reconcile_cursor=154` with the projector's last tick
+# line 3 minutes old — the note was never projected, so no wait on the event
+# side could have helped.
+#
+# This is a WAIT, not a waiver: if the projector never reaches the tip, that is
+# itself the finding and it fails here with the cursors, rather than 120s later
+# as a missing event.
+PROJ_DEADLINE=$(( $(date +%s) + ${RR_PROJECTOR_CATCHUP_SECS:-300} ))
+PROJ_CUR=""; PROJ_TIP=""
+while :; do
+    PROJ_CUR="$(pgq "SELECT projector_cursor FROM service_state WHERE id = 1" || echo "")"
+    PROJ_TIP="$(pgq "SELECT latest_block_number FROM service_state WHERE id = 1" || echo "")"
+    [[ "$PROJ_CUR" =~ ^[0-9]+$ && "$PROJ_CUR" == "$PROJ_TIP" ]] && break
+    [[ $(date +%s) -ge $PROJ_DEADLINE ]] && break
+    sleep 5
+done
+if [[ ! "$PROJ_CUR" =~ ^[0-9]+$ || "$PROJ_CUR" != "$PROJ_TIP" ]]; then
+    log "  --- projector state ---"
+    pgq "SELECT projector_cursor, reconcile_cursor, latest_block_number FROM service_state WHERE id=1" 2>&1 | sed 's/^/    | /'
+    log "  --- last projector tick lines ---"
+    { docker logs --tail 5000 "$AGGLAYER_CONTAINER" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' \
+        | grep -a 'synthetic projector tick' | tail -3 | sed 's/^/    | /'; } || true
+    fail "#148: the projector never reached the synthetic tip within ${RR_PROJECTOR_CATCHUP_SECS:-300}s after the \
+reset-Miden-store recovery (cursor='$PROJ_CUR' tip='$PROJ_TIP') — it is not lagging, it has stopped, and no \
+post-recovery bridge-out could be projected. Lines above give the last tick it logged."
 fi
-rm -f "${TMPDIR:-/tmp}/rr-l2l1.$$.log" 2>/dev/null || true
+log "  projector at the tip (cursor=$PROJ_CUR) — timing the fresh bridge-out from a caught-up state"
+
+RR_L2L1_LOG="$R_EVIDENCE_DIR/rr-post-recovery-l2-to-l1.log"
+if ! "$SCRIPT_DIR/e2e-l2-to-l1.sh" > "$RR_L2L1_LOG" 2>&1; then
+    sed -E 's/\x1b\[[0-9;]*m//g' "$RR_L2L1_LOG" 2>/dev/null | tail -20 | sed 's/^/  [l2-to-l1] /'
+    # The sub-log is KEPT (previously deleted on both paths, which is why an
+    # earlier failure here left nothing to diagnose), and the projector state is
+    # captured while the stack is still up.
+    log "  --- projector state at failure ---"
+    pgq "SELECT projector_cursor, reconcile_cursor, latest_block_number FROM service_state WHERE id=1" 2>&1 | sed 's/^/    | /'
+    log "  --- last projector tick lines ---"
+    { docker logs --tail 5000 "$AGGLAYER_CONTAINER" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' \
+        | grep -a 'synthetic projector tick' | tail -3 | sed 's/^/    | /'; } || true
+    log "  --- proxy warnings/errors since the recovery ---"
+    { docker logs --since "$RECREATE_SINCE" "$AGGLAYER_CONTAINER" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' \
+        | grep -aiE '\bWARN\b|\bERROR\b' | tail -20 | sed 's/^/    | /'; } || true
+    fail "#148: post-recovery Miden->L1 bridge-out (e2e-l2-to-l1.sh) failed — the recovered stack cannot \
+produce a fresh outbound exit for a new certificate. Full sub-log kept at $RR_L2L1_LOG"
+fi
 EMPTY_LER="0x27ae5ba08d7291c96c8cbddcc148bf48a6d68c7974b94356f53754ef6171d757"
 CERT_DEADLINE=$(( $(date +%s) + 300 )); NEW_CERT_HEIGHT=""; NEW_SETTLEMENT_TX=""
 while :; do

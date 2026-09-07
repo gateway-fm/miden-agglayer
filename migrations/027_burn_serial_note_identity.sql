@@ -1,0 +1,22 @@
+-- Cantina #5 BURN-serial monitor: record WHICH note each serial belongs to.
+--
+-- `monitor_burn_serials` keyed on the serial alone, so the tracker could not
+-- tell "the same burn observed again" from "a DIFFERENT burn reusing a
+-- serial" — and only the second is the attack the monitor exists to detect
+-- (see burn_serial_tracker's module docs: two distinct exit leaves whose BURN
+-- notes collide on NoteId and nullifier).
+--
+-- `on_post_sync` re-scans the ENTIRE consumed-note history every tick
+-- (`get_input_notes(NoteFilter::Consumed)`), so every historical burn was
+-- re-observed every tick and re-reported as a collision. Measured live on a
+-- growing chain: 504 collision lines in 3 minutes from 14 distinct serials,
+-- each repeated 36 times — once per 5-second tick. A security alarm that fires
+-- continuously for legitimate traffic cannot surface a real collision.
+--
+-- Nullable on purpose: rows written before this migration have no note
+-- identity and can never gain one retroactively. `burn_serial_observe` adopts
+-- the first post-migration observer into a NULL row rather than alarming on
+-- it — the alternative is to keep alarming forever on every legacy serial,
+-- which is the bug. A genuinely different burn reusing that serial afterwards
+-- still alarms, because the adopted note id no longer matches.
+ALTER TABLE monitor_burn_serials ADD COLUMN IF NOT EXISTS note_id BYTEA;

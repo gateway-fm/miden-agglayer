@@ -1,0 +1,19 @@
+-- 028 — durable RESTORE PROVENANCE, distinct from the #90 bootstrap window.
+--
+-- The full-DB-loss drill is only a FIDELITY test if the "before" state was
+-- produced by live traffic. Re-running it on a store that is itself restore
+-- output measures idempotence — restore(restore(H)) vs restore(H) — and passes
+-- trivially even if restore drops history on first contact.
+--
+-- The drill previously inferred provenance from `nonce_ledger_rebuilt`, which is
+-- the WRONG signal twice over:
+--   1. it is the #90 admission-bootstrap arm, not provenance, and
+--   2. it is TIME-BOXED (migration 025) and self-clears after ~6h, so a restored
+--      baseline silently reads as "live" on any battery iteration longer than the
+--      window — a false green in the one check meant to catch false greens.
+--
+-- `restored_at_cursor` is provenance and nothing else: the synthetic tip restore
+-- rebuilt to. It never expires and is never cleared. A drill can then classify
+-- its window exactly: blocks above the stamp are ORGANIC (true fidelity), blocks
+-- at or below it are restore output (idempotence). NULL means never restored.
+ALTER TABLE service_state ADD COLUMN IF NOT EXISTS restored_at_cursor BIGINT;

@@ -61,3 +61,6 @@ __pycache__/
 fixtures/live*
 fixtures/*.env
 demo/state/
+
+# Battery / scenario run artefacts (logs, matrices) — regenerated per run
+e2e-results/

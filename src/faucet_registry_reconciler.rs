@@ -17,7 +17,7 @@
 //! writable by design; faucet registration is admin-only, so an unexpected one is an
 //! attack signal, and silently adopting it would launder a compromise. The ONLY
 //! sanctioned path to import faucets the proxy did not itself register is `--restore`
-//! (`restore::restore_faucet_identities`).
+//! (the projector's restore-posture `faucet_bootstrap` primitive).
 //!
 //! ## Grace window (why not halt on the first sighting)
 //! The proxy's own registration lands the on-chain note slightly before it commits the
