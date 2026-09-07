@@ -97,10 +97,12 @@ docker exec "$NODE_CONTAINER" cat /data/node/miden-store.sqlite3-wal > "$TMP/nod
     || rm -f "$TMP/node.sqlite3-wal"
 
 # An unresolvable destination is intentionally terminal without a Miden CLAIM
-# note: the proxy records the exception durably and emits one ClaimEvent so
-# AggKit stops retrying funds that require operator rescue. Keep these events
-# strict too: match the durable record to the exact receipt block, globalIndex,
-# and transaction hash instead of weakening the generic extra-log check.
+# note. Since #185 it is terminal without a ClaimEvent either: the proxy records
+# the exception durably, accepts the claim and writes a REVERTED receipt, and
+# emits NOTHING — retry suppression comes from isClaimed/eth_estimateGas reading
+# the durable record, not from a fabricated log. So the (block, globalIndex,
+# tx-hash) triples below are what a ClaimEvent must NEVER carry; the python
+# fails the verdict on any that does (see lib-verify-completeness.py).
 PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" \
     -t -A -F '|' -c \
     "SELECT u.global_index, COALESCE(t.block_number::text, ''), u.eth_tx_hash

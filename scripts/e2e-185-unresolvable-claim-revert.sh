@@ -343,6 +343,14 @@ if [[ "${RUN_BRIDGE_OUT:-1}" == "1" ]]; then
     pass "(d) post-claim bridge-out completed"
 fi
 
+# Nothing new to certify without the bridge-out above, so the strictly-newer
+# assertion has nothing to wait FOR: it would burn the whole SETTLE_TIMEOUT and
+# then fail for a reason that is not #184. RUN_BRIDGE_OUT=0 is for planting an
+# unclaimable claim on an existing chain; the #184 proof needs the bridge-out.
+POST_SETTLED_HEIGHT="$PRE_SETTLED_HEIGHT"
+if [[ "${RUN_BRIDGE_OUT:-1}" != "1" ]]; then
+    warn "(d) RUN_BRIDGE_OUT=0 — no new bridge-out, so the strictly-newer-certificate assertion is SKIPPED (not proven this run)"
+else
 say "(d) waiting for a settled certificate STRICTLY newer than height $PRE_SETTLED_HEIGHT (<= ${SETTLE_TIMEOUT}s)..."
 t0=$SECONDS; POST_SETTLED_HEIGHT=0
 while :; do
@@ -355,6 +363,7 @@ while :; do
     sleep 20
 done
 pass "(d) certificate settlement ADVANCED across the unresolvable claim: height $PRE_SETTLED_HEIGHT -> $POST_SETTLED_HEIGHT"
+fi
 
 CUTS=$( set +o pipefail; docker logs --since "$MARK_TS" "$AGGKIT_C" 2>&1 | delog \
         | grep -acE 'cutting certificate at block' )
