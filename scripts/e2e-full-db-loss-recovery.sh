@@ -504,6 +504,29 @@ else
     BASELINE_KIND="live (true fidelity comparison)"
 fi
 say "baseline provenance: $BASELINE_KIND"
+
+# CAPTURE THE NOTE-LESS SET BEFORE THE DROP DESTROYS IT.
+#
+# RD-860: a claim whose destination cannot be resolved is SHORT-CIRCUITED at
+# admission — `unclaimable_claims` gets a row, a ClaimEvent is emitted so aggkit
+# stops retrying, and NO Miden note is ever created ("no known Miden AccountId
+# for Ethereum address 0x…dEaD"). `--restore` rebuilds history from
+# authoritative Miden NOTE state, so an event with no note has no on-chain
+# source to replay. That is the filed gap #103, and it is the ONLY class of log
+# a faithful restore may legitimately drop.
+#
+# The drill already knew this in its Phase 4 liveness check but not here, so a
+# post-chaos run failed with
+#   "eth_getLogs LOST logs across restore: 330 -> 328"
+# on two ClaimEvents at blocks 2244 and 2583 with destinations 0x…dEaD and
+# 0x0000…0000 — the second injected deliberately by e2e-fuzz-bridge.sh:376.
+#
+# This snapshot is what lets the comparison PROVE a missing log is that class
+# instead of tolerating a count drop. The table is dropped in Phase 1, so it
+# must be read now.
+UNCLAIMABLE_GIS="/tmp/fdl-unclaimable-gis-${RUN_SUFFIX}.txt"
+pgq "SELECT lower(global_index) FROM unclaimable_claims" > "$UNCLAIMABLE_GIS" 2>/dev/null || : > "$UNCLAIMABLE_GIS"
+say "note-less (RD-860) claims recorded pre-drop: $(grep -c . "$UNCLAIMABLE_GIS" 2>/dev/null || echo 0)"
 [[ "$NUHC0" == "$NINJECTED0" ]] || say "note: UHC($NUHC0) != injected($NINJECTED0) pre-drop — carrying the delta forward"
 NTX_MARK=$(docker logs "$NTX_CONTAINER" 2>&1 | grep -c "1007209807211405110" || true)
 say "ntx kernel-assert (poison) lines so far: $NTX_MARK"
@@ -594,15 +617,68 @@ consumer-level verdict"
 fi
 NGL0=$(wc -l < "$GL_BEFORE"); NGL1=$(wc -l < "$GL_AFTER")
 say "eth_getLogs: before=$NGL0 logs after=$NGL1 logs"
-(( NGL1 >= NGL0 )) || fail "eth_getLogs LOST logs across restore: $NGL0 -> $NGL1 (consumer-visible history shrank)"
+
+# WHICH logs went missing, not merely how many. A log is identified by
+# (block, address, topics, data) — deliberately NOT logIndex, because dropping
+# one log renumbers every later log in its block, and NOT transactionHash,
+# which a restore legitimately rewrites.
+gl_key() { awk -F'\t' '{print $1"|"$3"|"$4"|"$5}' "$1" | sort; }
+MISSING="/tmp/fdl-getlogs-missing-${RUN_SUFFIX}.txt"
+comm -23 <(gl_key "$GL_BEFORE") <(gl_key "$GL_AFTER") > "$MISSING" 2>/dev/null || : > "$MISSING"
+GAINED=$(comm -13 <(gl_key "$GL_BEFORE") <(gl_key "$GL_AFTER") 2>/dev/null | grep -c . || true)
+NMISS=$(grep -c . "$MISSING" 2>/dev/null || echo 0)
+
+if (( NMISS > 0 )); then
+    say "eth_getLogs: $NMISS log(s) present BEFORE and absent AFTER — classifying each"
+    CLAIM_TOPIC0="0x1df3f2a973a00d6635911755c260704e95e8a5876997546798770f76396fda4d"
+    UNEXPLAINED=0
+    while IFS= read -r m; do
+        [[ -n "$m" ]] || continue
+        m_block="${m%%|*}"; m_rest="${m#*|}"
+        m_addr="${m_rest%%|*}"; m_rest="${m_rest#*|}"
+        m_topics="${m_rest%%|*}"; m_data="${m_rest#*|}"
+        # A note-less RD-860 claim is a ClaimEvent whose global index — the FIRST
+        # 32-byte word of the event data — was recorded in `unclaimable_claims`
+        # before the drop. Anything else is real loss.
+        gi_hex="$(printf '%s' "${m_data#0x}" | cut -c1-64 | sed 's/^0*//')"
+        gi_dec="$(python3 -c "print(int('${gi_hex:-0}',16))" 2>/dev/null || echo "")"
+        if [[ "$m_topics" == "$CLAIM_TOPIC0"* ]] \
+           && grep -qiE "^(0x0*${gi_hex}|${gi_dec})$" "$UNCLAIMABLE_GIS" 2>/dev/null; then
+            say "  block $m_block ClaimEvent gi=0x$gi_hex — EXEMPT: recorded in \
+unclaimable_claims pre-drop (RD-860 note-less short-circuit, no Miden note exists to replay; gap #103)"
+        else
+            say "  block $m_block topics=${m_topics:0:18}… gi=0x${gi_hex:-?} — UNEXPLAINED LOSS"
+            UNEXPLAINED=$((UNEXPLAINED + 1))
+        fi
+    done < "$MISSING"
+    (( UNEXPLAINED == 0 )) || fail "eth_getLogs LOST $UNEXPLAINED log(s) that are NOT note-less \
+RD-860 claims ($NGL0 -> $NGL1 total) — consumer-visible history shrank and the restore cannot \
+account for it. Missing set: $MISSING"
+    say "PASS: every missing log is a proven RD-860 note-less claim (#103) — $NMISS exempt, 0 unexplained"
+fi
+(( GAINED == 0 )) || say "note: $GAINED log(s) present AFTER and absent BEFORE (new traffic during the drill)"
 # Blank field 8 (transactionHash) on both sides.
 blank_txh() { awk -F'\t' 'BEGIN{OFS="\t"} {$8="<txh>"; print}' "$1"; }
 blank_txh "$GL_BEFORE" > "${GL_BEFORE}.notxh"; blank_txh "$GL_AFTER" > "${GL_AFTER}.notxh"
-# Compare only the shared prefix of history (after >= before; extra tail is new traffic).
-head -n "$NGL0" "$GL_AFTER" > "${GL_AFTER}.trunc"
-head -n "$NGL0" "${GL_AFTER}.notxh" > "${GL_AFTER}.notxh.trunc"
-GL_FULL_DIFF=$(diff -u "$GL_BEFORE" "${GL_AFTER}.trunc" | grep -c '^[+-][^+-]' || true)
-GL_NOTXH_DIFF=$(diff -u "${GL_BEFORE}.notxh" "${GL_AFTER}.notxh.trunc" | grep -c '^[+-][^+-]' || true)
+# Compare the BEFORE logs that still exist AFTER, field by field. A positional
+# `head -n $NGL0` prefix was fine only while the two files lined up row for row;
+# an exempt note-less drop shifts every later row and would report the whole
+# tail as differing. Drop the exempt keys from BEFORE, then compare the two as
+# sets on the same identity used above.
+drop_missing() { # $1 = notxh file -> stdout, minus any key listed in $MISSING
+    awk -F'\t' -v miss="$MISSING" 'BEGIN{while((getline l < miss)>0) skip[l]=1}
+        {k=$1"|"$3"|"$4"|"$5; if (!(k in skip)) print}' "$1"
+}
+drop_missing "${GL_BEFORE}.notxh" | sort > "${GL_BEFORE}.notxh.cmp"
+drop_missing "$GL_BEFORE"         | sort > "${GL_BEFORE}.cmp"
+# The AFTER side keeps only rows whose identity also appears in BEFORE, so new
+# traffic during the drill is not mistaken for a difference.
+keep_shared() { awk -F'\t' -v b="${GL_BEFORE}.cmp" 'BEGIN{while((getline l < b)>0){split(l,f,"\t"); keep[f[1]"|"f[3]"|"f[4]"|"f[5]]=1}}
+        {k=$1"|"$3"|"$4"|"$5; if (k in keep) print}' "$1"; }
+keep_shared "${GL_AFTER}.notxh" | sort > "${GL_AFTER}.notxh.cmp"
+keep_shared "$GL_AFTER"         | sort > "${GL_AFTER}.cmp"
+GL_FULL_DIFF=$(diff -u "${GL_BEFORE}.cmp" "${GL_AFTER}.cmp" | grep -c '^[+-][^+-]' || true)
+GL_NOTXH_DIFF=$(diff -u "${GL_BEFORE}.notxh.cmp" "${GL_AFTER}.notxh.cmp" | grep -c '^[+-][^+-]' || true)
 if (( GL_NOTXH_DIFF == 0 )); then
     if (( GL_FULL_DIFF == 0 )); then
         say "PASS: eth_getLogs BIT-IDENTICAL across restore ($NGL0 logs, transaction_hash included)"
@@ -613,7 +689,7 @@ if (( GL_NOTXH_DIFF == 0 )); then
     fi
 else
     say "eth_getLogs DIFFERS in fields other than transaction_hash — first 40 diff lines:"
-    diff -u "${GL_BEFORE}.notxh" "${GL_AFTER}.notxh.trunc" | head -40 || true
+    diff -u "${GL_BEFORE}.notxh.cmp" "${GL_AFTER}.notxh.cmp" | head -40 || true
     fail "CONSUMER-LEVEL REGRESSION: eth_getLogs differs beyond transaction_hash \
 ($GL_NOTXH_DIFF differing lines) — baseline=$BASELINE_KIND"
 fi
