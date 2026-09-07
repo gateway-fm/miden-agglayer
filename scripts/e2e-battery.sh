@@ -210,6 +210,28 @@ if [[ "${ITER_START:-1}" == "1" ]]; then
   WIPE_ENV=(env -u WITH_WEB3SIGNER -u EXTRA_COMPOSE_FILES KEEP_CHAIN=0)
   "${WIPE_ENV[@]}" make e2e-down       >>"$R/logs/down.log" 2>&1 || true
   "${WIPE_ENV[@]}" make e2e-clean-data >>"$R/logs/down.log" 2>&1
+  # THE LIVE-BASELINE DRILL — must run HERE, before any target that restores.
+  #
+  # Quoting the failure it prevents (g1, growing chain):
+  #   baseline store is RESTORE OUTPUT (...) — this would compare restore-vs-restore,
+  #   not live-vs-restore, and would report a misleadingly green verdict
+  # The drill failed in 0m because `e2e-restore` had already run on the same chain.
+  # Reordering *within* an iteration does not fix it: `test-e2e` is the first target of
+  # every iteration and it restores too (`scripts/e2e-test.sh`), as do
+  # `e2e-cantina6-faucet-identity-restore`, `e2e-cantina13-metadata-recovery` and
+  # `e2e-reconciler-private-note`. On one growing chain the ONLY moment a fully-live
+  # baseline exists is immediately after the genesis wipe, before anything has restored.
+  #
+  # So the battery buys its strongest fidelity claim exactly once, here: fresh L2->L1
+  # traffic to build a live fixture, then the drill against a store whose
+  # `restored_at_cursor` is still NULL. Every later drill runs on a mixed baseline and
+  # is labelled as such by the drill itself (migration 028 + segment classification) —
+  # honest, but a weaker claim.
+  echo "=== live-baseline drill (pre-iteration-1, nothing has restored yet) ===" | tee -a "$R/battery.log"
+  run 1 "fixture-l2-to-l1-livebaseline" fresh make e2e-l2-to-l1
+  chain_mark "live-baseline drill: before"
+  run 1 "full-db-loss-recovery-livebaseline" keep ./scripts/e2e-full-db-loss-recovery.sh
+  chain_mark "live-baseline drill: after"
 else
   echo "=== resuming at iteration ${ITER_START} — chain preserved, no wipe ===" | tee -a "$R/battery.log"
 fi
@@ -234,7 +256,11 @@ for iter in $(seq "${ITER_START:-1}" "${ITERATIONS:-4}"); do
   # recovery-readiness is DESTRUCTIVE and provisions via e2e-l2l2-up
   run "$iter" "e2e-recovery-readiness" fresh make e2e-recovery-readiness
 
-  # (c) full-DB-loss drill on a stack carrying real round-trip state
+  # (c) full-DB-loss drill on a stack carrying real round-trip state.
+  # By now this iteration's restore-bearing targets have run, so the baseline is MIXED:
+  # fidelity for the organic blocks the fixture below just produced, idempotence for the
+  # restored prefix. The drill classifies and labels that itself; the fully-live claim is
+  # made once per battery by full-db-loss-recovery-livebaseline above.
   run "$iter" "fixture-l2-to-l1" fresh make e2e-l2-to-l1
   chain_mark "i$iter before full-db-loss-recovery"
   run "$iter" "full-db-loss-recovery" keep ./scripts/e2e-full-db-loss-recovery.sh
