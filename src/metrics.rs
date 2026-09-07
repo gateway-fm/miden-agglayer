@@ -123,6 +123,15 @@ pub fn init_metrics() {
          climb means many claims target unmapped destinations."
     );
     describe_counter!(
+        "rpc_estimate_gas_unclaimable_total",
+        "#185: eth_estimateGas(claimAsset) answered `execution reverted: AlreadyClaimed()` \
+         because the globalIndex is recorded in unclaimable_claims. This is what makes the \
+         claim submitter run its on-revert checkIfClaimed and mark the monitored tx CONFIRMED \
+         instead of re-sending; without it a single unresolvable deposit cost TEN reverted \
+         receipts and ten nonces before claimtxman's own history cap stopped it. Expect roughly \
+         one per unresolvable deposit AFTER its first (record-creating) attempt."
+    );
+    describe_counter!(
         "claim_inflight_dedup_total",
         "#55 third dedup window: a claimAsset arrived for a globalIndex whose winning claim was \
          SUBMITTED but had not LANDED yet (claim lock held, no ClaimEvent, within TTL) — the \
