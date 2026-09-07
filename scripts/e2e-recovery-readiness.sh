@@ -275,10 +275,21 @@ pass "3. No foreign/spurious ClaimEvent across recovery (count stable at $CLAIM_
 PROXY_CONTAINER="${AGGLAYER_CONTAINER:-${COMPOSE_PROJECT_NAME}-miden-agglayer-1}"
 AGGKIT_CONTAINER="${AGGKIT_CONTAINER:-${COMPOSE_PROJECT_NAME}-aggkit-1}"
 CLAIM_TX_LC="$(echo "$CLAIM_TX" | tr 'A-F' 'a-f')"
-# serve_count: how many times the (un-reset) proxy has served eth_getTransactionByHash for
-# THIS exact hash (src/service.rs logs "served stored tx <hash>"). It INCLUDES this script's
-# own reads (step 2) — step 4c requires a STRICT increase, so only a genuinely new (aggkit-
-# driven) fetch can pass, never the test re-reading.
+# serve_count: how many times the (un-reset) proxy has served THIS exact hash from its
+# durable store, on EITHER serving branch. It INCLUDES this script's own reads (step 2) —
+# step 4c counts a post-recreate window, so only a genuinely new (aggkit-driven) fetch can
+# pass, never the test re-reading.
+#
+# WHICH BRANCH ACTUALLY ANSWERS (this is what step 4c got wrong for four iterations):
+# aggkit reads a CLAIM's calldata with `debug_traceTransaction`, never with
+# `eth_getTransactionByHash` — `bridgesync/downloader.go:435` calls `extractCallData` ->
+# `extractRootCall` (`:743`), which issues `debug_traceTransaction`; `eth_getTransactionByHash`
+# is used only by `ExtractTxnAddresses` for a bridgeLeafTypeMessage BRIDGE event (`:170`).
+# The old form grepped a line emitted ONLY by the eth_getTransactionByHash handler
+# (`src/service.rs:566`), so it could never observe a claim re-fetch and reported ZERO while
+# the proxy was serving correctly. `src/service_debug.rs` now logs the same
+# "served stored tx <hash>" shape on the trace branch, and the grep below matches BOTH
+# ("eth_getTransactionByHash: served stored tx" / "debug_traceTransaction: served stored tx").
 serve_count() {
     docker logs --tail "${PROXY_LOG_TAIL:-20000}" "$PROXY_CONTAINER" 2>&1 \
         | sed -E 's/\x1b\[[0-9;]*m//g' | grep -iF 'served stored tx' | grep -icF "$CLAIM_TX_LC" || true
@@ -315,16 +326,20 @@ docker exec "$BRIDGE_PG_CONTAINER" psql -U bridge_user -d bridge_db \
 # instant that is definitely before the recreate and definitely after this
 # script's own step-2 read.
 RECREATE_SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-# How many eth_getTransactionByHash requests the proxy has ANSWERED so far, by
-# any branch. `served stored tx` only fires on the store-first branch, so a zero
-# serve-count is ambiguous between "aggkit never asked" and "aggkit asked and
-# the answer came from a different branch". This counter separates them.
-gettx_requests() {
+# How many requests of each kind the proxy has ANSWERED so far, by any branch.
+# A zero serve-count is ambiguous between "aggkit never asked" and "aggkit asked and the
+# answer came from a branch that does not log". These counters separate the two, and the
+# TRACE one is the meaningful half: it is the RPC aggkit uses to read claim calldata.
+rpc_requests() { # $1 = method label
     curl -sf --max-time 5 "$L2_RPC/metrics" 2>/dev/null \
-        | awk -F'[ }]' '/^rpc_request_duration_seconds_count\{.*eth_getTransactionByHash/ {print $NF; exit}' \
+        | awk -F'[ }]' -v m="$1" \
+            '$0 ~ ("^rpc_request_duration_seconds_count\\{.*" m) {print $NF; exit}' \
         | tr -d '[:space:]'
 }
+gettx_requests() { rpc_requests 'eth_getTransactionByHash'; }
+trace_requests() { rpc_requests 'debug_traceTransaction'; }
 GETTX_BEFORE="$(gettx_requests)"; GETTX_BEFORE="${GETTX_BEFORE%.*}"; GETTX_BEFORE="${GETTX_BEFORE:-0}"
+TRACE_BEFORE="$(trace_requests)"; TRACE_BEFORE="${TRACE_BEFORE%.*}"; TRACE_BEFORE="${TRACE_BEFORE:-0}"
 MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_GIT_REF:-x}" \
     "${E2E_COMPOSE[@]}" up -d --no-deps --force-recreate aggkit bridge-service bridge-autoclaim >/dev/null 2>&1
 # wait_for runs its predicate as a COMMAND (`"$@"` after `shift 3`), not an eval'd string,
@@ -421,10 +436,18 @@ if [[ "$SERVES_WINDOW" -lt 1 ]]; then
     # prints anything. It did exactly that on iteration 1: the header line was
     # the entire output.
     GETTX_AFTER="$(gettx_requests)"; GETTX_AFTER="${GETTX_AFTER%.*}"; GETTX_AFTER="${GETTX_AFTER:-0}"
-    echo "  --- eth_getTransactionByHash requests answered by the proxy (any branch) ---"
-    echo "    | before recreate: $GETTX_BEFORE   now: $GETTX_AFTER   delta: $(( GETTX_AFTER - GETTX_BEFORE ))"
-    echo "    | delta 0 => aggkit never asked for ANY tx by hash; delta > 0 => it asked but the"
-    echo "    |            answer did not come from the store-first branch that logs 'served stored tx'."
+    TRACE_AFTER="$(trace_requests)"; TRACE_AFTER="${TRACE_AFTER%.*}"; TRACE_AFTER="${TRACE_AFTER:-0}"
+    echo "  --- requests answered by the proxy since the recreate (any branch) ---"
+    echo "    | debug_traceTransaction   before: $TRACE_BEFORE  now: $TRACE_AFTER  delta: $(( TRACE_AFTER - TRACE_BEFORE ))"
+    echo "    | eth_getTransactionByHash before: $GETTX_BEFORE  now: $GETTX_AFTER  delta: $(( GETTX_AFTER - GETTX_BEFORE ))"
+    echo "    | debug_traceTransaction is THE call aggkit uses for claim calldata"
+    echo "    | (bridgesync/downloader.go:435 -> extractRootCall:743). Read it first:"
+    echo "    |   trace delta 0 => aggkit never re-fetched this claim at all (a resync/trigger"
+    echo "    |                    problem, not a serving problem);"
+    echo "    |   trace delta > 0 but no serve line => it asked and the store-first branch in"
+    echo "    |                    src/service_debug.rs did not answer — that IS a product bug."
+    echo "    | eth_getTransactionByHash is expected to stay near 0: aggkit uses it only for"
+    echo "    | bridgeLeafTypeMessage BRIDGE events (downloader.go:170), never for claims."
     echo "  --- proxy 'served stored tx' since $RECREATE_SINCE (ANY hash) ---"
     { docker logs --since "$RECREATE_SINCE" "$PROXY_CONTAINER" 2>&1 \
         | sed -E 's/\x1b\[[0-9;]*m//g' | grep -iF 'served stored tx' | tail -10 | sed 's/^/    | /'; } || true
@@ -433,11 +456,12 @@ if [[ "$SERVES_WINDOW" -lt 1 ]]; then
         | sed -E 's/\x1b\[[0-9;]*m//g' | grep -aiE 'bridgesync|claim' | tail -10 | sed 's/^/    | /'; } || true
     fail "#148: in the ${SERVE_WAIT_SECS:-240}s after the force-recreate the proxy served the recovered \
 hash $CLAIM_TX_LC ZERO times (whole-history serve total before the recreate: $SERVES_BEFORE; aggkit \
-re-processed to block $AGGKIT_MAXBLK >= $CLAIM_BLOCK; eth_getTransactionByHash requests answered in \
-that window: $(( ${GETTX_AFTER:-0} - GETTX_BEFORE ))). aggkit advanced past the claim's block without \
-re-fetching THIS claim's calldata — the lines above say whether it fetched anything at all."
+re-processed to block $AGGKIT_MAXBLK >= $CLAIM_BLOCK; debug_traceTransaction requests answered in \
+that window: $(( ${TRACE_AFTER:-0} - TRACE_BEFORE )), eth_getTransactionByHash: \
+$(( ${GETTX_AFTER:-0} - GETTX_BEFORE ))). aggkit advanced past the claim's block without being \
+served THIS claim's calldata — the lines above say whether it fetched anything at all."
 fi
-pass "4c. Proxy served the EXACT recovered hash to aggkit AFTER force-recreate ($SERVES_WINDOW serve(s) inside the post-recreate window; $SERVES_BEFORE over all prior history) — a genuinely NEW aggkit-driven fetch of THIS claim, not the test re-reading"
+pass "4c. Proxy served the EXACT recovered hash to aggkit AFTER force-recreate ($SERVES_WINDOW serve(s) inside the post-recreate window, on either serving branch; $SERVES_BEFORE over all prior history) — a genuinely NEW aggkit-driven fetch of THIS claim, not the test re-reading"
 
 # ── 4d. CONSUMER-SIDE exact global index (PR #151 round 3, gap 2) ────────────────────
 # The exact GI was bound INSIDE the proxy (ClaimEvent<->calldata, at PRE). Now require the
