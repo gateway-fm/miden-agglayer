@@ -299,6 +299,55 @@ async fn accept_and_revert_landed_claim(
     Ok(())
 }
 
+/// #185 — EVM-faithful handling for a claimAsset whose destination cannot be
+/// resolved to a Miden AccountId. Like the landed path, ACCEPT and write a
+/// REVERTED receipt (status 0x0, EMPTY logs, NO ClaimEvent) and advance the
+/// nonce atomically. Unlike the old RD-860 path it emits NO synthetic
+/// ClaimEvent: on EVM a claim that cannot be applied reverts and emits nothing,
+/// and the fabricated event made this claim (a) unreproducible after a
+/// full-DB-loss restore (#103) and (b) a "claim with unclaim" that cut AggLayer
+/// certificate settlement at its block (#184). Retry suppression comes from
+/// `isClaimed(globalIndex)` reading the durable `unclaimable_claims` record as
+/// claimed, so the claim submitter's on-revert `checkIfClaimed` stops
+/// re-driving; even absent that, the submitter's own `monitored_txs` row
+/// removes the deposit from its pending set.
+async fn accept_and_revert_unclaimable_claim(
+    service: &ServiceState,
+    params: &claimAssetCall,
+    tx_hash: TxHash,
+    txn_envelope: TxEnvelope,
+    signer: Address,
+    signer_str: &str,
+    tx_nonce: u64,
+) -> anyhow::Result<()> {
+    ::metrics::counter!("claim_unclaimable_reverted_total").increment(1);
+    let block_num = service.store.get_latest_block_number().await?;
+    let block_hash = service.block_state.get_block_hash(block_num);
+    service
+        .store
+        .commit_reverted_receipt_and_advance_nonce(
+            tx_hash,
+            TxnEntry {
+                id: None,
+                envelope: txn_envelope,
+                signer,
+                expires_at: None,
+                logs: vec![],
+            },
+            format!(
+                "claim for globalIndex {} has an unresolvable destination; reverted, no \
+                 event (RD-860/#185)",
+                params.globalIndex
+            ),
+            block_num,
+            block_hash,
+            signer_str,
+            tx_nonce,
+        )
+        .await?;
+    Ok(())
+}
+
 /// How long after a store rebuild the first-contact nonce bootstrap stays
 /// available. Measured from the DURABLE stamp, so restarts neither extend nor
 /// reset it. Generous by default: a continuing wallet must be able to reconnect
@@ -538,12 +587,12 @@ pub(crate) async fn worker_handle_claim_asset(
         claim_fence,
     );
 
-    // RD-860 — swallow unresolvable-destination claims permanently. If the
-    // destination address can't be resolved to a Miden AccountId, record the
-    // unclaimable entry, emit the synthetic ClaimEvent so aggkit marks the
-    // globalIndex complete and stops retrying, RELEASE the lock, and return success.
-    // Funds remain locked on L1; an operator rescue endpoint (tier 2, future work)
-    // would let ops re-process by registering a destination mapping and replaying.
+    // RD-860 / #185 — an unresolvable-destination claim is handled EVM-faithfully:
+    // record the unclaimable entry, accept and write a REVERTED receipt with NO
+    // ClaimEvent, RELEASE the lock, and return. `isClaimed(globalIndex)` reads the
+    // unclaimable record as claimed so the claim submitter stops retrying (see
+    // `accept_and_revert_unclaimable_claim`). Funds remain on L1; an operator rescue
+    // endpoint (tier 2, future work) would re-process by registering a mapping.
     //
     // This runs AFTER the landed classification (BLOCKER A): a LANDED gi already
     // took the accept-and-revert arm above, so RD-860 can only fire for a FRESH gi
@@ -587,16 +636,23 @@ pub(crate) async fn worker_handle_claim_asset(
              Funds remain on L1 pending operator rescue (RD-860)."
         );
 
-        // Emit the synthetic ClaimEvent even though no Miden funds moved. aggkit expects
-        // the event log on the eth tx receipt to mark the globalIndex claimed; without
-        // it, aggkit will retry forever. The unclaimable_claims table is the SOURCE OF
-        // TRUTH for reconciliation — anyone auditing flows MUST compare ClaimEvent
-        // counts against `unclaimable_claims` to see how many funds are truly on L1.
-        let event = crate::claim::ClaimEvent::from(params.clone());
-        let log = <crate::claim::ClaimEvent as alloy::sol_types::SolEvent>::encode_log_data(&event);
-        record_local_immediate_success(service, txn_hash, txn_envelope, signer, vec![log]).await?;
-        // The gi is now handled (unclaimable record + ClaimEvent); drop the lock so
-        // a resubmit classifies `Landed` (the ClaimEvent exists) → accept-and-revert.
+        // #185 — accept and REVERT, emit NO ClaimEvent. On EVM a claim that cannot be
+        // applied reverts and emits nothing; fabricating a ClaimEvent here made this
+        // claim unreproducible on restore (#103) and cut certificate settlement at its
+        // block (#184). Retry suppression comes from `isClaimed(globalIndex)`, which
+        // reads the durable unclaimable_claims record as claimed. The unclaimable_claims
+        // table remains the SOURCE OF TRUTH for how many funds are stranded on L1.
+        accept_and_revert_unclaimable_claim(
+            service,
+            &params,
+            txn_hash,
+            txn_envelope,
+            signer,
+            &signer_str,
+            tx_nonce,
+        )
+        .await?;
+        // The gi is handled (unclaimable record + reverted receipt); drop the lock.
         guard.release_explicitly().await;
         return Ok(());
     }
@@ -3074,9 +3130,9 @@ mod tests {
     }
 
     /// RD-860: a claim whose destination cannot be resolved is swallowed — we record
-    /// it in the `unclaimable_claims` store, emit a synthetic `ClaimEvent` so aggkit
-    /// stops retrying, and return success to the caller. Neither `try_claim` nor the
-    /// MidenClient publish path should be touched.
+    /// it in the `unclaimable_claims` store, accept-and-REVERT with no ClaimEvent
+    /// (#185), and return to the caller. Neither `try_claim` nor the MidenClient
+    /// publish path should be touched.
     #[tokio::test]
     async fn test_claim_asset_unresolvable_destination_swallowed() {
         let service = create_test_service();
@@ -3136,7 +3192,7 @@ mod tests {
         );
         assert_eq!(rec.eth_tx_hash, tx_hash);
 
-        // (4) Exactly one synthetic ClaimEvent emitted (so aggkit marks done).
+        // (4) #185 — NO ClaimEvent is emitted (EVM revert semantics).
         let filter = crate::log_synthesis::LogFilter {
             from_block: Some("0x0".to_string()),
             to_block: Some("0xFFFF".to_string()),
@@ -3152,13 +3208,27 @@ mod tests {
             .collect();
         assert_eq!(
             claim_logs.len(),
-            1,
-            "swallow path must emit exactly one ClaimEvent so aggkit stops retrying"
+            0,
+            "#185: unresolvable claim must emit NO ClaimEvent"
         );
 
-        // (5) Nonce incremented and receipt recorded so the RPC client sees success.
+        // (5) Nonce advanced and a REVERTED receipt (status 0x0) recorded.
         assert_eq!(store.nonce_get(&format!("{signer:#x}")).await.unwrap(), 1);
-        assert!(store.txn_receipt(tx_hash).await.unwrap().is_some());
+        let (recpt, _blk) = store.txn_receipt(tx_hash).await.unwrap().expect("receipt");
+        assert!(
+            recpt.is_err(),
+            "#185: unresolvable claim receipt must be reverted"
+        );
+
+        // (6) #185 — the unclaimable record is what isClaimed reads as claimed.
+        assert!(
+            store
+                .get_unclaimable_claim(&global_index)
+                .await
+                .unwrap()
+                .is_some(),
+            "#185: unclaimable record must back isClaimed"
+        );
     }
 
     #[tokio::test]
@@ -4429,9 +4499,9 @@ mod tests {
     ///
     /// Unit-harness note: the stub `MidenClient` never runs the publish
     /// closure, so the only claim route that completes SYNCHRONOUSLY is the
-    /// RD-860 unresolvable-destination swallow — which still exercises the
-    /// full RPC pipeline (chain-id, nonce, allow-list, dispatch) and emits the
-    /// synthetic ClaimEvent + receipt. The user here claims a deposit destined
+    /// RD-860/#185 unresolvable-destination swallow — which still exercises the
+    /// full RPC pipeline (chain-id, nonce, allow-list, dispatch) and records a
+    /// reverted receipt (no ClaimEvent). The user here claims a deposit destined
     /// to their own EVM address (no Miden mapping registered → swallow). The
     /// real-Miden happy path is covered by scripts/e2e-manual-user-claim.sh.
     #[tokio::test]
@@ -4458,10 +4528,12 @@ mod tests {
             "returned hash must be the user's tx hash"
         );
 
+        // #185 — the swallow route emits NO ClaimEvent; the manual claim is still
+        // ACCEPTED (the point of this test), recorded, and its nonce advances.
         assert_eq!(
             count_claim_events(&store).await,
-            1,
-            "exactly one ClaimEvent must be emitted for the user's claim"
+            0,
+            "#185: the unresolvable-destination swallow emits no ClaimEvent"
         );
         let txn = store
             .txn_get(tx_hash)
@@ -4765,9 +4837,9 @@ mod tests {
             "C's claim for someone else's deposit must reach the Miden publish"
         );
 
-        // Leg 2 — synchronous accept (RD-860 swallow route, the only one that
+        // Leg 2 — synchronous accept (RD-860/#185 swallow route, the only one that
         // completes under the stub): destination is a third party's EVM
-        // address ≠ C. Accepted, ClaimEvent emitted, and the recorded signer
+        // address ≠ C. Accepted, reverted (no ClaimEvent), and the recorded signer
         // is C — the destination in the calldata is untouched by who signed.
         //
         // Fresh service so C's nonce-0 slot is a clean reservation: leg 1 already
@@ -4790,7 +4862,11 @@ mod tests {
             .await
             .expect("permissionless claim for someone else's deposit must be accepted");
         assert_eq!(accepted, tx_hash);
-        assert_eq!(count_claim_events(&store).await, 1);
+        assert_eq!(
+            count_claim_events(&store).await,
+            0,
+            "#185: the unresolvable-destination swallow emits no ClaimEvent"
+        );
         let txn = store.txn_get(tx_hash).await.unwrap().expect("tx recorded");
         assert_eq!(
             txn.signer, addr_c,
