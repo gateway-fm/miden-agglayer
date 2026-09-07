@@ -150,6 +150,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "027_burn_serial_note_identity.sql",
         include_str!("../../migrations/027_burn_serial_note_identity.sql"),
     ),
+    (
+        "028_restore_provenance.sql",
+        include_str!("../../migrations/028_restore_provenance.sql"),
+    ),
 ];
 
 /// Postgres advisory-lock key. Arbitrary 64-bit int; just needs to be

@@ -976,6 +976,25 @@ pub trait Store: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Synthetic tip that `--restore` last rebuilt this store to, or `None` if
+    /// the store was never restored.
+    ///
+    /// PROVENANCE, deliberately separate from [`Store::is_nonce_ledger_rebuilt`]:
+    /// that marker is the #90 admission arm and is time-boxed (migration 025), so
+    /// it self-clears and cannot answer "was this history produced by live
+    /// traffic?". The full-DB-loss drill needs exactly that question answered to
+    /// know whether it is measuring fidelity or merely idempotence — blocks above
+    /// the stamp are organic, blocks at or below it are restore output. See
+    /// `migrations/028_restore_provenance.sql`.
+    async fn restored_at_cursor(&self) -> anyhow::Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Record that `--restore` rebuilt this store up to `cursor`. Never cleared.
+    async fn set_restored_at_cursor(&self, _cursor: u64) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn nonce_get(&self, addr: &str) -> anyhow::Result<u64>;
     /// Increment nonce, returning the value **before** increment.
     async fn nonce_increment(&self, addr: &str) -> anyhow::Result<u64>;

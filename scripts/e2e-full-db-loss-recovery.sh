@@ -484,26 +484,51 @@ say "before: digests uhc=${UHC0:0:12} inj=${INJ0:0:12} bridge=${BR0:0:12} claim=
 # already converged to its post-restore form (claim tx_hashes rewritten real->derived,
 # ordering already replay-ordered) and the comparison degenerates into "restore is
 # idempotent" — necessary, but NOT the fidelity claim this drill exists to make.
-# `nonce_ledger_rebuilt` is written ONLY by restore (finalize_restore_cursors), so it is
-# an exact tripwire. Caught live 2026-08-12: a P4 diagnostic had been re-run on an
-# already-restored stack and its green verdict silently meant far less than it read.
-BASELINE_RESTORED=$(pgq "SELECT coalesce(bool_or(nonce_ledger_rebuilt), false) FROM service_state")
-if [[ "$BASELINE_RESTORED" == "t" ]]; then
-    if [[ "${ALLOW_RESTORED_BASELINE:-0}" == "1" ]]; then
-        say "WARNING: baseline store is RESTORE OUTPUT (nonce_ledger_rebuilt=t). This run \
-measures restore-vs-restore IDEMPOTENCE, not live-vs-restore FIDELITY. Proceeding \
-because ALLOW_RESTORED_BASELINE=1."
+# Caught live 2026-08-12: a P4 diagnostic had been re-run on an already-restored stack
+# and its green verdict silently meant far less than it read.
+#
+# This used to read `nonce_ledger_rebuilt`, which was WRONG TWICE: it is the #90
+# admission arm rather than provenance, and migration 025 made it TIME-BOXED, so it
+# self-clears after ~6h. On the growing-chain battery (5h+ per iteration) a restored
+# baseline would read back as "live" — a false green in the very check that exists to
+# prevent false greens. `service_state.restored_at_cursor` (migration 028) is durable
+# provenance and is never cleared.
+#
+# On a GROWING chain the answer is not binary. Restore rebuilt history up to cursor R;
+# every block above R was then produced by LIVE traffic. So:
+#   R is NULL                    -> fully live; true fidelity over the whole window.
+#   R set, organic blocks above  -> MIXED: fidelity for blocks R+1..SNAP (organically
+#                                  produced, never seen by a restore), idempotence for
+#                                  blocks <= R. The full window is still compared —
+#                                  nothing may be lost anywhere — only the STRENGTH of
+#                                  the claim differs by segment, and the verdict says so.
+#   R set, nothing above         -> idempotence only; refuse unless explicitly accepted.
+RESTORED_AT=$(pgq "SELECT coalesce(max(restored_at_cursor)::text, '') FROM service_state")
+if [[ -z "$RESTORED_AT" ]]; then
+    BASELINE_KIND="live (true fidelity comparison)"
+    ORGANIC_LOGS=$NUHC0  # informational only; the whole window is organic here
+    ORGANIC_FROM=0
+else
+    ORGANIC_FROM=$RESTORED_AT
+    ORGANIC_LOGS=$(pgq "SELECT count(*) FROM synthetic_logs \
+                        WHERE block_number > $RESTORED_AT AND block_number <= $SNAP_BLOCK")
+    if [[ "${ORGANIC_LOGS:-0}" -gt 0 ]]; then
+        BASELINE_KIND="mixed (fidelity for blocks $((RESTORED_AT+1))..$SNAP_BLOCK: \
+$ORGANIC_LOGS organic logs; idempotence for blocks <= $RESTORED_AT)"
+    elif [[ "${ALLOW_RESTORED_BASELINE:-0}" == "1" ]]; then
+        say "WARNING: baseline store is RESTORE OUTPUT to cursor $RESTORED_AT with NO \
+organic history above it. This run measures restore-vs-restore IDEMPOTENCE, not \
+live-vs-restore FIDELITY. Proceeding because ALLOW_RESTORED_BASELINE=1."
         BASELINE_KIND="restored (idempotence only)"
     else
-        fail "baseline store is RESTORE OUTPUT (service_state.nonce_ledger_rebuilt=t) — this \
-would compare restore-vs-restore, not live-vs-restore, and would report a misleadingly \
-green verdict. Run this drill on a stack whose state was built LIVE (fresh stack + \
-traffic), or set ALLOW_RESTORED_BASELINE=1 to explicitly accept an idempotence-only run."
+        fail "baseline store is RESTORE OUTPUT (service_state.restored_at_cursor=$RESTORED_AT) \
+and NO synthetic log exists above that cursor, so there is no organically-produced \
+history to verify — this would compare restore-vs-restore and report a misleadingly \
+green verdict. Run fresh L2->L1 traffic first (which is what makes blocks above \
+$RESTORED_AT organic), or set ALLOW_RESTORED_BASELINE=1 to accept an idempotence-only run."
     fi
-else
-    BASELINE_KIND="live (true fidelity comparison)"
 fi
-say "baseline provenance: $BASELINE_KIND"
+say "baseline provenance: $BASELINE_KIND (organic-from=$ORGANIC_FROM organic-logs=$ORGANIC_LOGS)"
 
 # CAPTURE THE NOTE-LESS SET BEFORE THE DROP DESTROYS IT.
 #

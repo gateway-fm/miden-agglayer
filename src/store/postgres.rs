@@ -316,6 +316,31 @@ impl Store for PgStore {
             .map(|v| v.max(0) as u64))
     }
 
+    async fn restored_at_cursor(&self) -> anyhow::Result<Option<u64>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT restored_at_cursor FROM service_state WHERE id = 1",
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .first()
+            .and_then(|r| r.get::<_, Option<i64>>(0))
+            .map(|v| v.max(0) as u64))
+    }
+
+    async fn set_restored_at_cursor(&self, cursor: u64) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "UPDATE service_state SET restored_at_cursor = $1, updated_at = now() WHERE id = 1",
+                &[&(cursor as i64)],
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn nonce_bootstrap_if_absent(&self, addr: &str, nonce: u64) -> anyhow::Result<bool> {
         let mut client = self.pool.get().await?;
         let key = addr.to_lowercase();

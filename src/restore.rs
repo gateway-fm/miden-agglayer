@@ -224,6 +224,15 @@ pub(crate) async fn finalize_restore_cursors(
     store.set_projector_cursor(miden_tip).await?;
     tracing::info!("Phase 4: synthetic tip + projector cursor set to Miden tip {miden_tip}");
 
+    // Durable PROVENANCE stamp (migration 028). Distinct from the #90 marker
+    // below, which is an admission arm and expires. Without a non-expiring stamp
+    // the full-DB-loss drill cannot tell a live baseline from restore output, and
+    // a drill run on restore output measures idempotence — restore(restore(H))
+    // vs restore(H) — which passes even if restore drops history on first
+    // contact. Observed 2026-09-06: the growing-chain battery ran `e2e-restore`
+    // before the drill, and the drill's "before" fingerprint WAS restore output.
+    store.set_restored_at_cursor(miden_tip).await?;
+
     // #90 — the `nonces` table has NO chain source, so a rebuilt store starts with
     // an EMPTY nonce ledger while CONTINUING signers (aggkit's aggoracle/aggsender
     // wallets) keep submitting from where they left off. Without this marker the
@@ -437,6 +446,12 @@ mod tests {
                 .unwrap();
         }
 
+        assert_eq!(
+            store.restored_at_cursor().await.unwrap(),
+            None,
+            "a store that was never restored must carry NO provenance stamp"
+        );
+
         finalize_restore_cursors(&store, 130_000, Some(130_000))
             .await
             .unwrap();
@@ -444,6 +459,12 @@ mod tests {
         assert!(
             store.is_nonce_ledger_rebuilt().await.unwrap(),
             "#90 marker must still be set"
+        );
+        assert_eq!(
+            store.restored_at_cursor().await.unwrap(),
+            Some(130_000),
+            "restore must stamp durable provenance (migration 028) so the \
+             full-DB-loss drill can tell a live baseline from restore output"
         );
         // A DIFFERENT transaction must now be admissible at nonce 0 — that is
         // exactly the aggoracle's next GER injection after a restore.
