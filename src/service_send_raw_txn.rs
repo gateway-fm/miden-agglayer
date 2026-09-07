@@ -2065,38 +2065,83 @@ async fn bootstrap_one_signer(service: &ServiceState, signer: &str, bootstrap: b
         let eligible_now = candidate
             .as_ref()
             .is_some_and(|q| bootstrap || q.parked_during_recovery);
-        let settled = match (
-            candidate.as_ref(),
-            service.store.get_latest_block_number().await,
-        ) {
-            (Some(q), Ok(now_block)) => {
+        // ONE read of the tip serves both the settle check and the dead-gap TTL
+        // check below, so they cannot disagree about "now".
+        let now_block_for_gap = service.store.get_latest_block_number().await.unwrap_or(0);
+        let settled = match candidate.as_ref() {
+            Some(q) => {
                 let parked_at = q.expires_at.saturating_sub(QUEUE_TTL_BLOCKS);
-                now_block >= parked_at.saturating_add(BOOTSTRAP_SETTLE_BLOCKS)
+                now_block_for_gap >= parked_at.saturating_add(BOOTSTRAP_SETTLE_BLOCKS)
             }
-            _ => false,
+            None => false,
         };
         if eligible_now
             && settled
             && let Some(q) = candidate
             && q.nonce > 0
-            && matches!(
-                service
-                    .store
-                    .nonce_bootstrap_if_absent(signer, q.nonce)
-                    .await,
-                Ok(true)
-            )
         {
             let min_parked = q.nonce;
-            ::metrics::counter!("rpc_nonce_ledger_bootstrapped_total").increment(1);
-            tracing::warn!(
-                target: "rpc::nonce_repair",
-                signer = %signer,
-                adopted_nonce = min_parked,
-                "#90: no nonce ledger entry for this signer after a store rebuild — adopting \
-                 the LOWEST PARKED nonce as the baseline so a continuing wallet resumes; R4 \
-                 sequencing applies from here on"
-            );
+            // (a) The wallet has NO ledger row at all — the original #90 case.
+            if matches!(
+                service
+                    .store
+                    .nonce_bootstrap_if_absent(signer, min_parked)
+                    .await,
+                Ok(true)
+            ) {
+                ::metrics::counter!("rpc_nonce_ledger_bootstrapped_total").increment(1);
+                tracing::warn!(
+                    target: "rpc::nonce_repair",
+                    signer = %signer,
+                    adopted_nonce = min_parked,
+                    "#90: no nonce ledger entry for this signer after a store rebuild — adopting \
+                     the LOWEST PARKED nonce as the baseline so a continuing wallet resumes; R4 \
+                     sequencing applies from here on"
+                );
+            } else if q.expires_at <= now_block_for_gap {
+                // (b) The wallet HAS a row, stuck BELOW the lowest parked nonce,
+                // and the gap has now persisted a FULL queue TTL.
+                //
+                // Insert-if-absent cannot reach this: a wallet that transacted
+                // successfully before the recovery has a row, advanced by those
+                // successes. If the recovery loses the tx at exactly the expected
+                // nonce, every later transaction parks behind a nonce that can
+                // never arrive and `nonce_bootstrap_if_absent` returns false on
+                // every sweep, forever. Measured live on a growing chain: ledger
+                // at 5, five `success` transactions, 92 recovery-stamped rows
+                // queued at 6..97, no row at 5 anywhere — and every L1→L2 claim
+                // stopped landing from that moment on.
+                //
+                // The TTL is the evidence, and it is why this is not the reverted
+                // round-4 amnesty. `expires_at <= now` means the gap has gone
+                // unfilled for QUEUE_TTL_BLOCKS since this row parked, ON TOP OF
+                // the recovery stamp that already proves a continuing wallet from
+                // the rebuild era. A merely slow lower nonce cannot satisfy both.
+                // The advance is monotonic (`nonce < baseline` in SQL), so it can
+                // never move a ledger backwards or skip a nonce that later shows
+                // up — that one is refused "nonce too low", which is the string
+                // claimtxman's isNonceError matches, so it re-derives and
+                // resubmits rather than wedging.
+                if matches!(
+                    service
+                        .store
+                        .nonce_adopt_if_behind(signer, min_parked)
+                        .await,
+                    Ok(true)
+                ) {
+                    ::metrics::counter!("rpc_nonce_ledger_gap_adopted_total").increment(1);
+                    tracing::warn!(
+                        target: "rpc::nonce_repair",
+                        signer = %signer,
+                        adopted_nonce = min_parked,
+                        parked_expires_at = q.expires_at,
+                        now_block = now_block_for_gap,
+                        "#90: nonce ledger was STUCK below the lowest parked nonce and the gap \
+                         outlived a full queue TTL — adopting the lowest parked nonce so a \
+                         continuing wallet resumes instead of wedging forever"
+                    );
+                }
+            }
         }
         drop(guard);
     }
@@ -3333,6 +3378,81 @@ mod tests {
             3,
             "the executable successor at the frontier must be promoted despite the stale \
              row below it (old gate: MIN != expected => that signer was skipped forever)"
+        );
+    }
+
+    /// #90 follow-up — the ledger row EXISTS but is stuck below a gap that will
+    /// never fill. Insert-if-absent cannot reach this case, so it wedged forever.
+    ///
+    /// Measured live on a growing chain (2026-09-06): signer 0x635243a1… had
+    /// `nonces = 5`, five `transactions` rows all `success`, and NINETY-TWO
+    /// recovery-stamped rows queued at nonces 6..97 — with no transaction at
+    /// nonce 5 anywhere. The recovery lost exactly the tx at the expected nonce,
+    /// so `nonce_bootstrap_if_absent` returned false on every sweep (the row
+    /// exists), nothing promoted, and every L1→L2 claim stopped landing. The
+    /// battery cascaded: iteration 1 was 17 PASS/11 FAIL, iterations 2, 3 and 4
+    /// were each 8 PASS/20 FAIL, with Bridge and Claim event counts frozen.
+    ///
+    /// The fix adopts the lowest parked nonce, but ONLY once the gap has
+    /// outlived a full queue TTL — that is the evidence distinguishing "this
+    /// nonce is never coming" from "a lower nonce is still in validation", and
+    /// it is what keeps this from being the reverted round-4 amnesty.
+    #[tokio::test]
+    async fn finding90_stuck_ledger_below_dead_gap_is_adopted_after_ttl() {
+        let (service, _sd) = mempool_service();
+        let store = service.store.clone();
+        store.set_nonce_ledger_rebuilt(true).await.unwrap();
+
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
+
+        // The wallet transacted successfully before the recovery, so its ledger
+        // row EXISTS and expects nonce 5. Nothing will ever submit nonce 5.
+        store
+            .nonce_bootstrap_if_absent(&signer_str, 5)
+            .await
+            .unwrap();
+        assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 5);
+
+        // Its next transaction parks at 6, stamped by the recovery window.
+        let (raw, hash) = ger_tx_at(&key, 6, 0xC7);
+        let got = service_send_raw_txn(service.clone(), raw)
+            .await
+            .expect("a continuing signer's tx must be parked, never rejected");
+        assert_eq!(got, hash);
+        assert_eq!(
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            Some(6)
+        );
+
+        // Past the settle margin, but the gap has NOT yet outlived its TTL: the
+        // ledger must NOT move, because a lower nonce could still be arriving.
+        let now = store.get_latest_block_number().await.unwrap();
+        store
+            .set_latest_block_number(now + BOOTSTRAP_SETTLE_BLOCKS + 1)
+            .await
+            .unwrap();
+        resume_queued_drain(&service).await.unwrap();
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            5,
+            "the ledger must NOT skip a gap that is merely slow — only one that \
+             has outlived a full queue TTL"
+        );
+
+        // Now let the gap outlive the queue TTL. The parked row's own
+        // `expires_at` is the deadline, so advancing past it IS the evidence.
+        let parked = store.get_queued_txn(&signer_str, 6).await.unwrap().unwrap();
+        store
+            .set_latest_block_number(parked.expires_at + 1)
+            .await
+            .unwrap();
+        resume_queued_drain(&service).await.unwrap();
+
+        assert!(
+            store.nonce_get(&signer_str).await.unwrap() > 5,
+            "after the gap outlived its TTL the wallet must resume at its own \
+             nonce; leaving the ledger at 5 wedges every later claim forever"
         );
     }
 

@@ -348,6 +348,28 @@ impl Store for PgStore {
         Ok(affected > 0)
     }
 
+    async fn nonce_adopt_if_behind(&self, addr: &str, baseline: u64) -> anyhow::Result<bool> {
+        let mut client = self.pool.get().await?;
+        let key = addr.to_lowercase();
+        // Same transaction + statement_timeout shape as
+        // `nonce_bootstrap_if_absent`, for the same cancellation reason.
+        let tx = client.transaction().await?;
+        tx.batch_execute("SET LOCAL statement_timeout = '10s'")
+            .await?;
+        // Guarded by `nonce < $2`, so this is monotonic and idempotent across
+        // replicas: exactly one caller advances, everyone else affects 0 rows
+        // and falls through to the ordinary R4 path against the advanced row. It
+        // can never move a ledger BACKWARDS.
+        let affected = tx
+            .execute(
+                "UPDATE nonces SET nonce = $2 WHERE address = $1 AND nonce < $2",
+                &[&key, &(baseline as i64)],
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(affected > 0)
+    }
+
     async fn count_claim_events_awaiting_calldata(&self) -> anyhow::Result<u64> {
         let client = self.pool.get().await?;
         // O(1) read of the durable repair-backlog set (migration 019), seeded once

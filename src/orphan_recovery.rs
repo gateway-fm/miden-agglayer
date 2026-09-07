@@ -603,6 +603,35 @@ pub async fn recover_orphaned_pending_txns(service: &ServiceState) -> anyhow::Re
         );
     }
 
+    // Reap expired parked transactions. `evict_expired_queued_txns` existed but
+    // had NO caller anywhere outside the store layer, so the queue's TTL was
+    // dead code and expired rows accumulated without bound. (It deliberately
+    // EXEMPTS recovery-stamped rows — those leave via baseline adoption, not
+    // TTL — so this reaps only the ordinary expired ones.)
+    match service.store.get_latest_block_number().await {
+        Ok(now) => match service.store.evict_expired_queued_txns(now).await {
+            Ok(evicted) if !evicted.is_empty() => {
+                ::metrics::counter!("rpc_queued_txn_ttl_evicted_total")
+                    .increment(evicted.len() as u64);
+                for (signer, nonce, tx_hash) in &evicted {
+                    tracing::warn!(
+                        target: "recovery", %signer, nonce, %tx_hash,
+                        "evicted a parked transaction that outlived its queue TTL"
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                target: "recovery", error = %format!("{error:#}"),
+                "queued-txn TTL eviction failed; retrying next sweep"
+            ),
+        },
+        Err(error) => tracing::warn!(
+            target: "recovery", error = %format!("{error:#}"),
+            "could not read the tip for queued-txn TTL eviction; retrying next sweep"
+        ),
+    }
+
     let pending = service
         .store
         .recoverable_pending_txns(RECOVERY_SCAN_LIMIT)

@@ -537,6 +537,17 @@ impl Store for InMemoryStore {
         Ok(true)
     }
 
+    async fn nonce_adopt_if_behind(&self, addr: &str, baseline: u64) -> anyhow::Result<bool> {
+        let key = addr.to_lowercase();
+        let mut n = self.nonces.write();
+        match n.get(&key) {
+            Some(cur) if *cur >= baseline => Ok(false),
+            _ => {
+                n.insert(key, baseline);
+                Ok(true)
+            }
+        }
+    }
     async fn count_claim_events_awaiting_calldata(&self) -> anyhow::Result<u64> {
         // O(1) read of the durable repair-backlog set — NOT a scan of
         // `logs_by_tx`/`transactions` (review blocker 3). The `transactions`

@@ -545,6 +545,21 @@ pub fn init_metrics() {
          terminal entries linger for tx_ttl + sweeper interval after the work \
          finished. Use agglayer_writer_nonterminal_jobs for that."
     );
+    describe_counter!(
+        "rpc_queued_txn_ttl_evicted_total",
+        "Parked future-nonce transactions deleted for outliving the queue TTL. \
+         The eviction existed but had no caller, so expired rows accumulated \
+         without bound; recovery-stamped rows are exempt and leave via baseline \
+         adoption instead."
+    );
+    describe_counter!(
+        "rpc_nonce_ledger_gap_adopted_total",
+        "#90: a signer's nonce ledger was STUCK below its lowest parked nonce \
+         and the gap outlived a full queue TTL, so the lowest parked nonce was \
+         adopted as the new baseline. Non-zero means a recovery lost the \
+         transaction at the expected nonce and the wallet was unwedged; a \
+         REPEATEDLY rising value means recoveries keep losing one."
+    );
     describe_gauge!(
         "stranded_prepared_handoffs",
         "PREPARED note handoffs past their Miden expiration block whose owning \

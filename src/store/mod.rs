@@ -591,6 +591,26 @@ pub trait Store: Send + Sync + 'static {
         Ok(false)
     }
 
+    /// #90 follow-up — adopt `baseline` for a signer whose ledger row EXISTS but
+    /// is STUCK BELOW it. Advances iff `nonce < baseline`; never moves a ledger
+    /// backwards, and is a no-op once some other caller has advanced it.
+    ///
+    /// `nonce_bootstrap_if_absent` only covers a wallet with NO row. A wallet
+    /// that transacted successfully BEFORE a recovery has a row — advanced by
+    /// those successes — and if the recovery loses the tx at exactly the
+    /// expected nonce, every later transaction parks behind a nonce that can
+    /// never arrive. Measured live: ledger at 5, five `success` transactions,
+    /// and 92 recovery-stamped rows queued at nonces 6..97 with no row at 5.
+    /// The insert-if-absent path returned `false` on every sweep, so nothing
+    /// promoted and every L1→L2 claim stopped landing, permanently.
+    ///
+    /// Callers MUST supply the evidence that the gap is dead — see
+    /// `bootstrap_one_signer`, which requires the lowest parked row to be
+    /// recovery-stamped AND past its full queue TTL before calling this.
+    async fn nonce_adopt_if_behind(&self, _addr: &str, _baseline: u64) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// #148 — readiness backlog: how many ClaimEvent-bearing synthetic
     /// transactions still have NO persisted `claimAsset` calldata envelope in
     /// the `transactions` table. In steady state this is 0 — a claim's envelope
