@@ -46,6 +46,33 @@ fi
 # Default: per-caller subdir (BASH_SOURCE[1] is the sourcing script).
 B2AGG_STORE_DIR="${B2AGG_STORE_DIR:-$PROJECT_DIR/.b2agg-store/$(basename "${BASH_SOURCE[1]:-standalone}" .sh)}"
 
+# Take host ownership of the isolated store before writing to it.
+#
+# The tool image runs as ROOT, and a bind mount whose host path does not exist
+# yet is created by the docker daemon as root:root. Either way every file the
+# container leaves behind — and sometimes the store directory itself — is
+# root-owned on the host. The host side then cannot create `tmp/` or write
+# `$B2AGG_STORE_DIR/wallet-id`, and BOTH failures were silent: `mkdir -p`'s
+# error went to stderr and the redirect's failure was never checked, so
+# `provision_isolated_wallet` fell through to "no id file" and provisioned a
+# BRAND NEW wallet on every call. Observed 2026-09-07: e2e-l1-to-l2 funded
+# wallet 0xb73e… (1000 units) and the very next e2e-l2-to-l1 minted a different
+# wallet in the same store and died "Wallet has no balance — run
+# e2e-l1-to-l2.sh first", which reads as a bridge failure and is not one.
+#
+# Fix the cause rather than the symptom: chown the store back to the invoking
+# user (via a root container, the only thing that can) and make the caller
+# verify it is writable.
+_iso_own_store() {
+    if mkdir -p "$B2AGG_STORE_DIR/tmp" 2>/dev/null && [[ -w "$B2AGG_STORE_DIR" ]]; then
+        return 0
+    fi
+    docker run --rm -v "$B2AGG_STORE_DIR:/store" busybox \
+        chown -R "$(id -u):$(id -g)" /store >/dev/null 2>&1 || true
+    mkdir -p "$B2AGG_STORE_DIR/tmp" 2>/dev/null || true
+    [[ -w "$B2AGG_STORE_DIR" ]]
+}
+
 # iso_tool <args...> : run bridge-out-tool in a throwaway container against the
 # ISOLATED store. TMPDIR is kept on the same bind-mounted device as the store
 # to avoid rusqlite's "Invalid cross-device link" on atomic rename.
@@ -96,7 +123,8 @@ iso_wallet_balance() {
 iso_inspect_faucet() {
     local fid="$1" fresh rc out
     fresh="$B2AGG_STORE_DIR/inspect-$$-${RANDOM}"
-    mkdir -p "$fresh/tmp"
+    _iso_own_store || true
+    mkdir -p "$fresh/tmp" 2>/dev/null || true
     # Capture the container's exit code WITHOUT tripping the caller's set -e: a bare
     # `out=$(docker ...); rc=$?` aborts under errexit before rc is read on nonzero.
     if out=$(docker run --rm --network "$ISO_NETWORK" \
@@ -270,7 +298,7 @@ provision_isolated_wallet() {
     if [[ "${B2AGG_FRESH:-0}" == "1" ]]; then
         _iso_wipe_store
     fi
-    mkdir -p "$B2AGG_STORE_DIR/tmp"
+    _iso_own_store || { echo "isolated-wallet: $B2AGG_STORE_DIR is not writable by $(id -un) and could not be chowned" >&2; return 1; }
 
     WALLET_ID=""
     if [[ -s "$idfile" ]]; then
@@ -281,7 +309,7 @@ provision_isolated_wallet() {
             if [[ -z "$bal" ]]; then
                 echo "isolated-wallet: store at $B2AGG_STORE_DIR looks stale (balance probe failed) — re-provisioning fresh" >&2
                 _iso_wipe_store
-                mkdir -p "$B2AGG_STORE_DIR/tmp"
+                _iso_own_store || { echo "isolated-wallet: $B2AGG_STORE_DIR is not writable by $(id -un) and could not be chowned" >&2; return 1; }
                 WALLET_ID=""
             fi
         fi
@@ -300,7 +328,12 @@ provision_isolated_wallet() {
             echo "isolated-wallet: could not parse provisioned wallet id" >&2
             return 1
         fi
-        echo "$WALLET_ID" > "$idfile"
+        # A FAILED write here is what produced a new wallet per call. Hard-stop:
+        # a store whose id cannot be persisted is not a reusable store.
+        echo "$WALLET_ID" > "$idfile" || {
+            echo "isolated-wallet: could not persist the wallet id to $idfile — every later call would provision a NEW wallet" >&2
+            return 1
+        }
     fi
 
     WALLET_HEX="$WALLET_ID"

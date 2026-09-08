@@ -218,31 +218,49 @@ for name, (topic, root) in TOPICS.items():
                   f"a non-deposit must never emit")
         logs = [l for l in logs if l["transactionHash"].lower() not in forbidden]
 
-    # ClaimEvents for durable unclaimable records have no corresponding Miden
-    # CLAIM note. Match and remove only their exact (block, GI, tx-hash) logs;
-    # every other surplus ClaimEvent remains an error.
-    unclaim_exact = 0
+    # #185 INVERTED THIS CHECK. A durable unclaimable record (unresolvable
+    # destination) is terminal WITHOUT a Miden CLAIM note AND WITHOUT a
+    # ClaimEvent: the proxy accepts the claim, writes a REVERTED receipt
+    # (status 0x0, no logs) and emits nothing, exactly as an unappliable claim
+    # behaves on EVM.
+    #
+    # Before #185 it fabricated a ClaimEvent, and this block asserted that
+    # fabrication was PRESENT — one expected log per record, `unclaim_missing`
+    # counting any that were absent. That is the phantom event which made the
+    # claim unreproducible after a full-DB-loss restore (#103) and cut AggLayer
+    # certificate settlement at its block (#184), so the assertion now runs the
+    # other way: a ClaimEvent carrying an unclaimable record's exact
+    # (block, globalIndex, tx-hash) is a PHANTOM and fails the verdict.
+    #
+    # Left as-is, this block reported `unclaim 0/2 FAIL` on the first live stack
+    # carrying #185 (2026-09-07) — a green product failing a red test.
+    #
+    # `unclaim_missing` keeps one job: a record whose accept-and-revert
+    # transaction is unknown to the proxy store (no block) means the reverted
+    # receipt never persisted, which IS a real defect.
+    unclaim_phantom = 0
     unclaim_missing = 0
     if name == "CLAIM->ClaimEvent":
-        expected = Counter(
+        forbidden_gi = Counter(
             (block, gi, tx_hash)
             for gi, block, tx_hash in unclaimable
             if block is not None and block <= cut
         )
         unclaim_missing += sum(1 for _, block, _ in unclaimable if block is None)
-        kept = []
         for log in logs:
             block = int(log["blockNumber"], 16)
             data = log.get("data", "")
             gi = int((data[2:66] or "0"), 16)
             key = (block, gi, log["transactionHash"].lower())
-            if expected[key] > 0:
-                expected[key] -= 1
-                unclaim_exact += 1
-            else:
-                kept.append(log)
-        unclaim_missing += sum(expected.values())
-        logs = kept
+            if forbidden_gi[key] > 0:
+                forbidden_gi[key] -= 1
+                unclaim_phantom += 1
+                print(f"    PHANTOM ClaimEvent for an UNCLAIMABLE record "
+                      f"(block {block}, globalIndex {gi}, tx {log['transactionHash']}) — "
+                      f"#185 requires an unresolvable-destination claim to emit NOTHING; "
+                      f"this log is what breaks restore (#103) and certificate settlement (#184)")
+        # Every ClaimEvent must now pair with a Miden CLAIM note, so nothing is
+        # removed from `logs`: a phantom also shows up as `extra`, and both fail.
     all_log_blocks = [int(l["blockNumber"], 16) for l in logs]
     log_blocks = Counter(all_log_blocks)            # all logs (for exact/late matching)
     cut_log_blocks = Counter(b for b in all_log_blocks if b <= cut)  # extra-detection
@@ -301,11 +319,13 @@ for name, (topic, root) in TOPICS.items():
         missing -= deferred
     total_notes += n_notes
     total_logs += all_logs_count
-    ok = (missing == 0 and extra == 0 and unclaim_missing == 0 and forbidden_ct == 0
+    ok = (missing == 0 and extra == 0 and unclaim_missing == 0 and unclaim_phantom == 0
+          and forbidden_ct == 0
           and (name != "B2AGG->BridgeEvent" or unresolved_reclaims == 0)
           and (late == 0 or allow_late == "1"))
     overall_fail |= not ok
-    unclaim_col = f"{unclaim_exact}/{unclaim_exact + unclaim_missing}" if name == "CLAIM->ClaimEvent" else "-"
+    # Reported as phantom/unknown-tx, both of which must be 0 (#185).
+    unclaim_col = f"{unclaim_phantom}p/{unclaim_missing}u" if name == "CLAIM->ClaimEvent" else "-"
     forbid_col = str(forbidden_ct) if name == "B2AGG->BridgeEvent" else "-"
     print(f"{name:<22} {n_notes:>6} {all_logs_count:>6} {exact:>6} {late:>5} {missing:>8} {deferred:>6} {unclaim_col:>8} {forbid_col:>6} {extra:>6}  {'PASS' if ok else 'FAIL'}")
 

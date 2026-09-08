@@ -110,8 +110,27 @@ pub(crate) async fn service_estimate_gas(
             crate::applied_state::claim_and_ger_applied(&service, call.globalIndex, &combined)
                 .await
                 .map_err(|error| store_error(answer_id.clone(), error))?;
-        if claimed {
+        // #185 — an unclaimable-recorded gi is terminal (reverts, emits nothing),
+        // so the estimate must revert too. This is the estimate half of
+        // applied_state::claim_terminal and MUST match eth_call isClaimed:
+        // claimtxman reaches checkIfClaimed (→ isClaimed) only when this estimate
+        // reverts, so if they disagree the submitter re-drives to its history cap.
+        let unclaimable = service
+            .store
+            .get_unclaimable_claim(&call.globalIndex)
+            .await
+            .map_err(|error| store_error(answer_id.clone(), error))?
+            .is_some();
+        if claimed || unclaimable {
             ::metrics::counter!("rpc_estimate_gas_already_claimed_total").increment(1);
+            if unclaimable {
+                ::metrics::counter!("rpc_estimate_gas_unclaimable_total").increment(1);
+                tracing::info!(
+                    global_index = %call.globalIndex,
+                    "eth_estimateGas(claimAsset): globalIndex is recorded unclaimable; \
+                     returning AlreadyClaimed() so the submitter stops re-driving (#185)"
+                );
+            }
             return Err(JsonRpcResponse::error(answer_id, already_claimed_error()));
         }
         if !ger_applied {
@@ -208,6 +227,66 @@ mod tests {
         assert_eq!(
             json["error"]["message"],
             "execution reverted: AlreadyClaimed()"
+        );
+        assert_eq!(json["error"]["data"], "0x646cf558");
+    }
+
+    /// #185 — an unclaimable-recorded gi must revert the estimate with
+    /// `AlreadyClaimed()` (not "0x0, go ahead"), and must agree with the predicate
+    /// isClaimed reads (`applied_state::claim_terminal`) — else claimtxman never
+    /// reaches checkIfClaimed and re-drives to its history cap. The GER is
+    /// deliberately absent: the unclaimable record must win over the
+    /// GlobalExitRootInvalid() retry-later arm.
+    #[tokio::test]
+    async fn estimate_gas_unclaimable_record_reverts_already_claimed() {
+        use crate::store::{UnclaimableClaim, UnclaimableReason};
+        let service = create_test_service();
+        let request = estimate_request(&claim_calldata([0xAA; 32], [0xBB; 32]));
+
+        // Before the record: no claim, no GER -> GlobalExitRootInvalid() (retry later).
+        let before = service_estimate_gas(service.clone(), request)
+            .await
+            .expect_err("absent GER must revert");
+        let json = serde_json::to_value(before).unwrap();
+        assert_eq!(
+            json["error"]["message"],
+            "execution reverted: GlobalExitRootInvalid()"
+        );
+
+        service
+            .store
+            .record_unclaimable_claim(UnclaimableClaim {
+                global_index: U256::from(7u64),
+                destination_address: Address::from([0x42; 20]),
+                origin_network: 0,
+                origin_address: Address::ZERO,
+                amount: U256::from(1u64),
+                reason: UnclaimableReason::UnresolvableDestination,
+                eth_tx_hash: alloy::primitives::TxHash::from([0xAB; 32]),
+            })
+            .await
+            .unwrap();
+
+        // The predicate isClaimed reads must now be terminal for this gi — the
+        // estimate below must agree with it.
+        assert!(
+            crate::applied_state::claim_terminal(&service, U256::from(7u64))
+                .await
+                .unwrap(),
+            "#185: isClaimed's predicate must read the unclaimable record as claimed"
+        );
+
+        let response = service_estimate_gas(
+            service,
+            estimate_request(&claim_calldata([0xAA; 32], [0xBB; 32])),
+        )
+        .await
+        .expect_err("#185: an unclaimable-recorded globalIndex must revert the estimate");
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["error"]["code"], 3);
+        assert_eq!(
+            json["error"]["message"], "execution reverted: AlreadyClaimed()",
+            "#185: the estimate must agree with eth_call isClaimed, or checkIfClaimed never runs"
         );
         assert_eq!(json["error"]["data"], "0x646cf558");
     }

@@ -95,7 +95,11 @@ pub(crate) async fn service_eth_call(
                 ));
             };
             let global_index = crate::applied_state::global_index_for_claim(leaf_index, source);
-            let applied = crate::applied_state::claim_applied(&service, global_index)
+            // #185 — reads TRUE for an unclaimable-recorded claim (no ClaimEvent, no
+            // Miden funds moved): the retry-suppression signal that replaced the
+            // synthetic event, with no log to break restore (#103) or certificate
+            // settlement (#184). aggsender never reads isClaimed, so it enters no cert.
+            let applied = crate::applied_state::claim_terminal(&service, global_index)
                 .await
                 .map_err(|error| store_error(answer_id.clone(), error))?;
             return Ok(JsonRpcResponse::success(
@@ -157,6 +161,56 @@ mod tests {
             let json = serde_json::to_value(response).unwrap();
             assert_eq!(json["result"], ABI_TRUE);
         }
+    }
+
+    /// #185 — a claim recorded as unclaimable (unresolvable destination) reads as
+    /// CLAIMED via `isClaimed`, even though no ClaimEvent was emitted. This is the
+    /// retry-suppression signal that replaced the synthetic event; the submitter's
+    /// on-revert `checkIfClaimed` reads true and stops re-driving.
+    #[tokio::test]
+    async fn is_claimed_true_for_an_unclaimable_recorded_claim() {
+        use crate::store::{UnclaimableClaim, UnclaimableReason};
+        let (leaf, source) = (42u32, 0u32);
+        let service = create_test_service();
+        let gi = crate::applied_state::global_index_for_claim(leaf, source);
+
+        // No claim event, no Miden claim: isClaimed is FALSE.
+        let before = service_eth_call(
+            service.clone(),
+            eth_call_request(is_claimed_calldata(leaf, source)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(serde_json::to_value(before).unwrap()["result"], ABI_FALSE);
+
+        // Record it unclaimable (the RD-860/#185 swallow) — no event emitted.
+        let newly = service
+            .store
+            .record_unclaimable_claim(UnclaimableClaim {
+                global_index: gi,
+                destination_address: alloy_core::primitives::Address::from([0x42; 20]),
+                origin_network: 7,
+                origin_address: alloy_core::primitives::Address::from([0x11; 20]),
+                amount: alloy_core::primitives::U256::from(1_000_000u64),
+                reason: UnclaimableReason::UnresolvableDestination,
+                eth_tx_hash: alloy_core::primitives::TxHash::from([0xAB; 32]),
+            })
+            .await
+            .unwrap();
+        assert!(newly, "record must be new");
+
+        // Now isClaimed reads TRUE, with no ClaimEvent anywhere.
+        let after = service_eth_call(
+            service.clone(),
+            eth_call_request(is_claimed_calldata(leaf, source)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(after).unwrap()["result"],
+            ABI_TRUE,
+            "#185: an unclaimable-recorded gi must read as claimed for retry suppression"
+        );
     }
 
     #[tokio::test]

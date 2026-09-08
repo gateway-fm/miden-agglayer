@@ -114,6 +114,18 @@ pub fn init_metrics() {
          claim front-running, not a bug."
     );
     describe_counter!(
+        "claim_unclaimable_reverted_total",
+        "#185: an unresolvable-destination claimAsset was accepted with a reverted (0x0) receipt \
+         and NO ClaimEvent (EVM revert semantics). Compare against unclaimable_claims rows to \
+         see funds stranded on L1; a steady climb means many claims target unmapped destinations."
+    );
+    describe_counter!(
+        "rpc_estimate_gas_unclaimable_total",
+        "#185: eth_estimateGas(claimAsset) reverted AlreadyClaimed() for a gi recorded \
+         unclaimable, so the submitter's on-revert checkIfClaimed marks the tx CONFIRMED instead \
+         of re-sending. Expect ~one per unresolvable deposit after its first (record-creating) attempt."
+    );
+    describe_counter!(
         "claim_inflight_dedup_total",
         "#55 third dedup window: a claimAsset arrived for a globalIndex whose winning claim was \
          SUBMITTED but had not LANDED yet (claim lock held, no ClaimEvent, within TTL) — the \

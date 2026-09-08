@@ -210,6 +210,25 @@ pub(crate) async fn claim_applied(
         .context("claim state was not requested")
 }
 
+/// #185 — a globalIndex is terminally claimed if a ClaimEvent applied OR it was
+/// recorded unclaimable (unresolvable destination). Both stop the submitter
+/// re-driving; `isClaimed` and `eth_estimateGas` must agree on this, or
+/// claimtxman's on-revert `checkIfClaimed` never runs.
+pub(crate) async fn claim_terminal(
+    service: &ServiceState,
+    global_index: U256,
+) -> anyhow::Result<bool> {
+    if service
+        .store
+        .get_unclaimable_claim(&global_index)
+        .await?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    claim_applied(service, global_index).await
+}
+
 /// Read claim and GER state with at most one serialized Miden-client request.
 pub(crate) async fn claim_and_ger_applied(
     service: &ServiceState,

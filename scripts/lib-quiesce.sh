@@ -243,6 +243,53 @@ _q_evidence() { # $1 = the unmet condition
         _q_pgq "SELECT signer, nonce, tx_hash, expires_at, parked_during_recovery \
                 FROM queued_txns ORDER BY created_at" 2>&1
         echo
+        # A pending receipt is the condition that most often blocks quiesce, and
+        # "0x8112…|pending|0x6352…||2419" is not enough to act on. On 2026-09-08
+        # this exact line failed the drill (656s) and answering "which claim is
+        # it, and is it even still live?" took forty minutes of manual RLP
+        # decoding — by which time the proxy container had been recreated and
+        # its logs for the window were gone forever. Decode it HERE, while the
+        # evidence still exists.
+        echo "── pending receipts, DECODED (selector / globalIndex / destination / expiry) ──"
+        _q_pgq "SELECT tx_hash || '|' || coalesce(expires_at::text,'<none>') || '|' || \
+                       encode(envelope_bytes,'hex') \
+                FROM transactions WHERE status='pending' ORDER BY created_at" 2>/dev/null \
+          | python3 -c '
+import sys
+TIP = None
+CLAIM = bytes.fromhex("ccaa2d11")   # claimAsset(bytes32[32],bytes32[32],uint256,...)
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    parts = line.split("|")
+    if len(parts) < 3: continue
+    txh, exp, raw = parts[0], parts[1], parts[2]
+    try: b = bytes.fromhex(raw)
+    except ValueError:
+        print(f"  {txh} expires_at={exp} <envelope not hex>"); continue
+    i = b.find(CLAIM)
+    if i < 0:
+        print(f"  {txh} expires_at={exp} selector=<not claimAsset>"); continue
+    a = b[i+4:]
+    try:
+        gi = int.from_bytes(a[64*32:65*32], "big")
+        dest = "0x" + a[67*32:68*32][-20:].hex()
+    except Exception:
+        print(f"  {txh} expires_at={exp} claimAsset <args truncated>"); continue
+    print(f"  {txh} expires_at={exp} claimAsset globalIndex={gi} ({hex(gi)}) destination={dest}")
+' 2>/dev/null || echo "  (decode unavailable)"
+        echo
+        echo "── is a pending claim recorded UNCLAIMABLE? (#185 path taken or not) ──"
+        _q_pgq "SELECT u.global_index, u.destination_address, u.reason \
+                FROM unclaimable_claims u ORDER BY u.created_at" 2>&1
+        echo
+        echo "── proxy log tail (CAPTURED NOW — the container may be recreated before anyone reads this) ──"
+        _q_proxy_c="${PROXY_CONTAINER:-${AGGLAYER_CONTAINER:-}}"
+        [[ -n "$_q_proxy_c" ]] || _q_proxy_c="$(docker ps --format '{{.Names}}' \
+            | grep -E -- '-miden-agglayer-1$' | head -1)"
+        docker logs --tail "${QUIESCE_EVIDENCE_LOG_LINES:-400}" "$_q_proxy_c" 2>&1 \
+            | sed -E 's/\x1b\[[0-9;]*m//g' | tail -n "${QUIESCE_EVIDENCE_LOG_LINES:-400}" || true
+        echo
         echo "── synthetic log counts by family ──"
         _q_pgq "SELECT substring(topics[1] from 1 for 10) AS topic0, count(*) \
                 FROM synthetic_logs GROUP BY 1 ORDER BY 2 DESC" 2>&1
