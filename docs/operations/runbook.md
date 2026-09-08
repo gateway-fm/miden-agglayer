@@ -227,6 +227,66 @@ miden-client schema changed; use the full reset decision instead of assuming a
 zero-row success. Restart normally and verify a transaction before closing the
 incident.
 
+### Recovering a stranded unresolvable-destination claim (#189)
+
+A `claimAsset` whose destination has no Miden `AccountId` is recorded in
+`unclaimable_claims` and (with the #185 revert semantics) accepted with a
+reverted (status `0x0`) receipt and no `ClaimEvent`; the funds stay on L1.
+`isClaimed` and `eth_estimateGas` read the record as terminal
+(`applied_state::claim_terminal`), so the claim submitter stops re-driving. This
+is the fail-closed default — there is deliberately no automatic un-stick.
+Recovery is manual and operator-judged.
+
+Preconditions:
+
+- direct access to the proxy's Postgres store;
+- the intended Miden `AccountId` for the stranded destination is known off-chain;
+- a maintenance window — no claim for that `globalIndex` is in flight.
+
+1. Enumerate the stranded claims:
+
+   ```sql
+   SELECT global_index, destination_address, amount, reason, eth_tx_hash
+   FROM unclaimable_claims;
+   ```
+
+   `reason = 'unresolvable_destination'`; `global_index` is a `0x…` hex string.
+
+2. Register the destination → Miden account mapping the proxy reads on the next
+   attempt (same serialization as `set_address_mapping`: `eth_address` lower-case
+   `0x…`, `miden_account` the `AccountId` hex). The Miden account must already
+   exist on the node; if it does not, deploy it first.
+
+   ```sql
+   INSERT INTO address_mappings (eth_address, miden_account)
+   VALUES ('0x<destination_address>', '0x<miden_account_id_hex>')
+   ON CONFLICT (eth_address) DO UPDATE SET miden_account = EXCLUDED.miden_account;
+   ```
+
+3. Re-open the global index by removing the block:
+
+   ```sql
+   DELETE FROM unclaimable_claims WHERE global_index = '0x<global_index_hex>';
+   ```
+
+   `isClaimed(globalIndex)` now reads false again — nothing in `unclaimable_claims`
+   and no real `ClaimEvent`.
+
+4. Re-drive. The claim submitter (aggkit `claimtxman`) re-attempts on its next
+   review once `checkIfClaimed` reads false; on the retry `resolve_address` finds
+   the mapping and the CLAIM note is published. If the submitter has given up, an
+   operator resubmits the original `claimAsset`.
+
+5. Verify: a real `ClaimEvent` now exists for the `globalIndex` (`eth_getLogs`),
+   `isClaimed` reads true through that event, the `unclaimable_claims` row is
+   gone, and the destination Miden account received the funds.
+
+Never delete an `unclaimable_claims` row before making the destination
+resolvable — re-driving into the same unresolvable address just re-records it.
+The same stranding happens when a zero-padded destination resolves structurally
+(C5) to a never-deployed Miden account; the fix is the same — deploy/register the
+account, then re-drive.
+
 ### Full-history note resweep
 
 `--resweep-from-genesis` resets only the synthetic store's reconciler cursor.
