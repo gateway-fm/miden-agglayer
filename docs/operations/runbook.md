@@ -192,7 +192,7 @@ The flags below are not interchangeable.
 | `--unlock-miden-accounts` | Clears `locked` in known miden-client sqlite account-header tables | Yes | The service is stopped and evidence proves a stale local lock only |
 | `--resweep-from-genesis` | Resets the Postgres note-reconciler cursor to zero, then runs normally | No | Deliberate full-history visibility audit with an otherwise valid Miden store |
 | `--l1-indexer-from-block N` | Overrides L1 InfoTree start for that boot | No | Deliberate GER decomposition backfill from a verified L1 block |
-| `--restore` | Replays Miden history into the selected synthetic store, resets reconciler cursor, then exits | Yes | Reconstructing a lost/clean synthetic store from authoritative history |
+| `--restore` | Reconstructs the synthetic store by driving the canonical projector catch-up to a captured Miden tip (cursors reset to genesis, then parked at the tip), then exits | Yes | Reconstructing a lost/clean synthetic store from authoritative history |
 | `--reset-miden-store` | Deletes only miden-client `store.sqlite3`, WAL, and SHM before startup | No by itself | Local Miden sqlite is irrecoverably divergent; keystore/config are intact |
 | `--read-only` | Refuses all Miden transaction submission at the chokepoint | No | Passive recovery rehearsal/audit against a production network |
 
@@ -226,6 +226,66 @@ exits. If both known tables/columns are absent, it fails loudly because the
 miden-client schema changed; use the full reset decision instead of assuming a
 zero-row success. Restart normally and verify a transaction before closing the
 incident.
+
+### Recovering a stranded unresolvable-destination claim (#189)
+
+A `claimAsset` whose destination has no Miden `AccountId` is recorded in
+`unclaimable_claims` and (with the #185 revert semantics) accepted with a
+reverted (status `0x0`) receipt and no `ClaimEvent`; the funds stay on L1.
+`isClaimed` and `eth_estimateGas` read the record as terminal
+(`applied_state::claim_terminal`), so the claim submitter stops re-driving. This
+is the fail-closed default — there is deliberately no automatic un-stick.
+Recovery is manual and operator-judged.
+
+Preconditions:
+
+- direct access to the proxy's Postgres store;
+- the intended Miden `AccountId` for the stranded destination is known off-chain;
+- a maintenance window — no claim for that `globalIndex` is in flight.
+
+1. Enumerate the stranded claims:
+
+   ```sql
+   SELECT global_index, destination_address, amount, reason, eth_tx_hash
+   FROM unclaimable_claims;
+   ```
+
+   `reason = 'unresolvable_destination'`; `global_index` is a `0x…` hex string.
+
+2. Register the destination → Miden account mapping the proxy reads on the next
+   attempt (same serialization as `set_address_mapping`: `eth_address` lower-case
+   `0x…`, `miden_account` the `AccountId` hex). The Miden account must already
+   exist on the node; if it does not, deploy it first.
+
+   ```sql
+   INSERT INTO address_mappings (eth_address, miden_account)
+   VALUES ('0x<destination_address>', '0x<miden_account_id_hex>')
+   ON CONFLICT (eth_address) DO UPDATE SET miden_account = EXCLUDED.miden_account;
+   ```
+
+3. Re-open the global index by removing the block:
+
+   ```sql
+   DELETE FROM unclaimable_claims WHERE global_index = '0x<global_index_hex>';
+   ```
+
+   `isClaimed(globalIndex)` now reads false again — nothing in `unclaimable_claims`
+   and no real `ClaimEvent`.
+
+4. Re-drive. The claim submitter (aggkit `claimtxman`) re-attempts on its next
+   review once `checkIfClaimed` reads false; on the retry `resolve_address` finds
+   the mapping and the CLAIM note is published. If the submitter has given up, an
+   operator resubmits the original `claimAsset`.
+
+5. Verify: a real `ClaimEvent` now exists for the `globalIndex` (`eth_getLogs`),
+   `isClaimed` reads true through that event, the `unclaimable_claims` row is
+   gone, and the destination Miden account received the funds.
+
+Never delete an `unclaimable_claims` row before making the destination
+resolvable — re-driving into the same unresolvable address just re-records it.
+The same stranding happens when a zero-padded destination resolves structurally
+(C5) to a never-deployed Miden account; the fix is the same — deploy/register the
+account, then re-drive.
 
 ### Full-history note resweep
 
@@ -273,6 +333,69 @@ every restore phase, counts, cursor/tip, faucet identities, quarantines, and a
 complete log fingerprint before starting the normal service. `--restore`
 replays synthetic events during this offline reconstruction; the
 `SyntheticProjector` remains the sole producer in normal live operation.
+
+### The post-restore sequence — all three steps, in order
+
+A restore is not finished when the one-shot exits. Aggkit keeps its own
+transaction-manager state, which the restore cannot reach, and that state must
+be reset too. This is an ordinary part of the recovery playbook, not a defect —
+but it is **mandatory**, and skipping it leaves the bridge silently one-way:
+outbound (L2→L1) still works, while every inbound (L1→L2) deposit stops
+reaching `ready_for_claim`, indefinitely.
+
+**1. `--restore`** — as above, with the service stopped. It rebuilds the
+synthetic store and the nonce ledger, and drops every `nonce_reservations` row.
+Both halves matter: `nonces` and `nonce_reservations` describe one ledger
+between them, and a rebuilt (empty) `nonces` alongside surviving reservations
+makes the proxy reject the aggoracle's next injection —
+
+```
+ERROR rpc::error: nonce 0 for 0x… is reserved by a different tx 0x…
+      (concurrent submission at the same nonce slot); this tx must not execute
+```
+
+Confirm from the restore log:
+
+```
+Phase 4: nonce ledger is EMPTY after restore — flagged for first-contact
+bootstrap (#90) and stale nonce reservations dropped, cleared_reservations: N
+```
+
+**2. Reset aggkit's tx-manager / monitoring DB.**
+
+```bash
+PROJECT=<compose-project> ./scripts/aggkit-preserve-heal.sh aggkit
+```
+
+Aggkit's aggoracle may hold a monitored GER-inject transaction that the proxy
+never durably admitted; its deterministic tx-ID dedup then blocks any re-send
+forever and the injector loops on:
+
+```
+aggoracle: inject GER transaction already exists in monitoring DB with ID: 0x…
+```
+
+Use this script rather than a plain `restart` (which preserves
+`/tmp/ethtxmanager-aggoracle.sqlite`) or a blanket `--force-recreate` (which
+also destroys aggsender's cert lineage and the bridgesync cursors). Exit codes:
+`0` healed and an injection was observed, `2` no wedge to heal, `3` healed but
+unproven, anything else needs a look.
+
+**3. Verify GER injection actually resumed.** Neither step alone is sufficient
+— step 1 removes the proxy's veto, step 2 lets aggkit re-send — so verify the
+end state rather than either command's exit code:
+
+```bash
+L1_GER=$(cast call --rpc-url "$L1_RPC_URL" "$GER_MANAGER" \
+           'getLastGlobalExitRoot()(bytes32)')
+psql "$DATABASE_URL" -tAc "SELECT count(*) FROM ger_entries
+     WHERE is_injected AND '0x'||encode(ger_hash,'hex') = '$L1_GER'"
+```
+
+`1` means L1's current global exit root has been injected and consumed on Miden
+— the inbound pipeline is live. `0`, persisting over a few minutes while the
+aggoracle keeps logging, means the sequence has not completed: re-check step 1's
+`cleared_reservations` line and step 2's exit code before sending traffic.
 
 ### What a restore preserves — and the one field it cannot
 

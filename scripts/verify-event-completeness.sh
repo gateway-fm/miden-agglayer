@@ -32,7 +32,6 @@ AGGLAYER_CONTAINER="${AGGLAYER_CONTAINER:-miden-agglayer-miden-agglayer-1}"
 PG_HOST="${PG_HOST:-localhost}"; PG_PORT="${PG_PORT:-5434}"
 PG_USER="${PG_USER:-agglayer}"; PG_PASS="${PG_PASS:-agglayer}"; PG_DB="${PG_DB:-agglayer_store}"
 ALLOW_LATE="${ALLOW_LATE:-0}"
-TOOL_BIN="${TOOL_BIN:-$PROJECT_DIR/target/debug/bridge-out-tool}"
 
 TMP="$(mktemp -d)"
 # The client-store snapshot below briefly PAUSES the proxy; the trap guarantees
@@ -50,7 +49,9 @@ cleanup() {
 trap cleanup EXIT
 
 # 1. Canonical script roots from the same crates the proxy is built from.
-[[ -x "$TOOL_BIN" ]] || { echo "FAIL: $TOOL_BIN not built (cargo build --bin bridge-out-tool)"; exit 1; }
+# shellcheck source=scripts/lib-tool-preflight.sh
+. "$SCRIPT_DIR/lib-tool-preflight.sh"
+preflight_bridge_out_tool || exit 1
 "$TOOL_BIN" --print-script-roots --store-dir /tmp --node-url http://x > "$TMP/roots" \
     || { echo "FAIL: --print-script-roots failed"; exit 1; }
 B2AGG_ROOT=$(awk -F= '$1=="b2agg"{print $2}' "$TMP/roots")
@@ -96,10 +97,12 @@ docker exec "$NODE_CONTAINER" cat /data/node/miden-store.sqlite3-wal > "$TMP/nod
     || rm -f "$TMP/node.sqlite3-wal"
 
 # An unresolvable destination is intentionally terminal without a Miden CLAIM
-# note: the proxy records the exception durably and emits one ClaimEvent so
-# AggKit stops retrying funds that require operator rescue. Keep these events
-# strict too: match the durable record to the exact receipt block, globalIndex,
-# and transaction hash instead of weakening the generic extra-log check.
+# note. Since #185 it is terminal without a ClaimEvent either: the proxy records
+# the exception durably, accepts the claim and writes a REVERTED receipt, and
+# emits NOTHING — retry suppression comes from isClaimed/eth_estimateGas reading
+# the durable record, not from a fabricated log. So the (block, globalIndex,
+# tx-hash) triples below are what a ClaimEvent must NEVER carry; the python
+# fails the verdict on any that does (see lib-verify-completeness.py).
 PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" \
     -t -A -F '|' -c \
     "SELECT u.global_index, COALESCE(t.block_number::text, ''), u.eth_tx_hash

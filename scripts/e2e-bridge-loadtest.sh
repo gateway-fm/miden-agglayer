@@ -35,6 +35,15 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Build bridge-out-tool BEFORE any load. Without this the run discovers a missing
+# or stale tool only when it reaches the first L2->L1 leg — after the L1->L2 half
+# has already been submitted — and reports it as a delivery failure rather than a
+# missing binary. The isolated variant has had this since the battery preflight
+# went in; this standalone one was left behind.
+# shellcheck source=scripts/lib-tool-preflight.sh
+. "$SCRIPT_DIR/lib-tool-preflight.sh"
+preflight_bridge_out_tool || exit 1
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 FIXTURES_DIR="$PROJECT_DIR/fixtures"
 

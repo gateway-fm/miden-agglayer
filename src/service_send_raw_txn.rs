@@ -299,6 +299,50 @@ async fn accept_and_revert_landed_claim(
     Ok(())
 }
 
+/// #185 — EVM-faithful handling for a claimAsset whose destination cannot be
+/// resolved to a Miden AccountId. Like the landed path, ACCEPT and write a
+/// REVERTED receipt (status 0x0, empty logs, NO ClaimEvent) and advance the
+/// nonce atomically. No synthetic ClaimEvent: the old RD-860 one made this claim
+/// unreproducible on restore (#103) and cut certificate settlement at its block
+/// (#184). Retry suppression comes from `isClaimed` reading the unclaimable
+/// record (see `applied_state::claim_terminal`).
+async fn accept_and_revert_unclaimable_claim(
+    service: &ServiceState,
+    params: &claimAssetCall,
+    tx_hash: TxHash,
+    txn_envelope: TxEnvelope,
+    signer: Address,
+    signer_str: &str,
+    tx_nonce: u64,
+) -> anyhow::Result<()> {
+    ::metrics::counter!("claim_unclaimable_reverted_total").increment(1);
+    let block_num = service.store.get_latest_block_number().await?;
+    let block_hash = service.block_state.get_block_hash(block_num);
+    service
+        .store
+        .commit_reverted_receipt_and_advance_nonce(
+            tx_hash,
+            TxnEntry {
+                id: None,
+                envelope: txn_envelope,
+                signer,
+                expires_at: None,
+                logs: vec![],
+            },
+            format!(
+                "claim for globalIndex {} has an unresolvable destination; reverted, no \
+                 event (RD-860/#185)",
+                params.globalIndex
+            ),
+            block_num,
+            block_hash,
+            signer_str,
+            tx_nonce,
+        )
+        .await?;
+    Ok(())
+}
+
 /// How long after a store rebuild the first-contact nonce bootstrap stays
 /// available. Measured from the DURABLE stamp, so restarts neither extend nor
 /// reset it. Generous by default: a continuing wallet must be able to reconnect
@@ -538,18 +582,14 @@ pub(crate) async fn worker_handle_claim_asset(
         claim_fence,
     );
 
-    // RD-860 — swallow unresolvable-destination claims permanently. If the
-    // destination address can't be resolved to a Miden AccountId, record the
-    // unclaimable entry, emit the synthetic ClaimEvent so aggkit marks the
-    // globalIndex complete and stops retrying, RELEASE the lock, and return success.
-    // Funds remain locked on L1; an operator rescue endpoint (tier 2, future work)
-    // would let ops re-process by registering a destination mapping and replaying.
+    // RD-860 / #185 — an unresolvable-destination claim is accepted-and-reverted
+    // (no ClaimEvent) via `accept_and_revert_unclaimable_claim`; funds stay on L1
+    // pending operator rescue (tier 2, future work).
     //
-    // This runs AFTER the landed classification (BLOCKER A): a LANDED gi already
-    // took the accept-and-revert arm above, so RD-860 can only fire for a FRESH gi
-    // and can never emit a second ClaimEvent for an already-claimed one. Ordering
-    // vs C6: RD-860 first because unresolvable-destination is permanent while a
-    // missing GER is transient.
+    // Runs AFTER the landed classification (BLOCKER A): a LANDED gi already took the
+    // accept-and-revert arm above, so RD-860 fires only for a FRESH gi. Ordering vs
+    // C6: RD-860 first, because unresolvable-destination is permanent while a missing
+    // GER is transient.
     if let Err(err) = crate::address_mapper::resolve_address(
         &*service.store,
         params.destinationAddress,
@@ -587,16 +627,19 @@ pub(crate) async fn worker_handle_claim_asset(
              Funds remain on L1 pending operator rescue (RD-860)."
         );
 
-        // Emit the synthetic ClaimEvent even though no Miden funds moved. aggkit expects
-        // the event log on the eth tx receipt to mark the globalIndex claimed; without
-        // it, aggkit will retry forever. The unclaimable_claims table is the SOURCE OF
-        // TRUTH for reconciliation — anyone auditing flows MUST compare ClaimEvent
-        // counts against `unclaimable_claims` to see how many funds are truly on L1.
-        let event = crate::claim::ClaimEvent::from(params.clone());
-        let log = <crate::claim::ClaimEvent as alloy::sol_types::SolEvent>::encode_log_data(&event);
-        record_local_immediate_success(service, txn_hash, txn_envelope, signer, vec![log]).await?;
-        // The gi is now handled (unclaimable record + ClaimEvent); drop the lock so
-        // a resubmit classifies `Landed` (the ClaimEvent exists) → accept-and-revert.
+        // #185 — accept and REVERT, no ClaimEvent (see the fn doc). unclaimable_claims
+        // stays the SOURCE OF TRUTH for how many funds are stranded on L1.
+        accept_and_revert_unclaimable_claim(
+            service,
+            &params,
+            txn_hash,
+            txn_envelope,
+            signer,
+            &signer_str,
+            tx_nonce,
+        )
+        .await?;
+        // The gi is handled (unclaimable record + reverted receipt); drop the lock.
         guard.release_explicitly().await;
         return Ok(());
     }
@@ -1855,6 +1898,28 @@ const QUEUE_TTL_BLOCKS: u64 = 3_600;
 /// post-rebuild baseline, so a LOWER nonce still in validation can arrive first.
 const BOOTSTRAP_SETTLE_BLOCKS: u64 = 3;
 
+/// How long a nonce gap must persist before a STUCK ledger row adopts the
+/// lowest parked nonce (see `bootstrap_one_signer`).
+///
+/// Sized between the two existing constants, deliberately:
+///
+/// * MUCH larger than `BOOTSTRAP_SETTLE_BLOCKS` (3). That margin only has to
+///   outlast a same-tick race between a peek and a park. Here the hazard is a
+///   LOWER nonce still inside a stateful admission — strict-H6 waits are
+///   minutes long — so the window must outlast a whole in-flight admission.
+/// * MUCH smaller than `QUEUE_TTL_BLOCKS` (3600). Keying on the queue TTL was
+///   the first attempt and it is unusable: at the ~20 blocks/min this chain
+///   sustains it is roughly THREE HOURS, so the bridge stays wedged — no claim
+///   lands at all — for the entire time it takes to conclude something the
+///   recovery stamp plus a few minutes of silence already prove. Measured live:
+///   ledger stuck at 6 with a stamped row parked at 7, unchanged for six
+///   minutes, while every L1→L2 claim failed.
+///
+/// Blocks rather than wall-clock on purpose: a busier chain gives a slow lower
+/// nonce more chances to land, so the evidence scales with the traffic that
+/// would produce it.
+const GAP_ADOPT_STALL_BLOCKS: u64 = 120;
+
 /// Wall-clock budget for one signer's slice of the periodic drain sweep.
 const SWEEP_PER_SIGNER_BUDGET_SECS: u64 = 20;
 /// Bound on parked future-nonce txs per signer (a bursty sender's reorder depth
@@ -2065,38 +2130,88 @@ async fn bootstrap_one_signer(service: &ServiceState, signer: &str, bootstrap: b
         let eligible_now = candidate
             .as_ref()
             .is_some_and(|q| bootstrap || q.parked_during_recovery);
-        let settled = match (
-            candidate.as_ref(),
-            service.store.get_latest_block_number().await,
-        ) {
-            (Some(q), Ok(now_block)) => {
+        // ONE read of the tip serves both the settle check and the dead-gap TTL
+        // check below, so they cannot disagree about "now".
+        let now_block_for_gap = service.store.get_latest_block_number().await.unwrap_or(0);
+        let settled = match candidate.as_ref() {
+            Some(q) => {
                 let parked_at = q.expires_at.saturating_sub(QUEUE_TTL_BLOCKS);
-                now_block >= parked_at.saturating_add(BOOTSTRAP_SETTLE_BLOCKS)
+                now_block_for_gap >= parked_at.saturating_add(BOOTSTRAP_SETTLE_BLOCKS)
             }
-            _ => false,
+            None => false,
         };
         if eligible_now
             && settled
             && let Some(q) = candidate
             && q.nonce > 0
-            && matches!(
-                service
-                    .store
-                    .nonce_bootstrap_if_absent(signer, q.nonce)
-                    .await,
-                Ok(true)
-            )
         {
             let min_parked = q.nonce;
-            ::metrics::counter!("rpc_nonce_ledger_bootstrapped_total").increment(1);
-            tracing::warn!(
-                target: "rpc::nonce_repair",
-                signer = %signer,
-                adopted_nonce = min_parked,
-                "#90: no nonce ledger entry for this signer after a store rebuild — adopting \
-                 the LOWEST PARKED nonce as the baseline so a continuing wallet resumes; R4 \
-                 sequencing applies from here on"
-            );
+            // (a) The wallet has NO ledger row at all — the original #90 case.
+            if matches!(
+                service
+                    .store
+                    .nonce_bootstrap_if_absent(signer, min_parked)
+                    .await,
+                Ok(true)
+            ) {
+                ::metrics::counter!("rpc_nonce_ledger_bootstrapped_total").increment(1);
+                tracing::warn!(
+                    target: "rpc::nonce_repair",
+                    signer = %signer,
+                    adopted_nonce = min_parked,
+                    "#90: no nonce ledger entry for this signer after a store rebuild — adopting \
+                     the LOWEST PARKED nonce as the baseline so a continuing wallet resumes; R4 \
+                     sequencing applies from here on"
+                );
+            } else if now_block_for_gap
+                >= q.expires_at
+                    .saturating_sub(QUEUE_TTL_BLOCKS)
+                    .saturating_add(GAP_ADOPT_STALL_BLOCKS)
+            {
+                // (b) The wallet HAS a row, stuck BELOW the lowest parked nonce,
+                // and the gap has now persisted a FULL queue TTL.
+                //
+                // Insert-if-absent cannot reach this: a wallet that transacted
+                // successfully before the recovery has a row, advanced by those
+                // successes. If the recovery loses the tx at exactly the expected
+                // nonce, every later transaction parks behind a nonce that can
+                // never arrive and `nonce_bootstrap_if_absent` returns false on
+                // every sweep, forever. Measured live on a growing chain: ledger
+                // at 5, five `success` transactions, 92 recovery-stamped rows
+                // queued at 6..97, no row at 5 anywhere — and every L1→L2 claim
+                // stopped landing from that moment on.
+                //
+                // The STALL WINDOW is the evidence, and it is why this is not
+                // the reverted round-4 amnesty: the gap has gone unfilled for
+                // GAP_ADOPT_STALL_BLOCKS since this row parked, ON TOP OF the
+                // recovery stamp that already proves a continuing wallet from the
+                // rebuild era. A merely slow lower nonce cannot satisfy both.
+                // The advance is monotonic (`nonce < baseline` in SQL), so it can
+                // never move a ledger backwards or skip a nonce that later shows
+                // up — that one is refused "nonce too low", which is the string
+                // claimtxman's isNonceError matches, so it re-derives and
+                // resubmits rather than wedging.
+                if matches!(
+                    service
+                        .store
+                        .nonce_adopt_if_behind(signer, min_parked)
+                        .await,
+                    Ok(true)
+                ) {
+                    ::metrics::counter!("rpc_nonce_ledger_gap_adopted_total").increment(1);
+                    tracing::warn!(
+                        target: "rpc::nonce_repair",
+                        signer = %signer,
+                        adopted_nonce = min_parked,
+                        parked_at = q.expires_at.saturating_sub(QUEUE_TTL_BLOCKS),
+                        stall_blocks = GAP_ADOPT_STALL_BLOCKS,
+                        now_block = now_block_for_gap,
+                        "#90: nonce ledger was STUCK below the lowest parked nonce and the gap \
+                         outlived a full queue TTL — adopting the lowest parked nonce so a \
+                         continuing wallet resumes instead of wedging forever"
+                    );
+                }
+            }
         }
         drop(guard);
     }
@@ -3002,9 +3117,9 @@ mod tests {
     }
 
     /// RD-860: a claim whose destination cannot be resolved is swallowed — we record
-    /// it in the `unclaimable_claims` store, emit a synthetic `ClaimEvent` so aggkit
-    /// stops retrying, and return success to the caller. Neither `try_claim` nor the
-    /// MidenClient publish path should be touched.
+    /// it in the `unclaimable_claims` store, accept-and-REVERT with no ClaimEvent
+    /// (#185), and return to the caller. Neither `try_claim` nor the MidenClient
+    /// publish path should be touched.
     #[tokio::test]
     async fn test_claim_asset_unresolvable_destination_swallowed() {
         let service = create_test_service();
@@ -3064,7 +3179,7 @@ mod tests {
         );
         assert_eq!(rec.eth_tx_hash, tx_hash);
 
-        // (4) Exactly one synthetic ClaimEvent emitted (so aggkit marks done).
+        // (4) #185 — NO ClaimEvent is emitted (EVM revert semantics).
         let filter = crate::log_synthesis::LogFilter {
             from_block: Some("0x0".to_string()),
             to_block: Some("0xFFFF".to_string()),
@@ -3080,13 +3195,27 @@ mod tests {
             .collect();
         assert_eq!(
             claim_logs.len(),
-            1,
-            "swallow path must emit exactly one ClaimEvent so aggkit stops retrying"
+            0,
+            "#185: unresolvable claim must emit NO ClaimEvent"
         );
 
-        // (5) Nonce incremented and receipt recorded so the RPC client sees success.
+        // (5) Nonce advanced and a REVERTED receipt (status 0x0) recorded.
         assert_eq!(store.nonce_get(&format!("{signer:#x}")).await.unwrap(), 1);
-        assert!(store.txn_receipt(tx_hash).await.unwrap().is_some());
+        let (recpt, _blk) = store.txn_receipt(tx_hash).await.unwrap().expect("receipt");
+        assert!(
+            recpt.is_err(),
+            "#185: unresolvable claim receipt must be reverted"
+        );
+
+        // (6) #185 — the unclaimable record is what isClaimed reads as claimed.
+        assert!(
+            store
+                .get_unclaimable_claim(&global_index)
+                .await
+                .unwrap()
+                .is_some(),
+            "#185: unclaimable record must back isClaimed"
+        );
     }
 
     #[tokio::test]
@@ -3333,6 +3462,84 @@ mod tests {
             3,
             "the executable successor at the frontier must be promoted despite the stale \
              row below it (old gate: MIN != expected => that signer was skipped forever)"
+        );
+    }
+
+    /// #90 follow-up — the ledger row EXISTS but is stuck below a gap that will
+    /// never fill. Insert-if-absent cannot reach this case, so it wedged forever.
+    ///
+    /// Measured live on a growing chain (2026-09-06): signer 0x635243a1… had
+    /// `nonces = 5`, five `transactions` rows all `success`, and NINETY-TWO
+    /// recovery-stamped rows queued at nonces 6..97 — with no transaction at
+    /// nonce 5 anywhere. The recovery lost exactly the tx at the expected nonce,
+    /// so `nonce_bootstrap_if_absent` returned false on every sweep (the row
+    /// exists), nothing promoted, and every L1→L2 claim stopped landing. The
+    /// battery cascaded: iteration 1 was 17 PASS/11 FAIL, iterations 2, 3 and 4
+    /// were each 8 PASS/20 FAIL, with Bridge and Claim event counts frozen.
+    ///
+    /// The fix adopts the lowest parked nonce, but ONLY once the gap has
+    /// outlived a full queue TTL — that is the evidence distinguishing "this
+    /// nonce is never coming" from "a lower nonce is still in validation", and
+    /// it is what keeps this from being the reverted round-4 amnesty.
+    #[tokio::test]
+    async fn finding90_stuck_ledger_below_dead_gap_is_adopted_after_stall() {
+        let (service, _sd) = mempool_service();
+        let store = service.store.clone();
+        store.set_nonce_ledger_rebuilt(true).await.unwrap();
+
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer_str = format!("{:#x}", key.address());
+
+        // The wallet transacted successfully before the recovery, so its ledger
+        // row EXISTS and expects nonce 5. Nothing will ever submit nonce 5.
+        store
+            .nonce_bootstrap_if_absent(&signer_str, 5)
+            .await
+            .unwrap();
+        assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 5);
+
+        // Its next transaction parks at 6, stamped by the recovery window.
+        let (raw, hash) = ger_tx_at(&key, 6, 0xC7);
+        let got = service_send_raw_txn(service.clone(), raw)
+            .await
+            .expect("a continuing signer's tx must be parked, never rejected");
+        assert_eq!(got, hash);
+        assert_eq!(
+            store.peek_queued_min_nonce(&signer_str).await.unwrap(),
+            Some(6)
+        );
+
+        // Past the settle margin, but the gap has NOT yet outlived its TTL: the
+        // ledger must NOT move, because a lower nonce could still be arriving.
+        let now = store.get_latest_block_number().await.unwrap();
+        store
+            .set_latest_block_number(now + BOOTSTRAP_SETTLE_BLOCKS + 1)
+            .await
+            .unwrap();
+        resume_queued_drain(&service).await.unwrap();
+        assert_eq!(
+            store.nonce_get(&signer_str).await.unwrap(),
+            5,
+            "the ledger must NOT skip a gap that is merely slow — only one that \
+             has outlived the stall window"
+        );
+
+        // Now let the gap outlive the STALL WINDOW. Keying on the queue TTL
+        // instead was the first attempt and is unusable in practice: 3600 blocks
+        // is ~3 hours at this chain's rate, so the bridge would stay wedged for
+        // hours to conclude what the stamp plus a few minutes already prove.
+        let parked = store.get_queued_txn(&signer_str, 6).await.unwrap().unwrap();
+        let parked_at = parked.expires_at.saturating_sub(QUEUE_TTL_BLOCKS);
+        store
+            .set_latest_block_number(parked_at + GAP_ADOPT_STALL_BLOCKS + 1)
+            .await
+            .unwrap();
+        resume_queued_drain(&service).await.unwrap();
+
+        assert!(
+            store.nonce_get(&signer_str).await.unwrap() > 5,
+            "after the gap outlived the stall window the wallet must resume at \
+             its own nonce; leaving the ledger at 5 wedges every later claim"
         );
     }
 
@@ -4279,9 +4486,9 @@ mod tests {
     ///
     /// Unit-harness note: the stub `MidenClient` never runs the publish
     /// closure, so the only claim route that completes SYNCHRONOUSLY is the
-    /// RD-860 unresolvable-destination swallow — which still exercises the
-    /// full RPC pipeline (chain-id, nonce, allow-list, dispatch) and emits the
-    /// synthetic ClaimEvent + receipt. The user here claims a deposit destined
+    /// RD-860/#185 unresolvable-destination swallow — which still exercises the
+    /// full RPC pipeline (chain-id, nonce, allow-list, dispatch) and records a
+    /// reverted receipt (no ClaimEvent). The user here claims a deposit destined
     /// to their own EVM address (no Miden mapping registered → swallow). The
     /// real-Miden happy path is covered by scripts/e2e-manual-user-claim.sh.
     #[tokio::test]
@@ -4308,10 +4515,12 @@ mod tests {
             "returned hash must be the user's tx hash"
         );
 
+        // #185 — the swallow route emits NO ClaimEvent; the manual claim is still
+        // ACCEPTED (the point of this test), recorded, and its nonce advances.
         assert_eq!(
             count_claim_events(&store).await,
-            1,
-            "exactly one ClaimEvent must be emitted for the user's claim"
+            0,
+            "#185: the unresolvable-destination swallow emits no ClaimEvent"
         );
         let txn = store
             .txn_get(tx_hash)
@@ -4615,9 +4824,9 @@ mod tests {
             "C's claim for someone else's deposit must reach the Miden publish"
         );
 
-        // Leg 2 — synchronous accept (RD-860 swallow route, the only one that
+        // Leg 2 — synchronous accept (RD-860/#185 swallow route, the only one that
         // completes under the stub): destination is a third party's EVM
-        // address ≠ C. Accepted, ClaimEvent emitted, and the recorded signer
+        // address ≠ C. Accepted, reverted (no ClaimEvent), and the recorded signer
         // is C — the destination in the calldata is untouched by who signed.
         //
         // Fresh service so C's nonce-0 slot is a clean reservation: leg 1 already
@@ -4640,7 +4849,11 @@ mod tests {
             .await
             .expect("permissionless claim for someone else's deposit must be accepted");
         assert_eq!(accepted, tx_hash);
-        assert_eq!(count_claim_events(&store).await, 1);
+        assert_eq!(
+            count_claim_events(&store).await,
+            0,
+            "#185: the unresolvable-destination swallow emits no ClaimEvent"
+        );
         let txn = store.txn_get(tx_hash).await.unwrap().expect("tx recorded");
         assert_eq!(
             txn.signer, addr_c,

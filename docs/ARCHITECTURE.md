@@ -167,7 +167,7 @@ sequenceDiagram
     P->>P: require body-sweep frontier >= current Miden tip
     P->>N: sync_transactions for bridge account and block window
     N-->>P: finalized bridge transactions and consumed nullifiers
-    P->>M: read locally consumed CLAIM and GER notes
+    P->>P: resolve B2AGG, CLAIM and GER consumption from those transactions (resolve_bridge_consumptions)
     loop Each block from cursor plus one to Miden tip
         P->>P: order notes by transaction and input-note position
         P->>S: reserve B2AGG LET indices in that exact order
@@ -177,14 +177,14 @@ sequenceDiagram
     end
 ```
 
-The note sources are deliberately different:
-
-- B2AGG bridge-outs are externally created. Their finalized consumption comes
-  from `sync_transactions` filtered to the bridge account. The tag-0
-  `sync_notes` sweep supplies their bodies and gates projection until those
-  bodies are available.
-- CLAIM and `UpdateGerNote` notes are created by this proxy. Their consumption
-  is read from the local miden-client consumed-note view.
+Every family is projected from the same source (#167). B2AGG, CLAIM and
+`UpdateGerNote` consumption is all attributed from the bridge account's
+`sync_transactions` feed for `[cursor + 1, Miden tip]`, resolved through the one
+`resolve_bridge_consumptions` pipeline (exact `NoteId`, body, and authoritative
+metadata). The tag-0 `sync_notes` sweep supplies note bodies and gates projection
+until they are available. The local miden-client consumed-note view is no longer a
+projection source — it is read only for the live claim-calldata backfill and the
+completeness auditor, so a client-store loss cannot erase CLAIM/GER events.
 
 Each event path validates provenance and fails closed:
 
@@ -257,12 +257,18 @@ synthetic events or advance the tip. The projector enforces LET cardinality
 before sealing.
 
 `--restore` is an offline reconstruction mode. It pauses post-sync listener
-side effects, reimports configured accounts, syncs to the Miden tip, recovers
-missed public B2AGG notes, rebuilds faucet identities, replays B2AGG, CLAIM, and
-GER events through the shared derivations, finalizes the synthetic tip and
-projector cursor, resets the note-sweep cursor for a full healing pass, and
-exits. `--reset-miden-store --restore` is the full local-state recovery path;
-the PostgreSQL volume still contains EVM envelopes and calldata that do not
+side effects, reimports configured accounts, resets both projector cursors to
+genesis, and then drives the SAME `SyntheticProjector` catch-up the live
+scheduler runs — in blocking fail-closed mode, pinned to a captured Miden tip —
+through one frozen serialized actor session (issue #167; the former node-scan
+replay engine was deleted). The projector sources every event family (B2AGG,
+CLAIM, GER) from the bridge's transaction feed by exact note identity, rebuilds
+missing faucet identities through the `faucet_bootstrap` primitive before the
+first dependent event, and halts on any input it cannot reconstruct. It finalizes the synthetic tip
+and projector cursor, parks the note-sweep cursor at the tip the catch-up
+reached, and exits. `--reset-miden-store --restore` is the full local-state
+recovery path; the PostgreSQL volume still contains EVM envelopes and calldata
+that do not
 exist on Miden and therefore cannot be reconstructed from chain data alone.
 
 The independent completeness check is

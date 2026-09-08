@@ -35,6 +35,15 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# PREFLIGHT: the completeness verdict at the END of this run shells out to
+# bridge-out-tool. Build it NOW — a missing binary used to surface only after
+# the full ~38 minutes of load had already passed 30/30, turning a 5-second
+# provisioning miss into a wasted run and a red that looked like a product
+# failure.
+# shellcheck source=scripts/lib-tool-preflight.sh
+. "$SCRIPT_DIR/lib-tool-preflight.sh"
+preflight_bridge_out_tool || exit 1
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 FIXTURES_DIR="$PROJECT_DIR/fixtures"
 

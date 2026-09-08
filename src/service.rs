@@ -633,7 +633,7 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
                 tracing::info!("eth_getTransactionByHash: found synthetic tx {tx_hash_str}");
                 // A ClaimEvent-bearing tx should have been served by the stored-envelope
                 // path above (its full authoritative claimAsset calldata is persisted
-                // under the derived hash — `restore::persist_synthetic_claim_tx` + the
+                // under the derived hash — `projection::persist_synthetic_claim_tx` + the
                 // projector backfill). Reaching this fallback means the calldata is
                 // UNRECOVERABLE (or the backfill hasn't caught up yet): alarm loudly —
                 // aggkit will fail to parse the empty input and stall on this claim —

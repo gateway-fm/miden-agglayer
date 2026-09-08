@@ -3,7 +3,7 @@
 //! derivation (`derive_manual_claim_tx_hash`).
 //!
 //! Shared by the [`SyntheticProjector`](crate::synthetic_projector)'s
-//! `restore::project_claim_note` and the startup restore replay: both observe a
+//! `projection::project_claim_note` (live and `--restore` alike): both observe a
 //! CLAIM note consumed on Miden, decode its on-chain `ClaimNoteStorage`, and emit
 //! a synthetic `ClaimEvent` via `Store::commit_manual_claim_event_atomic`.
 //! Keeping the decoder + tx-hash derivation here means the projector and restore

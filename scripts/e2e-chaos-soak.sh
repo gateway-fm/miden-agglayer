@@ -43,14 +43,12 @@ FRESH="${FRESH:-0}"
 # A consciously-degraded run (e.g. a grown/recovered stack) may set ALLOW_LATE=1;
 # the verdict line prints the mode either way.
 ALLOW_LATE="${ALLOW_LATE:-0}"
-TOOL_BIN="${TOOL_BIN:-$PROJECT_DIR/target/debug/bridge-out-tool}"   # repo-local default; override with $TOOL_BIN
-# #41: fail FAST if the debug tool is missing — a late WARN used to let the whole
-# storm run and then skip the completeness verdict entirely.
-if [[ ! -x "$TOOL_BIN" ]]; then
-    echo "FATAL: $TOOL_BIN not found/executable — the completeness verdict cannot run." >&2
-    echo "       Build it first:  cargo build --bin bridge-out-tool   (then re-run, or pass TOOL_BIN=...)" >&2
-    exit 4
-fi
+# #41: resolve the debug tool FAST — a late WARN used to let the whole storm run
+# and then skip the completeness verdict entirely. Build it rather than only
+# reporting it missing: a report still costs the run.
+# shellcheck source=scripts/lib-tool-preflight.sh
+. "$SCRIPT_DIR/lib-tool-preflight.sh"
+preflight_bridge_out_tool || exit 4
 
 CHAOS_LOG="${CHAOS_LOG:-/tmp/chaos-events.log}"
 GARBO_LOG="${GARBO_LOG:-/tmp/chaos-garbo.log}"
