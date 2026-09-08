@@ -59,7 +59,8 @@ parent hash; they do not commit to the log set.
 
 ## Consumption sources
 
-One local feed cannot reliably serve every note type:
+Since #167, the bridge-account transaction feed serves every note type through
+one pipeline (`resolve_bridge_consumptions`):
 
 - B2AGG notes are made by external wallets and may be created and consumed
   between two proxy syncs. The projector reads bridge-account transactions for
@@ -68,7 +69,9 @@ One local feed cannot reliably serve every note type:
   canonical B2AGG body.
 - CLAIM and GER notes are made by the proxy, with their output metadata and
   durable EVM-transaction links recorded before those specific notes are
-  submitted. Their consumed records come from the local miden-client store.
+  submitted. Their consumption is attributed from that **same** bridge-account
+  transaction feed — not the local miden-client store, which is read only for the
+  claim-calldata backfill and the completeness audit.
 
 The note reconciler walks `sync_notes` for public tag-0 notes. Its persisted
 cursor means “all note bodies through this Miden block were swept,” not “all
