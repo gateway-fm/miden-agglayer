@@ -1,0 +1,7 @@
+[toolchain]
+# Pin the toolchain to the workspace MSRV (Cargo.toml `rust-version`). The stable
+# Miden 0.16 crates (miden-protocol 0.16.1, miden-client 0.16.0) require rustc
+# 1.98.1; without this file CI falls back to the runner's default (1.98.0) and
+# clippy's MSRV check fails. Pinning keeps CI, local dev, and the e2e box aligned.
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
