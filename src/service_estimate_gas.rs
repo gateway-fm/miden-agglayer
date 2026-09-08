@@ -296,14 +296,16 @@ mod tests {
             .await
             .unwrap();
 
-        let response = service_estimate_gas(service, estimate_request(&claim_calldata([0xAA; 32], [0xBB; 32])))
-            .await
-            .expect_err("#185: an unclaimable-recorded globalIndex must revert the estimate");
+        let response = service_estimate_gas(
+            service,
+            estimate_request(&claim_calldata([0xAA; 32], [0xBB; 32])),
+        )
+        .await
+        .expect_err("#185: an unclaimable-recorded globalIndex must revert the estimate");
         let json = serde_json::to_value(response).unwrap();
         assert_eq!(json["error"]["code"], 3);
         assert_eq!(
-            json["error"]["message"],
-            "execution reverted: AlreadyClaimed()",
+            json["error"]["message"], "execution reverted: AlreadyClaimed()",
             "#185: the estimate must agree with eth_call isClaimed, or checkIfClaimed never runs"
         );
         assert_eq!(json["error"]["data"], "0x646cf558");
