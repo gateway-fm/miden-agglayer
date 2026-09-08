@@ -110,33 +110,11 @@ pub(crate) async fn service_estimate_gas(
             crate::applied_state::claim_and_ger_applied(&service, call.globalIndex, &combined)
                 .await
                 .map_err(|error| store_error(answer_id.clone(), error))?;
-        // #185 — a claim already recorded UNCLAIMABLE (unresolvable destination)
-        // is terminal: re-running it reverts again and emits nothing, so the
-        // estimate must revert too.
-        //
-        // This read is not optional, it is the whole retry-suppression path.
-        // ClaimTxManager only calls `checkIfClaimed` (→ `isClaimed`, which since
-        // #185 reads this record) when `ReviewMonitoredTx` fails with an
-        // `execution reverted` error — and `ReviewMonitoredTx`'s only failure
-        // mode is this `eth_estimateGas`. Reading `claim_and_ger_applied` alone,
-        // which sees the Miden nullifier / ClaimEvent and therefore FALSE for an
-        // unclaimable claim, made the estimate answer "0x0, go ahead" while
-        // `eth_call isClaimed` answered "already claimed" — the two disagreed,
-        // `checkIfClaimed` was never reached, and the submitter simply re-sent.
-        //
-        // Measured on a live stack (2026-09-07, one unresolvable deposit):
-        //   claim_unclaimable_reverted_total 0 -> 10 in 19s, ten reverted
-        //   receipts and ten consumed nonces, and the ONLY thing that stopped it
-        //   was claimtxman's own backstop — "marked as failed because reached the
-        //   history size limit (10)". Bounded, but ten times the intended cost and
-        //   never through the mechanism #185 documents.
-        // With this read the second attempt's estimate reverts `AlreadyClaimed()`,
-        // `checkIfClaimed` runs, `isClaimed` returns true and the monitored tx is
-        // marked CONFIRMED.
-        //
-        // Operator rescue (tier 2) must delete the `unclaimable_claims` row to
-        // re-open a global index — the same precondition `eth_call isClaimed`
-        // already imposes since #185, not a new one.
+        // #185 — an unclaimable-recorded gi is terminal (reverts, emits nothing),
+        // so the estimate must revert too. This is the estimate half of
+        // applied_state::claim_terminal and MUST match eth_call isClaimed:
+        // claimtxman reaches checkIfClaimed (→ isClaimed) only when this estimate
+        // reverts, so if they disagree the submitter re-drives to its history cap.
         let unclaimable = service
             .store
             .get_unclaimable_claim(&call.globalIndex)
@@ -253,19 +231,12 @@ mod tests {
         assert_eq!(json["error"]["data"], "0x646cf558");
     }
 
-    /// #185 — a globalIndex recorded UNCLAIMABLE (unresolvable destination) must
-    /// revert the ESTIMATE with `AlreadyClaimed()`, not answer "0x0, go ahead".
-    ///
-    /// This is the load-bearing half of #185's retry suppression. ClaimTxManager
-    /// reaches `checkIfClaimed` (→ `isClaimed`, which reads this record) ONLY when
-    /// `ReviewMonitoredTx` fails `execution reverted`, and its only failure mode is
-    /// this estimate. Without this the estimate and `eth_call isClaimed` disagree and
-    /// the submitter re-sends until its own history cap — measured live at TEN
-    /// reverted receipts and ten consumed nonces for a single unresolvable deposit.
-    ///
-    /// Note the GER here is deliberately ABSENT: the unclaimable record must win over
-    /// the GlobalExitRootInvalid() arm, because "retry when the GER lands" is exactly
-    /// the wrong advice for a claim that can never be applied.
+    /// #185 — an unclaimable-recorded gi must revert the estimate with
+    /// `AlreadyClaimed()` (not "0x0, go ahead"), and must agree with the predicate
+    /// isClaimed reads (`applied_state::claim_terminal`) — else claimtxman never
+    /// reaches checkIfClaimed and re-drives to its history cap. The GER is
+    /// deliberately absent: the unclaimable record must win over the
+    /// GlobalExitRootInvalid() retry-later arm.
     #[tokio::test]
     async fn estimate_gas_unclaimable_record_reverts_already_claimed() {
         use crate::store::{UnclaimableClaim, UnclaimableReason};
@@ -295,6 +266,15 @@ mod tests {
             })
             .await
             .unwrap();
+
+        // The predicate isClaimed reads must now be terminal for this gi — the
+        // estimate below must agree with it.
+        assert!(
+            crate::applied_state::claim_terminal(&service, U256::from(7u64))
+                .await
+                .unwrap(),
+            "#185: isClaimed's predicate must read the unclaimable record as claimed"
+        );
 
         let response = service_estimate_gas(
             service,

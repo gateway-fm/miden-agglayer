@@ -301,16 +301,11 @@ async fn accept_and_revert_landed_claim(
 
 /// #185 — EVM-faithful handling for a claimAsset whose destination cannot be
 /// resolved to a Miden AccountId. Like the landed path, ACCEPT and write a
-/// REVERTED receipt (status 0x0, EMPTY logs, NO ClaimEvent) and advance the
-/// nonce atomically. Unlike the old RD-860 path it emits NO synthetic
-/// ClaimEvent: on EVM a claim that cannot be applied reverts and emits nothing,
-/// and the fabricated event made this claim (a) unreproducible after a
-/// full-DB-loss restore (#103) and (b) a "claim with unclaim" that cut AggLayer
-/// certificate settlement at its block (#184). Retry suppression comes from
-/// `isClaimed(globalIndex)` reading the durable `unclaimable_claims` record as
-/// claimed, so the claim submitter's on-revert `checkIfClaimed` stops
-/// re-driving; even absent that, the submitter's own `monitored_txs` row
-/// removes the deposit from its pending set.
+/// REVERTED receipt (status 0x0, empty logs, NO ClaimEvent) and advance the
+/// nonce atomically. No synthetic ClaimEvent: the old RD-860 one made this claim
+/// unreproducible on restore (#103) and cut certificate settlement at its block
+/// (#184). Retry suppression comes from `isClaimed` reading the unclaimable
+/// record (see `applied_state::claim_terminal`).
 async fn accept_and_revert_unclaimable_claim(
     service: &ServiceState,
     params: &claimAssetCall,
@@ -587,18 +582,14 @@ pub(crate) async fn worker_handle_claim_asset(
         claim_fence,
     );
 
-    // RD-860 / #185 — an unresolvable-destination claim is handled EVM-faithfully:
-    // record the unclaimable entry, accept and write a REVERTED receipt with NO
-    // ClaimEvent, RELEASE the lock, and return. `isClaimed(globalIndex)` reads the
-    // unclaimable record as claimed so the claim submitter stops retrying (see
-    // `accept_and_revert_unclaimable_claim`). Funds remain on L1; an operator rescue
-    // endpoint (tier 2, future work) would re-process by registering a mapping.
+    // RD-860 / #185 — an unresolvable-destination claim is accepted-and-reverted
+    // (no ClaimEvent) via `accept_and_revert_unclaimable_claim`; funds stay on L1
+    // pending operator rescue (tier 2, future work).
     //
-    // This runs AFTER the landed classification (BLOCKER A): a LANDED gi already
-    // took the accept-and-revert arm above, so RD-860 can only fire for a FRESH gi
-    // and can never emit a second ClaimEvent for an already-claimed one. Ordering
-    // vs C6: RD-860 first because unresolvable-destination is permanent while a
-    // missing GER is transient.
+    // Runs AFTER the landed classification (BLOCKER A): a LANDED gi already took the
+    // accept-and-revert arm above, so RD-860 fires only for a FRESH gi. Ordering vs
+    // C6: RD-860 first, because unresolvable-destination is permanent while a missing
+    // GER is transient.
     if let Err(err) = crate::address_mapper::resolve_address(
         &*service.store,
         params.destinationAddress,
@@ -636,12 +627,8 @@ pub(crate) async fn worker_handle_claim_asset(
              Funds remain on L1 pending operator rescue (RD-860)."
         );
 
-        // #185 — accept and REVERT, emit NO ClaimEvent. On EVM a claim that cannot be
-        // applied reverts and emits nothing; fabricating a ClaimEvent here made this
-        // claim unreproducible on restore (#103) and cut certificate settlement at its
-        // block (#184). Retry suppression comes from `isClaimed(globalIndex)`, which
-        // reads the durable unclaimable_claims record as claimed. The unclaimable_claims
-        // table remains the SOURCE OF TRUTH for how many funds are stranded on L1.
+        // #185 — accept and REVERT, no ClaimEvent (see the fn doc). unclaimable_claims
+        // stays the SOURCE OF TRUTH for how many funds are stranded on L1.
         accept_and_revert_unclaimable_claim(
             service,
             &params,

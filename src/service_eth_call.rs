@@ -95,21 +95,13 @@ pub(crate) async fn service_eth_call(
                 ));
             };
             let global_index = crate::applied_state::global_index_for_claim(leaf_index, source);
-            // #185 — a claim recorded as unclaimable (unresolvable destination) reads
-            // as CLAIMED here even though no ClaimEvent was emitted and no funds moved
-            // on Miden. This replaces the old synthetic ClaimEvent as the claim
-            // submitter's retry-suppression signal (its on-revert `checkIfClaimed`
-            // reads true), with no log to break restore (#103) or certificate
+            // #185 — reads TRUE for an unclaimable-recorded claim (no ClaimEvent, no
+            // Miden funds moved): the retry-suppression signal that replaced the
+            // synthetic event, with no log to break restore (#103) or certificate
             // settlement (#184). aggsender never reads isClaimed, so it enters no cert.
-            let applied = service
-                .store
-                .get_unclaimable_claim(&global_index)
+            let applied = crate::applied_state::claim_terminal(&service, global_index)
                 .await
-                .map_err(|error| store_error(answer_id.clone(), error))?
-                .is_some()
-                || crate::applied_state::claim_applied(&service, global_index)
-                    .await
-                    .map_err(|error| store_error(answer_id.clone(), error))?;
+                .map_err(|error| store_error(answer_id.clone(), error))?;
             return Ok(JsonRpcResponse::success(
                 answer_id,
                 if applied { ABI_TRUE } else { ABI_FALSE },

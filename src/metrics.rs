@@ -115,21 +115,15 @@ pub fn init_metrics() {
     );
     describe_counter!(
         "claim_unclaimable_reverted_total",
-        "#185 EVM-revert semantics: a claimAsset whose destination has no Miden AccountId \
-         (unresolvable) was recorded in unclaimable_claims and ACCEPTED with a reverted \
-         (status 0x0) receipt and NO ClaimEvent — matching how an unappliable claim behaves on \
-         EVM. Retry suppression comes from isClaimed reading the unclaimable record as claimed. \
-         Compare against unclaimable_claims rows to see funds truly stranded on L1; a steady \
-         climb means many claims target unmapped destinations."
+        "#185: an unresolvable-destination claimAsset was accepted with a reverted (0x0) receipt \
+         and NO ClaimEvent (EVM revert semantics). Compare against unclaimable_claims rows to \
+         see funds stranded on L1; a steady climb means many claims target unmapped destinations."
     );
     describe_counter!(
         "rpc_estimate_gas_unclaimable_total",
-        "#185: eth_estimateGas(claimAsset) answered `execution reverted: AlreadyClaimed()` \
-         because the globalIndex is recorded in unclaimable_claims. This is what makes the \
-         claim submitter run its on-revert checkIfClaimed and mark the monitored tx CONFIRMED \
-         instead of re-sending; without it a single unresolvable deposit cost TEN reverted \
-         receipts and ten nonces before claimtxman's own history cap stopped it. Expect roughly \
-         one per unresolvable deposit AFTER its first (record-creating) attempt."
+        "#185: eth_estimateGas(claimAsset) reverted AlreadyClaimed() for a gi recorded \
+         unclaimable, so the submitter's on-revert checkIfClaimed marks the tx CONFIRMED instead \
+         of re-sending. Expect ~one per unresolvable deposit after its first (record-creating) attempt."
     );
     describe_counter!(
         "claim_inflight_dedup_total",
