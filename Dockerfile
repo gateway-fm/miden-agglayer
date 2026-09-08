@@ -20,7 +20,13 @@ RUN \
     && cp target/release/bridge-out-tool bin/bridge-out-tool \
     && cp target/release/bridge-autoclaim bin/bridge-autoclaim
 
-FROM debian:trixie-slim
+# Named so release.yml can mark this stage uncached (`no-cache-filters`). The
+# `apt-get upgrade` below is what carries Debian security updates into the
+# image, and its buildx cache key is the instruction text (never changes) plus
+# the debian:trixie-slim digest — so while the base digest sits still, every
+# release after the first restores this layer from the gha cache and reships
+# the same package versions.
+FROM debian:trixie-slim AS runtime
 
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     ca-certificates \

@@ -50,6 +50,14 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+          # Aikido: always rebuild the `runtime` stage, the one that runs
+          # `apt-get update && apt-get upgrade -y`. Its cache key is the
+          # instruction text (never changes) plus the debian:trixie-slim
+          # digest, so between base-image refreshes the gha cache restores a
+          # pre-advisory layer and the release republishes the SAME vulnerable
+          # packages. Only this stage is uncached; the Rust build stage — the
+          # expensive one — still hits the cache.
+          no-cache-filters: runtime
           outputs: type=image,name=gatewayfm/miden-agglayer,push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest
