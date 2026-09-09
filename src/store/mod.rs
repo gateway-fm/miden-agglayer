@@ -1433,7 +1433,15 @@ pub trait Store: Send + Sync + 'static {
 
     // === Faucet registry ===
     /// Register or update a faucet entry (upsert by faucet_id).
-    async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<()>;
+    /// Register (or idempotently refresh) a faucet.
+    ///
+    /// Returns `true` when this `faucet_id` owns the origin's registry row after
+    /// the call — it was inserted, or an existing row for the SAME faucet_id was
+    /// refreshed. Returns `false` when a DIFFERENT faucet already holds
+    /// `(origin_address, origin_network)` and this call was a first-write-wins
+    /// no-op that wrote nothing for this faucet_id (see #196 for how a duplicate
+    /// generation gets here; the caller MUST NOT treat a `false` as a rebuild).
+    async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<bool>;
     /// Look up a faucet by its L1 origin token address and network.
     async fn get_faucet_by_origin(
         &self,
