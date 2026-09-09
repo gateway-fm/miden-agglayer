@@ -13,6 +13,8 @@ BASE_ENV=(env -u WITH_WEB3SIGNER -u EXTRA_COMPOSE_FILES)
 # shellcheck source=scripts/lib-tool-preflight.sh
 . "$PWD/scripts/lib-tool-preflight.sh"
 preflight_bridge_out_tool "$R/logs" || exit 1
+# shellcheck source=scripts/lib-stack-health.sh
+. "$PWD/scripts/lib-stack-health.sh"
 
 
 matrix() { "$PWD/scripts/e2e-battery-matrix.py" "$TSV" > "$R/MATRIX.md" 2>/dev/null; }
@@ -120,19 +122,23 @@ time out; the wedge is the cause, not those targets." | tee -a "$R/battery.log"
 # non-KEEP_CHAIN battery a `fresh` target's teardown clears the stack first, so
 # this correctly reads healthy after a reprovision.
 projector_wedged() { # $1 = iteration, $2 = next target label
-    local proxy reason
-    proxy="$(docker ps --format '{{.Names}}' | grep -E -- '-miden-agglayer-1$' | head -1)"
-    [[ -n "$proxy" ]] || return 1
-    reason="$(docker logs --tail 300 "$proxy" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' \
-        | grep -aoiE 'projector halted \(fail-closed\):.*' | tail -1 | cut -c1-260)"
-    [[ -n "$reason" ]] || return 1
+    # Classify the whole stack (lib-stack-health.sh), not just the projector: an
+    # INFRA-broken box (crash-looping/unhealthy containers, dead RPC — the 0/21
+    # box-corruption class) and a WEDGED pipeline (projector fail-closed / frozen
+    # tip) both make EVERY remaining target fail through no fault of its own. Name
+    # the cause ONCE with its verdict and let run() short-circuit the rest as SKIP.
+    local verdict rc kind
+    verdict="$(stack_health)"
+    rc=$?
+    (( rc == 0 )) && return 1 # HEALTHY — run the target
+    (( rc == 2 )) && kind=wedge || kind=infra
     if [[ "${BATTERY_WEDGED:-0}" != 1 ]]; then
         BATTERY_WEDGED=1
-        echo "[$(date -u +%H:%M:%SZ)] PROJECTOR WEDGE before $2 — $reason" | tee -a "$R/battery.log"
-        printf '%s\t%s\t%s\t%s\t%s\n' "${ITER_PREFIX:-}$1" "projector-wedge-before-$2" \
+        echo "[$(date -u +%H:%M:%SZ)] STACK ${kind^^} before $2 — $verdict" | tee -a "$R/battery.log"
+        printf '%s\t%s\t%s\t%s\t%s\n' "${ITER_PREFIX:-}$1" "stack-$kind-before-$2" \
             "FAIL" "0" "$R/battery.log" >> "$TSV"
         matrix
-        post_mortem "$1" "projector-wedge-before-$2"
+        post_mortem "$1" "stack-$kind-before-$2"
     fi
     return 0
 }
@@ -208,7 +214,7 @@ run() {
         printf '%s\t%s\t%s\t%s\t%s\n' "${ITER_PREFIX:-}$iter" "$label" \
             "SKIP-wedged" "0" "$R/battery.log" >> "$TSV"
         matrix
-        echo "[$(date -u +%H:%M:%SZ)] ${ITER_PREFIX:-i}$iter $label SKIP — projector wedged (see projector-wedge row)" | tee -a "$R/battery.log"
+        echo "[$(date -u +%H:%M:%SZ)] ${ITER_PREFIX:-i}$iter $label SKIP — stack unhealthy/wedged (see stack-*-before row)" | tee -a "$R/battery.log"
         return 0
     fi
     nonce_gate "$iter" "$label"
@@ -245,6 +251,13 @@ if [[ "${ITER_START:-1}" == "1" ]]; then
   echo "=== one-time genesis wipe before iteration 1 ===" | tee -a "$R/battery.log"
   WIPE_ENV=(env -u WITH_WEB3SIGNER -u EXTRA_COMPOSE_FILES KEEP_CHAIN=0)
   "${WIPE_ENV[@]}" make e2e-down       >>"$R/logs/down.log" 2>&1 || true
+  # NUCLEAR reset before clean-data: `make e2e-clean-data` does NOT recreate
+  # already-running node containers, so a corrupted box (stale node_data, a
+  # stateless L2B anvil, a wedged chain) survives it and fails every target on
+  # `up --wait` (observed: a 0/21 matrix). Remove all containers + volumes so a
+  # fresh genesis is truly fresh.
+  echo "=== nuclear reset (remove all miden-agglayer containers + volumes) ===" | tee -a "$R/battery.log"
+  stack_nuclear_reset
   "${WIPE_ENV[@]}" make e2e-clean-data >>"$R/logs/down.log" 2>&1
   # THE LIVE-BASELINE DRILL — must run HERE, before any target that restores.
   #
