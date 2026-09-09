@@ -108,6 +108,35 @@ time out; the wedge is the cause, not those targets." | tee -a "$R/battery.log"
     return 0
 }
 
+# A WEDGED projector is a distinct, UNRECOVERABLE class from the nonce-gap gate:
+# the projector fail-closed on a leaf it cannot resolve, the synthetic tip is
+# frozen, and NOTHING self-heals — so every later target only re-observes the
+# frozen tip and burns its full timeout. That is exactly the #193 g1->g3 run: a
+# half-registered native faucet quarantined a B2AGG leaf, the projector halted,
+# and 40+ targets each timed out with the wedge (not the target) as the cause.
+# Detect it straight from the proxy's own fail-closed log line (emitted every
+# sync tick while halted), name it ONCE with the halt reason, and let run() skip
+# the rest fast. Returns 0 (== "wedged, skip this target"), 1 otherwise. Under a
+# non-KEEP_CHAIN battery a `fresh` target's teardown clears the stack first, so
+# this correctly reads healthy after a reprovision.
+projector_wedged() { # $1 = iteration, $2 = next target label
+    local proxy reason
+    proxy="$(docker ps --format '{{.Names}}' | grep -E -- '-miden-agglayer-1$' | head -1)"
+    [[ -n "$proxy" ]] || return 1
+    reason="$(docker logs --tail 300 "$proxy" 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' \
+        | grep -aoiE 'projector halted \(fail-closed\):.*' | tail -1 | cut -c1-260)"
+    [[ -n "$reason" ]] || return 1
+    if [[ "${BATTERY_WEDGED:-0}" != 1 ]]; then
+        BATTERY_WEDGED=1
+        echo "[$(date -u +%H:%M:%SZ)] PROJECTOR WEDGE before $2 — $reason" | tee -a "$R/battery.log"
+        printf '%s\t%s\t%s\t%s\t%s\n' "${ITER_PREFIX:-}$1" "projector-wedge-before-$2" \
+            "FAIL" "0" "$R/battery.log" >> "$TSV"
+        matrix
+        post_mortem "$1" "projector-wedge-before-$2"
+    fi
+    return 0
+}
+
 # Chain growth is the point of the run, so it is recorded, not assumed. Called
 # at every drill and at each iteration boundary.
 chain_mark() { # $1 = label
@@ -175,6 +204,13 @@ run() {
     local iter="$1" label="$2" mode="$3"; shift 3
     local log="$R/logs/${ITER_PREFIX:-i}${iter}-${label}.log" t0 t1 rc
     [[ "$mode" == fresh ]] && down
+    if projector_wedged "$iter" "$label"; then
+        printf '%s\t%s\t%s\t%s\t%s\n' "${ITER_PREFIX:-}$iter" "$label" \
+            "SKIP-wedged" "0" "$R/battery.log" >> "$TSV"
+        matrix
+        echo "[$(date -u +%H:%M:%SZ)] ${ITER_PREFIX:-i}$iter $label SKIP — projector wedged (see projector-wedge row)" | tee -a "$R/battery.log"
+        return 0
+    fi
     nonce_gate "$iter" "$label"
     echo "[$(date -u +%H:%M:%SZ)] ${ITER_PREFIX:-i}$iter $label START" | tee -a "$R/battery.log"
     t0=$(date +%s)
