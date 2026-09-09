@@ -34,7 +34,13 @@ stack_health() {
     local rpc="${L2_RPC:-http://localhost:8546}"
     local proxy prefix
     proxy="$(_sh_proxy)"
-    if [[ -z "$proxy" ]]; then echo "INFRA:no-proxy-container-running"; return 1; fi
+    # No proxy container is the NORMAL pre-bring-up state — the very first target
+    # (and any fresh-provisioning target) runs `up --build` itself, so there is
+    # nothing up yet to be broken or wedged. Report HEALTHY so the preflight lets
+    # the target bring the stack up; INFRA/WEDGED below require a proxy to EXIST.
+    # (Treating "no proxy" as INFRA short-circuited a whole battery before its
+    # first target — a fresh-run false positive.)
+    if [[ -z "$proxy" ]]; then echo "HEALTHY:no-stack-yet"; return 0; fi
     prefix="${proxy%-miden-agglayer-1}"
 
     # 1. Any core container Exited/Dead/Restarting is a hard infra failure — the
