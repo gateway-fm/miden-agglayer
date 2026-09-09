@@ -43,6 +43,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # went in; this standalone one was left behind.
 # shellcheck source=scripts/lib-tool-preflight.sh
 . "$SCRIPT_DIR/lib-tool-preflight.sh"
+# shellcheck source=scripts/lib-stack-health.sh
+. "$SCRIPT_DIR/lib-stack-health.sh"
 preflight_bridge_out_tool || exit 1
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 FIXTURES_DIR="$PROJECT_DIR/fixtures"
@@ -562,6 +564,17 @@ while :; do
         last="$cur"; stalled=0
     else
         stalled=$((stalled + SETTLE_INTERVAL))
+    fi
+    # A stall can mean "settled" OR the pipeline wedged. Once claims have paused,
+    # classify the stack (lib-stack-health.sh) and abort FAST with the cause rather
+    # than blaming the loadtest for a wedge/infra break and waiting out the window.
+    if (( stalled >= 60 )); then
+        _lt_verdict="$(stack_health 2>/dev/null)"
+        if (( $? != 0 )); then
+            SETTLE_END_REASON="${_lt_verdict%%:*}"
+            r "  settle: ABORTING — stack is not healthy: $_lt_verdict"
+            break
+        fi
     fi
     [[ $stalled -ge $SETTLE_STALL ]] && { SETTLE_END_REASON=stall; r "  settle: no new claims for ${SETTLE_STALL}s — done"; break; }
     if [[ $elapsed -ge $SETTLE_CAP ]]; then
