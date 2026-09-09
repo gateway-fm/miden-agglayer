@@ -176,15 +176,20 @@ pass "monitor_* tables preserved across proxy restart"
 #            is unit-tested in src/burn_serial_tracker.rs.
 if [[ "$POST_COUNT" -ge 1 ]]; then
     step "Asserting INSERT … ON CONFLICT DO NOTHING semantics for a known-seen serial..."
-    SERIAL_HEX="$(pgquery "SELECT encode(serial, 'hex') FROM monitor_burn_serials LIMIT 1")"
+    SERIAL_HEX="$(pgquery "SELECT encode(serial, 'hex') FROM monitor_burn_serials LIMIT 1" | tr -d '[:space:]')"
     if [[ -z "$SERIAL_HEX" ]]; then
         fail "couldn't pull a sample serial from monitor_burn_serials"
     fi
     log "Sample serial: $SERIAL_HEX"
-    # Try to INSERT the same serial: ON CONFLICT DO NOTHING returns 0 rows.
-    INSERTED=$(pgquery "INSERT INTO monitor_burn_serials (serial) VALUES (decode('$SERIAL_HEX','hex')) ON CONFLICT (serial) DO NOTHING RETURNING serial" | wc -l | tr -d ' ')
-    if [[ "$INSERTED" -ne 0 ]]; then
-        fail "second INSERT of a known serial returned $INSERTED rows; ON CONFLICT semantics broken"
+    # Re-INSERT the SAME serial: ON CONFLICT DO NOTHING must affect 0 rows, so
+    # RETURNING yields nothing. Inspect the RETURNING value directly (trimmed), not
+    # `wc -l` — `pgquery` is `psql -t -A`, whose 0-row result is a trailing empty
+    # line that `wc -l` counted as "1 row", failing this assertion even though the
+    # DB correctly rejected the duplicate (serial is the PRIMARY KEY). That stale
+    # miscount, not the product, is why RD-913 was a chronic false red.
+    DUP_RET="$(pgquery "INSERT INTO monitor_burn_serials (serial) VALUES (decode('$SERIAL_HEX','hex')) ON CONFLICT (serial) DO NOTHING RETURNING encode(serial,'hex')" | tr -d '[:space:]')"
+    if [[ -n "$DUP_RET" ]]; then
+        fail "second INSERT of a known serial inserted a row ($DUP_RET); ON CONFLICT semantics broken"
     fi
     pass "duplicate BURN serial is correctly rejected at the DB layer"
 else
