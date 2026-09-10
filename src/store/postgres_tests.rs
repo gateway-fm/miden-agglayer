@@ -2789,3 +2789,61 @@ async fn test_pgstore_orphan_recovery_self_heals() {
     // Clean up this row so a re-run starts fresh (shared DB).
     let _ = store.txn_commit(hash, Ok(()), 1, [0u8; 32]).await;
 }
+
+/// #195 — the Postgres-specific silent no-op the misleading log hid. A DIFFERENT
+/// faucet for an origin already registered is a first-write-wins no-op:
+/// `register_faucet` MUST return `false` (not a false success), and the colliding
+/// faucet_id must have NO row — the exact condition that made `faucet_bootstrap`
+/// log a rebuild that wrote nothing and the projector then fail-close (#193/#196).
+/// InMemoryStore already modelled + warned this; PgStore did the no-op but reported
+/// it as success, so the bug (and its diagnosis) was Postgres-only.
+#[tokio::test]
+async fn register_faucet_colliding_origin_is_a_reported_noop_195() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    use miden_protocol::account::AccountId;
+    // Origin/network exclusive to this test so the shared DB stays re-run-safe.
+    let origin = [0x9Au8; 20];
+    let net = 7u32;
+    let faucet_a = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
+    let faucet_b = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
+    let entry = |id| crate::store::FaucetEntry {
+        faucet_id: id,
+        origin_address: origin,
+        origin_network: net,
+        symbol: "GEN".into(),
+        origin_decimals: 18,
+        miden_decimals: 8,
+        scale: 10,
+        metadata: vec![],
+    };
+
+    // First writer wins → reports it wrote its row.
+    assert!(
+        store.register_faucet(entry(faucet_a)).await.unwrap(),
+        "#195: first writer must report it wrote its row"
+    );
+    // A DIFFERENT faucet for the SAME origin → first-write-wins NO-OP.
+    assert!(
+        !store.register_faucet(entry(faucet_b)).await.unwrap(),
+        "#195: a colliding second faucet must report a NO-OP (false), not success"
+    );
+    // The colliding faucet_id has NO row — what made the rebuild silent.
+    assert!(
+        store.get_faucet_by_id(faucet_b).await.unwrap().is_none(),
+        "#195: the colliding faucet_id must have no row"
+    );
+    // The origin still resolves to the first writer.
+    let by_origin = store
+        .get_faucet_by_origin(&origin, net)
+        .await
+        .unwrap()
+        .expect("origin must resolve to the first faucet");
+    assert_eq!(by_origin.faucet_id, faucet_a);
+    // Re-registering the OWNING faucet_id is a truthful refresh → true.
+    assert!(
+        store.register_faucet(entry(faucet_a)).await.unwrap(),
+        "#195: re-registering the owning faucet_id refreshes and reports true"
+    );
+}

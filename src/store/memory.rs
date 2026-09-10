@@ -2446,7 +2446,7 @@ impl Store for InMemoryStore {
 
     // ── Faucet registry ──────────────────────────────────────────
 
-    async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<()> {
+    async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<bool> {
         let mut faucets = self.faucets.write();
         // Idempotent by faucet_id: the same faucet re-registering (e.g. startup
         // re-init) refreshes its mutable fields. Mirrors PgStore, whose faucet_id
@@ -2477,7 +2477,7 @@ impl Store for InMemoryStore {
             if !entry.metadata.is_empty() {
                 existing.metadata = entry.metadata;
             }
-            return Ok(());
+            return Ok(true);
         }
         // Finding #10 — converge on the (origin_address, origin_network) key.
         // A *different* faucet already owning this origin route means a
@@ -2496,10 +2496,10 @@ impl Store for InMemoryStore {
                 "finding #10: register_faucet origin already owned by another faucet; \
                  keeping the existing route (first-write wins)"
             );
-            return Ok(());
+            return Ok(false);
         }
         faucets.push(entry);
-        Ok(())
+        Ok(true)
     }
 
     async fn get_faucet_by_origin(
@@ -4126,7 +4126,7 @@ mod tests {
         let faucet_b = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
 
         // Worker A wins the race and registers first.
-        store
+        let wrote_a = store
             .register_faucet(FaucetEntry {
                 faucet_id: faucet_a,
                 origin_address: origin,
@@ -4139,10 +4139,14 @@ mod tests {
             })
             .await
             .unwrap();
+        assert!(
+            wrote_a,
+            "#195: the first writer must report it wrote its own row"
+        );
 
         // Worker B loses: a DIFFERENT faucet for the SAME (origin, network).
         // Post-fix this converges — no error, no second row.
-        store
+        let wrote_b = store
             .register_faucet(FaucetEntry {
                 faucet_id: faucet_b,
                 origin_address: origin,
@@ -4155,6 +4159,16 @@ mod tests {
             })
             .await
             .unwrap();
+        assert!(
+            !wrote_b,
+            "#195: a colliding second faucet must report a NO-OP (false), not a false success"
+        );
+        // And the colliding faucet_id must NOT resolve — the exact condition that
+        // makes faucet_bootstrap's rebuild a silent no-op and the projector halt.
+        assert!(
+            store.get_faucet_by_id(faucet_b).await.unwrap().is_none(),
+            "#195: the colliding faucet_id must have no row (get_faucet_by_id is None)"
+        );
 
         // Exactly one row survives — the first-writer's faucet.
         assert_eq!(store.list_faucets().await.unwrap().len(), 1);

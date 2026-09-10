@@ -25,6 +25,11 @@ use crate::store::Store;
 pub struct FaucetBootstrapReport {
     pub rebuilt: usize,
     pub already_known: usize,
+    /// Faucets the bridge registers whose rebuild was a first-write-wins no-op
+    /// because a DIFFERENT faucet already owns their origin (#196). Their
+    /// historical bridge-outs stay unresolvable; a nonzero count means restore
+    /// will fail-closed on one of them.
+    pub origin_collisions: usize,
 }
 
 /// Idempotent and cheap when nothing is missing, so the projector can run it
@@ -96,10 +101,28 @@ pub async fn rebuild_missing_faucet_identities(
             }
         };
         let (origin_network, scale) = (entry.origin_network, entry.scale);
-        store.register_faucet(entry).await.map_err(|e| {
+        let wrote = store.register_faucet(entry).await.map_err(|e| {
             ::metrics::counter!("restore_faucet_identity_rebuild_failed_total").increment(1);
             anyhow::anyhow!("faucet bootstrap: register_faucet({faucet_id}) failed: {e:#}")
         })?;
+        if !wrote {
+            // #195/#196 — the origin slot is already held by a DIFFERENT faucet
+            // generation, so this rebuild wrote nothing (first-write-wins no-op).
+            // Do NOT report it as rebuilt: this faucet's historical bridge-outs
+            // stay unresolvable and restore fail-closes on them (correct), and the
+            // operator must see WHY here, not a false "rebuilt" line.
+            ::metrics::counter!("restore_faucet_rebuild_origin_collision_total").increment(1);
+            report.origin_collisions += 1;
+            tracing::warn!(
+                faucet_id = %faucet_id,
+                origin_network,
+                scale,
+                "faucet bootstrap: NOT rebuilt — origin (address, network) already owned by a \
+                 different faucet generation (first-write-wins no-op); this faucet's historical \
+                 bridge-outs will not resolve and restore will halt on them (see #196)"
+            );
+            continue;
+        }
         report.rebuilt += 1;
         ::metrics::counter!("restore_faucet_identity_rebuilt_total").increment(1);
         tracing::info!(

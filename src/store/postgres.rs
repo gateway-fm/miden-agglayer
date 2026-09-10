@@ -3427,7 +3427,7 @@ impl Store for PgStore {
 
     // ── Faucet registry ──────────────────────────────────────────
 
-    async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<()> {
+    async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<bool> {
         let client = self.pool.get().await?;
         let faucet_id = entry.faucet_id.to_hex();
         // Finding #10 — converge on the (origin_address, origin_network) unique
@@ -3443,7 +3443,7 @@ impl Store for PgStore {
         // faucet for the same origin a no-op (first-write wins). There is no
         // live route-swap API; the only way to repoint an origin at a different
         // faucet is out-of-band DR/repair tooling operating directly on the row.
-        client
+        let rows = client
             .execute(
                 "INSERT INTO faucet_registry (faucet_id, origin_address, origin_network, symbol, origin_decimals, miden_decimals, scale, metadata)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -3474,8 +3474,24 @@ impl Store for PgStore {
                 ],
             )
             .await?;
+        // Zero rows means the `ON CONFLICT … WHERE faucet_id = EXCLUDED.faucet_id`
+        // guard rejected the write: the origin slot is already held by a DIFFERENT
+        // faucet (first-write-wins), so nothing was written for THIS faucet_id.
+        // Report that honestly — logging "faucet registered" here is what let a
+        // duplicate generation (#196) masquerade as a successful rebuild (#195).
+        if rows == 0 {
+            tracing::warn!(
+                faucet_id = %faucet_id,
+                symbol = %entry.symbol,
+                origin_network = entry.origin_network,
+                "PgStore: register_faucet was a NO-OP — origin (address, network) is already \
+                 owned by a DIFFERENT faucet (first-write-wins); no row written for this \
+                 faucet_id. A historical bridge-out minted by it will not resolve (see #196)"
+            );
+            return Ok(false);
+        }
         tracing::info!(faucet_id = %faucet_id, symbol = %entry.symbol, "PgStore: faucet registered");
-        Ok(())
+        Ok(true)
     }
 
     async fn get_faucet_by_origin(
