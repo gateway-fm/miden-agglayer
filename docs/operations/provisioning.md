@@ -243,21 +243,78 @@ fee asset `0x18101fa522c174b165efd4f70a0385` — fails at the first deploy with
 
 **You fund only the two KMS-keyed accounts; the proxy cascades the rest.**
 
-1. **Print what to fund.** With the signer configured exactly as for a normal
-   boot, run once with `--print-funding`. It builds and *persists*
-   `service`/`ger_manager` (their ids are random-seeded, so they exist only once
-   persisted), reads the chain's fee parameters, writes `funding.toml` beside
-   `bridge_accounts.toml`, prints the two addresses, the fee asset and the
-   recommended amounts, and exits **without deploying**. Re-running it re-prints
-   and never rebuilds.
-2. **Send the fee asset** to those two addresses as P2ID notes (your treasury /
-   the chain's faucet). `fund_service` is larger: it includes what `service`
-   cascades to the bridge and faucets.
-3. **Start the proxy normally.** `--init` *resumes* the recorded accounts, waits
-   (up to `--funding-wait-secs`, default 900) for each funding note, deploys
-   each account by **consuming** that note — the vault is filled before the fee
-   is charged, so the deploy pays for itself — then `service` cascade-funds the
-   bridge and every faucet (at init and as new tokens appear at runtime).
+### Manual procedure (DevOps)
+
+Run these by hand, in order. `$STORE`, `$NODE`, and `$SIGNER_FLAGS` are the same
+`--miden-store-dir`, `--miden-node`, and signer flags (`--signer-url`,
+`--signer-key …`) you boot the proxy with.
+
+**1. Print what to fund** — with the signer configured exactly as for a normal
+boot, run once with `--print-funding` and stop. It builds and *persists*
+`service`/`ger_manager` (their ids are random-seeded — they exist only once
+persisted), reads the chain's fee parameters, writes `funding.toml` beside
+`bridge_accounts.toml`, and exits **without deploying** (re-running re-prints and
+never rebuilds):
+
+```sh
+miden-agglayer-service --print-funding \
+  --miden-store-dir "$STORE" --miden-node "$NODE" $SIGNER_FLAGS
+cat "$STORE/funding.toml"
+```
+
+`funding.toml` gives you everything you need:
+
+```toml
+service       = "0x…"      # KMS-keyed — fund this
+ger_manager   = "0x…"      # KMS-keyed — fund this
+fee_faucet_id = "0x…"      # the chain's native fee asset
+verification_base_fee = 7
+max_fee_per_txn       = 210
+fund_service     = 80640   # bigger: covers what service cascades to bridge/faucets
+fund_ger_manager = 53760
+```
+
+**2. Send the fee asset** — from whatever account holds the native fee asset
+(your treasury; on the testnet, the genesis faucet operator), send **`fund_*`
+units to each address as a P2ID note**. Two addresses only. With the operator
+tool that means (`--faucet-operator-mac` is the *source-of-funds* account file
+that holds the fee asset and its key — the treasury/faucet-operator wallet, NOT
+the proxy's KMS accounts):
+
+```sh
+bridge-out-tool --fund-fee-asset \
+  --store-dir /tmp/funder --node-url "$NODE" \
+  --faucet-operator-mac /path/to/treasury.mac \
+  --funding-manifest "$STORE/funding.toml"
+```
+
+Or, from any Miden wallet you control, send two P2ID notes of the fee asset:
+`fund_service` → `service`, `fund_ger_manager` → `ger_manager`.
+
+**3. Start the proxy normally.** `--init` *resumes* the recorded accounts, waits
+(up to `--funding-wait-secs`, default 900) for each funding note, deploys each
+account by **consuming** it — the vault is filled before the fee is charged, so
+the deploy pays for itself — then `service` cascade-funds the bridge and every
+faucet (at init, and each new faucet as a token is first bridged). If a funding
+note is missing, the log says exactly which address to send how much of which
+asset; send it and init continues.
+
+### Ongoing top-ups
+
+Fees are per-transaction and continuous, so this is a **balance to maintain**,
+not a one-time deposit — `ger_manager` pays on every GER injection, `service` on
+every claim, the bridge on every network transaction, each faucet on every mint.
+Watch the vaults (an empty vault stalls that account) and top up with more P2IDs
+of the fee asset. `service` is the simplest single point: top it up and it keeps
+cascading, or fund any account directly by id:
+
+```sh
+bridge-out-tool --fund-fee-asset \
+  --store-dir /tmp/funder --node-url "$NODE" \
+  --faucet-operator-mac /path/to/treasury.mac \
+  --fee-faucet-id <fee_faucet_id from funding.toml> \
+  --fund <service-or-bridge-or-faucet-id>=<amount>
+```
 
 Nothing changes in custody: the cascade sends are `service`'s own transactions,
 signed by its (remote) key like its claims. The proxy never mints the fee asset
@@ -292,9 +349,6 @@ network account runs only allowlisted note scripts, and its tx-script allowlist
 holds only the network builder's expiration script, so `BasicWallet`'s send
 procedures are reachable through no path; the P2ID script calls
 `receive_asset` alone.)
-
-Watch the vaults: `ger_manager` pays on every GER injection and `service` on
-every claim, so this is an ongoing balance, not a one-time deposit.
 
 ## Signer backends
 
