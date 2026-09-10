@@ -611,6 +611,32 @@ fn parse_bind_addr(s: &str) -> Result<String, String> {
         })
 }
 
+/// Build the endpoint used by the `--require-hardening` remote-prover startup
+/// probe.
+///
+/// TLS has to be configured explicitly for `https://` URLs. A bare `Endpoint`
+/// has no TLS configured, and tonic then refuses the URI outright with
+/// "Connecting to HTTPS without TLS enabled" — so the probe would fail the boot
+/// on a prover that is perfectly reachable. The prover client itself connects
+/// with native roots, so a probe that cannot do the same is stricter than the
+/// client it exists to check, and rejects configurations that work at run time.
+///
+/// Constructing the endpoint performs no I/O; the caller connects.
+fn prover_probe_endpoint(prover_url: &str) -> anyhow::Result<::tonic::transport::Endpoint> {
+    let mut endpoint = ::tonic::transport::Endpoint::from_shared(prover_url.to_string())
+        .context("invalid --miden-prover-url for startup probe")?
+        .timeout(std::time::Duration::from_secs(5))
+        .connect_timeout(std::time::Duration::from_secs(5));
+
+    if endpoint.uri().scheme_str() == Some("https") {
+        endpoint = endpoint
+            .tls_config(::tonic::transport::ClientTlsConfig::new().with_native_roots())
+            .context("failed to enable TLS for the remote prover startup probe")?;
+    }
+
+    Ok(endpoint)
+}
+
 /// Build the JSON-RPC service URL from a validated bind host + port. IPv6
 /// literals are bracketed (`::1` → `http://[::1]:8546`); without brackets the
 /// colons in the address collide with the port separator and the URL is
@@ -766,14 +792,13 @@ async fn main() -> anyhow::Result<()> {
     //
     // Skipped when --require-hardening is false so dev/local boots remain
     // tolerant of an offline prover.
+    //
+    // The endpoint is built by `prover_probe_endpoint`, which enables TLS for
+    // https:// URLs — see that function for why a bare Endpoint is not enough.
     if command.require_hardening
         && let Some(prover_url) = command.miden_prover_url.as_deref()
     {
-        let endpoint = ::tonic::transport::Endpoint::from_shared(prover_url.to_string())
-            .context("invalid --miden-prover-url for startup probe")?
-            .timeout(std::time::Duration::from_secs(5))
-            .connect_timeout(std::time::Duration::from_secs(5));
-        endpoint
+        prover_probe_endpoint(prover_url)?
             .connect()
             .await
             .context("remote prover unreachable (startup probe)")?;
@@ -1733,6 +1758,34 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod hardening_tests {
     use super::*;
+
+    /// The probe must accept every URL the prover client itself accepts.
+    ///
+    /// Regression: the probe used to build a bare `Endpoint`, which has no TLS
+    /// configured, so tonic rejected any https:// URI with "Connecting to HTTPS
+    /// without TLS enabled" before a single packet was sent. A hardened boot
+    /// against a TLS-fronted prover therefore failed on a prover that was
+    /// reachable — the probe was stricter than the client it exists to check.
+    ///
+    /// Building the endpoint performs no I/O, so this stays hermetic.
+    #[test]
+    fn prover_probe_accepts_https_and_http() {
+        assert!(
+            prover_probe_endpoint("https://prover.example.com").is_ok(),
+            "https prover URL must be accepted; the client connects with native roots"
+        );
+        assert!(
+            prover_probe_endpoint("http://127.0.0.1:50051").is_ok(),
+            "plaintext prover URL must keep working"
+        );
+    }
+
+    /// A malformed URL is still a configuration error, and must not be
+    /// smuggled through by the TLS change above.
+    #[test]
+    fn prover_probe_rejects_a_malformed_url() {
+        assert!(prover_probe_endpoint("not a url").is_err());
+    }
 
     /// Test fixture: build a Command with all the boring fields set to
     /// minimum-valid defaults, then mutate the hardening fields per test.
