@@ -26,5 +26,6 @@ version = 1
 # account pays its own tx fee from its vault). The two KMS-keyed wallets are
 # funded by the `fee-funder` sidecar (from the genesis faucet operator) and
 # deploy by consuming those notes; the keyless network accounts (bridge,
-# faucets) are bootstrapped by `service` with a sponsored config note.
+# faucets) are built P2ID-fundable (BasicWallet + P2ID allowlisted, as Miden's
+# own network accounts are) and deploy the same way, cascade-funded by service.
 verification_base_fee = 7

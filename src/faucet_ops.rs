@@ -90,7 +90,7 @@ pub async fn create_and_register_faucet(
     // carries the mandatory zero-fee components against the chain's real fee
     // faucet.
     let fee_faucet_id = crate::fee_policy::fee_faucet_id_from_chain(client).await?;
-    let account = AggLayerFaucet::account_builder(
+    let account = crate::network_accounts::faucet_account_builder(
         client.rng().draw_word(),
         symbol,
         miden_decimals,
@@ -98,11 +98,8 @@ pub async fn create_and_register_faucet(
         Felt::new(0).expect("zero is a valid field element"),
         service_id,
         bridge_id,
-        crate::fee_policy::zero_fee_policy_manager_for(
-            AggLayerFaucet::allowed_notes(),
-            fee_faucet_id,
-        ),
-    )
+        fee_faucet_id,
+    )?
     .build()
     .map_err(|e| anyhow::anyhow!("faucet account build failed: {e}"))?;
     client.add_account(&account, false).await?;
@@ -118,10 +115,7 @@ pub async fn create_and_register_faucet(
         client,
         account.id(),
         symbol,
-        crate::fee_funding::DeployKind::NetworkAccount {
-            funder: service_id,
-            feature_script_root: miden_standards::note::MintNote::script_root(),
-        },
+        crate::fee_funding::DeployKind::NetworkAccount { funder: service_id },
         crate::metrics::ProofKind::Faucet,
         &fee,
         std::time::Duration::from_secs(120),

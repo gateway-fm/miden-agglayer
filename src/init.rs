@@ -9,7 +9,7 @@ use crate::miden_client::MidenClientLib;
 use crate::proxy_keystore::ProxyKeystore;
 use crate::remote_signer::SignerRole;
 use anyhow::Context;
-use miden_base_agglayer::{AggLayerBridge, BridgeRoles, MetadataHash};
+use miden_base_agglayer::{BridgeRoles, MetadataHash};
 use miden_client::crypto::FeltRng;
 use miden_client::keystore::Keystore;
 use miden_protocol::account::auth::{AuthSecretKey, PublicKeyCommitment};
@@ -158,16 +158,13 @@ async fn add_bridge(
         std::collections::BTreeSet::from([ger_manager_id]),
     )
     .map_err(|e| anyhow::anyhow!("bridge role construction failed: {e}"))?;
-    let account = AggLayerBridge::account_builder(
+    let account = crate::network_accounts::bridge_account_builder(
         client.rng().draw_word(),
         service_id,
         roles,
         network_id,
-        crate::fee_policy::zero_fee_policy_manager_for(
-            AggLayerBridge::allowed_notes(),
-            fee_faucet_id,
-        ),
-    )
+        fee_faucet_id,
+    )?
     .build()
     .map_err(|e| anyhow::anyhow!("bridge account build failed: {e}"))?;
     client.add_account(&account, false).await?;
@@ -178,10 +175,7 @@ async fn add_bridge(
         client,
         account.id(),
         "bridge",
-        fee_funding::DeployKind::NetworkAccount {
-            funder: service_id,
-            feature_script_root: miden_base_agglayer::ClaimNote::script_root(),
-        },
+        fee_funding::DeployKind::NetworkAccount { funder: service_id },
         ProofKind::Init,
         fee,
         funding_wait,

@@ -29,6 +29,7 @@ pub mod metadata_recovery;
 pub mod metrics;
 pub mod miden_client;
 pub mod mint_target_monitor;
+pub mod network_accounts;
 pub mod orphan_recovery;
 pub mod projection;
 pub mod projection_order;

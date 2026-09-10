@@ -270,22 +270,28 @@ wallet pre-funded with the fee asset and written with its key — because the fe
 faucet itself is a network account with an owner-only mint policy and no key,
 so nothing can mint from it directly.
 
-**The keyless network accounts are funded differently.** The bridge and every
-faucet are `AuthNetworkAccount` network accounts: they pay fees like everything
-else, but they have no `receive_asset`, so a P2ID cannot fund them, and an empty
-"deploy" transaction cannot pay from an empty vault. The protocol funds a
-network account through a **`FeeSponsorshipNote`** — one asset, bound to one
-feature note the account accepts, consumed in the same transaction: the
-account's auth collects it into the vault and the kernel fee is then paid from
-the vault. So `service` bootstraps each of them by emitting a harmless feature
-note (a `ConstantFeePolicyConfigNote` re-scheduling the zero fee the account
-already has) plus a sponsorship bound to it carrying the cascade amount, and the
-account's **first transaction consumes both** — funding, fee payment and deploy
-in one. After that, because the proxy's per-note fee policy is zero, ordinary
-notes (CLAIM, B2AGG, UpdateGer, MINT) need no sponsorship: the vault pays. Keep
-those vaults topped up (a sponsorship can be bound to any routine note, e.g.
-`UpdateGer`); an empty network-account vault stalls every network transaction
-against it.
+**The keyless network accounts are funded the same way — by construction.** The
+bridge and every faucet are `AuthNetworkAccount` network accounts and pay fees
+like everything else. As built upstream they could not be funded at all after
+genesis: they had no `receive_asset` (a P2ID aborts in the kernel), and every
+feature note they accept carries a `NetworkAccountTarget`, which the sender can
+only create once the target is on-chain — while the account cannot get on-chain
+without a funded vault. The proxy therefore builds them the way Miden builds its
+own post-genesis network accounts (the testnet network-monitor's counter): the
+upstream component set **plus a `BasicWallet`**, with the **P2ID script
+allowlisted at zero fee** (`src/network_accounts.rs`). A P2ID carries no
+attachment, so `service` can send one to the not-yet-created account, and the
+account's **first transaction consumes it** — funding the vault, paying the
+kernel fee from it, and deploying the account in one. `--init` cascades this to
+the bridge and the ETH faucet; each later faucet gets it at creation. After
+that, because the per-note fee policy is zero, ordinary notes (CLAIM, B2AGG,
+UpdateGer, MINT) need no sponsorship — the vault pays — and a top-up is just
+another P2ID from `service`. Keep those vaults topped up: an empty
+network-account vault stalls every network transaction against it. (Safety: a
+network account runs only allowlisted note scripts, and its tx-script allowlist
+holds only the network builder's expiration script, so `BasicWallet`'s send
+procedures are reachable through no path; the P2ID script calls
+`receive_asset` alone.)
 
 Watch the vaults: `ger_manager` pays on every GER injection and `service` on
 every claim, so this is an ongoing balance, not a one-time deposit.
