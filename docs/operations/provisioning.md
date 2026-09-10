@@ -262,10 +262,14 @@ fee asset `0x18101fa522c174b165efd4f70a0385` — fails at the first deploy with
 Nothing changes in custody: the cascade sends are `service`'s own transactions,
 signed by its (remote) key like its claims. The proxy never mints the fee asset
 and never holds a local secret for it. For dev/e2e the operator step is played
-by `bridge-out-tool --fund-fee-asset --native-faucet-mac <genesis
-native_faucet.mac> --funding-manifest <funding.toml>` (local custody, hence a
-separate tool), which the e2e `fee-funder` sidecar runs automatically. Fees
-are **enabled** in the e2e genesis so the battery exercises this path.
+by `bridge-out-tool --fund-fee-asset --faucet-operator-mac <genesis
+faucet_operator.mac> --funding-manifest <funding.toml>` (local custody, hence a
+separate tool), which the e2e `fee-funder` sidecar runs automatically. It sends
+from the genesis **faucet operator** — the native fee faucet's owner, a plain
+wallet pre-funded with the fee asset and written with its key — because the fee
+faucet itself is a network account with an owner-only mint policy and no key,
+so nothing can mint from it directly. Fees are **enabled** in the e2e genesis
+so the battery exercises this path.
 
 Watch the vaults: `ger_manager` pays on every GER injection and `service` on
 every claim, so this is an ongoing balance, not a one-time deposit.

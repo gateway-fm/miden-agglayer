@@ -464,7 +464,8 @@ services:
   # the e2e genesis (verification_base_fee = 7, matching the live testnet), so
   # every account the proxy deploys must hold the native fee asset. The proxy's
   # --init writes funding.toml (the two KMS-keyed accounts + amounts) and waits;
-  # this one-shot sidecar mints from the genesis native faucet — LOCAL custody,
+  # this one-shot sidecar sends from the genesis FAUCET OPERATOR's pre-funded
+  # vault (the fee faucet's owner; the faucet itself is keyless) — LOCAL custody,
   # exactly as an operator would, and independent of whether the proxy itself
   # runs with remote/KMS keys — to just those two accounts. The proxy then
   # consumes the notes as its deploys and cascade-funds the keyless bridge and
@@ -490,9 +491,12 @@ services:
           if [ "$$i" -gt 600 ]; then echo "[fee-funder] TIMEOUT waiting for $$M"; exit 1; fi
           sleep 2
         done
-        echo "[fee-funder] funding the accounts in $$M from the genesis native faucet"
+        echo "[fee-funder] funding the accounts in $$M from the genesis faucet operator's vault"
+        # faucet_operator.mac, NOT native_faucet.mac: the fee faucet is a network
+        # account with an owner-only mint policy and no key; its OWNER (the
+        # operator) is a plain wallet pre-funded with the fee asset at genesis.
         bridge-out-tool --store-dir /tmp/fee-funder --node-url http://miden-node:57291 \
-          --fund-fee-asset --native-faucet-mac /data/accounts/native_faucet.mac \
+          --fund-fee-asset --faucet-operator-mac /data/accounts/faucet_operator.mac \
           --funding-manifest "$$M"
         echo "[fee-funder] done"
 

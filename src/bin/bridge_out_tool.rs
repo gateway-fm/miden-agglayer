@@ -188,19 +188,23 @@ struct Args {
     #[arg(long)]
     create_native_faucet: bool,
 
-    /// #201: mint the chain's NATIVE FEE ASSET to the proxy's accounts so they can
-    /// pay transaction fees, using the genesis native faucet's account file
-    /// (`--native-faucet-mac`). Operator tooling — local custody by design, so it
+    /// #201: send the chain's NATIVE FEE ASSET to the proxy's accounts so they can
+    /// pay transaction fees, from the genesis FAUCET OPERATOR's pre-funded vault
+    /// (`--faucet-operator-mac`). Operator tooling — local custody by design, so it
     /// works unchanged when the proxy itself runs with remote/KMS keys. Targets
     /// come from a proxy `funding.toml` (`--funding-manifest`, written by the
     /// proxy's `--print-funding`) and/or explicit `--fund <account-hex>=<amount>`.
     #[arg(long)]
     fund_fee_asset: bool,
 
-    /// Path to the genesis `native_faucet.mac` (the account file `miden-validator
-    /// genesis --accounts-directory` writes for the chain's fee faucet).
+    /// Path to the genesis `faucet_operator.mac` — the account file
+    /// `miden-validator genesis --accounts-directory` writes for the native fee
+    /// faucet's OWNER: a plain wallet, pre-funded with the fee asset at genesis,
+    /// carrying its own signing key. (NOT `native_faucet.mac`: the fee faucet is
+    /// a network account with an owner-only mint policy and no key of its own,
+    /// so it cannot be minted from directly.)
     #[arg(long)]
-    native_faucet_mac: Option<PathBuf>,
+    faucet_operator_mac: Option<PathBuf>,
 
     /// A proxy `funding.toml` naming the KMS-keyed accounts and amounts to fund.
     #[arg(long)]
@@ -209,6 +213,11 @@ struct Args {
     /// Extra targets, repeatable: `<account-id-hex>=<amount>`.
     #[arg(long = "fund", num_args = 1..)]
     fund: Vec<String>,
+
+    /// The chain's fee faucet id (hex). Taken from `--funding-manifest` when
+    /// given; required only for `--fund`-only invocations.
+    #[arg(long)]
+    fee_faucet_id: Option<String>,
 
     /// Custom token symbol for --create-native-faucet (Miden TokenSymbol: <= 6 chars).
     #[arg(long, default_value = "MDN")]
@@ -553,10 +562,19 @@ async fn consume_pending_notes(
     }
 }
 
-/// #201: mint the chain's native fee asset to the proxy's accounts so they can
+/// #201: send the chain's native fee asset to the proxy's accounts so they can
 /// pay transaction fees. Operator tooling with LOCAL custody by design: the
 /// proxy's remote/KMS keystore rightly refuses to hold any local secret, so the
-/// one key this needs — the genesis native faucet's — lives here, not there.
+/// one key this needs lives here, not there.
+///
+/// Why the OPERATOR and not the faucet: the genesis native fee faucet is a
+/// network `FungibleFaucet` with an owner-only mint policy and NO key of its
+/// own (`native_faucet.mac` carries none; the client can't even build a mint
+/// against it — "does not contain the … fungible faucet interface"). Genesis
+/// also creates the faucet OPERATOR — a plain wallet, the faucet's owner,
+/// pre-funded with 1e9 units of the fee asset — and writes it as
+/// `faucet_operator.mac` WITH its signing key. Funding is therefore a plain
+/// P2ID send from the operator's vault: no minting, no faucet interface needed.
 async fn fund_fee_asset(
     client: &mut miden_agglayer_service::miden_client::MidenClientLib,
     keystore: Arc<miden_agglayer_service::proxy_keystore::ProxyKeystore>,
@@ -567,53 +585,68 @@ async fn fund_fee_asset(
         submit_new_transaction, wait_for_transaction_commit,
     };
     use miden_client::keystore::Keystore as _;
-    use miden_client::transaction::TransactionRequestBuilder;
+    use miden_client::transaction::{PaymentNoteDescription, TransactionRequestBuilder};
     use miden_protocol::account::AccountFile;
-    use miden_protocol::asset::FungibleAsset;
+    use miden_protocol::asset::{Asset, FungibleAsset};
     use miden_protocol::note::NoteType;
 
-    let mac = args.native_faucet_mac.as_ref().ok_or_else(|| {
-        anyhow!("--fund-fee-asset requires --native-faucet-mac <genesis native_faucet.mac>")
+    let mac = args.faucet_operator_mac.as_ref().ok_or_else(|| {
+        anyhow!("--fund-fee-asset requires --faucet-operator-mac <genesis faucet_operator.mac>")
     })?;
     let file = AccountFile::read(mac)
-        .with_context(|| format!("reading native faucet account file {}", mac.display()))?;
-    let faucet_id = file.account.id();
-    // The faucet must SIGN its mint transactions: load its secret(s) into this
-    // tool's local keystore.
+        .with_context(|| format!("reading faucet operator account file {}", mac.display()))?;
+    let operator_id = file.account.id();
+    if file.auth_secret_keys.is_empty() {
+        return Err(anyhow!(
+            "{} carries no signing key — is this native_faucet.mac instead of \
+             faucet_operator.mac? The operator (the faucet's owner) is the funding source",
+            mac.display()
+        ));
+    }
+    // The operator must SIGN its sends: load its secret(s) into this tool's
+    // local keystore.
     for key in &file.auth_secret_keys {
         keystore
-            .add_key(key, faucet_id)
+            .add_key(key, operator_id)
             .await
-            .map_err(|e| anyhow!("loading the native faucet key: {e}"))?;
+            .map_err(|e| anyhow!("loading the faucet operator key: {e}"))?;
     }
     client
         .add_account(&file.account, true)
         .await
-        .map_err(|e| anyhow!("importing native faucet {}: {e:?}", faucet_id.to_hex()))?;
+        .map_err(|e| anyhow!("importing faucet operator {}: {e:?}", operator_id.to_hex()))?;
     client
         .sync_state()
         .await
-        .map_err(|e| anyhow!("sync after native faucet import: {e:?}"))?;
+        .map_err(|e| anyhow!("sync after faucet operator import: {e:?}"))?;
 
     let mut targets: Vec<(AccountId, u64)> = Vec::new();
+    let mut fee_faucet_id: Option<AccountId> = None;
     if let Some(path) = args.funding_manifest.as_ref() {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let manifest: FundingManifest =
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        let expected = manifest.fee_faucet()?;
-        if expected != faucet_id {
-            return Err(anyhow!(
-                "{} names fee asset {} but {} is faucet {} — wrong chain or wrong account file",
-                path.display(),
-                expected.to_hex(),
-                mac.display(),
-                faucet_id.to_hex()
-            ));
-        }
+        fee_faucet_id = Some(manifest.fee_faucet()?);
         targets.push((manifest.service_id()?, manifest.fund_service));
         targets.push((manifest.ger_manager_id()?, manifest.fund_ger_manager));
     }
+    if let Some(hex) = args.fee_faucet_id.as_deref() {
+        let given = parse_account_id(hex).context("--fee-faucet-id")?;
+        if let Some(from_manifest) = fee_faucet_id
+            && from_manifest != given
+        {
+            return Err(anyhow!(
+                "--fee-faucet-id {} disagrees with the manifest's fee asset {}",
+                given.to_hex(),
+                from_manifest.to_hex()
+            ));
+        }
+        fee_faucet_id = Some(given);
+    }
+    let fee_faucet_id = fee_faucet_id.ok_or_else(|| {
+        anyhow!("--fund-fee-asset needs the fee asset: give --funding-manifest or --fee-faucet-id")
+    })?;
     for spec in &args.fund {
         let (id, amount) = spec
             .split_once('=')
@@ -628,21 +661,50 @@ async fn fund_fee_asset(
             "--fund-fee-asset: nothing to fund (give --funding-manifest and/or --fund)"
         ));
     }
+
+    // Self-check before spending: the operator's genesis vault must cover the
+    // total, in the SAME fee asset the manifest names (wrong chain otherwise).
+    let have: u64 = file
+        .account
+        .vault()
+        .assets()
+        .filter_map(|a| match a {
+            Asset::Fungible(f) if f.faucet_id() == fee_faucet_id => Some(f.amount().as_u64()),
+            _ => None,
+        })
+        .sum();
+    let need: u64 = targets.iter().map(|(_, a)| *a).sum();
+    if have < need {
+        return Err(anyhow!(
+            "faucet operator {} holds {have} units of fee asset {} but {need} are needed — \
+             wrong chain/account file, or the genesis operator balance is too small",
+            operator_id.to_hex(),
+            fee_faucet_id.to_hex()
+        ));
+    }
+
     for (target, amount) in targets {
-        let asset = FungibleAsset::new(faucet_id, amount)
-            .map_err(|e| anyhow!("fee asset amount {amount}: {e:?}"))?;
+        let asset = Asset::Fungible(
+            FungibleAsset::new(fee_faucet_id, amount)
+                .map_err(|e| anyhow!("fee asset amount {amount}: {e:?}"))?,
+        );
         let req = TransactionRequestBuilder::new()
-            .build_mint_fungible_asset(asset, target, NoteType::Public, client.rng())
-            .map_err(|e| anyhow!("building fee-asset mint to {}: {e:?}", target.to_hex()))?;
-        let txn = submit_new_transaction(client, faucet_id, req)
+            .build_pay_to_id(
+                PaymentNoteDescription::new(vec![asset], operator_id, target),
+                NoteType::Public,
+                client.rng(),
+            )
+            .map_err(|e| anyhow!("building fee-asset P2ID to {}: {e:?}", target.to_hex()))?;
+        let txn = submit_new_transaction(client, operator_id, req)
             .await
-            .map_err(|e| anyhow!("fee-asset mint to {} failed: {e:?}", target.to_hex()))?;
+            .map_err(|e| anyhow!("fee-asset send to {} failed: {e:?}", target.to_hex()))?;
         wait_for_transaction_commit(client, txn, 30, std::time::Duration::from_secs(2))
             .await
-            .map_err(|e| anyhow!("fee-asset mint commit wait: {e:?}"))?;
+            .map_err(|e| anyhow!("fee-asset send commit wait: {e:?}"))?;
         println!(
-            "[fund-fee-asset] minted {amount} units of fee asset {} to {}",
-            faucet_id.to_hex(),
+            "[fund-fee-asset] sent {amount} units of fee asset {} from faucet operator {} to {}",
+            fee_faucet_id.to_hex(),
+            operator_id.to_hex(),
             target.to_hex()
         );
     }

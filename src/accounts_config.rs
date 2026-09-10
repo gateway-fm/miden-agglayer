@@ -288,7 +288,7 @@ impl FundingManifest {
              Only these two (the KMS-keyed accounts) need funding: the proxy cascade-funds the\n\
              keyless bridge and faucets from `service`. Then start the proxy normally — --init\n\
              resumes these exact accounts from {p} and deploys each by consuming its note.\n\
-             dev/e2e: bridge-out-tool --fund-fee-asset --native-faucet-mac <native_faucet.mac> \
+             dev/e2e: bridge-out-tool --fund-fee-asset --faucet-operator-mac <faucet_operator.mac> \
              --funding-manifest {p}",
             bf = self.verification_base_fee,
             mx = self.max_fee_per_txn,
