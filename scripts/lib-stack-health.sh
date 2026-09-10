@@ -3,12 +3,15 @@
 # lib-stack-health.sh — classify the e2e stack so the harness never reports a
 # broken box as a wall of test failures.
 #
-# Two incidents this session motivated it, both of which reported as innocent
+# Three incidents this session motivated it, all of which reported as innocent
 # per-target failures:
 #   1. INFRA  — a stale/half-reset box left the proxy container `unhealthy` and
 #      L2B crash-looping; every target failed on `up --wait`, matrix showed 0/21.
 #   2. WEDGED — the projector fail-closed on a leaf and the synthetic tip froze;
 #      40+ later targets each burned their full timeout blaming themselves.
+#   3. INFRA  — anvil-l2b went `unhealthy` after ~7h on a long-lived chain; the
+#      L2B GER-updater's txns stranded and nonce-gap-wedged a whole battery (175
+#      g3), but the classifier watched only the base stack and never flagged it.
 #
 # `stack_health` prints ONE verdict and returns a matching code:
 #   HEALTHY           rc 0   — safe to run a target
@@ -61,6 +64,27 @@ stack_health() {
         s="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null)"
         [[ -n "$s" && "$s" != running ]] && { echo "INFRA:web3signer-${s}"; return 1; }
     fi
+
+    # 1b. L2B overlay (the second EVM L2, brought up by the l2l2 targets). Only
+    #     present once an l2l2 target starts it, so check ONLY containers that
+    #     EXIST (|| continue) — absence is normal on the base stack and before the
+    #     first l2l2 target, exactly like the no-proxy pre-bring-up case above.
+    #     anvil-l2b going `unhealthy` after hours on a long-lived chain stranded
+    #     the L2B GER-updater's txns and nonce-gap-wedged an entire battery (175
+    #     g3), yet the classifier missed it because it watched only the base stack.
+    #     Check crash-loop state AND docker health (anvil-l2b stays `running` while
+    #     its healthcheck reports `unhealthy` — the precise state that slipped by).
+    local l2b_health
+    for suf in anvil-l2b postgres-l2b bridge-service-l2b aggkit-l2b; do
+        name="${prefix}-${suf}-1"
+        s="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null)" || continue
+        case "$s" in
+            restarting)  echo "INFRA:${suf}-restarting"; return 1 ;;
+            exited|dead) echo "INFRA:${suf}-${s}"; return 1 ;;
+        esac
+        l2b_health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$name" 2>/dev/null)"
+        [[ "$l2b_health" == unhealthy ]] && { echo "INFRA:${suf}-unhealthy"; return 1; }
+    done
 
     # 2. The proxy's own health gate — the exact "(health: starting)"/unhealthy
     #    that failed the box this session.
