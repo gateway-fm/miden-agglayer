@@ -208,6 +208,127 @@ pub fn config_path_exists(miden_store_dir: Option<PathBuf>) -> anyhow::Result<bo
     Ok(fs::exists(&config_path)?)
 }
 
+// ── #201: fee-asset funding manifest ──────────────────────────────────────────
+//
+// Written by `--print-funding` (or by a fee-charging `--init` that found no
+// manifest) so an operator knows WHICH accounts to fund with HOW MUCH of WHICH
+// asset — and so a later `--init` RESUMES those exact accounts instead of
+// rebuilding them behind a fresh random seed, which would orphan the funded
+// ones. Ids are hex `AccountId`s: unambiguous, HRP-free, and what
+// `bridge-out-tool --fund-fee-asset` parses.
+
+/// Sibling of `bridge_accounts.toml` in the same (sanitized) store directory.
+pub fn funding_manifest_path(miden_store_dir: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    Ok(config_path(miden_store_dir)?.with_file_name("funding.toml"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FundingManifest {
+    pub service: String,
+    pub ger_manager: String,
+    pub fee_faucet_id: String,
+    pub verification_base_fee: u32,
+    pub max_fee_per_txn: u64,
+    pub fund_service: u64,
+    pub fund_ger_manager: u64,
+}
+
+impl FundingManifest {
+    pub fn new(
+        service: AccountId,
+        ger_manager: AccountId,
+        fee: &crate::fee_funding::FeeSnapshot,
+    ) -> Self {
+        Self {
+            service: service.to_hex(),
+            ger_manager: ger_manager.to_hex(),
+            fee_faucet_id: fee.fee_faucet_id.to_hex(),
+            verification_base_fee: fee.verification_base_fee,
+            max_fee_per_txn: crate::fee_funding::max_fee_per_txn(fee.verification_base_fee),
+            fund_service: crate::fee_funding::recommended_service(fee),
+            fund_ger_manager: crate::fee_funding::recommended_ger_manager(fee),
+        }
+    }
+
+    fn parse_id(field: &str, what: &str) -> anyhow::Result<AccountId> {
+        AccountId::from_hex(field)
+            .map_err(|e| anyhow::anyhow!("funding.toml: bad {what} id {field}: {e:?}"))
+    }
+
+    pub fn service_id(&self) -> anyhow::Result<AccountId> {
+        Self::parse_id(&self.service, "service")
+    }
+
+    pub fn ger_manager_id(&self) -> anyhow::Result<AccountId> {
+        Self::parse_id(&self.ger_manager, "ger_manager")
+    }
+
+    pub fn fee_faucet(&self) -> anyhow::Result<AccountId> {
+        Self::parse_id(&self.fee_faucet_id, "fee_faucet_id")
+    }
+
+    /// Operator-facing instructions — what `--print-funding` prints.
+    pub fn instructions(&self, path: &Path) -> String {
+        if self.verification_base_fee == 0 {
+            return format!(
+                "this chain charges no transaction fees (verification_base_fee = 0): nothing to \
+                 fund. manifest: {}",
+                path.display()
+            );
+        }
+        format!(
+            "FUND THESE ACCOUNTS BEFORE THEY DEPLOY (#201)\n\
+             chain fee:   verification_base_fee = {bf}  (at most {mx} units per transaction)\n\
+             fee asset:   {fa}  (the chain's native fee faucet)\n\
+             \n\
+             send, as P2ID notes of the fee asset:\n\
+             service      {svc}  ->  {fs} units   (own budget + what it cascades to bridge/faucets)\n\
+             ger_manager  {ger}  ->  {fg} units\n\
+             \n\
+             Only these two (the KMS-keyed accounts) need funding: the proxy cascade-funds the\n\
+             keyless bridge and faucets from `service`. Then start the proxy normally — --init\n\
+             resumes these exact accounts from {p} and deploys each by consuming its note.\n\
+             dev/e2e: bridge-out-tool --fund-fee-asset --native-faucet-mac <native_faucet.mac> \
+             --funding-manifest {p}",
+            bf = self.verification_base_fee,
+            mx = self.max_fee_per_txn,
+            fa = self.fee_faucet_id,
+            svc = self.service,
+            fs = self.fund_service,
+            ger = self.ger_manager,
+            fg = self.fund_ger_manager,
+            p = path.display(),
+        )
+    }
+}
+
+pub fn save_funding_manifest(
+    manifest: &FundingManifest,
+    miden_store_dir: Option<PathBuf>,
+) -> anyhow::Result<PathBuf> {
+    let path = funding_manifest_path(miden_store_dir)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // Write-then-rename so a crash never leaves a truncated manifest that a
+    // resuming --init would misread as "no manifest" and rebuild (orphaning).
+    let tmp = path.with_extension("toml.tmp");
+    fs::write(&tmp, toml::to_string(manifest)?)?;
+    fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
+pub fn load_funding_manifest(
+    miden_store_dir: Option<PathBuf>,
+) -> anyhow::Result<Option<FundingManifest>> {
+    let path = funding_manifest_path(miden_store_dir)?;
+    if !fs::exists(&path)? {
+        return Ok(None);
+    }
+    let manifest: FundingManifest = toml::from_str(&fs::read_to_string(&path)?)?;
+    Ok(Some(manifest))
+}
+
 pub fn save_config(
     config: AccountsConfig,
     net_id: &NetworkId,
@@ -292,6 +413,70 @@ pub fn load_config(miden_store_dir: Option<PathBuf>) -> anyhow::Result<AccountsC
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// #201: the manifest round-trips through disk (hex ids parse back to the
+    /// same `AccountId`s), the amounts follow the fee formula for the live
+    /// testnet's base fee 7, a missing file is `None` (not an error), and a
+    /// zero-fee chain yields a "nothing to fund" instruction.
+    #[test]
+    fn funding_manifest_roundtrip_and_amounts() {
+        let dir = tempdir().unwrap();
+        let store = Some(dir.path().to_path_buf());
+        assert!(load_funding_manifest(store.clone()).unwrap().is_none());
+
+        let service = AccountId::from_hex("0x18101fa522c174b165efd4f70a0385").unwrap();
+        let ger = AccountId::from_hex("0x367b10dc6b0a7251202dbf4de2b76e").unwrap();
+        let fee = crate::fee_funding::FeeSnapshot {
+            verification_base_fee: 7,
+            fee_faucet_id: service,
+        };
+        let manifest = FundingManifest::new(service, ger, &fee);
+        let path = save_funding_manifest(&manifest, store.clone()).unwrap();
+        assert_eq!(path.file_name().unwrap(), "funding.toml");
+        assert!(
+            !path.with_extension("toml.tmp").exists(),
+            "atomic rename left no tmp"
+        );
+
+        let loaded = load_funding_manifest(store)
+            .unwrap()
+            .expect("manifest exists");
+        assert_eq!(loaded, manifest);
+        assert_eq!(loaded.service_id().unwrap(), service);
+        assert_eq!(loaded.ger_manager_id().unwrap(), ger);
+        assert_eq!(loaded.fee_faucet().unwrap(), service);
+        assert_eq!(loaded.verification_base_fee, 7);
+        assert_eq!(
+            loaded.max_fee_per_txn,
+            crate::fee_funding::max_fee_per_txn(7)
+        );
+        assert_eq!(
+            loaded.fund_ger_manager,
+            crate::fee_funding::recommended_ger_manager(&fee)
+        );
+        assert_eq!(
+            loaded.fund_service,
+            crate::fee_funding::recommended_service(&fee)
+        );
+        assert!(
+            loaded.fund_service > loaded.fund_ger_manager,
+            "service also funds the cascade"
+        );
+
+        let text = loaded.instructions(&path);
+        assert!(text.contains(&service.to_hex()) && text.contains(&ger.to_hex()));
+        assert!(text.contains("verification_base_fee = 7"));
+
+        let zero = FundingManifest::new(
+            service,
+            ger,
+            &crate::fee_funding::FeeSnapshot {
+                verification_base_fee: 0,
+                fee_faucet_id: service,
+            },
+        );
+        assert!(zero.instructions(&path).contains("nothing to fund"));
+    }
 
     // Valid protocol-0.15 (version-1) account id; the 0.14 v0 encoding is
     // rejected by the 0.15 codec (`UnknownAccountIdVersion`).

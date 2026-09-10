@@ -20,4 +20,9 @@ timestamp = 1717344256
 version = 1
 
 [fee_parameters]
-verification_base_fee = 0
+# #201: fees are ENABLED in e2e, matching the live testnet (base fee 7), so the
+# battery exercises the real funding path — every deployed account must hold the
+# native fee asset, cascade-funded from the two KMS-keyed accounts. `0` hid a
+# deploy failure on every real chain ("amount in the vault is less than the
+# amount to remove"). The e2e `fee-funder` sidecar mints the initial funding.
+verification_base_fee = 7

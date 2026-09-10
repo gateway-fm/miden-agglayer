@@ -456,7 +456,45 @@ services:
       # longer than a bare RPC bind; with the --init account redeploy + external-prover
       # handshake, give the first healthy check headroom so `up --wait` does not abort
       # dependents prematurely.
-      start_period: 240s
+      # #201: --init now also waits for the fee-funder's notes before it can
+      # deploy (fees are enabled in the e2e genesis), so give it more room.
+      start_period: 600s
+
+  # #201 — the e2e stand-in for the OPERATOR's funding step. Fees are ENABLED in
+  # the e2e genesis (verification_base_fee = 7, matching the live testnet), so
+  # every account the proxy deploys must hold the native fee asset. The proxy's
+  # --init writes funding.toml (the two KMS-keyed accounts + amounts) and waits;
+  # this one-shot sidecar mints from the genesis native faucet — LOCAL custody,
+  # exactly as an operator would, and independent of whether the proxy itself
+  # runs with remote/KMS keys — to just those two accounts. The proxy then
+  # consumes the notes as its deploys and cascade-funds the keyless bridge and
+  # faucets from `service`. No production analogue: operators fund by hand.
+  fee-funder:
+    image: miden-agglayer-e2e:latest
+    restart: "no"
+    volumes:
+      - node_data:/data:ro
+      - ./.miden-agglayer-data:/var/lib/miden-agglayer-service
+    entrypoint: ["/bin/sh", "-c"]
+    depends_on:
+      miden-node:
+        condition: service_started
+    command:
+      - |
+        set -e
+        M=/var/lib/miden-agglayer-service/funding.toml
+        echo "[fee-funder] waiting for $$M (written by the proxy's --init)"
+        i=0
+        until [ -f "$$M" ]; do
+          i=$$((i+1))
+          if [ "$$i" -gt 600 ]; then echo "[fee-funder] TIMEOUT waiting for $$M"; exit 1; fi
+          sleep 2
+        done
+        echo "[fee-funder] funding the accounts in $$M from the genesis native faucet"
+        bridge-out-tool --store-dir /tmp/fee-funder --node-url http://miden-node:57291 \
+          --fund-fee-asset --native-faucet-mac /data/accounts/native_faucet.mac \
+          --funding-manifest "$$M"
+        echo "[fee-funder] done"
 
   # ── Bridge Service ─────────────────────────────────────────────────────────
   bridge-service:

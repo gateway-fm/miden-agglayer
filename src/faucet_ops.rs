@@ -107,30 +107,20 @@ pub async fn create_and_register_faucet(
     .map_err(|e| anyhow::anyhow!("faucet account build failed: {e}"))?;
     client.add_account(&account, false).await?;
 
-    // Deploy
-    tracing::info!(
-        "deploying {} faucet {} ...",
-        symbol,
-        AccountIdBech32(account.id())
-    );
-    let dummy_txn = TransactionRequestBuilder::new().build()?;
-    let txn_id = crate::metrics::meter_proof(
-        crate::metrics::ProofKind::Faucet,
-        crate::miden_client::submit_new_transaction(client, account.id(), dummy_txn),
-    )
-    .await?;
-    tracing::info!("deployed {symbol} faucet with txn_id {txn_id}");
-
-    let committed = crate::miden_client::wait_for_transaction_commit(
+    // Deploy (#201): on a fee-charging chain the faucet is a keyless account
+    // that pays its own deploy fee, so `service` cascade-funds it first and the
+    // deploy CONSUMES that note; a zero-fee chain keeps the empty-txn deploy.
+    let fee = crate::fee_funding::fee_snapshot(client).await?;
+    crate::fee_funding::deploy_account(
         client,
-        txn_id,
-        20,
-        std::time::Duration::from_secs(1),
+        account.id(),
+        symbol,
+        crate::metrics::ProofKind::Faucet,
+        &fee,
+        Some(service_id),
+        std::time::Duration::from_secs(120),
     )
     .await?;
-    if committed {
-        tracing::info!("deploy tx {txn_id} committed");
-    }
 
     // Register in bridge
     register_faucet_in_bridge(

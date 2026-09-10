@@ -47,6 +47,19 @@ struct Command {
     #[arg(long)]
     init: bool,
 
+    /// #201: build + persist the two KMS-keyed accounts (service, ger_manager),
+    /// write `funding.toml` — their addresses, the chain's native fee asset and
+    /// the recommended amounts — and exit WITHOUT deploying. Fund those two,
+    /// then start normally: --init resumes them and deploys each by consuming
+    /// its funding note, cascade-funding the keyless bridge/faucets from service.
+    #[arg(long)]
+    print_funding: bool,
+
+    /// #201: on a fee-charging chain, how long a deploy waits for the account's
+    /// fee-asset funding note before failing with the exact funding instruction.
+    #[arg(long, env = "FUNDING_WAIT_SECS", default_value_t = 900)]
+    funding_wait_secs: u64,
+
     /// PostgreSQL connection URL (enables PgStore instead of InMemoryStore)
     #[arg(long, env = "DATABASE_URL")]
     database_url: Option<String>,
@@ -848,7 +861,8 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let needs_init = command.init || !config_path_exists(miden_store_dir.clone())?;
+    let needs_init =
+        command.init || command.print_funding || !config_path_exists(miden_store_dir.clone())?;
 
     // Phase 1: Run init if needed (with a minimal client, no BridgeOutScanner)
     if needs_init {
@@ -895,13 +909,25 @@ async fn main() -> anyhow::Result<()> {
             init_net_id,
             init_network_id,
             miden_store_dir.clone(),
+            init::InitOptions {
+                print_funding: command.print_funding,
+                funding_wait: std::time::Duration::from_secs(command.funding_wait_secs),
+                miden_store_dir: miden_store_dir.clone(),
+            },
         )
         .await?;
-        tracing::info!("new config created at {config_path:?}");
+        if command.print_funding {
+            tracing::info!(
+                "funding manifest written to {config_path:?}; fund the listed accounts, then \
+                 start the proxy normally (--init resumes them)"
+            );
+        } else {
+            tracing::info!("new config created at {config_path:?}");
+        }
 
         init_client.shutdown()?;
 
-        if command.init {
+        if command.init || command.print_funding {
             return Ok(());
         }
     }
@@ -1821,6 +1847,8 @@ mod hardening_tests {
             chain_id: 1,
             network_id: 1,
             init: false,
+            print_funding: false,
+            funding_wait_secs: 900,
             database_url: None,
             restore: false,
             reset_miden_store: false,

@@ -188,6 +188,28 @@ struct Args {
     #[arg(long)]
     create_native_faucet: bool,
 
+    /// #201: mint the chain's NATIVE FEE ASSET to the proxy's accounts so they can
+    /// pay transaction fees, using the genesis native faucet's account file
+    /// (`--native-faucet-mac`). Operator tooling — local custody by design, so it
+    /// works unchanged when the proxy itself runs with remote/KMS keys. Targets
+    /// come from a proxy `funding.toml` (`--funding-manifest`, written by the
+    /// proxy's `--print-funding`) and/or explicit `--fund <account-hex>=<amount>`.
+    #[arg(long)]
+    fund_fee_asset: bool,
+
+    /// Path to the genesis `native_faucet.mac` (the account file `miden-validator
+    /// genesis --accounts-directory` writes for the chain's fee faucet).
+    #[arg(long)]
+    native_faucet_mac: Option<PathBuf>,
+
+    /// A proxy `funding.toml` naming the KMS-keyed accounts and amounts to fund.
+    #[arg(long)]
+    funding_manifest: Option<PathBuf>,
+
+    /// Extra targets, repeatable: `<account-id-hex>=<amount>`.
+    #[arg(long = "fund", num_args = 1..)]
+    fund: Vec<String>,
+
     /// Custom token symbol for --create-native-faucet (Miden TokenSymbol: <= 6 chars).
     #[arg(long, default_value = "MDN")]
     native_symbol: String,
@@ -531,6 +553,102 @@ async fn consume_pending_notes(
     }
 }
 
+/// #201: mint the chain's native fee asset to the proxy's accounts so they can
+/// pay transaction fees. Operator tooling with LOCAL custody by design: the
+/// proxy's remote/KMS keystore rightly refuses to hold any local secret, so the
+/// one key this needs — the genesis native faucet's — lives here, not there.
+async fn fund_fee_asset(
+    client: &mut miden_agglayer_service::miden_client::MidenClientLib,
+    keystore: Arc<miden_agglayer_service::proxy_keystore::ProxyKeystore>,
+    args: &Args,
+) -> anyhow::Result<()> {
+    use miden_agglayer_service::accounts_config::FundingManifest;
+    use miden_agglayer_service::miden_client::{
+        submit_new_transaction, wait_for_transaction_commit,
+    };
+    use miden_client::keystore::Keystore as _;
+    use miden_client::transaction::TransactionRequestBuilder;
+    use miden_protocol::account::AccountFile;
+    use miden_protocol::asset::FungibleAsset;
+    use miden_protocol::note::NoteType;
+
+    let mac = args.native_faucet_mac.as_ref().ok_or_else(|| {
+        anyhow!("--fund-fee-asset requires --native-faucet-mac <genesis native_faucet.mac>")
+    })?;
+    let file = AccountFile::read(mac)
+        .with_context(|| format!("reading native faucet account file {}", mac.display()))?;
+    let faucet_id = file.account.id();
+    // The faucet must SIGN its mint transactions: load its secret(s) into this
+    // tool's local keystore.
+    for key in &file.auth_secret_keys {
+        keystore
+            .add_key(key, faucet_id)
+            .await
+            .map_err(|e| anyhow!("loading the native faucet key: {e}"))?;
+    }
+    client
+        .add_account(&file.account, true)
+        .await
+        .map_err(|e| anyhow!("importing native faucet {}: {e:?}", faucet_id.to_hex()))?;
+    client
+        .sync_state()
+        .await
+        .map_err(|e| anyhow!("sync after native faucet import: {e:?}"))?;
+
+    let mut targets: Vec<(AccountId, u64)> = Vec::new();
+    if let Some(path) = args.funding_manifest.as_ref() {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let manifest: FundingManifest =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let expected = manifest.fee_faucet()?;
+        if expected != faucet_id {
+            return Err(anyhow!(
+                "{} names fee asset {} but {} is faucet {} — wrong chain or wrong account file",
+                path.display(),
+                expected.to_hex(),
+                mac.display(),
+                faucet_id.to_hex()
+            ));
+        }
+        targets.push((manifest.service_id()?, manifest.fund_service));
+        targets.push((manifest.ger_manager_id()?, manifest.fund_ger_manager));
+    }
+    for spec in &args.fund {
+        let (id, amount) = spec
+            .split_once('=')
+            .ok_or_else(|| anyhow!("--fund expects <account-id-hex>=<amount>, got {spec}"))?;
+        let amount: u64 = amount
+            .parse()
+            .with_context(|| format!("--fund amount {amount:?} is not a number"))?;
+        targets.push((parse_account_id(id)?, amount));
+    }
+    if targets.is_empty() {
+        return Err(anyhow!(
+            "--fund-fee-asset: nothing to fund (give --funding-manifest and/or --fund)"
+        ));
+    }
+    for (target, amount) in targets {
+        let asset = FungibleAsset::new(faucet_id, amount)
+            .map_err(|e| anyhow!("fee asset amount {amount}: {e:?}"))?;
+        let req = TransactionRequestBuilder::new()
+            .build_mint_fungible_asset(asset, target, NoteType::Public, client.rng())
+            .map_err(|e| anyhow!("building fee-asset mint to {}: {e:?}", target.to_hex()))?;
+        let txn = submit_new_transaction(client, faucet_id, req)
+            .await
+            .map_err(|e| anyhow!("fee-asset mint to {} failed: {e:?}", target.to_hex()))?;
+        wait_for_transaction_commit(client, txn, 30, std::time::Duration::from_secs(2))
+            .await
+            .map_err(|e| anyhow!("fee-asset mint commit wait: {e:?}"))?;
+        println!(
+            "[fund-fee-asset] minted {amount} units of fee asset {} to {}",
+            faucet_id.to_hex(),
+            target.to_hex()
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -568,6 +686,7 @@ async fn main() -> anyhow::Result<()> {
     if args.create_wallet
         || args.create_foreign_bridge
         || args.create_native_faucet
+        || args.fund_fee_asset
         || args.inspect_faucet.is_some()
     {
         // Provision / read-only modes: the store/keystore may not exist yet (a fresh
@@ -645,6 +764,9 @@ async fn main() -> anyhow::Result<()> {
     // way a receiving wallet does — purely from on-chain account state, on a fresh
     // client with no preloaded token map. Machine-readable output; a NON-resolving
     // faucet (the wallet's `Unknown`) or an RPC failure is a non-zero exit.
+    if args.fund_fee_asset {
+        return fund_fee_asset(&mut client, keystore.clone(), &args).await;
+    }
     if let Some(fid_hex) = args.inspect_faucet.as_deref() {
         let faucet_id = parse_account_id(fid_hex)
             .with_context(|| format!("inspect-faucet: bad faucet id {fid_hex}"))?;

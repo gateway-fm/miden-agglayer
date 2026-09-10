@@ -229,6 +229,47 @@ alert if the process/target is absent as well as if that gauge is wrong. During
 runtime, alert on signature failures and on an expected workload producing no
 increase in `remote_signer_signatures_total`.
 
+## Funding the accounts on a fee-charging chain (#201)
+
+Protocol 0.16 charges `verification_base_fee × (ilog2(cycles) + 1)` on **every**
+transaction, paid by the **executing account from its own vault** in the chain's
+native fee asset. Miden has no gas-paying EOA: a signing key only *authorizes*;
+the account pays. So every account that executes needs the fee asset in its
+vault — including the **keyless** bridge and faucets that only the two KMS keys
+authorize. (Our dev genesis sets `verification_base_fee = 0`, which is why a
+local stack never shows this; a real chain — e.g. the live testnet, base fee 7,
+fee asset `0x18101fa522c174b165efd4f70a0385` — fails at the first deploy with
+"amount in the vault is less than the amount to remove".)
+
+**You fund only the two KMS-keyed accounts; the proxy cascades the rest.**
+
+1. **Print what to fund.** With the signer configured exactly as for a normal
+   boot, run once with `--print-funding`. It builds and *persists*
+   `service`/`ger_manager` (their ids are random-seeded, so they exist only once
+   persisted), reads the chain's fee parameters, writes `funding.toml` beside
+   `bridge_accounts.toml`, prints the two addresses, the fee asset and the
+   recommended amounts, and exits **without deploying**. Re-running it re-prints
+   and never rebuilds.
+2. **Send the fee asset** to those two addresses as P2ID notes (your treasury /
+   the chain's faucet). `fund_service` is larger: it includes what `service`
+   cascades to the bridge and faucets.
+3. **Start the proxy normally.** `--init` *resumes* the recorded accounts, waits
+   (up to `--funding-wait-secs`, default 900) for each funding note, deploys
+   each account by **consuming** that note — the vault is filled before the fee
+   is charged, so the deploy pays for itself — then `service` cascade-funds the
+   bridge and every faucet (at init and as new tokens appear at runtime).
+
+Nothing changes in custody: the cascade sends are `service`'s own transactions,
+signed by its (remote) key like its claims. The proxy never mints the fee asset
+and never holds a local secret for it. For dev/e2e the operator step is played
+by `bridge-out-tool --fund-fee-asset --native-faucet-mac <genesis
+native_faucet.mac> --funding-manifest <funding.toml>` (local custody, hence a
+separate tool), which the e2e `fee-funder` sidecar runs automatically. Fees
+are **enabled** in the e2e genesis so the battery exercises this path.
+
+Watch the vaults: `ger_manager` pays on every GER injection and `service` on
+every claim, so this is an ongoing balance, not a one-time deposit.
+
 ## Signer backends
 
 The proxy is unaware of the signer's storage backend, but that does **not** make
