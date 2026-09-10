@@ -172,16 +172,18 @@ async fn add_bridge(
     .map_err(|e| anyhow::anyhow!("bridge account build failed: {e}"))?;
     client.add_account(&account, false).await?;
 
-    // #201: on a fee-charging chain `service` cascade-funds the keyless bridge
-    // and the deploy consumes that note; a zero-fee chain keeps the empty-txn
-    // deploy.
+    // #201: zero-fee chain → empty-txn deploy (unchanged). Fee-charging chain →
+    // fails loudly (network account; see fee_funding::DeployKind).
     fee_funding::deploy_account(
         client,
         account.id(),
         "bridge",
+        fee_funding::DeployKind::NetworkAccount {
+            funder: service_id,
+            feature_script_root: miden_base_agglayer::ClaimNote::script_root(),
+        },
         ProofKind::Init,
         fee,
-        Some(service_id),
         funding_wait,
     )
     .await?;
@@ -365,9 +367,9 @@ async fn add_accounts(
         client,
         ger_manager.id(),
         "ger_manager",
+        fee_funding::DeployKind::Wallet,
         ProofKind::Init,
         fee,
-        None,
         wait,
     )
     .await?;
@@ -379,16 +381,18 @@ async fn add_accounts(
             client,
             service.id(),
             "service",
+            fee_funding::DeployKind::Wallet,
             ProofKind::Init,
             fee,
-            None,
             wait,
         )
         .await?;
     }
     // The bridge is keyless (service administers it) and deploys via its own
-    // transaction inside add_bridge, which on a fee-charging chain cascade-funds
-    // it from service and consumes that note as the deploy.
+    // transaction inside add_bridge. It is a NETWORK account: on a fee-charging
+    // chain it cannot consume a P2ID, so its vault must come from a
+    // FeeSponsorshipNote paired with a feature note it accepts (the #201
+    // follow-up); until then a fee-charging init fails loudly there.
     let bridge = add_bridge(
         client,
         keystore.clone(),

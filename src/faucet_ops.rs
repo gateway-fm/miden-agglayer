@@ -107,17 +107,23 @@ pub async fn create_and_register_faucet(
     .map_err(|e| anyhow::anyhow!("faucet account build failed: {e}"))?;
     client.add_account(&account, false).await?;
 
-    // Deploy (#201): on a fee-charging chain the faucet is a keyless account
-    // that pays its own deploy fee, so `service` cascade-funds it first and the
-    // deploy CONSUMES that note; a zero-fee chain keeps the empty-txn deploy.
+    // Deploy (#201): a zero-fee chain keeps the empty-txn deploy. On a
+    // fee-charging chain a faucet is a keyless NETWORK account: it cannot pay an
+    // empty deploy from an empty vault, nor consume a P2ID (no receive_asset) —
+    // its vault is funded only by a FeeSponsorshipNote paired with a feature
+    // note it accepts, which is the #201 follow-up; until then this fails loudly
+    // with that reason instead of aborting in the kernel.
     let fee = crate::fee_funding::fee_snapshot(client).await?;
     crate::fee_funding::deploy_account(
         client,
         account.id(),
         symbol,
+        crate::fee_funding::DeployKind::NetworkAccount {
+            funder: service_id,
+            feature_script_root: miden_standards::note::MintNote::script_root(),
+        },
         crate::metrics::ProofKind::Faucet,
         &fee,
-        Some(service_id),
         std::time::Duration::from_secs(120),
     )
     .await?;

@@ -26,12 +26,15 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
+use miden_client::crypto::FeltRng;
+use miden_client::note::NoteScriptRoot;
 use miden_client::transaction::{PaymentNoteDescription, TransactionRequestBuilder};
 use miden_protocol::MAX_TX_EXECUTION_CYCLES;
 use miden_protocol::account::AccountId;
 use miden_protocol::asset::{Asset, FungibleAsset};
 use miden_protocol::block::BlockNumber;
 use miden_protocol::note::{Note, NoteType};
+use miden_standards::note::{ConstantFeePolicyConfigNote, FeeSponsorshipNote};
 
 use crate::accounts_config::AccountIdBech32;
 use crate::metrics::ProofKind;
@@ -198,21 +201,169 @@ pub async fn fund_from_service(
     Ok(())
 }
 
+/// What kind of account is being deployed — it decides how its deploy can pay
+/// its fee on a fee-charging chain.
+#[derive(Debug, Clone)]
+pub enum DeployKind {
+    /// A `BasicWallet` (service, ger_manager): can consume a P2ID funding note,
+    /// so the deploy IS the consumption of that note.
+    Wallet,
+    /// A network account (bridge, faucet: `AuthNetworkAccount`). It has no
+    /// `receive_asset`, so it can NOT consume a P2ID (kernel: "procedure root …
+    /// is not in the account procedure index map"); its vault is filled only by
+    /// a `FeeSponsorshipNote` bound to a feature note it accepts, consumed in the
+    /// same transaction. So `funder` (service) emits a harmless feature note —
+    /// a `ConstantFeePolicyConfigNote` re-scheduling the zero fee the account
+    /// already has for `feature_script_root` — plus a sponsorship bound to it,
+    /// and the account's first transaction consumes both: that transaction
+    /// funds the vault, pays its own kernel fee from it, and deploys the
+    /// account.
+    NetworkAccount {
+        funder: AccountId,
+        feature_script_root: NoteScriptRoot,
+    },
+}
+
+/// Bootstrap a NETWORK account on a fee-charging chain (#201): see
+/// [`DeployKind::NetworkAccount`]. The target is deliberately NOT declared as a
+/// foreign account on the funder's request — it is not deployed yet, so there
+/// is no on-chain state to pin; the sponsorship note carries no attachment and
+/// needs none, the config note carries the `NetworkAccountTarget` the account's
+/// script checks on consumption.
+pub async fn bootstrap_network_account(
+    client: &mut MidenClientLib,
+    funder: AccountId,
+    target: AccountId,
+    name: &str,
+    feature_script_root: NoteScriptRoot,
+    proof: ProofKind,
+    fee: &FeeSnapshot,
+) -> anyhow::Result<()> {
+    let amount = cascade_amount(fee);
+    let zero_fee = FungibleAsset::new(fee.fee_faucet_id, 0)
+        .map_err(|e| anyhow!("zero fee asset for {name}: {e:?}"))?;
+    let config: Note = ConstantFeePolicyConfigNote::builder()
+        .sender(funder)
+        .target(target)
+        .note_script_root(feature_script_root)
+        .fee_asset(zero_fee)
+        .serial_number(client.rng().draw_word())
+        .build()
+        .map_err(|e| anyhow!("building the bootstrap config note for {name}: {e:?}"))?
+        .into();
+    let sponsorship: Note = FeeSponsorshipNote::builder()
+        .sender(funder)
+        .target_account(target)
+        .feature_note_id(config.id())
+        .asset(Asset::Fungible(
+            FungibleAsset::new(fee.fee_faucet_id, amount)
+                .map_err(|e| anyhow!("sponsorship asset {amount} for {name}: {e:?}"))?,
+        ))
+        .generate_serial_number(client.rng())
+        .build()
+        .map_err(|e| anyhow!("building the sponsorship note for {name}: {e:?}"))?
+        .into();
+    tracing::info!(
+        target = name,
+        target_id = %AccountIdBech32(target),
+        amount,
+        config_note = %config.id(),
+        sponsorship_note = %sponsorship.id(),
+        "bootstrapping network account: funder emits config + sponsorship notes (#201)"
+    );
+    let request = TransactionRequestBuilder::new()
+        .own_output_notes(vec![config.clone(), sponsorship.clone()])
+        .build()
+        .map_err(|e| anyhow!("building the bootstrap send for {name}: {e:?}"))?;
+    let txn_id = crate::metrics::meter_proof(
+        proof,
+        crate::miden_client::submit_new_transaction(client, funder, request),
+    )
+    .await
+    .with_context(|| format!("funder could not emit the bootstrap notes for {name}"))?;
+    crate::miden_client::wait_for_transaction_commit(client, txn_id, 30, Duration::from_secs(2))
+        .await?;
+    client.sync_state().await?;
+
+    tracing::info!(
+        "deploying {} account {} by consuming its bootstrap notes ...",
+        name,
+        AccountIdBech32(target)
+    );
+    let request = TransactionRequestBuilder::new()
+        .build_consume_notes(vec![config, sponsorship])
+        .map_err(|e| anyhow!("building the bootstrap consumption for {name}: {e:?}"))?;
+    let txn_id = crate::metrics::meter_proof(
+        proof,
+        crate::miden_client::submit_new_transaction(client, target, request),
+    )
+    .await?;
+    tracing::info!("deployed {name} account with txn_id {txn_id}");
+    let committed = crate::miden_client::wait_for_transaction_commit(
+        client,
+        txn_id,
+        20,
+        Duration::from_secs(1),
+    )
+    .await?;
+    if committed {
+        tracing::info!("deploy tx {txn_id} committed");
+    }
+    Ok(())
+}
+
 /// Deploy `account_id` on-chain.
 ///
 /// Zero-fee chain: an empty transaction anchors the account (the historical
-/// behaviour, unchanged). Fee-charging chain: the deploy CONSUMES the account's
-/// fee-asset funding note(s) — cascaded from `funder` (`service`) first when
-/// given — so the very transaction that deploys the account also funds it.
+/// behaviour, unchanged, for every kind). Fee-charging chain: a wallet's deploy
+/// CONSUMES its fee-asset funding note(s), so the very transaction that
+/// deploys the account also funds it; a network account cannot be deployed
+/// that way (see [`DeployKind::NetworkAccount`]) and this fails loudly with the
+/// reason rather than aborting inside the kernel. An account that is already
+/// on-chain (a resumed `--init`) is skipped: its funding note was consumed by
+/// the deploy that put it there.
 pub async fn deploy_account(
     client: &mut MidenClientLib,
     account_id: AccountId,
     name: &str,
-    kind: ProofKind,
+    kind: DeployKind,
+    proof: ProofKind,
     fee: &FeeSnapshot,
-    funder: Option<AccountId>,
     wait: Duration,
 ) -> anyhow::Result<()> {
+    if fee.charges_fees() {
+        // Resume: --init reuses the accounts funding.toml records. One that was
+        // already deployed (nonce > 0) must not wait for a second funding note
+        // that will never come — its note was consumed by the first deploy.
+        client.sync_state().await?;
+        if let Some(account) = client.get_account(account_id).await?
+            && !account.is_new()
+        {
+            tracing::info!(
+                account = name,
+                account_id = %AccountIdBech32(account_id),
+                nonce = %account.nonce(),
+                "already deployed on-chain — skipping deploy (#201)"
+            );
+            return Ok(());
+        }
+        if let DeployKind::NetworkAccount {
+            funder,
+            feature_script_root,
+        } = &kind
+        {
+            return bootstrap_network_account(
+                client,
+                *funder,
+                account_id,
+                name,
+                *feature_script_root,
+                proof,
+                fee,
+            )
+            .await;
+        }
+    }
     tracing::info!(
         "deploying {} account {} ...",
         name,
@@ -221,24 +372,13 @@ pub async fn deploy_account(
     let request = if !fee.charges_fees() {
         TransactionRequestBuilder::new().build()?
     } else {
-        if let Some(service_id) = funder {
-            fund_from_service(
-                client,
-                service_id,
-                account_id,
-                name,
-                cascade_amount(fee),
-                fee,
-            )
-            .await?;
-        }
         let notes = wait_for_funding_notes(client, account_id, name, fee, wait).await?;
         TransactionRequestBuilder::new()
             .build_consume_notes(notes)
             .map_err(|e| anyhow!("building funding-note consumption for {name}: {e:?}"))?
     };
     let txn_id = crate::metrics::meter_proof(
-        kind,
+        proof,
         crate::miden_client::submit_new_transaction(client, account_id, request),
     )
     .await?;

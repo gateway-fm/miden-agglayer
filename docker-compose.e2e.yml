@@ -484,13 +484,15 @@ services:
       - |
         set -e
         M=/var/lib/miden-agglayer-service/funding.toml
-        echo "[fee-funder] waiting for $$M (written by the proxy's --init)"
+        C=/var/lib/miden-agglayer-service/bridge_accounts.toml
+        echo "[fee-funder] waiting for $$M (written by a fee-charging --init) or $$C (a zero-fee --init finished)"
         i=0
-        until [ -f "$$M" ]; do
+        until [ -f "$$M" ] || [ -f "$$C" ]; do
           i=$$((i+1))
-          if [ "$$i" -gt 600 ]; then echo "[fee-funder] TIMEOUT waiting for $$M"; exit 1; fi
+          if [ "$$i" -gt 600 ]; then echo "[fee-funder] TIMEOUT waiting for $$M / $$C"; exit 1; fi
           sleep 2
         done
+        if [ ! -f "$$M" ]; then echo "[fee-funder] zero-fee chain: init completed without needing funding — nothing to do"; exit 0; fi
         echo "[fee-funder] funding the accounts in $$M from the genesis faucet operator's vault"
         # faucet_operator.mac, NOT native_faucet.mac: the fee faucet is a network
         # account with an owner-only mint policy and no key; its OWNER (the

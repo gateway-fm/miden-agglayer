@@ -268,8 +268,24 @@ separate tool), which the e2e `fee-funder` sidecar runs automatically. It sends
 from the genesis **faucet operator** — the native fee faucet's owner, a plain
 wallet pre-funded with the fee asset and written with its key — because the fee
 faucet itself is a network account with an owner-only mint policy and no key,
-so nothing can mint from it directly. Fees are **enabled** in the e2e genesis
-so the battery exercises this path.
+so nothing can mint from it directly.
+
+**The keyless network accounts are funded differently.** The bridge and every
+faucet are `AuthNetworkAccount` network accounts: they pay fees like everything
+else, but they have no `receive_asset`, so a P2ID cannot fund them, and an empty
+"deploy" transaction cannot pay from an empty vault. The protocol funds a
+network account through a **`FeeSponsorshipNote`** — one asset, bound to one
+feature note the account accepts, consumed in the same transaction: the
+account's auth collects it into the vault and the kernel fee is then paid from
+the vault. So `service` bootstraps each of them by emitting a harmless feature
+note (a `ConstantFeePolicyConfigNote` re-scheduling the zero fee the account
+already has) plus a sponsorship bound to it carrying the cascade amount, and the
+account's **first transaction consumes both** — funding, fee payment and deploy
+in one. After that, because the proxy's per-note fee policy is zero, ordinary
+notes (CLAIM, B2AGG, UpdateGer, MINT) need no sponsorship: the vault pays. Keep
+those vaults topped up (a sponsorship can be bound to any routine note, e.g.
+`UpdateGer`); an empty network-account vault stalls every network transaction
+against it.
 
 Watch the vaults: `ger_manager` pays on every GER injection and `service` on
 every claim, so this is an ongoing balance, not a one-time deposit.
