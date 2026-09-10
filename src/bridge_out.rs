@@ -1142,11 +1142,15 @@ impl BridgeOutScanner {
                 // register-faucet CONFIG (public since 0.16, which is why the
                 // pre-0.16 two-root allowlist started false-alerting on init),
                 // UPDATE_GER, and the new REMOVE_GER / DEREGISTER_AGG_FAUCET.
-                let admin_roots: [[u8; 32]; 4] = [
+                // #201: on a fee-charging chain the bridge is P2ID-fundable and
+                // consumes its fee-asset funding note (creation + top-ups) —
+                // canonical, not a wrapper; it advances no LET.
+                let admin_roots: [[u8; 32]; 5] = [
                     miden_base_agglayer::ConfigAggBridgeNote::script_root().as_bytes(),
                     miden_base_agglayer::UpdateGerNote::script_root().as_bytes(),
                     miden_base_agglayer::RemoveGerNote::script_root().as_bytes(),
                     miden_base_agglayer::DeregisterAggFaucetNote::script_root().as_bytes(),
+                    miden_standards::note::P2idNote::script_root().as_bytes(),
                 ];
                 let observed_bytes = note.details().script().root().as_bytes();
                 use crate::unknown_wrapper_detector::{
@@ -1708,26 +1712,26 @@ impl BridgeOutScanner {
             // The Ownable2Step component stores the owner AccountId at a
             // named slot. Upstream exposes `owner_account_id` returning
             // `Err(OwnershipRenounced)` for the renounced case.
-            let observed: Option<AccountId> =
-                match miden_base_agglayer::AggLayerFaucet::owner_account_id(&acct) {
-                    Ok(id) => Some(id),
-                    Err(miden_base_agglayer::AgglayerFaucetError::OwnershipRenounced) => None,
-                    Err(e) => {
-                        // Classification already proved this IS an AggLayer
-                        // faucet, so a decode failure here means the monitor
-                        // cannot see a faucet it is responsible for. Loud.
-                        Self::count_ownership_unchecked(entry.faucet_id, "undecodable");
-                        tracing::error!(
-                            target: "bridge_out::ownership",
-                            faucet_id = %entry.faucet_id,
-                            error = ?e,
-                            "Cantina #4: AggLayer faucet owner failed to decode — the ownership \
-                             monitor is BLIND for this faucet (upstream storage layout or code \
-                             commitment change?)"
-                        );
-                        continue;
-                    }
-                };
+            let observed: Option<AccountId> = match crate::network_accounts::owner_account_id(&acct)
+            {
+                Ok(id) => Some(id),
+                Err(miden_base_agglayer::AgglayerFaucetError::OwnershipRenounced) => None,
+                Err(e) => {
+                    // Classification already proved this IS an AggLayer
+                    // faucet, so a decode failure here means the monitor
+                    // cannot see a faucet it is responsible for. Loud.
+                    Self::count_ownership_unchecked(entry.faucet_id, "undecodable");
+                    tracing::error!(
+                        target: "bridge_out::ownership",
+                        faucet_id = %entry.faucet_id,
+                        error = ?e,
+                        "Cantina #4: AggLayer faucet owner failed to decode — the ownership \
+                         monitor is BLIND for this faucet (upstream storage layout or code \
+                         commitment change?)"
+                    );
+                    continue;
+                }
+            };
             metrics::counter!("bridge_faucet_ownership_checked_total").increment(1);
             match crate::faucet_ownership_monitor::check_faucet_owner(
                 self.bridge_account_id,

@@ -36,15 +36,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::anyhow;
-use miden_base_agglayer::{AggLayerBridge, AggLayerFaucet, BridgeRoles};
-use miden_client::Felt;
+use miden_base_agglayer::{
+    AggLayerBridge, AggLayerFaucet, AgglayerBridgeError, AgglayerFaucetError, BridgeRoles, ExitRoot,
+};
 use miden_client::note::NoteScriptRoot;
-use miden_protocol::account::{AccountBuilder, AccountId};
+use miden_protocol::account::{Account, AccountBuilder, AccountId, StorageMapKey};
 use miden_protocol::asset::TokenSymbol;
+use miden_protocol::crypto::hash::poseidon2::Poseidon2;
+use miden_protocol::{Felt, Word};
 use miden_standards::account::access::{
     Authority, Ownable2Step, Pausable, PausableManager, RoleBasedAccessControl, RoleConfig,
 };
 use miden_standards::account::auth::NetworkAccount;
+use miden_standards::account::faucets::FungibleFaucet;
 use miden_standards::account::fees::ConstantFeeManager;
 use miden_standards::account::policies::{
     BurnPolicy, MintPolicy, TokenPolicyManager, TransferPolicy,
@@ -133,6 +137,66 @@ pub fn faucet_account_builder(
         .with_component(ConstantFeeManager::for_basic_constant_fee_policy())
         .with_component(BasicWallet);
     Ok(builder)
+}
+
+// ── Readers that do not gate on the code commitment ────────────────────────────
+//
+// Upstream's `AggLayerBridge::is_ger_registered`, `AggLayerFaucet::
+// try_faucet_from_account` and `AggLayerFaucet::owner_account_id` first assert
+// `BRIDGE_CODE_COMMITMENT == account.code().commitment()` (resp. the faucet's).
+// The P2ID-fundable variants carry one more code component, so that assertion
+// fails ("the code commitment of the provided account does not match …") and
+// the proxy could no longer read its own bridge's GER map — the live deposit
+// stalled on exactly that. Storage is identical (`BasicWallet` has none), so
+// these replicas keep upstream's STORAGE checks and formulas and drop only the
+// code gate. They return upstream's error types so call sites are unchanged.
+
+/// `AggLayerBridge::is_ger_registered` without the code-commitment gate.
+pub fn is_ger_registered(
+    ger: ExitRoot,
+    bridge_account: &Account,
+) -> Result<bool, AgglayerBridgeError> {
+    // Same key derivation as upstream: poseidon2::merge(GER_LOWER, GER_UPPER).
+    let elements = ger.to_elements();
+    let ger_lower: Word = elements[0..4]
+        .try_into()
+        .expect("an exit root is eight field elements");
+    let ger_upper: Word = elements[4..8]
+        .try_into()
+        .expect("an exit root is eight field elements");
+    let ger_hash = Poseidon2::merge(&[ger_lower, ger_upper]);
+    let stored = bridge_account
+        .storage()
+        .get_map_item(
+            AggLayerBridge::ger_map_slot_name(),
+            StorageMapKey::from_raw(ger_hash),
+        )
+        .map_err(|_| AgglayerBridgeError::StorageSlotsMismatch)?;
+    let registered: Word = [Felt::ONE, Felt::ZERO, Felt::ZERO, Felt::ZERO].into();
+    Ok(stored == registered)
+}
+
+/// `AggLayerFaucet::owner_account_id` without the code-commitment gate: the
+/// AggLayer-owned faucet's `Ownable2Step` slot IS the discriminator — a
+/// Miden-native operator faucet has none and fails here, as upstream's does.
+pub fn owner_account_id(faucet_account: &Account) -> Result<AccountId, AgglayerFaucetError> {
+    let ownership = Ownable2Step::try_from_storage(faucet_account.storage())
+        .map_err(AgglayerFaucetError::Ownable2StepError)?;
+    ownership
+        .owner()
+        .ok_or(AgglayerFaucetError::OwnershipRenounced)
+}
+
+/// `AggLayerFaucet::try_faucet_from_account` without the code-commitment gate:
+/// requires the AggLayer ownership slot (see [`owner_account_id`]) and decodes
+/// the standard fungible-faucet metadata.
+pub fn try_faucet_from_account(
+    faucet_account: &Account,
+) -> Result<FungibleFaucet, AgglayerFaucetError> {
+    Ownable2Step::try_from_storage(faucet_account.storage())
+        .map_err(|_| AgglayerFaucetError::StorageSlotsMismatch)?;
+    FungibleFaucet::try_from(faucet_account.storage())
+        .map_err(AgglayerFaucetError::FungibleFaucetError)
 }
 
 #[cfg(test)]

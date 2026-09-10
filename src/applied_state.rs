@@ -106,7 +106,7 @@ async fn bridge_snapshot_with_client(
 
     let ger_applied = ger
         .map(|root| {
-            AggLayerBridge::is_ger_registered(ExitRoot::new(root), &bridge)
+            crate::network_accounts::is_ger_registered(ExitRoot::new(root), &bridge)
                 .context("reading bridge GER map")
         })
         .transpose()?;

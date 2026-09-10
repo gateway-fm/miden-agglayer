@@ -8,7 +8,7 @@ use crate::metadata_recovery::{EmitMetadata, FaucetConversion, recover_bridge_ou
 use crate::miden_client::MidenClientLib;
 use crate::store::FaucetEntry;
 use alloy::primitives::{Address, Bytes};
-use miden_base_agglayer::{AggLayerFaucet, ConfigAggBridgeNote, ConversionMetadata, MetadataHash};
+use miden_base_agglayer::{ConfigAggBridgeNote, ConversionMetadata, MetadataHash};
 use miden_client::Felt;
 use miden_client::asset::FungibleAsset;
 use miden_client::crypto::FeltRng;
@@ -40,7 +40,7 @@ pub fn classify_faucet_account(
     faucet_account: &Account,
 ) -> anyhow::Result<(FaucetKind, FungibleFaucet)> {
     // Supported #1: bridge-owned AggLayer wrapped faucet (foreign-origin tokens).
-    if let Ok(faucet) = AggLayerFaucet::try_faucet_from_account(faucet_account) {
+    if let Ok(faucet) = crate::network_accounts::try_faucet_from_account(faucet_account) {
         return Ok((FaucetKind::AggLayerOwned, faucet));
     }
     // Supported #2: native operator BasicFungibleFaucet (Miden-originated tokens). It lacks
