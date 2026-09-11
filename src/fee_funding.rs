@@ -367,7 +367,7 @@ mod tests {
         // recommendation and still keep its full personal budget.
         assert!(
             recommended_service(&f)
-                >= recommended_ger_manager(&f) + cascade_amount(&f) * CASCADE_RESERVE_TARGETS
+                >= recommended_ger_manager(&f) + cascade_amount(&f) * cascade_reserve_targets()
         );
     }
 }
