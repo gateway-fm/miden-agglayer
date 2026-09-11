@@ -152,6 +152,10 @@ struct Command {
     #[arg(long, env = "FAUCET_RECONCILER_POLL_SECS", default_value_t = 30)]
     faucet_reconciler_poll_secs: u64,
 
+    fee_vault_poll_secs: 60,
+
+    fee_vault_warn_txns: 32,
+
     /// #201: how often to export the fee-asset vault balances of service,
     /// ger_manager, the bridge and every faucet (`bridge_fee_vault_balance`,
     /// `bridge_fee_vault_txns_left`). `0` disables. Default 60s.
@@ -1892,6 +1896,10 @@ mod hardening_tests {
             l1_indexer_from_block: None,
             l1_evidence_tag: "latest".to_string(),
             faucet_reconciler_poll_secs: 30,
+
+            fee_vault_poll_secs: 60,
+
+            fee_vault_warn_txns: 32,
             faucet_reconciler_grace_ticks: 3,
             miden_debug: false,
             cors_allowed_origins: cors,
