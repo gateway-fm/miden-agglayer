@@ -77,8 +77,13 @@ for _ in $(seq 1 60); do
     sleep 2
 done
 [[ "$KEYS" == \[\"0x* ]] || fail "the signer never served a public key (got: ${KEYS:-<nothing>})"
-SIGNER_KEY="$(echo "$KEYS" | sed 's/\[\"//;s/\".*//')"
-pass "signer holds key $SIGNER_KEY"
+# Report the key the proxy is actually BOUND to for `service` (the signer may
+# serve several — e.g. raw-file keys next to cloud-KMS ones — and its list order
+# is not meaningful), and assert the signer serves that exact key.
+SIGNER_KEY="$(printf '%s' "$AGGLAYER_SIGNER_KEYS" | tr ',' '\n' | grep '^service=' | cut -d= -f2)"
+[[ -n "$SIGNER_KEY" ]] || SIGNER_KEY="$(echo "$KEYS" | sed 's/\[\"//;s/\".*//')"
+echo "$KEYS" | grep -qi "$SIGNER_KEY" || fail "the signer does not serve the bound service key $SIGNER_KEY (serves: $KEYS)"
+pass "signer holds the bound service key $SIGNER_KEY"
 
 log "waiting for the proxy to become healthy with remote signing enabled"
 for _ in $(seq 1 90); do
