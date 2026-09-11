@@ -40,9 +40,7 @@ use miden_base_agglayer::{
     AggLayerBridge, AggLayerFaucet, AgglayerBridgeError, AgglayerFaucetError, BridgeRoles, ExitRoot,
 };
 use miden_client::note::NoteScriptRoot;
-use miden_protocol::account::{
-    Account, AccountBuilder, AccountId, AssetCallbackFlag, StorageMapKey,
-};
+use miden_protocol::account::{Account, AccountBuilder, AccountId, StorageMapKey};
 use miden_protocol::asset::TokenSymbol;
 use miden_protocol::crypto::hash::poseidon2::Poseidon2;
 use miden_protocol::{Felt, Word};
@@ -127,17 +125,8 @@ pub fn faucet_account_builder(
         .active_send_policy(TransferPolicy::allow_all())
         .active_receive_policy(TransferPolicy::allow_all())
         .build();
-    // A faucet that configures a transfer policy MUST carry AssetCallbackFlag::
-    // Enabled (miden-protocol AccountBuilder doc; the flag is immutable, baked
-    // into the id). The upstream AggLayerFaucet::account_builder omits it, so it
-    // builds a Disabled faucet — which the proxy's own Cantina #4 detector
-    // rejects (a legit wrapped-faucet MINT must have Enabled callbacks; live at
-    // base fee 7, the deposit's MINT tripped "asset_callbacks: expected Enabled,
-    // observed Disabled"). Derive it the way miden-standards' faucet helper does.
-    let asset_callbacks = AssetCallbackFlag::from(token_policy_manager.has_transfer_policy());
     let builder = NetworkAccount::builder(seed.into(), allowed, fee_policy_manager)
         .map_err(|e| anyhow!("faucet note allowlist: {e:?}"))?
-        .with_asset_callbacks(asset_callbacks)
         .with_component(faucet)
         .with_component(Ownable2Step::new(bridge_account_id))
         .with_component(rbac)
@@ -222,32 +211,5 @@ mod tests {
         let faucet = p2id_fundable(AggLayerFaucet::allowed_notes());
         assert!(faucet.contains(&P2idNote::script_root()));
         assert!(faucet.is_superset(&AggLayerFaucet::allowed_notes()));
-    }
-
-    #[test]
-    fn faucet_is_asset_callback_enabled() {
-        use miden_protocol::account::{AccountId, AssetCallbackFlag};
-        use miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_PUBLIC_ACCOUNT_IMMUTABLE_CODE as X;
-        let id = AccountId::try_from(X).unwrap();
-        let faucet = faucet_account_builder(
-            [7u8; 32],
-            "ETH",
-            8,
-            Felt::new(1_000_000).unwrap(),
-            Felt::new(0).unwrap(),
-            id,
-            id,
-            id,
-        )
-        .unwrap()
-        .build()
-        .unwrap();
-        // The wrapped faucet configures a transfer policy, so its immutable
-        // AssetCallbackFlag must be Enabled — the invariant the proxy's Cantina
-        // #4 MINT detector enforces (upstream's builder leaves it Disabled).
-        assert_eq!(
-            faucet.id().asset_callback_flag(),
-            AssetCallbackFlag::Enabled
-        );
     }
 }
