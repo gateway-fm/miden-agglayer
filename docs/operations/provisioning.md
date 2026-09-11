@@ -306,7 +306,9 @@ asset; send it and init continues.
 `bridge_fee_vault_balance` (units of the fee asset), `bridge_fee_vault_txns_left`
 (balance ÷ the per-transaction cap `bridge_fee_max_per_txn`), and logs WARN below
 `--fee-vault-warn-txns` (default 32) and ERROR at 0. Alert on
-`bridge_fee_vault_txns_left < 32`. Measured at base fee 7: network transactions
+`bridge_fee_vault_txns_left < 32`. A top-up P2ID is consumed by the proxy on its next
+monitor tick (the note pays for its own consume, so an empty vault recovers without a
+restart). Measured at base fee 7: network transactions
 (bridge, faucets) cost ~40–50 units, signed client transactions the 210 cap; a
 busy bridge ran 27 network transactions in ten minutes, so the 13,440-unit
 cascade is hours of runway — top up from the metric, not on a schedule.
