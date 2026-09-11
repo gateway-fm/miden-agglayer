@@ -149,6 +149,13 @@ impl FeeVaultMonitor {
                             tracing::warn!(account = %name, id = %id.to_hex(), "fee-vault monitor: account not in the client store");
                             continue;
                         };
+                        // Sweep top-ups: a P2ID of the fee asset sent to this account
+                        // (runbook top-up, cascade, exhaustion recovery) lands only once consumed.
+                        match crate::fee_funding::consume_fee_notes(client, id, &snap).await {
+                            Ok(n) if n > 0 => tracing::info!(account = %name, notes = n, "consuming fee-asset top-up note(s) (#201)"),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(account = %name, error = %format!("{e:#}"), "could not consume a fee-asset top-up"),
+                        }
                         let balance = fee_balance(&account, snap.fee_faucet_id);
                         let left = txns_left(balance, max_fee);
                         metrics::gauge!("bridge_fee_vault_balance", "account" => name.clone())

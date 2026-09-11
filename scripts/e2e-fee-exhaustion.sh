@@ -45,8 +45,7 @@ for i in $(seq 1 8); do
 done
 [[ "$(txns_left)" == "0" ]] || fail "$ACCOUNT never ran dry after 8 deposits (txns_left=$(txns_left)) — budget too generous"
 (( stuck > 0 )) || fail "$ACCOUNT is dry but no deposit stalled — the stall is not visible in the flow"
-proxy_log | grep -q "fee vault EMPTY.*account=\"$ACCOUNT\"\|account=\"$ACCOUNT\".*fee vault EMPTY" \
-  || proxy_log | grep -qE "fee vault EMPTY" || fail "no 'fee vault EMPTY' ERROR for $ACCOUNT in the proxy log"
+proxy_log | grep "fee vault EMPTY" | grep -q "account=$ACCOUNT" || fail "no 'fee vault EMPTY' ERROR for $ACCOUNT in the proxy log"
 pass "$ACCOUNT ran dry after $passed deposit(s): txns_left=0, ERROR logged, $stuck deposit(s) stuck"
 
 # ── top up (the runbook's way) and expect self-recovery ───────────────────────

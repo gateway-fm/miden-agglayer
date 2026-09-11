@@ -87,7 +87,10 @@ pub fn max_fee_per_txn(verification_base_fee: u32) -> u64 {
 /// A transaction budget, overridable per account through the environment so the
 /// fee-exhaustion e2e can start an account nearly dry (`FEE_TXN_BUDGET_<NAME>`).
 fn budget(env: &str, default: u64) -> u64 {
-    std::env::var(env).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(env)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 /// Recommended fee-asset funding for `ger_manager`.
@@ -106,7 +109,8 @@ pub fn recommended_service(fee: &FeeSnapshot) -> u64 {
 
 /// What `service` sends each keyless account it funds.
 pub fn cascade_amount(fee: &FeeSnapshot) -> u64 {
-    max_fee_per_txn(fee.verification_base_fee) * budget("FEE_TXN_BUDGET_CASCADE", CASCADE_TXN_BUDGET)
+    max_fee_per_txn(fee.verification_base_fee)
+        * budget("FEE_TXN_BUDGET_CASCADE", CASCADE_TXN_BUDGET)
 }
 
 fn carries_fee_asset(note: &Note, fee: &FeeSnapshot) -> bool {
@@ -118,6 +122,31 @@ fn carries_fee_asset(note: &Note, fee: &FeeSnapshot) -> bool {
 /// Poll until `account_id` has at least one consumable note carrying the fee
 /// asset, syncing between polls. The first miss logs the exact funding
 /// instruction so an operator watching the log knows what to send where.
+/// Consume every pending fee-asset note addressed to `account_id` (a top-up).
+/// Nobody else would: the ntx-builder only executes network notes, and a
+/// wallet's proxy-side transactions never look for stray P2IDs. The consumed
+/// note pays for its own consume, so this works on an empty vault too.
+pub async fn consume_fee_notes(
+    client: &mut MidenClientLib,
+    account_id: AccountId,
+    fee: &FeeSnapshot,
+) -> anyhow::Result<usize> {
+    let mut notes = Vec::new();
+    for (record, _) in client.get_consumable_notes(Some(account_id)).await? {
+        if let Ok(note) = Note::try_from(record)
+            && carries_fee_asset(&note, fee)
+        {
+            notes.push(note);
+        }
+    }
+    let n = notes.len();
+    if n > 0 {
+        let request = TransactionRequestBuilder::new().build_consume_notes(notes)?;
+        crate::miden_client::submit_new_transaction(client, account_id, request).await?;
+    }
+    Ok(n)
+}
+
 pub async fn wait_for_funding_notes(
     client: &mut MidenClientLib,
     account_id: AccountId,
