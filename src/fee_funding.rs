@@ -358,13 +358,13 @@ mod tests {
         assert_eq!(cascade_amount(&f), per * CASCADE_TXN_BUDGET);
         assert_eq!(
             recommended_service(&f),
-            per * KMS_ACCOUNT_TXN_BUDGET + per * CASCADE_TXN_BUDGET * INIT_CASCADE_TARGETS
+            per * KMS_ACCOUNT_TXN_BUDGET + per * CASCADE_TXN_BUDGET * CASCADE_RESERVE_TARGETS
         );
         // service must be able to fund every init cascade target out of its own
         // recommendation and still keep its full personal budget.
         assert!(
             recommended_service(&f)
-                >= recommended_ger_manager(&f) + cascade_amount(&f) * INIT_CASCADE_TARGETS
+                >= recommended_ger_manager(&f) + cascade_amount(&f) * CASCADE_RESERVE_TARGETS
         );
     }
 }
