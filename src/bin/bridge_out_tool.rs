@@ -645,10 +645,14 @@ async fn fund_fee_asset(
             .await
             .map_err(|e| anyhow!("loading the faucet operator key: {e}"))?;
     }
-    client
-        .add_account(&file.account, true)
-        .await
-        .map_err(|e| anyhow!("importing faucet operator {}: {e:?}", operator_id.to_hex()))?;
+    // A store that already tracks the operator holds its CURRENT state; re-importing
+    // the genesis file over it fails with AccountNonceTooLow.
+    if client.get_account(operator_id).await?.is_none() {
+        client
+            .add_account(&file.account, false)
+            .await
+            .map_err(|e| anyhow!("importing faucet operator {}: {e:?}", operator_id.to_hex()))?;
+    }
     client
         .sync_state()
         .await
