@@ -316,6 +316,20 @@ bridge-out-tool --fund-fee-asset \
   --fund <service-or-bridge-or-faucet-id>=<amount>
 ```
 
+**Recipients (bridged-in claimants) pay to consume their mint.** The MINT the
+faucet produces is a P2ID to the claimant, and consuming it is a transaction the
+*claimant's* account executes — so on a fee-charging chain it pays
+`verification_base_fee × …` from the claimant's own vault, in the native fee
+asset, before the bridged tokens land. A fresh wallet has none and the consume
+aborts in the kernel ("failed to remove the fungible asset from the vault …"):
+the mint is on-chain and waiting, the balance just never shows. This is standard
+Miden UX (users get the native asset from a faucet first), not a bridge
+concern — but tell your users, and give any test/relayer wallet the fee asset
+before it claims. The e2e does exactly that: `lib-isolated-wallet.sh` funds its
+isolated recipient wallet from the genesis faucet operator whenever the chain
+charges fees, and the wallet's next consume takes the fee P2ID together with the
+mint, paying for itself.
+
 Nothing changes in custody: the cascade sends are `service`'s own transactions,
 signed by its (remote) key like its claims. The proxy never mints the fee asset
 and never holds a local secret for it. For dev/e2e the operator step is played
