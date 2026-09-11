@@ -505,8 +505,10 @@ services:
           --fund-fee-asset --faucet-operator-mac /data/accounts/faucet_operator.mac \
           --funding-manifest "$$M"; }
         # Retry until it lands: a single failed attempt would leave --init waiting for
-        # notes that never come and the healthcheck to give up.
-        until fund; do echo "[fee-funder] funding failed — retrying in 10s"; sleep 10; done
+        # notes that never come and the healthcheck to give up. Not on a restart after
+        # --init already finished: the accounts are funded, and a spurious send from the
+        # operator races other funders spending the same account ("conflicts with mempool").
+        if [ ! -f "$$C" ]; then until fund; do echo "[fee-funder] funding failed — retrying in 10s"; sleep 10; done; fi
         # Stay alive: `compose up --wait` treats an exited one-shot as a failed wait, and a
         # test that wipes the proxy's data dir makes --init write a NEW manifest — fund that too.
         last=$$(md5sum "$$M")

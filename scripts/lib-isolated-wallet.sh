@@ -108,8 +108,11 @@ iso_fund_fee_asset() {
     [[ -n "$fee_faucet" && -n "$max_fee" ]] || { echo "isolated-wallet: $manifest lacks fee_faucet_id/max_fee_per_txn" >&2; return 1; }
     amount=${want:-$(( max_fee * 1024 ))}
     echo "isolated-wallet: fee-charging chain — funding $wallet with $amount units of the fee asset $fee_faucet (from the genesis faucet operator)" >&2
-    local out
-    if ! out=$(docker run --rm --network "$ISO_NETWORK" \
+    # The operator account is shared with other funders (the fee-funder sidecar); a send
+    # can lose a mempool race ("conflicts with current mempool state") — retry.
+    local out attempt
+    for attempt in 1 2 3 4; do
+        if out=$(docker run --rm --network "$ISO_NETWORK" \
             -v "$B2AGG_STORE_DIR:/store" \
             -v "${ISO_NODE_DATA_VOLUME:-miden-agglayer_node_data}:/data:ro" \
             -e "MIDEN_PROVER_URL=$ISO_PROVER_URL" -e "TMPDIR=/store/tmp" \
@@ -117,8 +120,10 @@ iso_fund_fee_asset() {
             --store-dir /store/funder --node-url "$ISO_NODE_URL" \
             --miden-prover-url "$ISO_PROVER_URL" \
             --fund-fee-asset --faucet-operator-mac /data/accounts/faucet_operator.mac \
-            --fee-faucet-id "$fee_faucet" --fund "$wallet=$amount" 2>&1); then
-        echo "$out" | tail -15 >&2
+            --fee-faucet-id "$fee_faucet" --fund "$wallet=$amount" 2>&1); then break; fi
+        echo "isolated-wallet: fee-asset send attempt $attempt failed — retrying in 10s" >&2; sleep 10; out=""
+    done
+    if [[ -z "$out" ]]; then
         echo "isolated-wallet: fee-asset funding of $wallet FAILED — on this chain its consumes cannot pay their fee" >&2
         return 1
     fi
