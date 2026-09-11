@@ -24,7 +24,11 @@ esac
 
 log "fresh stack with a tiny fee budget for $ACCOUNT"
 make e2e-down >/dev/null 2>&1 || true; make e2e-clean-data >/dev/null 2>&1 || true
-make e2e-up >/tmp/e2e-fee-exhaustion-up.log 2>&1 || { tail -20 /tmp/e2e-fee-exhaustion-up.log; fail "stack bring-up"; }
+make e2e-up >/tmp/e2e-fee-exhaustion-up.log 2>&1 || {
+  tail -5 /tmp/e2e-fee-exhaustion-up.log
+  echo "--- proxy log (why --init did not come up healthy) ---"
+  docker logs miden-agglayer-miden-agglayer-1 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' | grep -E "WARN|ERROR|Error|deploy|cascade|funding|panick" | tail -25
+  fail "stack bring-up"; }
 [[ -f "$DATA/funding.toml" ]] || fail "no funding.toml — this test needs a fee-charging chain (base fee > 0)"
 MAX_FEE=$(sed -n 's/^max_fee_per_txn *= *\([0-9]*\).*/\1/p' "$DATA/funding.toml")
 ACCOUNT_ID=$(sed -n "s/^$ACCOUNT *= *\"\(.*\)\"/\1/p" "$DATA/bridge_accounts.toml")
