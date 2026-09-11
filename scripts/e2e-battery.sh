@@ -13,6 +13,8 @@ BASE_ENV=(env -u WITH_WEB3SIGNER -u EXTRA_COMPOSE_FILES)
 # shellcheck source=scripts/lib-tool-preflight.sh
 . "$PWD/scripts/lib-tool-preflight.sh"
 preflight_bridge_out_tool "$R/logs" || exit 1
+# shellcheck source=scripts/lib-stack-health.sh
+. "$PWD/scripts/lib-stack-health.sh"
 
 
 matrix() { "$PWD/scripts/e2e-battery-matrix.py" "$TSV" > "$R/MATRIX.md" 2>/dev/null; }
@@ -108,6 +110,39 @@ time out; the wedge is the cause, not those targets." | tee -a "$R/battery.log"
     return 0
 }
 
+# A WEDGED projector is a distinct, UNRECOVERABLE class from the nonce-gap gate:
+# the projector fail-closed on a leaf it cannot resolve, the synthetic tip is
+# frozen, and NOTHING self-heals — so every later target only re-observes the
+# frozen tip and burns its full timeout. That is exactly the #193 g1->g3 run: a
+# half-registered native faucet quarantined a B2AGG leaf, the projector halted,
+# and 40+ targets each timed out with the wedge (not the target) as the cause.
+# Detect it straight from the proxy's own fail-closed log line (emitted every
+# sync tick while halted), name it ONCE with the halt reason, and let run() skip
+# the rest fast. Returns 0 (== "wedged, skip this target"), 1 otherwise. Under a
+# non-KEEP_CHAIN battery a `fresh` target's teardown clears the stack first, so
+# this correctly reads healthy after a reprovision.
+projector_wedged() { # $1 = iteration, $2 = next target label
+    # Classify the whole stack (lib-stack-health.sh), not just the projector: an
+    # INFRA-broken box (crash-looping/unhealthy containers, dead RPC — the 0/21
+    # box-corruption class) and a WEDGED pipeline (projector fail-closed / frozen
+    # tip) both make EVERY remaining target fail through no fault of its own. Name
+    # the cause ONCE with its verdict and let run() short-circuit the rest as SKIP.
+    local verdict rc kind
+    verdict="$(stack_health)"
+    rc=$?
+    (( rc == 0 )) && return 1 # HEALTHY — run the target
+    (( rc == 2 )) && kind=wedge || kind=infra
+    if [[ "${BATTERY_WEDGED:-0}" != 1 ]]; then
+        BATTERY_WEDGED=1
+        echo "[$(date -u +%H:%M:%SZ)] STACK ${kind^^} before $2 — $verdict" | tee -a "$R/battery.log"
+        printf '%s\t%s\t%s\t%s\t%s\n' "${ITER_PREFIX:-}$1" "stack-$kind-before-$2" \
+            "FAIL" "0" "$R/battery.log" >> "$TSV"
+        matrix
+        post_mortem "$1" "stack-$kind-before-$2"
+    fi
+    return 0
+}
+
 # Chain growth is the point of the run, so it is recorded, not assumed. Called
 # at every drill and at each iteration boundary.
 chain_mark() { # $1 = label
@@ -175,6 +210,13 @@ run() {
     local iter="$1" label="$2" mode="$3"; shift 3
     local log="$R/logs/${ITER_PREFIX:-i}${iter}-${label}.log" t0 t1 rc
     [[ "$mode" == fresh ]] && down
+    if projector_wedged "$iter" "$label"; then
+        printf '%s\t%s\t%s\t%s\t%s\n' "${ITER_PREFIX:-}$iter" "$label" \
+            "SKIP-wedged" "0" "$R/battery.log" >> "$TSV"
+        matrix
+        echo "[$(date -u +%H:%M:%SZ)] ${ITER_PREFIX:-i}$iter $label SKIP — stack unhealthy/wedged (see stack-*-before row)" | tee -a "$R/battery.log"
+        return 0
+    fi
     nonce_gate "$iter" "$label"
     echo "[$(date -u +%H:%M:%SZ)] ${ITER_PREFIX:-i}$iter $label START" | tee -a "$R/battery.log"
     t0=$(date +%s)
@@ -209,6 +251,13 @@ if [[ "${ITER_START:-1}" == "1" ]]; then
   echo "=== one-time genesis wipe before iteration 1 ===" | tee -a "$R/battery.log"
   WIPE_ENV=(env -u WITH_WEB3SIGNER -u EXTRA_COMPOSE_FILES KEEP_CHAIN=0)
   "${WIPE_ENV[@]}" make e2e-down       >>"$R/logs/down.log" 2>&1 || true
+  # NUCLEAR reset before clean-data: `make e2e-clean-data` does NOT recreate
+  # already-running node containers, so a corrupted box (stale node_data, a
+  # stateless L2B anvil, a wedged chain) survives it and fails every target on
+  # `up --wait` (observed: a 0/21 matrix). Remove all containers + volumes so a
+  # fresh genesis is truly fresh.
+  echo "=== nuclear reset (remove all miden-agglayer containers + volumes) ===" | tee -a "$R/battery.log"
+  stack_nuclear_reset
   "${WIPE_ENV[@]}" make e2e-clean-data >>"$R/logs/down.log" 2>&1
   # THE LIVE-BASELINE DRILL — must run HERE, before any target that restores.
   #
