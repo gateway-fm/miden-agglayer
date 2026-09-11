@@ -51,11 +51,7 @@ pub fn fee_balance(account: &Account, fee_faucet_id: AccountId) -> u64 {
 
 /// Conservative "transactions before empty" at the per-transaction fee cap.
 pub fn txns_left(balance: u64, max_fee: u64) -> u64 {
-    if max_fee == 0 {
-        u64::MAX
-    } else {
-        balance / max_fee
-    }
+    balance.checked_div(max_fee).unwrap_or(u64::MAX)
 }
 
 pub struct FeeVaultMonitor {
