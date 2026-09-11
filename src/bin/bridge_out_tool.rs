@@ -263,6 +263,15 @@ struct Args {
     #[arg(long)]
     inspect_faucet: Option<String>,
 
+    /// Print the fungible vault balances of one or more PUBLIC accounts (hex or
+    /// bech32 ids), read-only — imports each account by id from the node. The
+    /// operator's view of "how much fee asset does my bridge / faucet / service
+    /// hold" for top-ups (#201). Output: one `vault-balance: account=<hex>
+    /// faucet=<hex> amount=<n>` line per asset (`(empty)` when the vault holds
+    /// nothing). Requires only --store-dir + --node-url.
+    #[arg(long = "vault-balance", num_args = 1..)]
+    vault_balance: Vec<String>,
+
     /// Received-asset linkage mode (#147 / PR#152). Enumerate the fungible faucets the
     /// RECEIVING wallet (--wallet-id) actually holds, derived from its ON-CHAIN vault
     /// after syncing + consuming any pending P2ID notes — so the e2e can identify the
@@ -750,6 +759,7 @@ async fn main() -> anyhow::Result<()> {
         || args.create_native_faucet
         || args.fund_fee_asset
         || args.inspect_faucet.is_some()
+        || !args.vault_balance.is_empty()
     {
         // Provision / read-only modes: the store/keystore may not exist yet (a fresh
         // temp dir for --inspect-faucet) — create them.
@@ -828,6 +838,55 @@ async fn main() -> anyhow::Result<()> {
     // faucet (the wallet's `Unknown`) or an RPC failure is a non-zero exit.
     if args.fund_fee_asset {
         return fund_fee_asset(&mut client, keystore.clone(), &args).await;
+    }
+    if !args.vault_balance.is_empty() {
+        sync_with_retry(&mut client, "vault-balance").await?;
+        let mut failures = 0;
+        for id_str in &args.vault_balance {
+            let id = match parse_account_id(id_str) {
+                Ok(id) => id,
+                Err(e) => {
+                    eprintln!("vault-balance: ERROR bad account id {id_str}: {e:?}");
+                    failures += 1;
+                    continue;
+                }
+            };
+            // Already-tracked accounts (the wallet, a previously imported id) make
+            // the import a no-op / benign error; the read below is what matters.
+            if let Err(e) = client.import_account_by_id(id).await {
+                eprintln!(
+                    "vault-balance: note: import of {} returned {e:?} (reading tracked state)",
+                    id.to_hex()
+                );
+            }
+            let Some(record) = client.get_account(id).await? else {
+                eprintln!(
+                    "vault-balance: ERROR account {} not found on the node",
+                    id.to_hex()
+                );
+                failures += 1;
+                continue;
+            };
+            let mut any = false;
+            for asset in record.vault().assets() {
+                if let miden_protocol::asset::Asset::Fungible(f) = asset {
+                    any = true;
+                    println!(
+                        "vault-balance: account={} faucet={} amount={}",
+                        id.to_hex(),
+                        f.faucet_id().to_hex(),
+                        f.amount().as_u64()
+                    );
+                }
+            }
+            if !any {
+                println!("vault-balance: account={} (empty)", id.to_hex());
+            }
+        }
+        if failures > 0 {
+            std::process::exit(2);
+        }
+        return Ok(());
     }
     if let Some(fid_hex) = args.inspect_faucet.as_deref() {
         let faucet_id = parse_account_id(fid_hex)
