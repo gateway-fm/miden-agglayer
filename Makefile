@@ -433,6 +433,9 @@ e2e-claim-watcher-synthesis: e2e-claim-watcher ## After watcher happy path, simu
 	$(COMPOSE_ENV) ./scripts/e2e-claim-watcher-synthesis.sh
 
 .PHONY: e2e-claim-provenance
+e2e-fee-exhaustion: ## #201: service, ger_manager and the bridge each run out of fee asset mid-flow and must recover when topped up (fee-charging chain; brings its own stacks)
+	for a in service ger_manager bridge; do $(COMPOSE_ENV) ./scripts/e2e-fee-exhaustion.sh $$a || exit 1; done
+
 e2e-claim-provenance: ## Deploy a FOREIGN bridge on the same chain, drive a claim through it, assert zero ClaimEvent leakage (stack must be up)
 	$(COMPOSE_ENV) ./scripts/e2e-claim-provenance.sh
 

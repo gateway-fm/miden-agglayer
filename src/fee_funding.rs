@@ -84,21 +84,29 @@ pub fn max_fee_per_txn(verification_base_fee: u32) -> u64 {
     u64::from(verification_base_fee) * u64::from(MAX_TX_EXECUTION_CYCLES.ilog2() + 1)
 }
 
+/// A transaction budget, overridable per account through the environment so the
+/// fee-exhaustion e2e can start an account nearly dry (`FEE_TXN_BUDGET_<NAME>`).
+fn budget(env: &str, default: u64) -> u64 {
+    std::env::var(env).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
 /// Recommended fee-asset funding for `ger_manager`.
 pub fn recommended_ger_manager(fee: &FeeSnapshot) -> u64 {
-    max_fee_per_txn(fee.verification_base_fee) * KMS_ACCOUNT_TXN_BUDGET
+    max_fee_per_txn(fee.verification_base_fee)
+        * budget("FEE_TXN_BUDGET_GER_MANAGER", KMS_ACCOUNT_TXN_BUDGET)
 }
 
 /// Recommended fee-asset funding for `service`: its own budget PLUS everything
 /// it cascades to the keyless accounts at init.
 pub fn recommended_service(fee: &FeeSnapshot) -> u64 {
     let per = max_fee_per_txn(fee.verification_base_fee);
-    per * KMS_ACCOUNT_TXN_BUDGET + per * CASCADE_TXN_BUDGET * INIT_CASCADE_TARGETS
+    per * budget("FEE_TXN_BUDGET_SERVICE", KMS_ACCOUNT_TXN_BUDGET)
+        + cascade_amount(fee) * INIT_CASCADE_TARGETS
 }
 
 /// What `service` sends each keyless account it funds.
 pub fn cascade_amount(fee: &FeeSnapshot) -> u64 {
-    max_fee_per_txn(fee.verification_base_fee) * CASCADE_TXN_BUDGET
+    max_fee_per_txn(fee.verification_base_fee) * budget("FEE_TXN_BUDGET_CASCADE", CASCADE_TXN_BUDGET)
 }
 
 fn carries_fee_asset(note: &Note, fee: &FeeSnapshot) -> bool {

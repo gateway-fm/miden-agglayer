@@ -198,6 +198,7 @@ FRESH_TARGETS=(
   e2e-cantina12-getlogs-returns-all e2e-cantina13
   e2e-ger-decomposition e2e-security e2e-fuzz
   e2e-reconciler-private-note e2e-reconciler-cursor-persistence
+  e2e-fee-exhaustion
   e2e-rd913-restart-burn-collision e2e-rd940
 )
 
