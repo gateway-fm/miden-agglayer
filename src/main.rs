@@ -152,6 +152,17 @@ struct Command {
     #[arg(long, env = "FAUCET_RECONCILER_POLL_SECS", default_value_t = 30)]
     faucet_reconciler_poll_secs: u64,
 
+    /// #201: how often to export the fee-asset vault balances of service,
+    /// ger_manager, the bridge and every faucet (`bridge_fee_vault_balance`,
+    /// `bridge_fee_vault_txns_left`). `0` disables. Default 60s.
+    #[arg(long, env = "FEE_VAULT_POLL_SECS", default_value_t = 60)]
+    fee_vault_poll_secs: u64,
+
+    /// #201: WARN when an account can pay for fewer than this many transactions
+    /// at the fee cap (ERROR at 0). Default 32.
+    #[arg(long, env = "FEE_VAULT_WARN_TXNS", default_value_t = 32)]
+    fee_vault_warn_txns: u64,
+
     /// Consecutive reconciler scans an unknown bridge faucet must survive before it
     /// halts the proxy. The grace window (poll_secs × grace_ticks) tolerates the brief
     /// gap between the proxy's own on-chain registration note and its store-row commit,
@@ -1510,6 +1521,25 @@ async fn main() -> anyhow::Result<()> {
         // as the L1 indexer above — no graceful-shutdown path holds it).
         std::mem::forget(reconciler.spawn());
         tracing::info!("FaucetRegistryReconciler spawned");
+    }
+
+    // #201: fee-vault balances → metrics (every account pays its own tx fees).
+    if command.fee_vault_poll_secs == 0 {
+        tracing::warn!(
+            "fee-vault monitor DISABLED (--fee-vault-poll-secs 0): an empty fee vault will not be visible in metrics"
+        );
+    } else {
+        let monitor = miden_agglayer_service::fee_vault_monitor::FeeVaultMonitor::new(
+            state.miden_client.clone(),
+            state.store.clone(),
+            state.accounts.0.service.0,
+            state.accounts.0.ger_manager.as_ref().map(|g| g.0),
+            state.accounts.0.bridge.0,
+        )
+        .with_poll_interval(std::time::Duration::from_secs(command.fee_vault_poll_secs))
+        .with_warn_txns(command.fee_vault_warn_txns);
+        std::mem::forget(monitor.spawn());
+        tracing::info!("FeeVaultMonitor spawned");
     }
 
     // (Metrics recorder + `init_metrics` are installed at the very top of

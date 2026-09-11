@@ -301,6 +301,16 @@ asset; send it and init continues.
 
 ### Ongoing top-ups
 
+**Watch the vaults in metrics.** The proxy exports, every `--fee-vault-poll-secs`
+(default 60 s), per account (`account="service"|"ger_manager"|"bridge"|"faucet:<SYMBOL>"`):
+`bridge_fee_vault_balance` (units of the fee asset), `bridge_fee_vault_txns_left`
+(balance ÷ the per-transaction cap `bridge_fee_max_per_txn`), and logs WARN below
+`--fee-vault-warn-txns` (default 32) and ERROR at 0. Alert on
+`bridge_fee_vault_txns_left < 32`. Measured at base fee 7: network transactions
+(bridge, faucets) cost ~40–50 units, signed client transactions the 210 cap; a
+busy bridge ran 27 network transactions in ten minutes, so the 13,440-unit
+cascade is hours of runway — top up from the metric, not on a schedule.
+
 Fees are per-transaction and continuous, so this is a **balance to maintain**,
 not a one-time deposit — `ger_manager` pays on every GER injection, `service` on
 every claim, the bridge on every network transaction, each faucet on every mint.
