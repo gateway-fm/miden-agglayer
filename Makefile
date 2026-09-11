@@ -408,6 +408,10 @@ e2e-l2l2-up: e2e-clean-data gen-l2b-configs ## Bring up base stack + L2B overlay
 e2e-l2l2: ## Run the L2<->L2 group (preflight + forward L2B->Miden + back Miden->L2B + evidence). Stack must be up (make e2e-l2l2-up).
 	$(COMPOSE_ENV) ./scripts/e2e-test.sh l2l2
 
+.PHONY: e2e-loadtest-isolated
+e2e-loadtest-isolated: e2e-up ## Isolated bridge-out reliability loadtest (N=30, 1 ETH + 9 ERC-20) on a fresh stack
+	$(COMPOSE_ENV) env N=$${N:-30} ./scripts/e2e-bridge-loadtest-isolated.sh
+
 .PHONY: e2e-miden-origin
 e2e-miden-origin: ## Miden-originated token round-trips (->L2B, ->L1, permissionless ->L2B). L2B overlay must be up (make e2e-l2l2-up).
 	for v in "DEST=l2b" "DEST=l1" "REGISTER_MODE=permissionless DEST=l2b"; do env $$v $(COMPOSE_ENV) ./scripts/e2e-miden-origin.sh || exit 1; done

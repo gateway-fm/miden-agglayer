@@ -180,6 +180,13 @@ impl FeeVaultMonitor {
                         if balance == 0 {
                             tracing::error!(account = %name, id = %id.to_hex(),
                                 "fee vault EMPTY — every transaction of this account will abort until it is topped up (#201)");
+                        } else if name == "service"
+                            && balance < crate::fee_funding::cascade_amount(&snap) + max_fee
+                        {
+                            // A cascade is a 64-tx-sized spend: service can look healthy per
+                            // transaction and still be unable to fund the next new faucet.
+                            tracing::warn!(account = %name, id = %id.to_hex(), balance,
+                                "fee vault too low to fund another faucet — the next new token's claims will fail until topped up (#201)");
                         } else if left < warn_txns {
                             tracing::warn!(account = %name, id = %id.to_hex(), balance, txns_left = left,
                                 "fee vault low — top up with a P2ID of the fee asset (#201)");

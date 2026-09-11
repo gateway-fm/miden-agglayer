@@ -270,7 +270,7 @@ ger_manager   = "0x…"      # KMS-keyed — fund this
 fee_faucet_id = "0x…"      # the chain's native fee asset
 verification_base_fee = 7
 max_fee_per_txn       = 210
-fund_service     = 80640   # bigger: covers what service cascades to bridge/faucets
+fund_service     = 215040  # bigger: its own budget + cascades for the bridge, the ETH faucet and 10 runtime faucets
 fund_ger_manager = 53760
 ```
 
@@ -327,6 +327,11 @@ bridge-out-tool --fund-fee-asset \
   --fee-faucet-id <fee_faucet_id from funding.toml> \
   --fund <service-or-bridge-or-faucet-id>=<amount>
 ```
+
+**Every new token costs `service` one cascade** (13,440 units at base fee 7): the
+recommended `fund_service` reserves ten of them; past that the proxy logs "fee
+vault too low to fund another faucet" and new tokens' claims fail until `service`
+is topped up.
 
 **Recipients (bridged-in claimants) pay to consume their mint.** The MINT the
 faucet produces is a P2ID to the claimant, and consuming it is a transaction the

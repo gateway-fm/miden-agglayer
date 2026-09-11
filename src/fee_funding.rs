@@ -45,6 +45,11 @@ pub const CASCADE_TXN_BUDGET: u64 = 64;
 /// Keyless accounts `--init` cascade-funds from `service`: the bridge and the
 /// ETH faucet. Later faucets are cascade-funded at runtime as tokens appear.
 pub const INIT_CASCADE_TARGETS: u64 = 2;
+/// How many cascades `service` is funded for up front: the two init targets plus
+/// runtime faucets (one per new token bridged in). Loadtest N=30 (9 new tokens)
+/// ran `service` dry after four; the real answer for an unbounded token count is
+/// the fee-vault monitor and top-ups, this just makes the common case not stall.
+pub const CASCADE_RESERVE_TARGETS: u64 = INIT_CASCADE_TARGETS + 10;
 const FUNDING_POLL: Duration = Duration::from_secs(5);
 
 /// The chain's fee parameters, read from the genesis header (constant for the
@@ -104,7 +109,7 @@ pub fn recommended_ger_manager(fee: &FeeSnapshot) -> u64 {
 pub fn recommended_service(fee: &FeeSnapshot) -> u64 {
     let per = max_fee_per_txn(fee.verification_base_fee);
     per * budget("FEE_TXN_BUDGET_SERVICE", KMS_ACCOUNT_TXN_BUDGET)
-        + cascade_amount(fee) * INIT_CASCADE_TARGETS
+        + cascade_amount(fee) * CASCADE_RESERVE_TARGETS
 }
 
 /// What `service` sends each keyless account it funds.
