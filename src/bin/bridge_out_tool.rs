@@ -584,6 +584,31 @@ async fn consume_pending_notes(
 /// pre-funded with 1e9 units of the fee asset — and writes it as
 /// `faucet_operator.mac` WITH its signing key. Funding is therefore a plain
 /// P2ID send from the operator's vault: no minting, no faucet interface needed.
+/// The creator wallet's own fee funding is a P2ID that lands only once consumed;
+/// consume it and wait, or the cascade below fails with "asset error" (#201).
+async fn settle_fee_notes(
+    client: &mut miden_agglayer_service::miden_client::MidenClientLib,
+    wallet: AccountId,
+    fee: &miden_agglayer_service::fee_funding::FeeSnapshot,
+) -> anyhow::Result<()> {
+    if miden_agglayer_service::fee_funding::consume_fee_notes(client, wallet, fee).await? == 0 {
+        return Ok(());
+    }
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        client.sync_state().await?;
+        if let Some(a) = client.get_account(wallet).await?
+            && miden_agglayer_service::fee_vault_monitor::fee_balance(&a, fee.fee_faucet_id) > 0
+        {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "fee funding note of {} did not land within 60s",
+        wallet.to_hex()
+    )
+}
+
 async fn fund_fee_asset(
     client: &mut miden_agglayer_service::miden_client::MidenClientLib,
     keystore: Arc<miden_agglayer_service::proxy_keystore::ProxyKeystore>,
@@ -1019,6 +1044,7 @@ async fn main() -> anyhow::Result<()> {
             let funder = args.wallet_id.as_deref().map(AccountId::from_hex).transpose()
                 .map_err(|e| anyhow!("bad --wallet-id: {e:?}"))?
                 .ok_or_else(|| anyhow!("--create-foreign-bridge on a fee-charging chain needs --wallet-id <funded creator wallet> (#201)"))?;
+            settle_fee_notes(&mut client, funder, &fee).await?;
             fund_from_service(
                 &mut client,
                 funder,
@@ -1213,6 +1239,9 @@ async fn main() -> anyhow::Result<()> {
         }
         client.add_account(&faucet, false).await?;
         let fee = miden_agglayer_service::fee_funding::fee_snapshot(&mut client).await?;
+        if fee.charges_fees() {
+            settle_fee_notes(&mut client, wallet_id, &fee).await?;
+        }
         miden_agglayer_service::fee_funding::deploy_account(
             &mut client,
             faucet.id(),
