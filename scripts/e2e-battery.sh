@@ -254,6 +254,8 @@ for iter in $(seq "${ITER_START:-1}" "${ITERATIONS:-4}"); do
   # l2l2 group: bring up its own stack, then run the group
   run "$iter" "e2e-l2l2-up" fresh make e2e-l2l2-up
   run "$iter" "e2e-l2l2"    keep  make e2e-l2l2
+  # Miden-originated round-trips need the L2B overlay; test-e2e SKIPs them on the base stack.
+  run "$iter" "e2e-miden-origin" keep make e2e-miden-origin
   # recovery-readiness is DESTRUCTIVE and provisions via e2e-l2l2-up
   run "$iter" "e2e-recovery-readiness" fresh make e2e-recovery-readiness
 
