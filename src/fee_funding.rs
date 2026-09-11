@@ -133,9 +133,10 @@ pub async fn consume_fee_notes(
 ) -> anyhow::Result<usize> {
     let mut notes = Vec::new();
     for (record, _) in client.get_consumable_notes(Some(account_id)).await? {
-        if let Ok(note) = Note::try_from(record)
-            && carries_fee_asset(&note, fee)
-        {
+        let Ok(note) = <_ as TryInto<Note>>::try_into(record) else {
+            continue;
+        };
+        if carries_fee_asset(&note, fee) {
             notes.push(note);
         }
     }
