@@ -96,13 +96,12 @@ test-scripts: ## Syntax-check + run the shell guard test harnesses (no docker ne
 	bash scripts/test-quiesce-predicate.sh
 
 .PHONY: test-e2e
-test-e2e: ## Spin up docker stack, run E2E tests, tear down (fully self-contained)
+test-e2e: ## Spin up the stack WITH the L2B overlay, run ALL E2E tiers (incl. L2<->L2 + Miden-origin), tear down (fully self-contained)
 	@echo "╔══════════════════════════════════════════════════════════════╗"
-	@echo "║  Starting E2E stack (Anvil, Miden node, PG, bridge, aggkit) ║"
+	@echo "║  Starting E2E stack + L2B overlay (rollup #2)                ║"
 	@echo "╚══════════════════════════════════════════════════════════════╝"
-	@$(MAKE) --no-print-directory e2e-clean-data
 	@./scripts/ensure-e2e-secrets.sh
-	$(E2E_COMPOSE) up -d --build --wait
+	@$(MAKE) --no-print-directory e2e-l2l2-up
 	@echo ""
 	@echo "Stack is up — running E2E tests..."
 	@echo ""
@@ -112,7 +111,7 @@ test-e2e: ## Spin up docker stack, run E2E tests, tear down (fully self-containe
 			echo "KEEP_CHAIN=1 — leaving the stack UP (the chain must survive this target)"; \
 		else \
 			echo "Tearing down stack..."; \
-			$(E2E_COMPOSE) down -v; \
+			$(L2L2_COMPOSE) down -v; \
 		fi; \
 		exit $$EXIT_CODE
 
