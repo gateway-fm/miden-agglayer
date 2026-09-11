@@ -179,7 +179,9 @@ log "  synthetic tip                     = $BASE_TIP"
 
 # ── Step 2: Deploy the FOREIGN deployment on the same chain ─────────────────
 step "Deploying foreign deployment (service, ger_manager, bridge net=$FOREIGN_NETWORK_ID, ETH faucet)"
-FB_OUT=$(iso_tool --create-foreign-bridge --foreign-network-id "$FOREIGN_NETWORK_ID" 2>&1) \
+# #201: on a fee-charging chain the foreign deployment is funded by a creator wallet.
+provision_isolated_wallet || fail "could not provision the creator wallet"
+FB_OUT=$(iso_tool --create-foreign-bridge --foreign-network-id "$FOREIGN_NETWORK_ID" --wallet-id "$WALLET_ID" 2>&1) \
     || { echo "$FB_OUT" | tail -30 >&2; fail "--create-foreign-bridge failed"; }
 FOREIGN_SERVICE_ID=$(echo "$FB_OUT" | grep "service-id:" | awk '{print $NF}')
 FOREIGN_GER_MANAGER_ID=$(echo "$FB_OUT" | grep "ger-manager-id:" | awk '{print $NF}')

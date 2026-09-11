@@ -167,7 +167,7 @@ garbo_foreign_claim() {
     FOREIGN_ATTEMPTS=$((FOREIGN_ATTEMPTS + 1)); echo x >> "$STATE/foreign_attempts"
     _iso_wipe_store; mkdir -p "$B2AGG_STORE_DIR/tmp"
     local fb_out fs fg fbid ffaucet
-    fb_out=$(iso_tool --create-foreign-bridge --foreign-network-id "$FOREIGN_NETWORK_ID" 2>&1) || {
+    fb_out=$(iso_tool --create-foreign-bridge --foreign-network-id "$FOREIGN_NETWORK_ID" --wallet-id "$WALLET_ID" 2>&1) || {
         glog "GARBO foreign-claim: --create-foreign-bridge FAILED — $(echo "$fb_out" | tail -2)"; return 1; }
     fs=$(echo "$fb_out" | grep "service-id:" | awk '{print $NF}')
     fg=$(echo "$fb_out" | grep "ger-manager-id:" | awk '{print $NF}')

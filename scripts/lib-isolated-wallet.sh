@@ -98,7 +98,7 @@ iso_tool() {
 # (`/data/accounts/faucet_operator.mac` on the node_data volume), exactly as the
 # e2e `fee-funder` sidecar uses for the proxy's own accounts. The wallet's next
 # consume takes the fee P2ID together with whatever else is pending and pays for
-# itself. 64 × the per-transaction fee bound covers a whole suite run.
+# itself. 1024× the fee cap: a creator wallet also funds native-faucet / foreign-bridge deployments.
 iso_fund_fee_asset() {
     local wallet="$1" manifest="$PROJECT_DIR/.miden-agglayer-data/funding.toml"
     [[ -f "$manifest" ]] || return 0   # zero-fee chain: nothing to do
@@ -106,7 +106,7 @@ iso_fund_fee_asset() {
     fee_faucet=$(sed -n 's/^fee_faucet_id *= *"\(.*\)"/\1/p' "$manifest")
     max_fee=$(sed -n 's/^max_fee_per_txn *= *\([0-9]*\).*/\1/p' "$manifest")
     [[ -n "$fee_faucet" && -n "$max_fee" ]] || { echo "isolated-wallet: $manifest lacks fee_faucet_id/max_fee_per_txn" >&2; return 1; }
-    amount=$(( max_fee * 64 ))
+    amount=$(( max_fee * 1024 ))
     echo "isolated-wallet: fee-charging chain — funding $wallet with $amount units of the fee asset $fee_faucet (from the genesis faucet operator)" >&2
     local out
     if ! out=$(docker run --rm --network "$ISO_NETWORK" \

@@ -989,10 +989,7 @@ async fn main() -> anyhow::Result<()> {
     // bridge account, ETH faucet registered in the FOREIGN bridge. All keys
     // live in this isolated store — the proxy's store is never touched.
     if args.create_foreign_bridge {
-        use miden_agglayer_service::miden_client::{
-            submit_new_transaction, wait_for_transaction_commit,
-        };
-        use miden_base_agglayer::{AggLayerBridge, BridgeRoles, MetadataHash};
+        use miden_base_agglayer::{BridgeRoles, MetadataHash};
         use miden_client::crypto::FeltRng;
 
         println!(
@@ -1010,15 +1007,53 @@ async fn main() -> anyhow::Result<()> {
             miden_agglayer_service::init::create_standalone_wallet(&mut client, keystore.clone())
                 .await
                 .map_err(|e| anyhow!("foreign ger_manager wallet creation failed: {e:?}"))?;
-
-        // Deploy ger_manager via dummy txn (mirrors init.rs::deploy_account).
-        let dummy = TransactionRequestBuilder::new().build()?;
-        let txn_id = submit_new_transaction(&mut client, ger_manager.id(), dummy)
+        // #201: every account pays its own fees, so the creator wallet (--wallet-id) funds
+        // the foreign service/ger_manager like the operator funds the proxy's.
+        use miden_agglayer_service::fee_funding::{
+            DeployKind, deploy_account, fee_snapshot, fund_from_service, recommended_ger_manager,
+            recommended_service,
+        };
+        let fee = fee_snapshot(&mut client).await?;
+        let wait = std::time::Duration::from_secs(180);
+        if fee.charges_fees() {
+            let funder = args.wallet_id.as_deref().map(AccountId::from_hex).transpose()
+                .map_err(|e| anyhow!("bad --wallet-id: {e:?}"))?
+                .ok_or_else(|| anyhow!("--create-foreign-bridge on a fee-charging chain needs --wallet-id <funded creator wallet> (#201)"))?;
+            fund_from_service(
+                &mut client,
+                funder,
+                service.id(),
+                "foreign service",
+                recommended_service(&fee),
+                &fee,
+            )
+            .await?;
+            fund_from_service(
+                &mut client,
+                funder,
+                ger_manager.id(),
+                "foreign ger_manager",
+                recommended_ger_manager(&fee),
+                &fee,
+            )
+            .await?;
+        }
+        for (id, name) in [
+            (service.id(), "foreign service"),
+            (ger_manager.id(), "foreign ger_manager"),
+        ] {
+            deploy_account(
+                &mut client,
+                id,
+                name,
+                DeployKind::Wallet,
+                miden_agglayer_service::metrics::ProofKind::BridgeOut,
+                &fee,
+                wait,
+            )
             .await
-            .map_err(|e| anyhow!("foreign ger_manager deploy failed: {e:?}"))?;
-        wait_for_transaction_commit(&mut client, txn_id, 30, std::time::Duration::from_secs(2))
-            .await
-            .map_err(|e| anyhow!("foreign ger_manager deploy commit wait failed: {e:?}"))?;
+            .map_err(|e| anyhow!("{name} deploy failed: {e:?}"))?;
+        }
 
         // Foreign bridge (mirrors init.rs::add_bridge). rc.4: role-based
         // creation — the foreign service is ADMIN + faucet manager, the
@@ -1032,29 +1067,32 @@ async fn main() -> anyhow::Result<()> {
             std::collections::BTreeSet::from([ger_manager.id()]),
         )
         .map_err(|e| anyhow!("foreign bridge role construction failed: {e}"))?;
-        let bridge = AggLayerBridge::account_builder(
+        let bridge = miden_agglayer_service::network_accounts::bridge_account_builder(
             client.rng().draw_word(),
             service.id(),
             roles,
             args.foreign_network_id,
-            miden_agglayer_service::fee_policy::zero_fee_policy_manager_for(
-                AggLayerBridge::allowed_notes(),
-                fee_faucet_id,
-            ),
-        )
+            fee_faucet_id,
+        )?
         .build()
         .map_err(|e| anyhow!("foreign bridge account build failed: {e}"))?;
         client
             .add_account(&bridge, false)
             .await
             .map_err(|e| anyhow!("adding foreign bridge account failed: {e:?}"))?;
-        let dummy = TransactionRequestBuilder::new().build()?;
-        let txn_id = submit_new_transaction(&mut client, bridge.id(), dummy)
-            .await
-            .map_err(|e| anyhow!("foreign bridge deploy failed: {e:?}"))?;
-        wait_for_transaction_commit(&mut client, txn_id, 30, std::time::Duration::from_secs(2))
-            .await
-            .map_err(|e| anyhow!("foreign bridge deploy commit wait failed: {e:?}"))?;
+        deploy_account(
+            &mut client,
+            bridge.id(),
+            "foreign bridge",
+            DeployKind::NetworkAccount {
+                funder: service.id(),
+            },
+            miden_agglayer_service::metrics::ProofKind::BridgeOut,
+            &fee,
+            wait,
+        )
+        .await
+        .map_err(|e| anyhow!("foreign bridge deploy failed: {e:?}"))?;
 
         // Settle accounts before the faucet registration note targets the bridge
         // (mirrors init.rs's NTX-builder settlement wait).
@@ -1166,19 +1204,26 @@ async fn main() -> anyhow::Result<()> {
             .with_component(faucet_component)
             .with_components(policy_manager)
             .with_component(auth_component)
+            // #201: P2ID-fundable — on a fee-charging chain the creator wallet funds the vault.
+            .with_component(miden_standards::account::wallets::BasicWallet)
             .build_with_schema_commitment()
             .map_err(|e| anyhow!("faucet account build failed: {e:?}"))?;
         if let Some(key_pair) = key_pair.as_ref() {
             keystore.add_key(key_pair, faucet.id()).await?;
         }
         client.add_account(&faucet, false).await?;
-        let dummy = TransactionRequestBuilder::new().build()?;
-        let txn_id = submit_new_transaction(&mut client, faucet.id(), dummy)
-            .await
-            .map_err(|e| anyhow!("faucet deploy failed: {e:?}"))?;
-        wait_for_transaction_commit(&mut client, txn_id, 30, std::time::Duration::from_secs(2))
-            .await
-            .map_err(|e| anyhow!("faucet deploy commit wait failed: {e:?}"))?;
+        let fee = miden_agglayer_service::fee_funding::fee_snapshot(&mut client).await?;
+        miden_agglayer_service::fee_funding::deploy_account(
+            &mut client,
+            faucet.id(),
+            "native faucet",
+            miden_agglayer_service::fee_funding::DeployKind::NetworkAccount { funder: wallet_id },
+            miden_agglayer_service::metrics::ProofKind::BridgeOut,
+            &fee,
+            std::time::Duration::from_secs(180),
+        )
+        .await
+        .map_err(|e| anyhow!("faucet deploy failed: {e:?}"))?;
         println!(
             "[native-faucet] deployed operator faucet {}",
             faucet.id().to_hex()
