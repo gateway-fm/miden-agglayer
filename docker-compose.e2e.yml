@@ -311,6 +311,7 @@ services:
       FEE_TXN_BUDGET_SERVICE: "${FEE_TXN_BUDGET_SERVICE:-}"
       FEE_TXN_BUDGET_GER_MANAGER: "${FEE_TXN_BUDGET_GER_MANAGER:-}"
       FEE_TXN_BUDGET_CASCADE: "${FEE_TXN_BUDGET_CASCADE:-}"
+      FEE_TXN_BUDGET_CASCADE_TARGETS: "${FEE_TXN_BUDGET_CASCADE_TARGETS:-}"
       # Regression requirement: offload ALL proxy tx proving (CLAIM / GER /
       # faucet / bridge-out / init) to an EXTERNAL Miden tx-prover instead of
       # the in-process LocalTransactionProver. Fallback-to-local stays OFF

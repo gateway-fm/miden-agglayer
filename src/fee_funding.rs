@@ -49,7 +49,10 @@ pub const INIT_CASCADE_TARGETS: u64 = 2;
 /// runtime faucets (one per new token bridged in). Loadtest N=30 (9 new tokens)
 /// ran `service` dry after four; the real answer for an unbounded token count is
 /// the fee-vault monitor and top-ups, this just makes the common case not stall.
-pub const CASCADE_RESERVE_TARGETS: u64 = INIT_CASCADE_TARGETS + 10;
+/// Env-tunable so the exhaustion e2e can leave `service` with only its own budget.
+pub fn cascade_reserve_targets() -> u64 {
+    budget("FEE_TXN_BUDGET_CASCADE_TARGETS", INIT_CASCADE_TARGETS + 10)
+}
 const FUNDING_POLL: Duration = Duration::from_secs(5);
 
 /// The chain's fee parameters, read from the genesis header (constant for the
@@ -109,7 +112,7 @@ pub fn recommended_ger_manager(fee: &FeeSnapshot) -> u64 {
 pub fn recommended_service(fee: &FeeSnapshot) -> u64 {
     let per = max_fee_per_txn(fee.verification_base_fee);
     per * budget("FEE_TXN_BUDGET_SERVICE", KMS_ACCOUNT_TXN_BUDGET)
-        + cascade_amount(fee) * CASCADE_RESERVE_TARGETS
+        + cascade_amount(fee) * cascade_reserve_targets()
 }
 
 /// What `service` sends each keyless account it funds.
@@ -358,7 +361,7 @@ mod tests {
         assert_eq!(cascade_amount(&f), per * CASCADE_TXN_BUDGET);
         assert_eq!(
             recommended_service(&f),
-            per * KMS_ACCOUNT_TXN_BUDGET + per * CASCADE_TXN_BUDGET * CASCADE_RESERVE_TARGETS
+            per * KMS_ACCOUNT_TXN_BUDGET + per * CASCADE_TXN_BUDGET * cascade_reserve_targets()
         );
         // service must be able to fund every init cascade target out of its own
         // recommendation and still keep its full personal budget.

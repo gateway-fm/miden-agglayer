@@ -16,7 +16,7 @@ ts(){ date -u +%H:%M:%S; }; log(){ echo "[$(ts)] $*"; }; pass(){ echo "[$(ts)] P
 
 # Tiny budgets: enough to deploy and serve a deposit or two, then dry mid-flow.
 case "$ACCOUNT" in
-  service)     export FEE_TXN_BUDGET_SERVICE=4 ;;   # init itself costs ~3 (deploy, cascade sends, registration)
+  service)     export FEE_TXN_BUDGET_SERVICE=4 FEE_TXN_BUDGET_CASCADE_TARGETS=2 ;;   # own budget ~3 spent by init; no runtime-faucet reserve
   ger_manager) export FEE_TXN_BUDGET_GER_MANAGER=3 ;;
   bridge)      export FEE_TXN_BUDGET_CASCADE=3 ;;   # the bridge burns fastest (a network tx per GER update)
   *) fail "unknown account $ACCOUNT" ;;
