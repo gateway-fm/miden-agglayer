@@ -23,6 +23,9 @@ case "$ACCOUNT" in
 esac
 
 log "fresh stack with a tiny fee budget for $ACCOUNT"
+# Budgets apply at --init, so the chain AND the proxy store must be reset together: under the
+# battery's KEEP_CHAIN=1 a wipe of one but not the other leaves a store from another genesis.
+export KEEP_CHAIN=0
 make e2e-down >/dev/null 2>&1 || true; make e2e-clean-data >/dev/null 2>&1 || true
 make e2e-up >/tmp/e2e-fee-exhaustion-up.log 2>&1 || {
   tail -5 /tmp/e2e-fee-exhaustion-up.log
