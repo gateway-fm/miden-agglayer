@@ -229,6 +229,151 @@ alert if the process/target is absent as well as if that gauge is wrong. During
 runtime, alert on signature failures and on an expected workload producing no
 increase in `remote_signer_signatures_total`.
 
+## Funding the accounts on a fee-charging chain (#201)
+
+Protocol 0.16 charges `verification_base_fee × (ilog2(cycles) + 1)` on **every**
+transaction, paid by the **executing account from its own vault** in the chain's
+native fee asset. Miden has no gas-paying EOA: a signing key only *authorizes*;
+the account pays. So every account that executes needs the fee asset in its
+vault — including the **keyless** bridge and faucets that only the two KMS keys
+authorize. (Our dev genesis sets `verification_base_fee = 0`, which is why a
+local stack never shows this; a real chain — e.g. the live testnet, base fee 7,
+fee asset `0x18101fa522c174b165efd4f70a0385` — fails at the first deploy with
+"amount in the vault is less than the amount to remove".)
+
+**You fund only the two KMS-keyed accounts; the proxy cascades the rest.**
+
+### Manual procedure (DevOps)
+
+Run these by hand, in order. `$STORE`, `$NODE`, and `$SIGNER_FLAGS` are the same
+`--miden-store-dir`, `--miden-node`, and signer flags (`--signer-url`,
+`--signer-key …`) you boot the proxy with.
+
+**1. Print what to fund** — with the signer configured exactly as for a normal
+boot, run once with `--print-funding` and stop. It builds and *persists*
+`service`/`ger_manager` (their ids are random-seeded — they exist only once
+persisted), reads the chain's fee parameters, writes `funding.toml` beside
+`bridge_accounts.toml`, and exits **without deploying** (re-running re-prints and
+never rebuilds):
+
+```sh
+miden-agglayer-service --print-funding \
+  --miden-store-dir "$STORE" --miden-node "$NODE" $SIGNER_FLAGS
+cat "$STORE/funding.toml"
+```
+
+`funding.toml` gives you everything you need:
+
+```toml
+service       = "0x…"      # KMS-keyed — fund this
+ger_manager   = "0x…"      # KMS-keyed — fund this
+fee_faucet_id = "0x…"      # the chain's native fee asset
+verification_base_fee = 7
+max_fee_per_txn       = 210
+fund_service     = 80640   # bigger: covers what service cascades to bridge/faucets
+fund_ger_manager = 53760
+```
+
+**2. Send the fee asset** — from whatever account holds the native fee asset
+(your treasury; on the testnet, the genesis faucet operator), send **`fund_*`
+units to each address as a P2ID note**. Two addresses only. With the operator
+tool that means (`--faucet-operator-mac` is the *source-of-funds* account file
+that holds the fee asset and its key — the treasury/faucet-operator wallet, NOT
+the proxy's KMS accounts):
+
+```sh
+bridge-out-tool --fund-fee-asset \
+  --store-dir /tmp/funder --node-url "$NODE" \
+  --faucet-operator-mac /path/to/treasury.mac \
+  --funding-manifest "$STORE/funding.toml"
+```
+
+Or, from any Miden wallet you control, send two P2ID notes of the fee asset:
+`fund_service` → `service`, `fund_ger_manager` → `ger_manager`.
+
+**3. Start the proxy normally.** `--init` *resumes* the recorded accounts, waits
+(up to `--funding-wait-secs`, default 900) for each funding note, deploys each
+account by **consuming** it — the vault is filled before the fee is charged, so
+the deploy pays for itself — then `service` cascade-funds the bridge and every
+faucet (at init, and each new faucet as a token is first bridged). If a funding
+note is missing, the log says exactly which address to send how much of which
+asset; send it and init continues.
+
+### Ongoing top-ups
+
+**Watch the vaults in metrics.** The proxy exports, every `--fee-vault-poll-secs`
+(default 60 s), per account (`account="service"|"ger_manager"|"bridge"|"faucet:<SYMBOL>"`):
+`bridge_fee_vault_balance` (units of the fee asset), `bridge_fee_vault_txns_left`
+(balance ÷ the per-transaction cap `bridge_fee_max_per_txn`), and logs WARN below
+`--fee-vault-warn-txns` (default 32) and ERROR at 0. Alert on
+`bridge_fee_vault_txns_left < 32`. Measured at base fee 7: network transactions
+(bridge, faucets) cost ~40–50 units, signed client transactions the 210 cap; a
+busy bridge ran 27 network transactions in ten minutes, so the 13,440-unit
+cascade is hours of runway — top up from the metric, not on a schedule.
+
+Fees are per-transaction and continuous, so this is a **balance to maintain**,
+not a one-time deposit — `ger_manager` pays on every GER injection, `service` on
+every claim, the bridge on every network transaction, each faucet on every mint.
+Watch the vaults (an empty vault stalls that account) and top up with more P2IDs
+of the fee asset. `service` is the simplest single point: top it up and it keeps
+cascading, or fund any account directly by id:
+
+```sh
+bridge-out-tool --fund-fee-asset \
+  --store-dir /tmp/funder --node-url "$NODE" \
+  --faucet-operator-mac /path/to/treasury.mac \
+  --fee-faucet-id <fee_faucet_id from funding.toml> \
+  --fund <service-or-bridge-or-faucet-id>=<amount>
+```
+
+**Recipients (bridged-in claimants) pay to consume their mint.** The MINT the
+faucet produces is a P2ID to the claimant, and consuming it is a transaction the
+*claimant's* account executes — so on a fee-charging chain it pays
+`verification_base_fee × …` from the claimant's own vault, in the native fee
+asset, before the bridged tokens land. A fresh wallet has none and the consume
+aborts in the kernel ("failed to remove the fungible asset from the vault …"):
+the mint is on-chain and waiting, the balance just never shows. This is standard
+Miden UX (users get the native asset from a faucet first), not a bridge
+concern — but tell your users, and give any test/relayer wallet the fee asset
+before it claims. The e2e does exactly that: `lib-isolated-wallet.sh` funds its
+isolated recipient wallet from the genesis faucet operator whenever the chain
+charges fees, and the wallet's next consume takes the fee P2ID together with the
+mint, paying for itself.
+
+Nothing changes in custody: the cascade sends are `service`'s own transactions,
+signed by its (remote) key like its claims. The proxy never mints the fee asset
+and never holds a local secret for it. For dev/e2e the operator step is played
+by `bridge-out-tool --fund-fee-asset --faucet-operator-mac <genesis
+faucet_operator.mac> --funding-manifest <funding.toml>` (local custody, hence a
+separate tool), which the e2e `fee-funder` sidecar runs automatically. It sends
+from the genesis **faucet operator** — the native fee faucet's owner, a plain
+wallet pre-funded with the fee asset and written with its key — because the fee
+faucet itself is a network account with an owner-only mint policy and no key,
+so nothing can mint from it directly.
+
+**The keyless network accounts are funded the same way — by construction.** The
+bridge and every faucet are `AuthNetworkAccount` network accounts and pay fees
+like everything else. As built upstream they could not be funded at all after
+genesis: they had no `receive_asset` (a P2ID aborts in the kernel), and every
+feature note they accept carries a `NetworkAccountTarget`, which the sender can
+only create once the target is on-chain — while the account cannot get on-chain
+without a funded vault. The proxy therefore builds them the way Miden builds its
+own post-genesis network accounts (the testnet network-monitor's counter): the
+upstream component set **plus a `BasicWallet`**, with the **P2ID script
+allowlisted at zero fee** (`src/network_accounts.rs`). A P2ID carries no
+attachment, so `service` can send one to the not-yet-created account, and the
+account's **first transaction consumes it** — funding the vault, paying the
+kernel fee from it, and deploying the account in one. `--init` cascades this to
+the bridge and the ETH faucet; each later faucet gets it at creation. After
+that, because the per-note fee policy is zero, ordinary notes (CLAIM, B2AGG,
+UpdateGer, MINT) need no sponsorship — the vault pays — and a top-up is just
+another P2ID from `service`. Keep those vaults topped up: an empty
+network-account vault stalls every network transaction against it. (Safety: a
+network account runs only allowlisted note scripts, and its tx-script allowlist
+holds only the network builder's expiration script, so `BasicWallet`'s send
+procedures are reachable through no path; the P2ID script calls
+`receive_asset` alone.)
+
 ## Signer backends
 
 The proxy is unaware of the signer's storage backend, but that does **not** make

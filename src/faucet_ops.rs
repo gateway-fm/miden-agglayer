@@ -8,7 +8,7 @@ use crate::metadata_recovery::{EmitMetadata, FaucetConversion, recover_bridge_ou
 use crate::miden_client::MidenClientLib;
 use crate::store::FaucetEntry;
 use alloy::primitives::{Address, Bytes};
-use miden_base_agglayer::{AggLayerFaucet, ConfigAggBridgeNote, ConversionMetadata, MetadataHash};
+use miden_base_agglayer::{ConfigAggBridgeNote, ConversionMetadata, MetadataHash};
 use miden_client::Felt;
 use miden_client::asset::FungibleAsset;
 use miden_client::crypto::FeltRng;
@@ -40,7 +40,7 @@ pub fn classify_faucet_account(
     faucet_account: &Account,
 ) -> anyhow::Result<(FaucetKind, FungibleFaucet)> {
     // Supported #1: bridge-owned AggLayer wrapped faucet (foreign-origin tokens).
-    if let Ok(faucet) = AggLayerFaucet::try_faucet_from_account(faucet_account) {
+    if let Ok(faucet) = crate::network_accounts::try_faucet_from_account(faucet_account) {
         return Ok((FaucetKind::AggLayerOwned, faucet));
     }
     // Supported #2: native operator BasicFungibleFaucet (Miden-originated tokens). It lacks
@@ -90,7 +90,7 @@ pub async fn create_and_register_faucet(
     // carries the mandatory zero-fee components against the chain's real fee
     // faucet.
     let fee_faucet_id = crate::fee_policy::fee_faucet_id_from_chain(client).await?;
-    let account = AggLayerFaucet::account_builder(
+    let account = crate::network_accounts::faucet_account_builder(
         client.rng().draw_word(),
         symbol,
         miden_decimals,
@@ -98,39 +98,29 @@ pub async fn create_and_register_faucet(
         Felt::new(0).expect("zero is a valid field element"),
         service_id,
         bridge_id,
-        crate::fee_policy::zero_fee_policy_manager_for(
-            AggLayerFaucet::allowed_notes(),
-            fee_faucet_id,
-        ),
-    )
+        fee_faucet_id,
+    )?
     .build()
     .map_err(|e| anyhow::anyhow!("faucet account build failed: {e}"))?;
     client.add_account(&account, false).await?;
 
-    // Deploy
-    tracing::info!(
-        "deploying {} faucet {} ...",
-        symbol,
-        AccountIdBech32(account.id())
-    );
-    let dummy_txn = TransactionRequestBuilder::new().build()?;
-    let txn_id = crate::metrics::meter_proof(
-        crate::metrics::ProofKind::Faucet,
-        crate::miden_client::submit_new_transaction(client, account.id(), dummy_txn),
-    )
-    .await?;
-    tracing::info!("deployed {symbol} faucet with txn_id {txn_id}");
-
-    let committed = crate::miden_client::wait_for_transaction_commit(
+    // Deploy (#201): a zero-fee chain keeps the empty-txn deploy. On a
+    // fee-charging chain a faucet is a keyless NETWORK account: it cannot pay an
+    // empty deploy from an empty vault, nor consume a P2ID (no receive_asset) —
+    // its vault is funded only by a FeeSponsorshipNote paired with a feature
+    // note it accepts, which is the #201 follow-up; until then this fails loudly
+    // with that reason instead of aborting in the kernel.
+    let fee = crate::fee_funding::fee_snapshot(client).await?;
+    crate::fee_funding::deploy_account(
         client,
-        txn_id,
-        20,
-        std::time::Duration::from_secs(1),
+        account.id(),
+        symbol,
+        crate::fee_funding::DeployKind::NetworkAccount { funder: service_id },
+        crate::metrics::ProofKind::Faucet,
+        &fee,
+        std::time::Duration::from_secs(120),
     )
     .await?;
-    if committed {
-        tracing::info!("deploy tx {txn_id} committed");
-    }
 
     // Register in bridge
     register_faucet_in_bridge(

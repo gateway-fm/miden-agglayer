@@ -163,6 +163,24 @@ pub fn init_metrics() {
          zkevm-bridge-service claimtxman) is rejected at that nonce forever."
     );
     describe_counter!("ger_injections_total", "Total GER injections");
+    // #201 fee vaults: every account pays its own tx fees; an empty vault stalls it.
+    describe_gauge!(
+        "bridge_fee_vault_balance",
+        "#201: units of the chain's native fee asset in the vault of the labelled \
+         account (service, ger_manager, bridge, faucet:<SYMBOL>). Every transaction \
+         the account executes pays from it; at 0 the account stalls."
+    );
+    describe_gauge!(
+        "bridge_fee_vault_txns_left",
+        "#201: bridge_fee_vault_balance / bridge_fee_max_per_txn — a conservative \
+         count of transactions the account can still pay for. ALERT on this: e.g. \
+         `bridge_fee_vault_txns_left < 32` (the proxy logs a warning there and an error at 0)."
+    );
+    describe_gauge!(
+        "bridge_fee_max_per_txn",
+        "#201: the per-transaction fee cap, verification_base_fee × \
+         (ilog2(MAX_TX_EXECUTION_CYCLES)+1). 0 means a zero-fee chain."
+    );
     describe_gauge!(
         "last_ger_injection_timestamp_seconds",
         "Unix time (seconds) of the most recent GER injection (new insert or a \
