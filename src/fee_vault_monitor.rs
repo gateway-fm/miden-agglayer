@@ -150,8 +150,13 @@ impl FeeVaultMonitor {
                             continue;
                         };
                         // Sweep top-ups: a P2ID of the fee asset sent to this account
-                        // (runbook top-up, cascade, exhaustion recovery) lands only once consumed.
-                        match crate::fee_funding::consume_fee_notes(client, id, &snap).await {
+                        // lands only once consumed. Not for an account still being
+                        // created — its cascade note is the deploy's to consume.
+                        match if account.is_new() {
+                            Ok(0)
+                        } else {
+                            crate::fee_funding::consume_fee_notes(client, id, &snap).await
+                        } {
                             Ok(n) if n > 0 => tracing::info!(account = %name, notes = n, "consuming fee-asset top-up note(s) (#201)"),
                             Ok(_) => {}
                             Err(e) => tracing::warn!(account = %name, error = %format!("{e:#}"), "could not consume a fee-asset top-up"),
