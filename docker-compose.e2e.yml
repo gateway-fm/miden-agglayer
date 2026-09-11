@@ -504,13 +504,15 @@ services:
         fund() { bridge-out-tool --store-dir /tmp/fee-funder --node-url http://miden-node:57291 \
           --fund-fee-asset --faucet-operator-mac /data/accounts/faucet_operator.mac \
           --funding-manifest "$$M"; }
-        fund
+        # Retry until it lands: a single failed attempt would leave --init waiting for
+        # notes that never come and the healthcheck to give up.
+        until fund; do echo "[fee-funder] funding failed — retrying in 10s"; sleep 10; done
         # Stay alive: `compose up --wait` treats an exited one-shot as a failed wait, and a
         # test that wipes the proxy's data dir makes --init write a NEW manifest — fund that too.
         last=$$(md5sum "$$M")
         while sleep 10; do
           cur=$$(md5sum "$$M" 2>/dev/null) || continue
-          [ "$$cur" != "$$last" ] && { echo "[fee-funder] new manifest — funding again"; fund; last=$$cur; }
+          [ "$$cur" != "$$last" ] && { echo "[fee-funder] new manifest — funding again"; until fund; do sleep 10; done; last=$$cur; }
         done
 
   # ── Bridge Service ─────────────────────────────────────────────────────────
