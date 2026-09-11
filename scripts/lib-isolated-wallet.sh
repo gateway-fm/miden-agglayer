@@ -98,7 +98,8 @@ iso_tool() {
 # (`/data/accounts/faucet_operator.mac` on the node_data volume), exactly as the
 # e2e `fee-funder` sidecar uses for the proxy's own accounts. The wallet's next
 # consume takes the fee P2ID together with whatever else is pending and pays for
-# itself. 1024× the fee cap: a creator wallet also funds native-faucet / foreign-bridge deployments.
+# itself. 2048× the fee cap: a creator wallet also funds native-faucet / foreign-bridge
+# deployments, and a foreign service is funded with the full recommended amount (12 cascades).
 iso_fund_fee_asset() {
     local wallet="$1" want="${2:-}" manifest="$PROJECT_DIR/.miden-agglayer-data/funding.toml"
     [[ -f "$manifest" ]] || return 0   # zero-fee chain: nothing to do
@@ -106,7 +107,7 @@ iso_fund_fee_asset() {
     fee_faucet=$(sed -n 's/^fee_faucet_id *= *"\(.*\)"/\1/p' "$manifest")
     max_fee=$(sed -n 's/^max_fee_per_txn *= *\([0-9]*\).*/\1/p' "$manifest")
     [[ -n "$fee_faucet" && -n "$max_fee" ]] || { echo "isolated-wallet: $manifest lacks fee_faucet_id/max_fee_per_txn" >&2; return 1; }
-    amount=${want:-$(( max_fee * 1024 ))}
+    amount=${want:-$(( max_fee * 2048 ))}
     echo "isolated-wallet: fee-charging chain — funding $wallet with $amount units of the fee asset $fee_faucet (from the genesis faucet operator)" >&2
     # The operator account is shared with other funders (the fee-funder sidecar); a send
     # can lose a mempool race ("conflicts with current mempool state") — retry. A fresh
