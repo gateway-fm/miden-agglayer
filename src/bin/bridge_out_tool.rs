@@ -759,7 +759,7 @@ async fn fund_fee_asset(
                 .build()
                 .map_err(|e| anyhow!("building fee-asset P2ID to {}: {e:?}", target.to_hex()))?;
             TransactionRequestBuilder::new()
-                .own_output_notes(vec![miden_protocol::note::Note::from(note).into()])
+                .own_output_notes(vec![miden_protocol::note::Note::from(note)])
                 .foreign_accounts([miden_client::transaction::ForeignAccount::public(
                     target,
                     miden_client::rpc::domain::account::AccountStorageRequirements::default(),
