@@ -306,9 +306,10 @@ asset; send it and init continues.
 `bridge_fee_vault_balance` (units of the fee asset), `bridge_fee_vault_txns_left`
 (balance ÷ the per-transaction cap `bridge_fee_max_per_txn`), and logs WARN below
 `--fee-vault-warn-txns` (default 32) and ERROR at 0. Alert on
-`bridge_fee_vault_txns_left < 32`. A top-up P2ID is consumed by the proxy on its next
-monitor tick (the note pays for its own consume, so an empty vault recovers without a
-restart).
+`bridge_fee_vault_txns_left < 32`. A top-up P2ID to `service` or `ger_manager` is
+consumed by the proxy on its next monitor tick; one to the bridge or a faucet by the
+ntx-builder (see below). Either way the note pays for its own consume, so an empty
+vault recovers without a restart.
 
 **What a dry `service` / `ger_manager` does to in-flight work.** A claim or GER
 insert whose signer cannot pay the fee is NOT failed: the proxy holds the accepted
