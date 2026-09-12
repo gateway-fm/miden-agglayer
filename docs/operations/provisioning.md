@@ -308,7 +308,18 @@ asset; send it and init continues.
 `--fee-vault-warn-txns` (default 32) and ERROR at 0. Alert on
 `bridge_fee_vault_txns_left < 32`. A top-up P2ID is consumed by the proxy on its next
 monitor tick (the note pays for its own consume, so an empty vault recovers without a
-restart). Measured at base fee 7: network transactions
+restart).
+
+**What a dry `service` / `ger_manager` does to in-flight work.** A claim or GER
+insert whose signer cannot pay the fee is NOT failed: the proxy holds the accepted
+transaction pending (receipt `null`), logs `fee vault EMPTY — holding the transaction
+pending` and re-tries it every 30 s; `agglayer_writer_jobs_parked` counts the held
+transactions. The first retry after the top-up lands them, so deposits that arrived
+while the vault was empty complete on their own. This matters because the claim
+sponsor (bridge-service's ClaimTxManager) gives up on a deposit after ten reverted
+claim transactions — a hard-coded limit — and a reverted receipt per attempt would
+strand every deposit touched by a dry vault until someone re-drove it by hand.
+Measured at base fee 7: network transactions
 (bridge, faucets) cost ~105–112 units, signed client transactions the 210 cap; a
 busy bridge ran 27 network transactions in ten minutes, so the 53,760-unit
 cascade (~480 of them) is hours of runway — top up from the metric, not on a
