@@ -178,8 +178,12 @@ impl FeeVaultMonitor {
                                 "fee vault topped up (#201)"),
                             _ => {}
                         }
-                        if balance == 0 {
-                            tracing::error!(account = %name, id = %id.to_hex(),
+                        // Same threshold as the gauge operators alert on: below one
+                        // worst-case fee the next transaction can already abort (the
+                        // bridge stalled at 77 units, a 105-unit note in the queue), so
+                        // "empty" is txns_left == 0, not a literal zero balance.
+                        if left == 0 {
+                            tracing::error!(account = %name, id = %id.to_hex(), balance,
                                 "fee vault EMPTY — every transaction of this account will abort until it is topped up (#201)");
                         } else if name == "service"
                             && balance < crate::fee_funding::cascade_amount(&snap) + max_fee
