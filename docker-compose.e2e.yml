@@ -317,7 +317,10 @@ services:
       FEE_TXN_BUDGET_SERVICE: "${FEE_TXN_BUDGET_SERVICE:-4096}"
       FEE_TXN_BUDGET_GER_MANAGER: "${FEE_TXN_BUDGET_GER_MANAGER:-4096}"
       FEE_TXN_BUDGET_CASCADE: "${FEE_TXN_BUDGET_CASCADE:-1024}"
-      FEE_TXN_BUDGET_CASCADE_TARGETS: "${FEE_TXN_BUDGET_CASCADE_TARGETS:-}"
+      # Every token the battery bridges in costs `service` one cascade; test-e2e
+      # alone creates nine, loadtest and chaos more. 12 reserve cascades ran out
+      # 1.7 h into final6 (service 3.44M → 1.07M), so reserve for the whole run.
+      FEE_TXN_BUDGET_CASCADE_TARGETS: "${FEE_TXN_BUDGET_CASCADE_TARGETS:-64}"
       # Regression requirement: offload ALL proxy tx proving (CLAIM / GER /
       # faucet / bridge-out / init) to an EXTERNAL Miden tx-prover instead of
       # the in-process LocalTransactionProver. Fallback-to-local stays OFF
