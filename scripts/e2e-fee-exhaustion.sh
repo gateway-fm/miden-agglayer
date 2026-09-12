@@ -52,7 +52,9 @@ for i in $(seq 1 8); do
 done
 [[ "$(txns_left)" == "0" ]] || fail "$ACCOUNT never ran dry after 8 deposits (txns_left=$(txns_left)) — budget too generous"
 (( stuck > 0 )) || fail "$ACCOUNT is dry but no deposit stalled — the stall is not visible in the flow"
-proxy_log | grep "fee vault EMPTY" | grep -qE "account[:=] *\"?$ACCOUNT\b" || fail "no 'fee vault EMPTY' ERROR for $ACCOUNT in the proxy log"
+# No `grep -q` here: under pipefail it can exit before `docker logs` finishes writing
+# and the SIGPIPE fails the pipeline even though the line was found.
+proxy_log | grep "fee vault EMPTY" | grep -E "account[:=] *\"?$ACCOUNT\b" >/dev/null || fail "no 'fee vault EMPTY' ERROR for $ACCOUNT in the proxy log"
 pass "$ACCOUNT ran dry after $passed deposit(s): txns_left=0, ERROR logged, $stuck deposit(s) stuck"
 
 # ── top up (the runbook's way) and expect self-recovery ───────────────────────

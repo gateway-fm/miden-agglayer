@@ -768,6 +768,9 @@ impl WriterWorker {
             "writer worker starting"
         );
         let mut parked_retry = tokio::time::interval(PARKED_RETRY_INTERVAL);
+        // Ticks skipped while nothing was parked must not fire as a burst the
+        // moment a job is parked (seen live: eight retries in half a second).
+        parked_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 biased;
