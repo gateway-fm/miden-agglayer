@@ -569,6 +569,13 @@ pub fn init_metrics() {
          >0.95×cap for 2 min → page."
     );
     describe_gauge!(
+        "agglayer_writer_jobs_parked",
+        "#201: WriteJobs held because their signer's fee vault could not pay \
+         the Miden fee; each is re-dispatched every 30s and lands once the \
+         account is topped up. Non-zero means an account is dry — see \
+         bridge_fee_vault_txns_left."
+    );
+    describe_gauge!(
         "agglayer_writer_inflight_jobs",
         "RD-940: WriteJobs in the in-flight DashMap (Queued + Submitting + \
          not-yet-TTL'd terminal entries). Informational — NOT a drain signal: \
