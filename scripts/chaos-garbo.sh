@@ -170,7 +170,7 @@ garbo_foreign_claim() {
     # (fresh) store: on a fee-charging chain --create-foreign-bridge pays the foreign
     # service/ger_manager from it, and the garbo wallet is in another store. Provision
     # one here and keep the garbo wallet's globals for the private-note class.
-    local saved_id="$WALLET_ID" saved_hex="${WALLET_HEX:-}" saved_dest="${DEST_ADDR:-}" creator
+    local saved_id="${WALLET_ID:-}" saved_hex="${WALLET_HEX:-}" saved_dest="${DEST_ADDR:-}" creator
     provision_isolated_wallet || { glog "GARBO foreign-claim: creator wallet provisioning FAILED"; return 1; }
     creator="$WALLET_ID"; WALLET_ID="$saved_id"; WALLET_HEX="$saved_hex"; DEST_ADDR="$saved_dest"
     local fb_out fs fg fbid ffaucet
