@@ -166,7 +166,19 @@ aggkit_settled_count() {
 # and error-free for the whole 19-minute cold start, and during it every
 # readiness wait is guaranteed to fail. Producing a certificate is the first
 # moment it can answer the question the suite is about to ask.
-aggkit_ready() { [[ "$(aggkit_settled_count)" -gt 0 ]]; }
+#
+# After a RECREATE mid-run there may be nothing to certify yet: aggsender comes
+# up, evaluates the range and says "no bridges or claims found … so no
+# certificate will be built" — the exits that would produce one come from the
+# back-operations that run AFTER this gate, so waiting for a settlement here
+# deadlocks until the timeout (both standalone chaos soaks on 2026-09-12). An
+# evaluated range proves the same thing a settlement does — aggsender is synced
+# and answering — so accept either.
+aggkit_evaluated_count() {
+    docker logs "${AGGKIT_CONTAINER:-l2l2-aggkit-1}" 2>&1 \
+        | grep -c "no bridges or claims found" || echo 0
+}
+aggkit_ready() { [[ "$(aggkit_settled_count)" -gt 0 || "$(aggkit_evaluated_count)" -gt 0 ]]; }
 
 # Gate a timed wait behind aggkit being able to answer. Call after anything that
 # recreates it (restore drill, chaos fault, compose recreate).
