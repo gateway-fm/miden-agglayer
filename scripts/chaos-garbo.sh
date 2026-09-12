@@ -166,8 +166,15 @@ garbo_foreign_claim() {
     B2AGG_STORE_DIR="$FOREIGN_STORE"
     FOREIGN_ATTEMPTS=$((FOREIGN_ATTEMPTS + 1)); echo x >> "$STATE/foreign_attempts"
     _iso_wipe_store; mkdir -p "$B2AGG_STORE_DIR/tmp"
+    # The foreign deployment is funded from a creator wallet that must live in THIS
+    # (fresh) store: on a fee-charging chain --create-foreign-bridge pays the foreign
+    # service/ger_manager from it, and the garbo wallet is in another store. Provision
+    # one here and keep the garbo wallet's globals for the private-note class.
+    local saved_id="$WALLET_ID" saved_hex="${WALLET_HEX:-}" saved_dest="${DEST_ADDR:-}" creator
+    provision_isolated_wallet || { glog "GARBO foreign-claim: creator wallet provisioning FAILED"; return 1; }
+    creator="$WALLET_ID"; WALLET_ID="$saved_id"; WALLET_HEX="$saved_hex"; DEST_ADDR="$saved_dest"
     local fb_out fs fg fbid ffaucet
-    fb_out=$(iso_tool --create-foreign-bridge --foreign-network-id "$FOREIGN_NETWORK_ID" --wallet-id "$WALLET_ID" 2>&1) || {
+    fb_out=$(iso_tool --create-foreign-bridge --foreign-network-id "$FOREIGN_NETWORK_ID" --wallet-id "$creator" 2>&1) || {
         glog "GARBO foreign-claim: --create-foreign-bridge FAILED — $(echo "$fb_out" | tail -2)"; return 1; }
     fs=$(echo "$fb_out" | grep "service-id:" | awk '{print $NF}')
     fg=$(echo "$fb_out" | grep "ger-manager-id:" | awk '{print $NF}')
