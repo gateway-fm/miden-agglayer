@@ -270,7 +270,7 @@ ger_manager   = "0x…"      # KMS-keyed — fund this
 fee_faucet_id = "0x…"      # the chain's native fee asset
 verification_base_fee = 7
 max_fee_per_txn       = 210
-fund_service     = 215040  # bigger: its own budget + cascades for the bridge, the ETH faucet and 10 runtime faucets
+fund_service     = 698880  # bigger: its own budget + cascades for the bridge, the ETH faucet and 10 runtime faucets
 fund_ger_manager = 53760
 ```
 
@@ -309,9 +309,10 @@ asset; send it and init continues.
 `bridge_fee_vault_txns_left < 32`. A top-up P2ID is consumed by the proxy on its next
 monitor tick (the note pays for its own consume, so an empty vault recovers without a
 restart). Measured at base fee 7: network transactions
-(bridge, faucets) cost ~40–50 units, signed client transactions the 210 cap; a
-busy bridge ran 27 network transactions in ten minutes, so the 13,440-unit
-cascade is hours of runway — top up from the metric, not on a schedule.
+(bridge, faucets) cost ~105–112 units, signed client transactions the 210 cap; a
+busy bridge ran 27 network transactions in ten minutes, so the 53,760-unit
+cascade (~480 of them) is hours of runway — top up from the metric, not on a
+schedule. (A 13,440-unit cascade ran a bridge dry in 2.5 h of e2e traffic.)
 
 Fees are per-transaction and continuous, so this is a **balance to maintain**,
 not a one-time deposit — `ger_manager` pays on every GER injection, `service` on
@@ -328,7 +329,7 @@ bridge-out-tool --fund-fee-asset \
   --fund <service-or-bridge-or-faucet-id>=<amount>
 ```
 
-**Every new token costs `service` one cascade** (13,440 units at base fee 7): the
+**Every new token costs `service` one cascade** (53,760 units at base fee 7): the
 recommended `fund_service` reserves ten of them; past that the proxy logs "fee
 vault too low to fund another faucet" and new tokens' claims fail until `service`
 is topped up.

@@ -308,9 +308,15 @@ services:
       DATABASE_URL: "host=agglayer-postgres user=agglayer password=agglayer dbname=agglayer_store"
       RUST_LOG: "info"
       # #201 e2e-fee-exhaustion: start one account nearly dry (unset = production defaults).
-      FEE_TXN_BUDGET_SERVICE: "${FEE_TXN_BUDGET_SERVICE:-}"
-      FEE_TXN_BUDGET_GER_MANAGER: "${FEE_TXN_BUDGET_GER_MANAGER:-}"
-      FEE_TXN_BUDGET_CASCADE: "${FEE_TXN_BUDGET_CASCADE:-}"
+      # The production defaults are runway for a manual top-up (hours); the
+      # battery runs unattended on ONE growing chain for half a day and nobody
+      # tops up, so e2e budgets are sized for the whole run (the bridge alone
+      # burned a 64-transaction cascade in 2.5 h). The genesis operator holds
+      # 1e9 units, so the ~4.3M this costs is nothing. The exhaustion e2e still
+      # overrides these to tiny values through the same variables.
+      FEE_TXN_BUDGET_SERVICE: "${FEE_TXN_BUDGET_SERVICE:-4096}"
+      FEE_TXN_BUDGET_GER_MANAGER: "${FEE_TXN_BUDGET_GER_MANAGER:-4096}"
+      FEE_TXN_BUDGET_CASCADE: "${FEE_TXN_BUDGET_CASCADE:-1024}"
       FEE_TXN_BUDGET_CASCADE_TARGETS: "${FEE_TXN_BUDGET_CASCADE_TARGETS:-}"
       # Regression requirement: offload ALL proxy tx proving (CLAIM / GER /
       # faucet / bridge-out / init) to an EXTERNAL Miden tx-prover instead of

@@ -41,7 +41,11 @@ use crate::miden_client::MidenClientLib;
 /// (`ger_manager` pays on every GER injection, `service` on every claim).
 pub const KMS_ACCOUNT_TXN_BUDGET: u64 = 256;
 /// Fee headroom cascaded to each keyless account (bridge, faucet) at deploy.
-pub const CASCADE_TXN_BUDGET: u64 = 64;
+/// Counted in worst-case (210-unit) transactions, but a bridge network
+/// transaction really costs ~112 units, so 256 is ~480 of them: several hours
+/// at a busy bridge's 27 per ten minutes — enough for a human to act on the
+/// `txns_left` alert. 64 (≈120 transactions) ran a bridge dry in 2.5 h of e2e.
+pub const CASCADE_TXN_BUDGET: u64 = 256;
 /// Keyless accounts `--init` cascade-funds from `service`: the bridge and the
 /// ETH faucet. Later faucets are cascade-funded at runtime as tokens appear.
 pub const INIT_CASCADE_TARGETS: u64 = 2;

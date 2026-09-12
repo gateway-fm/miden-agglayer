@@ -6,9 +6,10 @@
 //! the bridge on every network transaction (UpdateGer, CLAIM, B2AGG…), each
 //! faucet on every MINT/BURN. An empty vault silently stalls that account
 //! (its transactions abort in the kernel). Measured at base fee 7: network
-//! transactions cost ~40–50 units, signed client transactions the 210 cap; a
-//! busy bridge ran 27 network transactions in ten minutes — so the cascade
-//! amounts are hours, not weeks, of runway, and the balance has to be watched.
+//! transactions cost ~105–112 units (the bridge burned 13,440 in 120 of them),
+//! signed client transactions the 210 cap; a busy bridge ran 27 network
+//! transactions in ten minutes — so the cascade amounts are hours, not weeks,
+//! of runway, and the balance has to be watched.
 //!
 //! Gauges (labelled `account="service"|"ger_manager"|"bridge"|"faucet:<SYMBOL>"`):
 //! - `bridge_fee_vault_balance` — units of the fee asset in the vault;
