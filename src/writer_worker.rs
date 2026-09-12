@@ -49,6 +49,7 @@ use crate::service_state::ServiceState;
 use alloy::consensus::TxEnvelope;
 use alloy::primitives::{Address, TxHash};
 use dashmap::DashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -555,6 +556,29 @@ pub struct WriterWorker {
     inflight: Arc<DashMap<TxHash, InFlightEntry>>,
     service: ServiceState,
     tx_ttl: Duration,
+    /// Jobs whose signer could not pay the Miden fee (#201), kept for retry
+    /// instead of a failure receipt — see [`is_fee_vault_empty`].
+    parked: VecDeque<WriteJob>,
+}
+
+/// How often parked jobs are re-dispatched. A top-up lands within one
+/// fee-vault monitor tick, so this only bounds how long recovery lags it.
+const PARKED_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The kernel abort a signing account hits when its fee vault cannot cover the
+/// transaction fee (#201). It reaches us as executor error text, so match the
+/// wording the way `is_recoverable_account_error` matches the node's.
+///
+/// Why this must not become a failure receipt: the claim sponsor
+/// (bridge-service's ClaimTxManager) resends a reverted claim every ~2 s and
+/// marks the deposit permanently FAILED after ten mined-and-failed attempts —
+/// a hard-coded history limit, not config — so an empty vault would strand
+/// every deposit it touched even after the operator tops the account up.
+/// Left pending (receipt `null`) the sponsor simply waits, and the parked job
+/// lands on the first retry after the top-up.
+pub(crate) fn is_fee_vault_empty(err: &anyhow::Error) -> bool {
+    format!("{err:#}")
+        .contains("amount of the asset in the vault is less than the amount to remove")
 }
 
 impl WriterWorker {
@@ -641,6 +665,7 @@ impl WriterWorker {
             inflight: inflight.clone(),
             service: service.clone(),
             tx_ttl,
+            parked: VecDeque::new(),
         };
 
         tokio::spawn(async move {
@@ -742,12 +767,23 @@ impl WriterWorker {
             tx_ttl_secs = self.tx_ttl.as_secs(),
             "writer worker starting"
         );
+        let mut parked_retry = tokio::time::interval(PARKED_RETRY_INTERVAL);
+        // Ticks skipped while nothing was parked must not fire as a burst the
+        // moment a job is parked (seen live: eight retries in half a second).
+        parked_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 biased;
                 _ = &mut *shutdown_rx => {
                     tracing::info!(target: "writer_worker", "shutdown signal received");
                     break;
+                }
+                _ = parked_retry.tick(), if !self.parked.is_empty() => {
+                    // Oldest first, so a signer's held nonces land in admission order.
+                    let retry: Vec<WriteJob> = self.parked.drain(..).collect();
+                    for job in retry {
+                        self.process(job).await;
+                    }
                 }
                 maybe_job = self.receiver.recv() => {
                     let Some(job) = maybe_job else {
@@ -782,7 +818,7 @@ impl WriterWorker {
         tracing::info!(target: "writer_worker", "writer worker stopped");
     }
 
-    async fn process(&self, job: WriteJob) {
+    async fn process(&mut self, job: WriteJob) {
         let hash = job.eth_tx_hash();
         let kind = job.kind();
         let job_id = job.job_id();
@@ -880,6 +916,8 @@ impl WriterWorker {
 
         let outcome_label;
         let dispatch_service = self.service.clone();
+        // Kept so a fee-starved job can be parked and re-dispatched verbatim.
+        let retry_copy = job.clone();
         let result =
             supervise_dispatch(async move { dispatch_job(&dispatch_service, job).await }).await;
         match result {
@@ -916,7 +954,24 @@ impl WriterWorker {
                 );
             }
             Err(err) => {
-                if preserve_pending_after_handoff(&self.service.store, hash).await {
+                if is_fee_vault_empty(&err) {
+                    if let Some(mut entry) = self.inflight.get_mut(&hash) {
+                        entry.state = JobState::Queued;
+                        // Restart the TTL clock: the wait for a top-up is the
+                        // operator's, not queue congestion.
+                        entry.created_at = Instant::now();
+                    }
+                    self.parked.push_back(retry_copy);
+                    outcome_label = "parked";
+                    tracing::error!(
+                        target: "writer_worker",
+                        %hash, kind = kind.as_str(), %job_id, signer = %signer,
+                        parked = self.parked.len(),
+                        "fee vault EMPTY — holding the transaction pending and retrying every {}s until the account is topped up (#201)",
+                        PARKED_RETRY_INTERVAL.as_secs()
+                    );
+                    ::metrics::gauge!("agglayer_writer_jobs_parked").set(self.parked.len() as f64);
+                } else if preserve_pending_after_handoff(&self.service.store, hash).await {
                     self.inflight.remove(&hash);
                     outcome_label = "pending";
                     tracing::warn!(
@@ -1083,6 +1138,21 @@ async fn preserve_pending_after_handoff(
 mod tests {
     use super::*;
     use alloy::consensus::{SignableTransaction, TxLegacy};
+
+    #[test]
+    fn fee_vault_empty_is_recognised_through_the_error_chain() {
+        // The kernel assertion text as the executor surfaces it (repro 2026-09-12).
+        let inner = anyhow::anyhow!(
+            "failed to execute transaction kernel program:\n  x assertion failed with error \
+             message: failed to remove the fungible asset from the vault since the amount of \
+             the asset in the vault is less than the amount to remove"
+        );
+        let err = inner.context("transaction execution failed");
+        assert!(is_fee_vault_empty(&err));
+        assert!(!is_fee_vault_empty(&anyhow::anyhow!(
+            "GER is already registered in storage"
+        )));
+    }
     use alloy::primitives::U256;
     use alloy::signers::SignerSync;
     use alloy::signers::local::PrivateKeySigner;
@@ -1188,11 +1258,12 @@ mod tests {
         let mut entry = InFlightEntry::from_job(&job);
         entry.created_at = Instant::now() - Duration::from_secs(2);
         inflight.insert(hash, entry);
-        let worker = WriterWorker {
+        let mut worker = WriterWorker {
             receiver,
             inflight: inflight.clone(),
             service,
             tx_ttl: Duration::from_secs(1),
+            parked: VecDeque::new(),
         };
 
         worker.process(job).await;

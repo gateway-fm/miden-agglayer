@@ -307,6 +307,20 @@ services:
       NETWORK_ID: "${NETWORK_ID:-1}"
       DATABASE_URL: "host=agglayer-postgres user=agglayer password=agglayer dbname=agglayer_store"
       RUST_LOG: "info"
+      # #201 e2e-fee-exhaustion: start one account nearly dry (unset = production defaults).
+      # The production defaults are runway for a manual top-up (hours); the
+      # battery runs unattended on ONE growing chain for half a day and nobody
+      # tops up, so e2e budgets are sized for the whole run (the bridge alone
+      # burned a 64-transaction cascade in 2.5 h). The genesis operator holds
+      # 1e9 units, so the ~4.3M this costs is nothing. The exhaustion e2e still
+      # overrides these to tiny values through the same variables.
+      FEE_TXN_BUDGET_SERVICE: "${FEE_TXN_BUDGET_SERVICE:-4096}"
+      FEE_TXN_BUDGET_GER_MANAGER: "${FEE_TXN_BUDGET_GER_MANAGER:-4096}"
+      FEE_TXN_BUDGET_CASCADE: "${FEE_TXN_BUDGET_CASCADE:-1024}"
+      # Every token the battery bridges in costs `service` one cascade; test-e2e
+      # alone creates nine, loadtest and chaos more. 12 reserve cascades ran out
+      # 1.7 h into final6 (service 3.44M → 1.07M), so reserve for the whole run.
+      FEE_TXN_BUDGET_CASCADE_TARGETS: "${FEE_TXN_BUDGET_CASCADE_TARGETS:-64}"
       # Regression requirement: offload ALL proxy tx proving (CLAIM / GER /
       # faucet / bridge-out / init) to an EXTERNAL Miden tx-prover instead of
       # the in-process LocalTransactionProver. Fallback-to-local stays OFF
@@ -371,6 +385,9 @@ services:
       # but inherits environment; restore/recovery must therefore retain the
       # exact policy already bound to this database.
       L1_RPC_URL: "http://anvil:8545"
+      # Origin-network RPCs for ERC-20 metadata recovery on --restore (finding #62): one-shot
+      # `compose run … --restore` replaces the command args, so this must come from the env.
+      NETWORK_RPC_URLS: "2=http://anvil-l2b:8545"
       GER_L1_ADDRESS: "0x1f7ad7caA53e35b4f0D138dC5CBF91aC108a2674"
       L1_INDEXER_FROM_BLOCK: "1"
       L1_EVIDENCE_TAG: "${L1_EVIDENCE_TAG:-latest}"
@@ -456,7 +473,62 @@ services:
       # longer than a bare RPC bind; with the --init account redeploy + external-prover
       # handshake, give the first healthy check headroom so `up --wait` does not abort
       # dependents prematurely.
-      start_period: 240s
+      # #201: --init now also waits for the fee-funder's notes before it can
+      # deploy (fees are enabled in the e2e genesis), so give it more room.
+      start_period: 600s
+
+  # #201 — the e2e stand-in for the OPERATOR's funding step. Fees are ENABLED in
+  # the e2e genesis (verification_base_fee = 7, matching the live testnet), so
+  # every account the proxy deploys must hold the native fee asset. The proxy's
+  # --init writes funding.toml (the two KMS-keyed accounts + amounts) and waits;
+  # this one-shot sidecar sends from the genesis FAUCET OPERATOR's pre-funded
+  # vault (the fee faucet's owner; the faucet itself is keyless) — LOCAL custody,
+  # exactly as an operator would, and independent of whether the proxy itself
+  # runs with remote/KMS keys — to just those two accounts. The proxy then
+  # consumes the notes as its deploys and cascade-funds the keyless bridge and
+  # faucets from `service`. No production analogue: operators fund by hand.
+  fee-funder:
+    image: miden-agglayer-e2e:latest
+    restart: "no"
+    volumes:
+      - node_data:/data:ro
+      - ./.miden-agglayer-data:/var/lib/miden-agglayer-service
+    entrypoint: ["/bin/sh", "-c"]
+    depends_on:
+      miden-node:
+        condition: service_started
+    command:
+      - |
+        set -e
+        M=/var/lib/miden-agglayer-service/funding.toml
+        C=/var/lib/miden-agglayer-service/bridge_accounts.toml
+        echo "[fee-funder] waiting for $$M (written by a fee-charging --init) or $$C (a zero-fee --init finished)"
+        i=0
+        until [ -f "$$M" ] || [ -f "$$C" ]; do
+          i=$$((i+1))
+          if [ "$$i" -gt 600 ]; then echo "[fee-funder] TIMEOUT waiting for $$M / $$C"; exit 1; fi
+          sleep 2
+        done
+        if [ ! -f "$$M" ]; then echo "[fee-funder] zero-fee chain: init completed without needing funding — nothing to do"; exit 0; fi
+        echo "[fee-funder] funding the accounts in $$M from the genesis faucet operator's vault"
+        # faucet_operator.mac, NOT native_faucet.mac: the fee faucet is a network
+        # account with an owner-only mint policy and no key; its OWNER (the
+        # operator) is a plain wallet pre-funded with the fee asset at genesis.
+        fund() { bridge-out-tool --store-dir /tmp/fee-funder --node-url http://miden-node:57291 \
+          --fund-fee-asset --faucet-operator-mac /data/accounts/faucet_operator.mac \
+          --funding-manifest "$$M"; }
+        # Retry until it lands: a single failed attempt would leave --init waiting for
+        # notes that never come and the healthcheck to give up. Not on a restart after
+        # --init already finished: the accounts are funded, and a spurious send from the
+        # operator races other funders spending the same account ("conflicts with mempool").
+        if [ ! -f "$$C" ]; then until fund; do echo "[fee-funder] funding failed — retrying in 10s"; sleep 10; done; fi
+        # Stay alive: `compose up --wait` treats an exited one-shot as a failed wait, and a
+        # test that wipes the proxy's data dir makes --init write a NEW manifest — fund that too.
+        last=$$(md5sum "$$M")
+        while sleep 10; do
+          cur=$$(md5sum "$$M" 2>/dev/null) || continue
+          [ "$$cur" != "$$last" ] && { echo "[fee-funder] new manifest — funding again"; until fund; do sleep 10; done; last=$$cur; }
+        done
 
   # ── Bridge Service ─────────────────────────────────────────────────────────
   bridge-service:
