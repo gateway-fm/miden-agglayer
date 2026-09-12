@@ -444,8 +444,14 @@ e2e-claim-watcher-synthesis: e2e-claim-watcher ## After watcher happy path, simu
 	$(COMPOSE_ENV) ./scripts/e2e-claim-watcher-synthesis.sh
 
 .PHONY: e2e-claim-provenance
+# Each scenario bakes a starved account into its own chain; in the battery every later
+# target shares whatever chain is up, so the target hands back a default-budget stack,
+# pass or fail — otherwise the whole tail of the run inherits a service with no reserve.
 e2e-fee-exhaustion: ## #201: service, ger_manager and the bridge each run out of fee asset mid-flow and must recover when topped up (fee-charging chain; brings its own stacks)
-	for a in service ger_manager bridge; do $(COMPOSE_ENV) ./scripts/e2e-fee-exhaustion.sh $$a || exit 1; done
+	rc=0; for a in service ger_manager bridge; do $(COMPOSE_ENV) ./scripts/e2e-fee-exhaustion.sh $$a || { rc=1; break; }; done; \
+	echo "e2e-fee-exhaustion: handing back a default-budget stack (rc=$$rc)"; \
+	KEEP_CHAIN=0 $(MAKE) e2e-down >/dev/null 2>&1; KEEP_CHAIN=0 $(MAKE) e2e-clean-data >/dev/null 2>&1; $(MAKE) e2e-up >/dev/null 2>&1 || echo "WARN: default-budget bring-up failed"; \
+	exit $$rc
 
 e2e-claim-provenance: ## Deploy a FOREIGN bridge on the same chain, drive a claim through it, assert zero ClaimEvent leakage (stack must be up)
 	$(COMPOSE_ENV) ./scripts/e2e-claim-provenance.sh
