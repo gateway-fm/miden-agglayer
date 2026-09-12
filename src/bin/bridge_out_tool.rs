@@ -726,13 +726,58 @@ async fn fund_fee_asset(
             FungibleAsset::new(fee_faucet_id, amount)
                 .map_err(|e| anyhow!("fee asset amount {amount}: {e:?}"))?,
         );
-        let req = TransactionRequestBuilder::new()
-            .build_pay_to_id(
-                PaymentNoteDescription::new(vec![asset], operator_id, target),
-                NoteType::Public,
-                client.rng(),
-            )
-            .map_err(|e| anyhow!("building fee-asset P2ID to {}: {e:?}", target.to_hex()))?;
+        // A DEPLOYED network account (bridge, faucet) is executed only by the
+        // ntx-builder — the node refuses user-submitted transactions for it
+        // ("Network transactions may not be submitted by users yet") — and the
+        // ntx-builder only picks up notes carrying a NetworkAccountTarget. So a
+        // top-up for one must carry the attachment, and the sender declares the
+        // target as a foreign account because the fee policy is read from it.
+        // Before deployment the plain P2ID is right: the account's creation
+        // transaction consumes it (see fee_funding::deploy_account).
+        let deployed_network = {
+            if client.get_account(target).await?.is_none() {
+                let _ = client.import_account_by_id(target).await; // not on chain yet ⇒ Err
+            }
+            client.get_account(target).await?.is_some_and(|account| {
+                miden_standards::account::auth::NetworkAccount::new(account).is_ok()
+            })
+        };
+        let req = if deployed_network {
+            let note = miden_standards::note::P2idNote::builder()
+                .sender(operator_id)
+                .target(target)
+                .asset(asset)
+                .note_type(NoteType::Public)
+                .attachment(miden_protocol::note::NoteAttachment::from(
+                    miden_standards::note::NetworkAccountTarget::new(
+                        target,
+                        miden_standards::note::NoteExecutionHint::Always,
+                    )
+                    .map_err(|e| anyhow!("network target for {}: {e:?}", target.to_hex()))?,
+                ))
+                .generate_serial_number(client.rng())
+                .build()
+                .map_err(|e| anyhow!("building fee-asset P2ID to {}: {e:?}", target.to_hex()))?;
+            TransactionRequestBuilder::new()
+                .own_output_notes(vec![miden_protocol::note::Note::from(note).into()])
+                .foreign_accounts([miden_client::transaction::ForeignAccount::public(
+                    target,
+                    miden_client::rpc::domain::account::AccountStorageRequirements::default(),
+                )
+                .map_err(|e| {
+                    anyhow!("declaring {} as a foreign account: {e:?}", target.to_hex())
+                })?])
+                .build()
+                .map_err(|e| anyhow!("building fee-asset P2ID to {}: {e:?}", target.to_hex()))?
+        } else {
+            TransactionRequestBuilder::new()
+                .build_pay_to_id(
+                    PaymentNoteDescription::new(vec![asset], operator_id, target),
+                    NoteType::Public,
+                    client.rng(),
+                )
+                .map_err(|e| anyhow!("building fee-asset P2ID to {}: {e:?}", target.to_hex()))?
+        };
         let txn = submit_new_transaction(client, operator_id, req)
             .await
             .map_err(|e| anyhow!("fee-asset send to {} failed: {e:?}", target.to_hex()))?;

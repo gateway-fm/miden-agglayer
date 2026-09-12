@@ -329,7 +329,11 @@ Fees are per-transaction and continuous, so this is a **balance to maintain**,
 not a one-time deposit — `ger_manager` pays on every GER injection, `service` on
 every claim, the bridge on every network transaction, each faucet on every mint.
 Watch the vaults (an empty vault stalls that account) and top up with more P2IDs
-of the fee asset. `service` is the simplest single point: top it up and it keeps
+of the fee asset. For a **deployed network account** (the bridge, every faucet) the
+P2ID must carry a `NetworkAccountTarget` attachment naming it — only the ntx-builder
+can execute such an account, and it only sees notes with that attachment (the node
+rejects user-submitted transactions for network accounts). `bridge-out-tool
+--fund-fee-asset` does this automatically when the target is already on chain. `service` is the simplest single point: top it up and it keeps
 cascading, or fund any account directly by id:
 
 ```sh

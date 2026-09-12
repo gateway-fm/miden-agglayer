@@ -153,7 +153,15 @@ impl FeeVaultMonitor {
                         // Sweep top-ups: a P2ID of the fee asset sent to this account
                         // lands only once consumed. Not for an account still being
                         // created — its cascade note is the deploy's to consume.
-                        match if account.is_new() {
+                        // Deployed network accounts (bridge, faucets) cannot be swept
+                        // from here: the node refuses user-submitted transactions for
+                        // them, the ntx-builder consumes their top-ups (the funding
+                        // tool attaches the network target). Only wallets are swept.
+                        let network = miden_standards::account::auth::NetworkAccount::new(
+                            account.clone(),
+                        )
+                        .is_ok();
+                        match if account.is_new() || network {
                             Ok(0)
                         } else {
                             crate::fee_funding::consume_fee_notes(client, id, &snap).await
