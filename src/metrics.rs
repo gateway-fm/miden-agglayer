@@ -1236,9 +1236,23 @@ mod tests {
 
     #[test]
     fn issue_210_debug_filter_exposes_start_heartbeat_and_cancellation() {
-        let _logging_guard = crate::logging::TEST_LOGGING_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        const CHILD_ENV: &str = "MIDEN_WRITER_TRACE_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // The production callsites also fire on other test threads with no
+            // subscriber. A fresh process gives us the proxy's real model: one
+            // global subscriber for its lifetime, including cancellation/drop.
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "metrics::tests::issue_210_debug_filter_exposes_start_heartbeat_and_cancellation", "--nocapture"])
+                .env(CHILD_ENV, "1").output().unwrap();
+            assert!(
+                child.status.success()
+                    && String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+                "trace subprocess failed: {}\n{}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+            return;
+        }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .start_paused(true)
@@ -1246,7 +1260,7 @@ mod tests {
             .unwrap();
         use std::io::Write;
         use std::sync::{Arc, Mutex};
-        use tracing::instrument::WithSubscriber;
+        use tracing::Instrument;
         #[derive(Clone)]
         struct LogWriter(Arc<Mutex<Vec<u8>>>);
         impl Write for LogWriter {
@@ -1266,6 +1280,8 @@ mod tests {
             .without_time()
             .with_writer(move || writer.clone())
             .finish();
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+        let job_span = tracing::info_span!("writer_job", hash = "diagnostic-hash");
         runtime.block_on(
             async {
                 let result = tokio::time::timeout(
@@ -1281,15 +1297,25 @@ mod tests {
                 meter_writer_stage("claim", "finished_test", async { Ok::<_, &str>(()) })
                     .await
                     .unwrap();
+                assert!(
+                    meter_writer_stage("claim", "error_test", async {
+                        Err::<(), _>("do-not-log-payload")
+                    })
+                    .await
+                    .is_err()
+                );
             }
-            .with_subscriber(subscriber),
+            .instrument(job_span),
         );
         let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
         assert!(logs.contains("stage started"), "{logs}");
         assert_eq!(logs.matches("stage still running").count(), 2, "{logs}");
         assert!(logs.contains("elapsed_secs=60"), "{logs}");
-        assert!(logs.contains("outcome=\"cancelled\""), "{logs}");
-        assert!(logs.contains("outcome=\"ok\""), "{logs}");
+        for outcome in ["cancelled", "ok", "error"] {
+            assert!(logs.contains(&format!("outcome=\"{outcome}\"")), "{logs}");
+        }
+        assert!(logs.contains("diagnostic-hash"), "{logs}");
+        assert!(!logs.contains("do-not-log-payload"), "{logs}");
     }
 
     /// Every histogram we alert or capacity-plan on must render as real
