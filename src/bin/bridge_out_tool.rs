@@ -188,6 +188,37 @@ struct Args {
     #[arg(long)]
     create_native_faucet: bool,
 
+    /// #201: send the chain's NATIVE FEE ASSET to the proxy's accounts so they can
+    /// pay transaction fees, from the genesis FAUCET OPERATOR's pre-funded vault
+    /// (`--faucet-operator-mac`). Operator tooling — local custody by design, so it
+    /// works unchanged when the proxy itself runs with remote/KMS keys. Targets
+    /// come from a proxy `funding.toml` (`--funding-manifest`, written by the
+    /// proxy's `--print-funding`) and/or explicit `--fund <account-hex>=<amount>`.
+    #[arg(long)]
+    fund_fee_asset: bool,
+
+    /// Path to the genesis `faucet_operator.mac` — the account file
+    /// `miden-validator genesis --accounts-directory` writes for the native fee
+    /// faucet's OWNER: a plain wallet, pre-funded with the fee asset at genesis,
+    /// carrying its own signing key. (NOT `native_faucet.mac`: the fee faucet is
+    /// a network account with an owner-only mint policy and no key of its own,
+    /// so it cannot be minted from directly.)
+    #[arg(long)]
+    faucet_operator_mac: Option<PathBuf>,
+
+    /// A proxy `funding.toml` naming the KMS-keyed accounts and amounts to fund.
+    #[arg(long)]
+    funding_manifest: Option<PathBuf>,
+
+    /// Extra targets, repeatable: `<account-id-hex>=<amount>`.
+    #[arg(long = "fund", num_args = 1..)]
+    fund: Vec<String>,
+
+    /// The chain's fee faucet id (hex). Taken from `--funding-manifest` when
+    /// given; required only for `--fund`-only invocations.
+    #[arg(long)]
+    fee_faucet_id: Option<String>,
+
     /// Custom token symbol for --create-native-faucet (Miden TokenSymbol: <= 6 chars).
     #[arg(long, default_value = "MDN")]
     native_symbol: String,
@@ -231,6 +262,15 @@ struct Args {
     /// silent empty symbol. Requires only --store-dir + --node-url.
     #[arg(long)]
     inspect_faucet: Option<String>,
+
+    /// Print the fungible vault balances of one or more PUBLIC accounts (hex or
+    /// bech32 ids), read-only — imports each account by id from the node. The
+    /// operator's view of "how much fee asset does my bridge / faucet / service
+    /// hold" for top-ups (#201). Output: one `vault-balance: account=<hex>
+    /// faucet=<hex> amount=<n>` line per asset (`(empty)` when the vault holds
+    /// nothing). Requires only --store-dir + --node-url.
+    #[arg(long = "vault-balance", num_args = 1..)]
+    vault_balance: Vec<String>,
 
     /// Received-asset linkage mode (#147 / PR#152). Enumerate the fungible faucets the
     /// RECEIVING wallet (--wallet-id) actually holds, derived from its ON-CHAIN vault
@@ -531,6 +571,229 @@ async fn consume_pending_notes(
     }
 }
 
+/// #201: send the chain's native fee asset to the proxy's accounts so they can
+/// pay transaction fees. Operator tooling with LOCAL custody by design: the
+/// proxy's remote/KMS keystore rightly refuses to hold any local secret, so the
+/// one key this needs lives here, not there.
+///
+/// Why the OPERATOR and not the faucet: the genesis native fee faucet is a
+/// network `FungibleFaucet` with an owner-only mint policy and NO key of its
+/// own (`native_faucet.mac` carries none; the client can't even build a mint
+/// against it — "does not contain the … fungible faucet interface"). Genesis
+/// also creates the faucet OPERATOR — a plain wallet, the faucet's owner,
+/// pre-funded with 1e9 units of the fee asset — and writes it as
+/// `faucet_operator.mac` WITH its signing key. Funding is therefore a plain
+/// P2ID send from the operator's vault: no minting, no faucet interface needed.
+/// The creator wallet's own fee funding is a P2ID that lands only once consumed;
+/// consume it and wait, or the cascade below fails with "asset error" (#201).
+async fn settle_fee_notes(
+    client: &mut miden_agglayer_service::miden_client::MidenClientLib,
+    wallet: AccountId,
+    fee: &miden_agglayer_service::fee_funding::FeeSnapshot,
+) -> anyhow::Result<()> {
+    if miden_agglayer_service::fee_funding::consume_fee_notes(client, wallet, fee).await? == 0 {
+        return Ok(());
+    }
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        client.sync_state().await?;
+        if let Some(a) = client.get_account(wallet).await?
+            && miden_agglayer_service::fee_vault_monitor::fee_balance(&a, fee.fee_faucet_id) > 0
+        {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "fee funding note of {} did not land within 60s",
+        wallet.to_hex()
+    )
+}
+
+async fn fund_fee_asset(
+    client: &mut miden_agglayer_service::miden_client::MidenClientLib,
+    keystore: Arc<miden_agglayer_service::proxy_keystore::ProxyKeystore>,
+    args: &Args,
+) -> anyhow::Result<()> {
+    use miden_agglayer_service::accounts_config::FundingManifest;
+    use miden_agglayer_service::miden_client::{
+        submit_new_transaction, wait_for_transaction_commit,
+    };
+    use miden_client::keystore::Keystore as _;
+    use miden_client::transaction::{PaymentNoteDescription, TransactionRequestBuilder};
+    use miden_protocol::account::AccountFile;
+    use miden_protocol::asset::{Asset, FungibleAsset};
+    use miden_protocol::note::NoteType;
+
+    let mac = args.faucet_operator_mac.as_ref().ok_or_else(|| {
+        anyhow!("--fund-fee-asset requires --faucet-operator-mac <genesis faucet_operator.mac>")
+    })?;
+    let file = AccountFile::read(mac)
+        .with_context(|| format!("reading faucet operator account file {}", mac.display()))?;
+    let operator_id = file.account.id();
+    if file.auth_secret_keys.is_empty() {
+        return Err(anyhow!(
+            "{} carries no signing key — is this native_faucet.mac instead of \
+             faucet_operator.mac? The operator (the faucet's owner) is the funding source",
+            mac.display()
+        ));
+    }
+    // The operator must SIGN its sends: load its secret(s) into this tool's
+    // local keystore.
+    for key in &file.auth_secret_keys {
+        keystore
+            .add_key(key, operator_id)
+            .await
+            .map_err(|e| anyhow!("loading the faucet operator key: {e}"))?;
+    }
+    // A store that already tracks the operator holds its CURRENT state; re-importing
+    // the genesis file over it fails with AccountNonceTooLow.
+    if client.get_account(operator_id).await?.is_none() {
+        client
+            .add_account(&file.account, false)
+            .await
+            .map_err(|e| anyhow!("importing faucet operator {}: {e:?}", operator_id.to_hex()))?;
+    }
+    client
+        .sync_state()
+        .await
+        .map_err(|e| anyhow!("sync after faucet operator import: {e:?}"))?;
+
+    let mut targets: Vec<(AccountId, u64)> = Vec::new();
+    let mut fee_faucet_id: Option<AccountId> = None;
+    if let Some(path) = args.funding_manifest.as_ref() {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let manifest: FundingManifest =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        fee_faucet_id = Some(manifest.fee_faucet()?);
+        targets.push((manifest.service_id()?, manifest.fund_service));
+        targets.push((manifest.ger_manager_id()?, manifest.fund_ger_manager));
+    }
+    if let Some(hex) = args.fee_faucet_id.as_deref() {
+        let given = parse_account_id(hex).context("--fee-faucet-id")?;
+        if let Some(from_manifest) = fee_faucet_id
+            && from_manifest != given
+        {
+            return Err(anyhow!(
+                "--fee-faucet-id {} disagrees with the manifest's fee asset {}",
+                given.to_hex(),
+                from_manifest.to_hex()
+            ));
+        }
+        fee_faucet_id = Some(given);
+    }
+    let fee_faucet_id = fee_faucet_id.ok_or_else(|| {
+        anyhow!("--fund-fee-asset needs the fee asset: give --funding-manifest or --fee-faucet-id")
+    })?;
+    for spec in &args.fund {
+        let (id, amount) = spec
+            .split_once('=')
+            .ok_or_else(|| anyhow!("--fund expects <account-id-hex>=<amount>, got {spec}"))?;
+        let amount: u64 = amount
+            .parse()
+            .with_context(|| format!("--fund amount {amount:?} is not a number"))?;
+        targets.push((parse_account_id(id)?, amount));
+    }
+    if targets.is_empty() {
+        return Err(anyhow!(
+            "--fund-fee-asset: nothing to fund (give --funding-manifest and/or --fund)"
+        ));
+    }
+
+    // Self-check before spending: the operator's genesis vault must cover the
+    // total, in the SAME fee asset the manifest names (wrong chain otherwise).
+    let have: u64 = file
+        .account
+        .vault()
+        .assets()
+        .filter_map(|a| match a {
+            Asset::Fungible(f) if f.faucet_id() == fee_faucet_id => Some(f.amount().as_u64()),
+            _ => None,
+        })
+        .sum();
+    let need: u64 = targets.iter().map(|(_, a)| *a).sum();
+    if have < need {
+        return Err(anyhow!(
+            "faucet operator {} holds {have} units of fee asset {} but {need} are needed — \
+             wrong chain/account file, or the genesis operator balance is too small",
+            operator_id.to_hex(),
+            fee_faucet_id.to_hex()
+        ));
+    }
+
+    for (target, amount) in targets {
+        let asset = Asset::Fungible(
+            FungibleAsset::new(fee_faucet_id, amount)
+                .map_err(|e| anyhow!("fee asset amount {amount}: {e:?}"))?,
+        );
+        // A DEPLOYED network account (bridge, faucet) is executed only by the
+        // ntx-builder — the node refuses user-submitted transactions for it
+        // ("Network transactions may not be submitted by users yet") — and the
+        // ntx-builder only picks up notes carrying a NetworkAccountTarget. So a
+        // top-up for one must carry the attachment, and the sender declares the
+        // target as a foreign account because the fee policy is read from it.
+        // Before deployment the plain P2ID is right: the account's creation
+        // transaction consumes it (see fee_funding::deploy_account).
+        let deployed_network = {
+            if client.get_account(target).await?.is_none() {
+                let _ = client.import_account_by_id(target).await; // not on chain yet ⇒ Err
+            }
+            client.get_account(target).await?.is_some_and(|account| {
+                miden_standards::account::auth::NetworkAccount::new(account).is_ok()
+            })
+        };
+        let req = if deployed_network {
+            let note = miden_standards::note::P2idNote::builder()
+                .sender(operator_id)
+                .target(target)
+                .asset(asset)
+                .note_type(NoteType::Public)
+                .attachment(miden_protocol::note::NoteAttachment::from(
+                    miden_standards::note::NetworkAccountTarget::new(
+                        target,
+                        miden_standards::note::NoteExecutionHint::Always,
+                    )
+                    .map_err(|e| anyhow!("network target for {}: {e:?}", target.to_hex()))?,
+                ))
+                .generate_serial_number(client.rng())
+                .build()
+                .map_err(|e| anyhow!("building fee-asset P2ID to {}: {e:?}", target.to_hex()))?;
+            TransactionRequestBuilder::new()
+                .own_output_notes(vec![miden_protocol::note::Note::from(note)])
+                .foreign_accounts([miden_client::transaction::ForeignAccount::public(
+                    target,
+                    miden_client::rpc::domain::account::AccountStorageRequirements::default(),
+                )
+                .map_err(|e| {
+                    anyhow!("declaring {} as a foreign account: {e:?}", target.to_hex())
+                })?])
+                .build()
+                .map_err(|e| anyhow!("building fee-asset P2ID to {}: {e:?}", target.to_hex()))?
+        } else {
+            TransactionRequestBuilder::new()
+                .build_pay_to_id(
+                    PaymentNoteDescription::new(vec![asset], operator_id, target),
+                    NoteType::Public,
+                    client.rng(),
+                )
+                .map_err(|e| anyhow!("building fee-asset P2ID to {}: {e:?}", target.to_hex()))?
+        };
+        let txn = submit_new_transaction(client, operator_id, req)
+            .await
+            .map_err(|e| anyhow!("fee-asset send to {} failed: {e:?}", target.to_hex()))?;
+        wait_for_transaction_commit(client, txn, 30, std::time::Duration::from_secs(2))
+            .await
+            .map_err(|e| anyhow!("fee-asset send commit wait: {e:?}"))?;
+        println!(
+            "[fund-fee-asset] sent {amount} units of fee asset {} from faucet operator {} to {}",
+            fee_faucet_id.to_hex(),
+            operator_id.to_hex(),
+            target.to_hex()
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -568,7 +831,9 @@ async fn main() -> anyhow::Result<()> {
     if args.create_wallet
         || args.create_foreign_bridge
         || args.create_native_faucet
+        || args.fund_fee_asset
         || args.inspect_faucet.is_some()
+        || !args.vault_balance.is_empty()
     {
         // Provision / read-only modes: the store/keystore may not exist yet (a fresh
         // temp dir for --inspect-faucet) — create them.
@@ -645,6 +910,58 @@ async fn main() -> anyhow::Result<()> {
     // way a receiving wallet does — purely from on-chain account state, on a fresh
     // client with no preloaded token map. Machine-readable output; a NON-resolving
     // faucet (the wallet's `Unknown`) or an RPC failure is a non-zero exit.
+    if args.fund_fee_asset {
+        return fund_fee_asset(&mut client, keystore.clone(), &args).await;
+    }
+    if !args.vault_balance.is_empty() {
+        sync_with_retry(&mut client, "vault-balance").await?;
+        let mut failures = 0;
+        for id_str in &args.vault_balance {
+            let id = match parse_account_id(id_str) {
+                Ok(id) => id,
+                Err(e) => {
+                    eprintln!("vault-balance: ERROR bad account id {id_str}: {e:?}");
+                    failures += 1;
+                    continue;
+                }
+            };
+            // Already-tracked accounts (the wallet, a previously imported id) make
+            // the import a no-op / benign error; the read below is what matters.
+            if let Err(e) = client.import_account_by_id(id).await {
+                eprintln!(
+                    "vault-balance: note: import of {} returned {e:?} (reading tracked state)",
+                    id.to_hex()
+                );
+            }
+            let Some(record) = client.get_account(id).await? else {
+                eprintln!(
+                    "vault-balance: ERROR account {} not found on the node",
+                    id.to_hex()
+                );
+                failures += 1;
+                continue;
+            };
+            let mut any = false;
+            for asset in record.vault().assets() {
+                if let miden_protocol::asset::Asset::Fungible(f) = asset {
+                    any = true;
+                    println!(
+                        "vault-balance: account={} faucet={} amount={}",
+                        id.to_hex(),
+                        f.faucet_id().to_hex(),
+                        f.amount().as_u64()
+                    );
+                }
+            }
+            if !any {
+                println!("vault-balance: account={} (empty)", id.to_hex());
+            }
+        }
+        if failures > 0 {
+            std::process::exit(2);
+        }
+        return Ok(());
+    }
     if let Some(fid_hex) = args.inspect_faucet.as_deref() {
         let faucet_id = parse_account_id(fid_hex)
             .with_context(|| format!("inspect-faucet: bad faucet id {fid_hex}"))?;
@@ -746,10 +1063,7 @@ async fn main() -> anyhow::Result<()> {
     // bridge account, ETH faucet registered in the FOREIGN bridge. All keys
     // live in this isolated store — the proxy's store is never touched.
     if args.create_foreign_bridge {
-        use miden_agglayer_service::miden_client::{
-            submit_new_transaction, wait_for_transaction_commit,
-        };
-        use miden_base_agglayer::{AggLayerBridge, BridgeRoles, MetadataHash};
+        use miden_base_agglayer::{BridgeRoles, MetadataHash};
         use miden_client::crypto::FeltRng;
 
         println!(
@@ -767,15 +1081,54 @@ async fn main() -> anyhow::Result<()> {
             miden_agglayer_service::init::create_standalone_wallet(&mut client, keystore.clone())
                 .await
                 .map_err(|e| anyhow!("foreign ger_manager wallet creation failed: {e:?}"))?;
-
-        // Deploy ger_manager via dummy txn (mirrors init.rs::deploy_account).
-        let dummy = TransactionRequestBuilder::new().build()?;
-        let txn_id = submit_new_transaction(&mut client, ger_manager.id(), dummy)
+        // #201: every account pays its own fees, so the creator wallet (--wallet-id) funds
+        // the foreign service/ger_manager like the operator funds the proxy's.
+        use miden_agglayer_service::fee_funding::{
+            DeployKind, deploy_account, fee_snapshot, fund_from_service, recommended_ger_manager,
+            recommended_service,
+        };
+        let fee = fee_snapshot(&mut client).await?;
+        let wait = std::time::Duration::from_secs(180);
+        if fee.charges_fees() {
+            let funder = args.wallet_id.as_deref().map(AccountId::from_hex).transpose()
+                .map_err(|e| anyhow!("bad --wallet-id: {e:?}"))?
+                .ok_or_else(|| anyhow!("--create-foreign-bridge on a fee-charging chain needs --wallet-id <funded creator wallet> (#201)"))?;
+            settle_fee_notes(&mut client, funder, &fee).await?;
+            fund_from_service(
+                &mut client,
+                funder,
+                service.id(),
+                "foreign service",
+                recommended_service(&fee),
+                &fee,
+            )
+            .await?;
+            fund_from_service(
+                &mut client,
+                funder,
+                ger_manager.id(),
+                "foreign ger_manager",
+                recommended_ger_manager(&fee),
+                &fee,
+            )
+            .await?;
+        }
+        for (id, name) in [
+            (service.id(), "foreign service"),
+            (ger_manager.id(), "foreign ger_manager"),
+        ] {
+            deploy_account(
+                &mut client,
+                id,
+                name,
+                DeployKind::Wallet,
+                miden_agglayer_service::metrics::ProofKind::BridgeOut,
+                &fee,
+                wait,
+            )
             .await
-            .map_err(|e| anyhow!("foreign ger_manager deploy failed: {e:?}"))?;
-        wait_for_transaction_commit(&mut client, txn_id, 30, std::time::Duration::from_secs(2))
-            .await
-            .map_err(|e| anyhow!("foreign ger_manager deploy commit wait failed: {e:?}"))?;
+            .map_err(|e| anyhow!("{name} deploy failed: {e:?}"))?;
+        }
 
         // Foreign bridge (mirrors init.rs::add_bridge). rc.4: role-based
         // creation — the foreign service is ADMIN + faucet manager, the
@@ -789,29 +1142,32 @@ async fn main() -> anyhow::Result<()> {
             std::collections::BTreeSet::from([ger_manager.id()]),
         )
         .map_err(|e| anyhow!("foreign bridge role construction failed: {e}"))?;
-        let bridge = AggLayerBridge::account_builder(
+        let bridge = miden_agglayer_service::network_accounts::bridge_account_builder(
             client.rng().draw_word(),
             service.id(),
             roles,
             args.foreign_network_id,
-            miden_agglayer_service::fee_policy::zero_fee_policy_manager_for(
-                AggLayerBridge::allowed_notes(),
-                fee_faucet_id,
-            ),
-        )
+            fee_faucet_id,
+        )?
         .build()
         .map_err(|e| anyhow!("foreign bridge account build failed: {e}"))?;
         client
             .add_account(&bridge, false)
             .await
             .map_err(|e| anyhow!("adding foreign bridge account failed: {e:?}"))?;
-        let dummy = TransactionRequestBuilder::new().build()?;
-        let txn_id = submit_new_transaction(&mut client, bridge.id(), dummy)
-            .await
-            .map_err(|e| anyhow!("foreign bridge deploy failed: {e:?}"))?;
-        wait_for_transaction_commit(&mut client, txn_id, 30, std::time::Duration::from_secs(2))
-            .await
-            .map_err(|e| anyhow!("foreign bridge deploy commit wait failed: {e:?}"))?;
+        deploy_account(
+            &mut client,
+            bridge.id(),
+            "foreign bridge",
+            DeployKind::NetworkAccount {
+                funder: service.id(),
+            },
+            miden_agglayer_service::metrics::ProofKind::BridgeOut,
+            &fee,
+            wait,
+        )
+        .await
+        .map_err(|e| anyhow!("foreign bridge deploy failed: {e:?}"))?;
 
         // Settle accounts before the faucet registration note targets the bridge
         // (mirrors init.rs's NTX-builder settlement wait).
@@ -923,19 +1279,29 @@ async fn main() -> anyhow::Result<()> {
             .with_component(faucet_component)
             .with_components(policy_manager)
             .with_component(auth_component)
+            // #201: P2ID-fundable — on a fee-charging chain the creator wallet funds the vault.
+            .with_component(miden_standards::account::wallets::BasicWallet)
             .build_with_schema_commitment()
             .map_err(|e| anyhow!("faucet account build failed: {e:?}"))?;
         if let Some(key_pair) = key_pair.as_ref() {
             keystore.add_key(key_pair, faucet.id()).await?;
         }
         client.add_account(&faucet, false).await?;
-        let dummy = TransactionRequestBuilder::new().build()?;
-        let txn_id = submit_new_transaction(&mut client, faucet.id(), dummy)
-            .await
-            .map_err(|e| anyhow!("faucet deploy failed: {e:?}"))?;
-        wait_for_transaction_commit(&mut client, txn_id, 30, std::time::Duration::from_secs(2))
-            .await
-            .map_err(|e| anyhow!("faucet deploy commit wait failed: {e:?}"))?;
+        let fee = miden_agglayer_service::fee_funding::fee_snapshot(&mut client).await?;
+        if fee.charges_fees() {
+            settle_fee_notes(&mut client, wallet_id, &fee).await?;
+        }
+        miden_agglayer_service::fee_funding::deploy_account(
+            &mut client,
+            faucet.id(),
+            "native faucet",
+            miden_agglayer_service::fee_funding::DeployKind::NetworkAccount { funder: wallet_id },
+            miden_agglayer_service::metrics::ProofKind::BridgeOut,
+            &fee,
+            std::time::Duration::from_secs(180),
+        )
+        .await
+        .map_err(|e| anyhow!("faucet deploy failed: {e:?}"))?;
         println!(
             "[native-faucet] deployed operator faucet {}",
             faucet.id().to_hex()

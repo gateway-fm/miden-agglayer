@@ -87,6 +87,52 @@ iso_tool() {
         --miden-prover-url "$ISO_PROVER_URL" "$@"
 }
 
+# iso_fund_fee_asset <wallet_id> : on a FEE-CHARGING chain, give a freshly
+# provisioned isolated wallet the native fee asset (#201). Every transaction an
+# account executes pays the kernel fee from its own vault — including the
+# claimant's consume of its minted P2ID — so a fresh recipient with an empty
+# vault aborts in the kernel ("failed to remove the fungible asset from the
+# vault …") and the deposit's balance never shows although the mint is on-chain.
+# The proxy writes `funding.toml` only when the chain charges fees, so its
+# presence is the guard; the source of funds is the genesis faucet operator
+# (`/data/accounts/faucet_operator.mac` on the node_data volume), exactly as the
+# e2e `fee-funder` sidecar uses for the proxy's own accounts. The wallet's next
+# consume takes the fee P2ID together with whatever else is pending and pays for
+# itself. 8192× the fee cap: a creator wallet also funds native-faucet / foreign-bridge
+# deployments, and a foreign service is funded with the full recommended amount (its
+# own budget + 12 cascades of 256 = 698,880 at base fee 7; 2048× no longer covered it).
+iso_fund_fee_asset() {
+    local wallet="$1" want="${2:-}" manifest="$PROJECT_DIR/.miden-agglayer-data/funding.toml"
+    [[ -f "$manifest" ]] || return 0   # zero-fee chain: nothing to do
+    local fee_faucet max_fee amount
+    fee_faucet=$(sed -n 's/^fee_faucet_id *= *"\(.*\)"/\1/p' "$manifest")
+    max_fee=$(sed -n 's/^max_fee_per_txn *= *\([0-9]*\).*/\1/p' "$manifest")
+    [[ -n "$fee_faucet" && -n "$max_fee" ]] || { echo "isolated-wallet: $manifest lacks fee_faucet_id/max_fee_per_txn" >&2; return 1; }
+    amount=${want:-$(( max_fee * 8192 ))}
+    echo "isolated-wallet: fee-charging chain — funding $wallet with $amount units of the fee asset $fee_faucet (from the genesis faucet operator)" >&2
+    # The operator account is shared with other funders (the fee-funder sidecar); a send
+    # can lose a mempool race ("conflicts with current mempool state") — retry. A fresh
+    # store per call: a reused one carries the operator from another chain / nonce.
+    local out attempt
+    for attempt in 1 2 3 4; do
+        if out=$(docker run --rm --network "$ISO_NETWORK" \
+            -v "$B2AGG_STORE_DIR:/store" \
+            -v "${ISO_NODE_DATA_VOLUME:-miden-agglayer_node_data}:/data:ro" \
+            -e "MIDEN_PROVER_URL=$ISO_PROVER_URL" -e "TMPDIR=/store/tmp" \
+            --entrypoint bridge-out-tool "$ISO_IMAGE" \
+            --store-dir "/store/tmp/funder-$$-$RANDOM" --node-url "$ISO_NODE_URL" \
+            --miden-prover-url "$ISO_PROVER_URL" \
+            --fund-fee-asset --faucet-operator-mac /data/accounts/faucet_operator.mac \
+            --fee-faucet-id "$fee_faucet" --fund "$wallet=$amount" 2>&1); then break; fi
+        echo "isolated-wallet: fee-asset send attempt $attempt failed — retrying in 10s" >&2; sleep 10; out=""
+    done
+    if [[ -z "$out" ]]; then
+        echo "isolated-wallet: fee-asset funding of $wallet FAILED — on this chain its consumes cannot pay their fee" >&2
+        return 1
+    fi
+    echo "$out" | grep -E "\[fund\]|sent|committed" | tail -3 >&2 || true
+}
+
 # Remove the isolated store. Container-created files inside it are root-owned
 # on the host, so fall back to a root busybox container when plain rm fails.
 _iso_wipe_store() {
@@ -334,6 +380,7 @@ provision_isolated_wallet() {
             echo "isolated-wallet: could not persist the wallet id to $idfile — every later call would provision a NEW wallet" >&2
             return 1
         }
+        iso_fund_fee_asset "$WALLET_ID" || return 1
     fi
 
     WALLET_HEX="$WALLET_ID"

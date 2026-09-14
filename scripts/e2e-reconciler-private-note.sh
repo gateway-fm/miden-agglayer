@@ -210,14 +210,18 @@ else
     STATUS=$(printf '%s\n' "$TX" | awk '$1=="status"{print $2; exit}')
     [[ "$STATUS" == "1" ]] || fail "L1 deposit tx failed (status=$STATUS)"
     log "L1 deposit sent; waiting for auto-claim + P2ID delivery..."
-    for attempt in $(seq 1 24); do
+    # Up to 10 min, not 4: right after the battery's nonce-gap heal the GER
+    # pipeline lags for minutes (#205 — funding landed at poll 5 after a long
+    # gate and never within 240 s after a 30 s one); the same lib flow passes
+    # elsewhere, so the window is the only thing this Phase 0 gets wrong.
+    for attempt in $(seq 1 60); do
         sleep 10
         BAL=$(iso_wallet_balance "$BRIDGE_ID" "$FAUCET_ID")
         BAL="${BAL:-0}"
-        log "  attempt $attempt/24: balance = $BAL"
+        log "  attempt $attempt/60: balance = $BAL"
         [[ "$BAL" -gt 0 ]] && break
     done
-    [[ "$BAL" -gt 0 ]] || fail "wallet not funded after 240s"
+    [[ "$BAL" -gt 0 ]] || fail "wallet not funded after 600s"
 fi
 pass "isolated wallet funded (balance $BAL)"
 

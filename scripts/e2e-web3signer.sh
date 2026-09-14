@@ -30,7 +30,12 @@ export MIDEN_NODE_GIT_URL MIDEN_NODE_GIT_REF
 # or it silently starts with zero keys loaded. See docker-compose.web3signer.yml.
 WEB3SIGNER_UID="$(id -u)"; WEB3SIGNER_GID="$(id -g)"
 export WEB3SIGNER_UID WEB3SIGNER_GID
-COMPOSE=(docker compose -f docker-compose.e2e.yml -f docker-compose.web3signer.yml --env-file fixtures/.env)
+# EXTRA_COMPOSE_FILES layers a site overlay (e.g. the cloud-KMS credentials for
+# the signer: `-f docker-compose.kms-local.yml`) exactly as lib-compose.sh and
+# `make` do — without it this test could only ever exercise raw-file signer keys.
+# Unquoted on purpose: it is a pre-split "-f a -f b" list.
+# shellcheck disable=SC2206
+COMPOSE=(docker compose -f docker-compose.e2e.yml -f docker-compose.web3signer.yml ${EXTRA_COMPOSE_FILES:-} --env-file fixtures/.env)
 PROXY="${PROJECT}-miden-agglayer-1"
 SIGNER="${PROJECT}-web3signer-1"
 SIGNER_URL="${SIGNER_URL:-http://127.0.0.1:9000}"
@@ -45,8 +50,16 @@ fail() { echo -e "${RED}[$(ts)] FAIL:${NC} $*"; exit 1; }
 # ── 0. provision the signer's key + bring the stack up ───────────────────────
 log "provisioning the signer key"
 ./scripts/gen-web3signer-keys.sh || fail "could not provision the signer keys"
-# Per-role bindings (AGGLAYER_SIGNER_KEYS) for the compose overlay.
-set -a; . ./fixtures/web3signer-keys.env; set +a
+# Per-role bindings (AGGLAYER_SIGNER_KEYS) for the compose overlay. The generated
+# env binds the roles to the RAW-FILE keys; a caller that already exported
+# AGGLAYER_SIGNER_KEYS (e.g. bound to cloud-KMS keys the signer serves via
+# EXTRA_COMPOSE_FILES) keeps its binding — sourcing would silently clobber it
+# and turn a KMS run back into a file-key run.
+if [[ -n "${AGGLAYER_SIGNER_KEYS:-}" ]]; then
+    echo "[$(ts)] using pre-set AGGLAYER_SIGNER_KEYS (not the generated file-key bindings)"
+else
+    set -a; . ./fixtures/web3signer-keys.env; set +a
+fi
 
 log "bringing up the stack with the web3signer overlay"
 "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1
@@ -64,8 +77,13 @@ for _ in $(seq 1 60); do
     sleep 2
 done
 [[ "$KEYS" == \[\"0x* ]] || fail "the signer never served a public key (got: ${KEYS:-<nothing>})"
-SIGNER_KEY="$(echo "$KEYS" | sed 's/\[\"//;s/\".*//')"
-pass "signer holds key $SIGNER_KEY"
+# Report the key the proxy is actually BOUND to for `service` (the signer may
+# serve several — e.g. raw-file keys next to cloud-KMS ones — and its list order
+# is not meaningful), and assert the signer serves that exact key.
+SIGNER_KEY="$(printf '%s' "$AGGLAYER_SIGNER_KEYS" | tr ',' '\n' | grep '^service=' | cut -d= -f2)"
+[[ -n "$SIGNER_KEY" ]] || SIGNER_KEY="$(echo "$KEYS" | sed 's/\[\"//;s/\".*//')"
+echo "$KEYS" | grep -qi "$SIGNER_KEY" || fail "the signer does not serve the bound service key $SIGNER_KEY (serves: $KEYS)"
+pass "signer holds the bound service key $SIGNER_KEY"
 
 log "waiting for the proxy to become healthy with remote signing enabled"
 for _ in $(seq 1 90); do

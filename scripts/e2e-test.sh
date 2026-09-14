@@ -121,7 +121,8 @@ case "$test_filter" in
             # COORDINATED proxy + bridge-service drop+restore (PR #150 re-review — no
             # separate destructive proxy-only reset that would wedge cantina13).
         else
-            echo "SKIP L2<->L2 + native tiers — L2B overlay not up (base stack). Run 'make e2e-l2l2-up' to include them."
+            # No silent skip: L2<->L2 and the Miden-origin round-trips are part of the suite.
+            echo "FAIL: L2B overlay not up — test-e2e requires it (make e2e-l2l2-up)" >&2; exit 1
         fi
         echo ""
         # cantina13 recovery — runs AFTER the L2<->L2 + native tiers so its from-scratch

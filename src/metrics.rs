@@ -163,6 +163,24 @@ pub fn init_metrics() {
          zkevm-bridge-service claimtxman) is rejected at that nonce forever."
     );
     describe_counter!("ger_injections_total", "Total GER injections");
+    // #201 fee vaults: every account pays its own tx fees; an empty vault stalls it.
+    describe_gauge!(
+        "bridge_fee_vault_balance",
+        "#201: units of the chain's native fee asset in the vault of the labelled \
+         account (service, ger_manager, bridge, faucet:<SYMBOL>). Every transaction \
+         the account executes pays from it; at 0 the account stalls."
+    );
+    describe_gauge!(
+        "bridge_fee_vault_txns_left",
+        "#201: bridge_fee_vault_balance / bridge_fee_max_per_txn — a conservative \
+         count of transactions the account can still pay for. ALERT on this: e.g. \
+         `bridge_fee_vault_txns_left < 32` (the proxy logs a warning there and an error at 0)."
+    );
+    describe_gauge!(
+        "bridge_fee_max_per_txn",
+        "#201: the per-transaction fee cap, verification_base_fee × \
+         (ilog2(MAX_TX_EXECUTION_CYCLES)+1). 0 means a zero-fee chain."
+    );
     describe_gauge!(
         "last_ger_injection_timestamp_seconds",
         "Unix time (seconds) of the most recent GER injection (new insert or a \
@@ -549,6 +567,13 @@ pub fn init_metrics() {
         "RD-940: current number of WriteJobs sitting in the writer-worker \
          mpsc channel (gauge). Alert: >0.8×cap for 10 min → warn; \
          >0.95×cap for 2 min → page."
+    );
+    describe_gauge!(
+        "agglayer_writer_jobs_parked",
+        "#201: WriteJobs held because their signer's fee vault could not pay \
+         the Miden fee; each is re-dispatched every 30s and lands once the \
+         account is topped up. Non-zero means an account is dry — see \
+         bridge_fee_vault_txns_left."
     );
     describe_gauge!(
         "agglayer_writer_inflight_jobs",

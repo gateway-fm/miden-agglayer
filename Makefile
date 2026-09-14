@@ -96,13 +96,12 @@ test-scripts: ## Syntax-check + run the shell guard test harnesses (no docker ne
 	bash scripts/test-quiesce-predicate.sh
 
 .PHONY: test-e2e
-test-e2e: ## Spin up docker stack, run E2E tests, tear down (fully self-contained)
+test-e2e: ## Spin up the stack WITH the L2B overlay, run ALL E2E tiers (incl. L2<->L2 + Miden-origin), tear down (fully self-contained)
 	@echo "╔══════════════════════════════════════════════════════════════╗"
-	@echo "║  Starting E2E stack (Anvil, Miden node, PG, bridge, aggkit) ║"
+	@echo "║  Starting E2E stack + L2B overlay (rollup #2)                ║"
 	@echo "╚══════════════════════════════════════════════════════════════╝"
-	@$(MAKE) --no-print-directory e2e-clean-data
 	@./scripts/ensure-e2e-secrets.sh
-	$(E2E_COMPOSE) up -d --build --wait
+	@$(MAKE) --no-print-directory e2e-l2l2-up
 	@echo ""
 	@echo "Stack is up — running E2E tests..."
 	@echo ""
@@ -112,7 +111,7 @@ test-e2e: ## Spin up docker stack, run E2E tests, tear down (fully self-containe
 			echo "KEEP_CHAIN=1 — leaving the stack UP (the chain must survive this target)"; \
 		else \
 			echo "Tearing down stack..."; \
-			$(E2E_COMPOSE) down -v; \
+			$(L2L2_COMPOSE) down -v; \
 		fi; \
 		exit $$EXIT_CODE
 
@@ -409,6 +408,18 @@ e2e-l2l2-up: e2e-clean-data gen-l2b-configs ## Bring up base stack + L2B overlay
 e2e-l2l2: ## Run the L2<->L2 group (preflight + forward L2B->Miden + back Miden->L2B + evidence). Stack must be up (make e2e-l2l2-up).
 	$(COMPOSE_ENV) ./scripts/e2e-test.sh l2l2
 
+.PHONY: e2e-loadtest-isolated
+e2e-loadtest-isolated: e2e-up ## Isolated bridge-out reliability loadtest (N=30, 1 ETH + 9 ERC-20) on a fresh stack
+	$(COMPOSE_ENV) env N=$${N:-30} ./scripts/e2e-bridge-loadtest-isolated.sh
+
+.PHONY: e2e-miden-origin-fresh
+e2e-miden-origin-fresh: e2e-l2l2-up ## Fresh stack + L2B overlay, then the three Miden-origin round-trips
+	$(MAKE) --no-print-directory e2e-miden-origin
+
+.PHONY: e2e-miden-origin
+e2e-miden-origin: ## Miden-originated token round-trips (->L2B, ->L1, permissionless ->L2B). L2B overlay must be up (make e2e-l2l2-up).
+	for v in "DEST=l2b" "DEST=l1" "REGISTER_MODE=permissionless DEST=l2b"; do env $$v $(COMPOSE_ENV) ./scripts/e2e-miden-origin.sh || exit 1; done
+
 .PHONY: e2e-recovery-readiness
 e2e-recovery-readiness: e2e-l2l2-up ## #148: fresh stack -> land a claim -> run the DESTRUCTIVE recovery-readiness test 3x (retained-PG + reset-Miden-store). DEDICATED gate, NOT in e2e-test.sh all: it drops bridge_db + force-recreates aggkit, which would degrade later suite tiers.
 	# Land a real ClaimEvent (with calldata) for the recovery test to blank + repair.
@@ -433,6 +444,15 @@ e2e-claim-watcher-synthesis: e2e-claim-watcher ## After watcher happy path, simu
 	$(COMPOSE_ENV) ./scripts/e2e-claim-watcher-synthesis.sh
 
 .PHONY: e2e-claim-provenance
+# Each scenario bakes a starved account into its own chain; in the battery every later
+# target shares whatever chain is up, so the target hands back a default-budget stack,
+# pass or fail — otherwise the whole tail of the run inherits a service with no reserve.
+e2e-fee-exhaustion: ## #201: service, ger_manager and the bridge each run out of fee asset mid-flow and must recover when topped up (fee-charging chain; brings its own stacks)
+	rc=0; for a in service ger_manager bridge; do $(COMPOSE_ENV) ./scripts/e2e-fee-exhaustion.sh $$a || { rc=1; break; }; done; \
+	echo "e2e-fee-exhaustion: handing back a default-budget stack (rc=$$rc)"; \
+	KEEP_CHAIN=0 $(MAKE) e2e-down >/dev/null 2>&1; KEEP_CHAIN=0 $(MAKE) e2e-clean-data >/dev/null 2>&1; $(MAKE) e2e-up >/dev/null 2>&1 || echo "WARN: default-budget bring-up failed"; \
+	exit $$rc
+
 e2e-claim-provenance: ## Deploy a FOREIGN bridge on the same chain, drive a claim through it, assert zero ClaimEvent leakage (stack must be up)
 	$(COMPOSE_ENV) ./scripts/e2e-claim-provenance.sh
 

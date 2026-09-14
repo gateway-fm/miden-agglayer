@@ -47,6 +47,19 @@ struct Command {
     #[arg(long)]
     init: bool,
 
+    /// #201: build + persist the two KMS-keyed accounts (service, ger_manager),
+    /// write `funding.toml` — their addresses, the chain's native fee asset and
+    /// the recommended amounts — and exit WITHOUT deploying. Fund those two,
+    /// then start normally: --init resumes them and deploys each by consuming
+    /// its funding note, cascade-funding the keyless bridge/faucets from service.
+    #[arg(long)]
+    print_funding: bool,
+
+    /// #201: on a fee-charging chain, how long a deploy waits for the account's
+    /// fee-asset funding note before failing with the exact funding instruction.
+    #[arg(long, env = "FUNDING_WAIT_SECS", default_value_t = 900)]
+    funding_wait_secs: u64,
+
     /// PostgreSQL connection URL (enables PgStore instead of InMemoryStore)
     #[arg(long, env = "DATABASE_URL")]
     database_url: Option<String>,
@@ -138,6 +151,17 @@ struct Command {
     /// to `0` to disable (NOT recommended in production). Default 30s.
     #[arg(long, env = "FAUCET_RECONCILER_POLL_SECS", default_value_t = 30)]
     faucet_reconciler_poll_secs: u64,
+
+    /// #201: how often to export the fee-asset vault balances of service,
+    /// ger_manager, the bridge and every faucet (`bridge_fee_vault_balance`,
+    /// `bridge_fee_vault_txns_left`). `0` disables. Default 60s.
+    #[arg(long, env = "FEE_VAULT_POLL_SECS", default_value_t = 60)]
+    fee_vault_poll_secs: u64,
+
+    /// #201: WARN when an account can pay for fewer than this many transactions
+    /// at the fee cap (ERROR at 0). Default 32.
+    #[arg(long, env = "FEE_VAULT_WARN_TXNS", default_value_t = 32)]
+    fee_vault_warn_txns: u64,
 
     /// Consecutive reconciler scans an unknown bridge faucet must survive before it
     /// halts the proxy. The grace window (poll_secs × grace_ticks) tolerates the brief
@@ -848,7 +872,8 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let needs_init = command.init || !config_path_exists(miden_store_dir.clone())?;
+    let needs_init =
+        command.init || command.print_funding || !config_path_exists(miden_store_dir.clone())?;
 
     // Phase 1: Run init if needed (with a minimal client, no BridgeOutScanner)
     if needs_init {
@@ -895,13 +920,25 @@ async fn main() -> anyhow::Result<()> {
             init_net_id,
             init_network_id,
             miden_store_dir.clone(),
+            init::InitOptions {
+                print_funding: command.print_funding,
+                funding_wait: std::time::Duration::from_secs(command.funding_wait_secs),
+                miden_store_dir: miden_store_dir.clone(),
+            },
         )
         .await?;
-        tracing::info!("new config created at {config_path:?}");
+        if command.print_funding {
+            tracing::info!(
+                "funding manifest written to {config_path:?}; fund the listed accounts, then \
+                 start the proxy normally (--init resumes them)"
+            );
+        } else {
+            tracing::info!("new config created at {config_path:?}");
+        }
 
         init_client.shutdown()?;
 
-        if command.init {
+        if command.init || command.print_funding {
             return Ok(());
         }
     }
@@ -1486,6 +1523,25 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("FaucetRegistryReconciler spawned");
     }
 
+    // #201: fee-vault balances → metrics (every account pays its own tx fees).
+    if command.fee_vault_poll_secs == 0 {
+        tracing::warn!(
+            "fee-vault monitor DISABLED (--fee-vault-poll-secs 0): an empty fee vault will not be visible in metrics"
+        );
+    } else {
+        let monitor = miden_agglayer_service::fee_vault_monitor::FeeVaultMonitor::new(
+            state.miden_client.clone(),
+            state.store.clone(),
+            state.accounts.0.service.0,
+            state.accounts.0.ger_manager.as_ref().map(|g| g.0),
+            state.accounts.0.bridge.0,
+        )
+        .with_poll_interval(std::time::Duration::from_secs(command.fee_vault_poll_secs))
+        .with_warn_txns(command.fee_vault_warn_txns);
+        std::mem::forget(monitor.spawn());
+        tracing::info!("FeeVaultMonitor spawned");
+    }
+
     // (Metrics recorder + `init_metrics` are installed at the very top of
     // main, before any metric-emitting thread exists — see
     // `metrics::install_prometheus_recorder`.)
@@ -1821,6 +1877,8 @@ mod hardening_tests {
             chain_id: 1,
             network_id: 1,
             init: false,
+            print_funding: false,
+            funding_wait_secs: 900,
             database_url: None,
             restore: false,
             reset_miden_store: false,
@@ -1834,6 +1892,10 @@ mod hardening_tests {
             l1_indexer_from_block: None,
             l1_evidence_tag: "latest".to_string(),
             faucet_reconciler_poll_secs: 30,
+
+            fee_vault_poll_secs: 60,
+
+            fee_vault_warn_txns: 32,
             faucet_reconciler_grace_ticks: 3,
             miden_debug: false,
             cors_allowed_origins: cors,

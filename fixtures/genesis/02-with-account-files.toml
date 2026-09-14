@@ -20,4 +20,12 @@ timestamp = 1717344256
 version = 1
 
 [fee_parameters]
-verification_base_fee = 0
+# #201: fees are ENABLED in e2e, mirroring the live testnet (base fee 7), so the
+# battery exercises the real funding path. `0` hid a deploy failure on every
+# real chain ("amount in the vault is less than the amount to remove" — every
+# account pays its own tx fee from its vault). The two KMS-keyed wallets are
+# funded by the `fee-funder` sidecar (from the genesis faucet operator) and
+# deploy by consuming those notes; the keyless network accounts (bridge,
+# faucets) are built P2ID-fundable (BasicWallet + P2ID allowlisted, as Miden's
+# own network accounts are) and deploy the same way, cascade-funded by service.
+verification_base_fee = 7

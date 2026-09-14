@@ -108,6 +108,23 @@ step "Driving an L1→L2 deposit to populate monitor_burn_serials..."
 }
 pass "L1→L2 deposit succeeded; bridge-in path has emitted observation events"
 
+# The counts are compared exactly across the restart, so the chain must be
+# quiet first: the deposit above keeps landing notes (mint, P2ID, fee top-ups)
+# for a while, and a row observed between the two snapshots is not a
+# restart-survival regression (final7: twin_notes 9 → 10 in the 15 s window).
+# Wait until all three counts hold still for 30 s before each snapshot.
+counts() { echo "$(pgquery "SELECT COUNT(*) FROM monitor_burn_serials")/$(pgquery "SELECT COUNT(*) FROM monitor_twin_notes")/$(pgquery "SELECT COUNT(*) FROM monitor_expected_mints")"; }
+settle_counts() {
+    local last="" cur stable=0 i
+    for i in $(seq 1 60); do
+        cur="$(counts)"
+        if [[ "$cur" == "$last" ]]; then stable=$((stable+1)); [[ $stable -ge 3 ]] && { log "monitor counts settled at $cur"; return 0; }; else stable=0; fi
+        last="$cur"; sleep 10
+    done
+    warn "monitor counts still moving after 10 min ($cur) — snapshotting anyway"
+}
+settle_counts
+
 # ── Step 2: snapshot pre-restart serial count.
 PRE_COUNT="$(pgquery "SELECT COUNT(*) FROM monitor_burn_serials")"
 log "Pre-restart monitor_burn_serials count: $PRE_COUNT"
@@ -136,6 +153,7 @@ wait_for "miden-agglayer back up" \
      -d '{\"jsonrpc\":\"2.0\",\"method\":\"eth_chainId\",\"params\":[],\"id\":1}' >/dev/null" \
     90 3
 pass "miden-agglayer restarted and responsive"
+settle_counts
 
 # ── Step 4: re-snapshot. Pre-RD-913 these counts would all be either
 #            unchanged in PG but UNUSED by the proxy (i.e. the in-memory
