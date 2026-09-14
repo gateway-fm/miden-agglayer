@@ -659,8 +659,11 @@ fi
 # 10.2 GET /metrics — no sensitive data
 METRICS=$(curl -s "$L2_RPC/metrics" | tr -d '\0')
 METRICS_LEAK=false
+# With pipefail, `echo "$METRICS" | grep -q` can report failure after
+# grep finds a match: the producer gets SIGPIPE on a large metrics response.
+# Direct stdin preserves both metric-presence and sensitive-data detection.
 for pattern in "password" "PRIVATE_KEY" "DATABASE_URL" "secret"; do
-    if echo "$METRICS" | grep -qi "$pattern"; then
+    if grep -qi "$pattern" <<< "$METRICS"; then
         fail "10.2 /metrics contains sensitive pattern '$pattern'"
         METRICS_LEAK=true
     fi
@@ -677,7 +680,7 @@ METRICS_OK=true
 for counter in "rpc_requests_total" "rpc_request_duration_seconds"; do
     FOUND=false
     for _ in 1 2 3 4; do
-        if echo "$METRICS" | grep -q "$counter"; then FOUND=true; break; fi
+        if grep -q "$counter" <<< "$METRICS"; then FOUND=true; break; fi
         curl -sf "$L2_RPC" -H 'Content-Type: application/json'             -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' >/dev/null 2>&1 || true
         sleep 2
         METRICS=$(curl -s "$L2_RPC/metrics" 2>/dev/null | tr -d '\0' || true)
