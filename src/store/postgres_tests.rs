@@ -3,7 +3,7 @@
 //! Requires:
 //! - `--features postgres`
 //! - `DATABASE_URL` env var pointing to a PostgreSQL instance
-//! - The schema from `migrations/001_initial.sql` applied
+//! - All numbered SQL migrations from `migrations/` applied
 //!
 //! Run with:
 //!   DATABASE_URL=postgres://... cargo test --features postgres pgstore
@@ -551,7 +551,10 @@ async fn test_pgstore_success_supersedes_prior_failure() {
     };
     reset_state(&store).await;
 
-    let tx_hash = TxHash::from([0x5Bu8; 32]);
+    // The full suite shares a database; another regression uses [0x5b; 32].
+    let mut hash = [0x5Bu8; 32];
+    hash[..8].copy_from_slice(&rand_u64().to_be_bytes());
+    let tx_hash = TxHash::from(hash);
     // Attach a ClaimEvent-shaped log so the override's materialisation is checked.
     let mut entry = dummy_txn_entry();
     entry.logs = vec![alloy::primitives::LogData::new_unchecked(
@@ -612,11 +615,17 @@ async fn test_pgstore_txn_commit_concurrent_begin_single_snapshot() {
     reset_state(&store).await;
     let store = std::sync::Arc::new(store);
 
+    // Keep these rows separate from exact handoffs created by other tests.
+    // A failure after a handoff intentionally remains pending, which is a
+    // different invariant from the unsubmitted begin/commit race tested here.
+    let run = rand_u64().to_be_bytes();
     let mut handles = Vec::new();
     for i in 0..64u8 {
         let store = store.clone();
         handles.push(tokio::spawn(async move {
-            let tx_hash = TxHash::from([i; 32]);
+            let mut hash = [i; 32];
+            hash[..8].copy_from_slice(&run);
+            let tx_hash = TxHash::from(hash);
             // Racer A: begin then a failure commit.
             let a = {
                 let store = store.clone();
@@ -2539,13 +2548,20 @@ async fn test_pgstore_different_tx_cannot_take_over() {
     let lease = std::time::Duration::from_secs(90);
     let base = rand_u64();
     let addr = format!("0x{:040x}", base as u128);
-    let ha = TxHash::from([(base % 251) as u8 + 10; 32]);
-    let hb = TxHash::from([(base % 241) as u8 + 11; 32]);
+    let mut hash_a = [0xa1; 32];
+    hash_a[..8].copy_from_slice(&base.to_be_bytes());
+    let mut hash_b = hash_a;
+    hash_b[31] = 0xb1;
+    let ha = TxHash::from(hash_a);
+    let hb = TxHash::from(hash_b);
 
     let NonceReservation::Won { fence } = store.reserve_nonce(&addr, 1, ha, lease).await.unwrap()
     else {
         panic!("fresh must win");
     };
+    // Ambiguity starts at durable admission. A pre-admission failure without
+    // a transaction row is deliberately reclaimable by a different hash.
+    store.txn_begin(ha, dummy_txn_entry()).await.unwrap();
     store
         .release_reservation(&addr, 1, ha, fence, false)
         .await
