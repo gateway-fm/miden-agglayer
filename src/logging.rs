@@ -3,6 +3,11 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
+// Local tracing subscribers rebuild process-wide callsite interest. Serialize
+// subscriber-capture tests (including metrics diagnostics) to avoid interference.
+#[cfg(test)]
+pub(crate) static TEST_LOGGING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn stdout_layer<S>() -> Box<dyn Layer<S> + Send + Sync + 'static>
 where
     S: Subscriber,
@@ -136,7 +141,6 @@ mod tests {
     /// sibling test can `set_var`/`remove_var` between our `set_var` and
     /// `log_filter()` read — building the filter from the wrong directive and
     /// silently dropping the events we expect to capture (`seen == []`).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Build the production filter under a forced `RUST_LOG=debug` and run `f`
     /// against a `Registry` that captures every event. This mirrors what the
@@ -145,7 +149,9 @@ mod tests {
         // Hold the lock across the whole env-var window (set → build filter →
         // restore). A poisoned lock just means a prior test panicked while
         // holding it; the env state is still ours to overwrite, so recover it.
-        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env_guard = super::TEST_LOGGING_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("RUST_LOG").ok();
         // SAFETY: setting env vars is unsafe on some platforms (Rust 1.84+).
         unsafe {
@@ -241,6 +247,18 @@ mod tests {
                     .any(|(t, l)| t == "miden_agglayer_service::claim_watcher"
                         && *l == tracing::Level::DEBUG),
                 "own-crate debug event was suppressed by clamp — directive too broad. seen={seen:?}",
+            );
+        });
+    }
+    #[test]
+    fn issue_210_production_filter_keeps_writer_diagnostics() {
+        with_debug_filter(|capture| {
+            tracing::debug!(target: "writer_diagnostics", "operator enabled phase tracing");
+            let seen = capture.seen.lock().unwrap();
+            assert!(
+                seen.iter()
+                    .any(|(target, level)| target == "writer_diagnostics"
+                        && *level == tracing::Level::DEBUG)
             );
         });
     }

@@ -152,9 +152,9 @@ async fn submit_update_ger_note(
 ) -> anyhow::Result<()> {
     let inner_accounts = accounts.0.clone();
     miden_client
-        .with(move |client| {
+        .with_operation("ger", move |client| {
             Box::new(async move {
-                client.sync_state().await?;
+                crate::miden_client::sync_state_bounded(client).await?;
                 let ger_manager_id = inner_accounts
                     .ger_manager
                     .as_ref()
@@ -190,7 +190,13 @@ async fn submit_update_ger_note(
                     .expiration_delta(crate::claim::submission_note_expiration_delta())
                     .build()?;
                 crate::miden_client::ensure_writable(ger_manager_id)?;
-                let tx_result = match client.execute_transaction(ger_manager_id, tx_request).await {
+                let tx_result = match crate::metrics::meter_writer_stage(
+                    "ger",
+                    "execute",
+                    client.execute_transaction(ger_manager_id, tx_request),
+                )
+                .await
+                {
                     Ok(result) => result,
                     Err(e) => {
                         // Stale tracked bridge record (the fee-manager FPI
@@ -227,22 +233,32 @@ async fn submit_update_ger_note(
                 // before the first external submit. A crash after this point is
                 // fail-closed: same-hash rebroadcasts observe the link and never
                 // build a second random UpdateGerNote.
-                record_ger_submission_handoff(
-                    &*store,
-                    txn_hash,
-                    &note_commitment,
-                    &note_id,
-                    expiration_block,
-                    txn_envelope,
-                    signer,
+                crate::metrics::meter_writer_stage(
+                    "ger",
+                    "prepare_handoff",
+                    record_ger_submission_handoff(
+                        &*store,
+                        txn_hash,
+                        &note_commitment,
+                        &note_id,
+                        expiration_block,
+                        txn_envelope,
+                        signer,
+                    ),
                 )
                 .await?;
-                let submission_height = client
-                    .submit_proven_transaction(proven_tx, &tx_result)
-                    .await?;
-                client
-                    .apply_transaction(&tx_result, submission_height)
-                    .await?;
+                let submission_height = crate::metrics::meter_writer_stage(
+                    "ger",
+                    "submit",
+                    client.submit_proven_transaction(proven_tx, &tx_result),
+                )
+                .await?;
+                crate::metrics::meter_writer_stage(
+                    "ger",
+                    "apply",
+                    client.apply_transaction(&tx_result, submission_height),
+                )
+                .await?;
                 tracing::info!(
                     tx_id = %tx_id,
                     ger = %hex::encode(ger_bytes),
@@ -260,9 +276,12 @@ async fn submit_update_ger_note(
                     anyhow::bail!("UpdateGerNote tx {tx_id} not committed after 30s");
                 }
                 let tx_key = format!("{txn_hash:#x}");
-                if !store
-                    .confirm_note_handoff(&tx_key, &note_commitment)
-                    .await?
+                if !crate::metrics::meter_writer_stage(
+                    "ger",
+                    "confirm_handoff",
+                    store.confirm_note_handoff(&tx_key, &note_commitment),
+                )
+                .await?
                 {
                     anyhow::bail!("GER note handoff changed before commit confirmation");
                 }
@@ -583,14 +602,18 @@ pub async fn wait_for_ger_l1_observed(
     evidence_tag: EvidenceTag,
     txn_hash: TxHash,
 ) -> anyhow::Result<()> {
-    wait_for_ger_l1_observed_with_timing(
-        store,
-        ger_bytes,
-        require_l1_observed,
-        evidence_tag,
-        txn_hash,
-        ger_evidence_wait_timeout(),
-        GER_EVIDENCE_POLL_INTERVAL,
+    crate::metrics::meter_writer_stage(
+        "ger",
+        "l1_evidence",
+        wait_for_ger_l1_observed_with_timing(
+            store,
+            ger_bytes,
+            require_l1_observed,
+            evidence_tag,
+            txn_hash,
+            ger_evidence_wait_timeout(),
+            GER_EVIDENCE_POLL_INTERVAL,
+        ),
     )
     .await
 }

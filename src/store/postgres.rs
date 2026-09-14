@@ -2645,6 +2645,30 @@ impl Store for PgStore {
         }))
     }
 
+    async fn renew_claim_fenced(
+        &self,
+        global_index: U256,
+        owner_tx_hash: TxHash,
+        fence: u64,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let updated = client
+            .execute(
+                "UPDATE claimed_indices SET lease_expires_at = clock_timestamp() + ($4 || ' seconds')::interval
+             WHERE global_index = $1 AND owner_tx_hash = $2 AND fence_token = $3
+               AND claim_state = 'executing' AND lease_expires_at > clock_timestamp()",
+                &[
+                    &format!("{global_index:#x}"),
+                    &format!("{owner_tx_hash:#x}"),
+                    &(fence as i64),
+                    &lease.as_secs_f64().to_string(),
+                ],
+            )
+            .await?;
+        Ok(updated == 1)
+    }
+
     async fn prepare_claim_submission_fenced(
         &self,
         global_index: U256,

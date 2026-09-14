@@ -834,13 +834,17 @@ async fn publish_claim_internal(
     // the two prove attempts are split across the outcome label.
     local_prover_fallback: Option<Arc<dyn TransactionProver + Send + Sync>>,
 ) -> anyhow::Result<PublishClaimTxn> {
-    let faucet = find_or_create_faucet(
-        params.originTokenAddress,
-        params.originNetwork,
-        &params.metadata,
-        store,
-        client,
-        accounts,
+    let faucet = crate::metrics::meter_writer_stage(
+        "claim",
+        "faucet",
+        find_or_create_faucet(
+            params.originTokenAddress,
+            params.originNetwork,
+            &params.metadata,
+            store,
+            client,
+            accounts,
+        ),
     )
     .await?;
 
@@ -855,13 +859,17 @@ async fn publish_claim_internal(
         "creating CLAIM note"
     );
 
-    let claim_note = create_claim(
-        params.clone(),
-        faucet,
-        accounts,
-        store,
-        client.rng(),
-        reject_zero_padding,
+    let claim_note = crate::metrics::meter_writer_stage(
+        "claim",
+        "build_note",
+        create_claim(
+            params.clone(),
+            faucet,
+            accounts,
+            store,
+            client.rng(),
+            reject_zero_padding,
+        ),
     )
     .await?;
     let claim_note_id = claim_note.id().to_string();
@@ -909,9 +917,12 @@ async fn publish_claim_internal(
     // Execute and check the output notes before submission. `ExecutedTransaction` still
     // produces `RawOutputNote::{Full, Partial}`, but the proven transaction now produces
     // `OutputNote::{Public, Private}` — 0.14.x renamed the final-form variants.
-    let tx_result = match client
-        .execute_transaction(accounts.service.0, txn_request)
-        .await
+    let tx_result = match crate::metrics::meter_writer_stage(
+        "claim",
+        "execute",
+        client.execute_transaction(accounts.service.0, txn_request),
+    )
+    .await
     {
         Ok(result) => result,
         Err(e) => {
@@ -961,7 +972,9 @@ async fn publish_claim_internal(
     // trigger in the recovery-scenario e2e.
     tracing::info!("proving CLAIM note (Miden proof in progress)");
     let primary_start = std::time::Instant::now();
-    let primary_res = client.prove_transaction(&tx_result).await;
+    let primary_res =
+        crate::metrics::meter_writer_stage("claim", "prove", client.prove_transaction(&tx_result))
+            .await;
     let primary_elapsed = primary_start.elapsed().as_secs_f64();
     let (primary_res, retry_outcome) = crate::metrics::record_primary_attempt(
         crate::metrics::ProofKind::Claim,
@@ -979,7 +992,12 @@ async fn publish_claim_internal(
                     "remote prover failed, retrying CLAIM proof against local fallback",
                 );
                 let fb_start = std::time::Instant::now();
-                let fb_res = client.prove_transaction_with(&tx_result, prover).await;
+                let fb_res = crate::metrics::meter_writer_stage(
+                    "claim",
+                    "prove_fallback",
+                    client.prove_transaction_with(&tx_result, prover),
+                )
+                .await;
                 let fb_elapsed = fb_start.elapsed().as_secs_f64();
                 crate::metrics::record_fallback_attempt(
                     crate::metrics::ProofKind::Claim,
@@ -1009,15 +1027,24 @@ async fn publish_claim_internal(
     // Atomically seal the current claim fence and persist the exact note
     // identity before the first external side effect. It remains PREPARED
     // until commit or exact-note observation proves inclusion.
-    submission_fence
-        .prepare(&note_commitment, &claim_note_id, expiration_block)
-        .await?;
-    let _submission_height = client
-        .submit_proven_transaction(proven_tx, &tx_result)
-        .await?;
-    client
-        .apply_transaction(&tx_result, _submission_height)
-        .await?;
+    crate::metrics::meter_writer_stage(
+        "claim",
+        "prepare_handoff",
+        submission_fence.prepare(&note_commitment, &claim_note_id, expiration_block),
+    )
+    .await?;
+    let _submission_height = crate::metrics::meter_writer_stage(
+        "claim",
+        "submit",
+        client.submit_proven_transaction(proven_tx, &tx_result),
+    )
+    .await?;
+    crate::metrics::meter_writer_stage(
+        "claim",
+        "apply",
+        client.apply_transaction(&tx_result, _submission_height),
+    )
+    .await?;
     tracing::info!("submitted claim note txn: {txn_id}, claim_note_id: {claim_note_id}");
 
     // Cantina #7: record the submitted CLAIM in the expected-MINT tracker
@@ -1068,7 +1095,12 @@ async fn publish_claim_internal(
     )
     .await?;
     if committed {
-        submission_fence.confirm(&note_commitment).await?;
+        crate::metrics::meter_writer_stage(
+            "claim",
+            "confirm_handoff",
+            submission_fence.confirm(&note_commitment),
+        )
+        .await?;
         tracing::info!("claim tx {txn_id} committed to block");
         // Cantina #7: mark Landed once `wait_for_transaction_commit`
         // confirms the CLAIM tx was committed. Aggkit's miden-client
@@ -1262,7 +1294,7 @@ async fn attempt_publish_claim(
     let result = Arc::new(OnceLock::<PublishClaimTxn>::new());
     let result_inner = result.clone();
     client
-        .with(move |client| {
+        .with_operation("claim", move |client| {
             Box::new(async move {
                 let value = publish_claim_internal(
                     params,

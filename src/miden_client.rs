@@ -229,10 +229,13 @@ pub async fn submit_new_transaction(
     tx_request: miden_client::transaction::TransactionRequest,
 ) -> anyhow::Result<miden_protocol::transaction::TransactionId> {
     ensure_writable(account_id)?;
-    client
-        .submit_new_transaction(account_id, tx_request)
-        .await
-        .map_err(anyhow::Error::from)
+    crate::metrics::meter_writer_stage(
+        "client",
+        "execute_prove_submit",
+        client.submit_new_transaction(account_id, tx_request),
+    )
+    .await
+    .map_err(anyhow::Error::from)
 }
 
 fn next_backoff(current: Duration) -> Duration {
@@ -271,6 +274,9 @@ struct Request {
 
 #[async_trait::async_trait]
 pub trait SyncListener: Send + Sync {
+    fn diagnostic_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
     fn on_sync(&self, summary: &SyncSummary);
     async fn on_post_sync(&self, _client: &mut MidenClientLib) -> anyhow::Result<()> {
         Ok(())
@@ -336,11 +342,7 @@ pub fn build_rpc_client(
     // Single chokepoint: every component's node handle comes from here, so
     // pacing at this point covers restore, the synthetic projector, the
     // persistent client and both CLI tools without touching a call site.
-    // Unconfigured means unpaced — the pre-existing behaviour, bit for bit.
-    match crate::rpc_pacer::PacedRpcClient::new(client.clone()) {
-        Some(paced) => Arc::new(paced),
-        None => client,
-    }
+    Arc::new(crate::rpc_pacer::PacedRpcClient::new(client))
 }
 
 /// Orders one account's transactions by their on-chain execution chain, not by the RPC
@@ -830,36 +832,25 @@ impl MidenClient {
     }
 
     async fn sync(client: &mut MidenClientLib) -> anyhow::Result<SyncSummary> {
-        let mut backoff = BACKOFF_MIN;
-        loop {
-            let result = client.sync_state().await;
-            match result {
-                Ok(summary) => {
-                    tracing::debug!(target: concat!(module_path!(), "::sync::debug"), "MidenClient::sync succeeded at block {}", summary.block_num);
-                    return Ok(summary);
-                }
-                Err(client_err) => {
-                    match Self::unwrap_connection_error(client_err) {
-                        Ok(conn_err) => {
-                            metrics::counter!("miden_sync_errors_total", "kind" => "connection")
-                                .increment(1);
-                            tracing::error!(
-                                "MidenClient::sync connection error: {conn_err:?}, retrying in {backoff:?}..."
-                            );
-                        }
-                        Err(other_err) => {
-                            metrics::counter!("miden_sync_errors_total", "kind" => "other")
-                                .increment(1);
-                            tracing::error!(
-                                "MidenClient::sync non-connection error: {other_err:#}, retrying in {backoff:?}..."
-                            );
-                        }
-                    }
-                    tokio::time::sleep(backoff).await;
-                    backoff = next_backoff(backoff);
-                }
-            }
+        // Retry on the next background tick. Retrying here monopolizes the
+        // sole client owner forever and prevents queued writes from running.
+        let result = sync_state_bounded(client).await;
+        if let Err(err) = &result {
+            let kind = match err.downcast_ref::<ClientError>() {
+                Some(ClientError::RpcError(RpcError::ConnectionError(_)))
+                | Some(ClientError::RpcError(RpcError::RequestError {
+                    error_kind: GrpcError::Unavailable,
+                    ..
+                })) => "connection",
+                _ => "other",
+            };
+            metrics::counter!("miden_sync_errors_total", "kind" => kind).increment(1);
+            tracing::warn!(error = %format!("{err:#}"), "Miden sync failed; yielding to queued requests before the next tick");
+        } else if let Ok(summary) = &result {
+            tracing::debug!(target: "miden_agglayer_service::miden_client::sync::debug",
+                block_num = summary.block_num.as_u64(), "Miden sync succeeded");
         }
+        result
     }
 
     async fn on_sync(
@@ -877,12 +868,20 @@ impl MidenClient {
             // `on_sync` is the cheap summary hook — keep firing it so
             // listeners can keep low-frequency tick-counter state in step
             // even while the heavier `on_post_sync` is suppressed.
+            let listener_name = listener.diagnostic_name();
+            tracing::debug!(target: "writer_diagnostics", listener = listener_name, paused, "sync summary hook started");
             listener.on_sync(&summary);
+            tracing::debug!(target: "writer_diagnostics", listener = listener_name, paused, "sync summary hook finished");
             if paused {
                 ::metrics::counter!("miden_listener_skipped_paused_total").increment(1);
                 continue;
             }
-            listener.on_post_sync(client).await?;
+            crate::metrics::meter_writer_stage(
+                listener.diagnostic_name(),
+                "post_sync",
+                listener.on_post_sync(client),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -981,9 +980,11 @@ impl MidenClient {
         // initial sync
         tokio::select! {
             result = Self::sync(&mut client) => {
+                let synced = result.is_ok();
                 if let Err(err) = Self::on_sync(result, &mut client, sync_listeners, listeners_paused).await {
                     tracing::error!("MidenClient initial sync listener error: {err:#}");
                 }
+                alive.store(synced, Ordering::Release);
             },
             _ = &mut *done_receiver => {
                 tracing::debug!("MidenClient::run loop done");
@@ -991,8 +992,9 @@ impl MidenClient {
             }
         }
 
-        alive.store(true, Ordering::Release);
         let mut sync_interval = tokio::time::interval(Duration::from_secs(5));
+        sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        sync_interval.tick().await; // initial sync has already run
 
         loop {
             tokio::select! {
@@ -1004,12 +1006,16 @@ impl MidenClient {
                 _ = sync_interval.tick() => {
                     tokio::select! {
                         result = Self::sync(&mut client) => {
+                            alive.store(result.is_ok(), Ordering::Release);
                             if let Err(err) = Self::on_sync(result, &mut client, sync_listeners, listeners_paused).await {
                                 tracing::error!("MidenClient sync listener error: {err:#}");
                             }
                         },
                         _ = &mut *done_receiver => break,
                     }
+                    // A slow sync/listener pass must not accumulate immediate
+                    // follow-up ticks ahead of the queued writer.
+                    sync_interval.reset();
                 },
                 _ = &mut *done_receiver => break,
             }
@@ -1027,34 +1033,134 @@ impl MidenClient {
         ) -> Box<dyn Future<Output = anyhow::Result<()>> + 'c>,
         Fn: Send + 'static,
     {
+        self.with_operation(std::any::type_name::<Fn>(), closure)
+            .await
+    }
+
+    pub(crate) async fn with_operation<Fn>(
+        &self,
+        operation: &'static str,
+        closure: Fn,
+    ) -> anyhow::Result<()>
+    where
+        Fn: for<'c> FnOnce(
+            &'c mut MidenClientLib,
+        ) -> Box<dyn Future<Output = anyhow::Result<()>> + 'c>,
+        Fn: Send + 'static,
+    {
+        let queued_at = std::time::Instant::now();
+        let span = tracing::Span::current();
         let (response_sender, response_receiver) = oneshot::channel::<anyhow::Result<()>>();
 
         let request = Request {
             response_sender,
-            closure: Box::new(|client| Box::into_pin(closure(client))),
+            closure: Box::new(move |client| {
+                use tracing::Instrument;
+                Box::pin(async move {
+                    let wait = queued_at.elapsed().as_secs_f64();
+                    metrics::histogram!("miden_client_queue_wait_seconds", "operation" => operation)
+                        .record(wait);
+                    tracing::debug!(target: "writer_diagnostics", operation, queue_wait_secs = wait, "Miden client request started");
+                    crate::metrics::meter_writer_stage(operation, "client_request", Box::into_pin(closure(client))).await
+                }.instrument(span))
+            }),
         };
-        if self.sender.send(request).await.is_err() {
+        if crate::metrics::meter_writer_stage(
+            operation,
+            "client_enqueue",
+            self.sender.send(request),
+        )
+        .await
+        .is_err()
+        {
             anyhow::bail!("MidenClient::with: failed to queue a request - receiver is closed");
         }
 
-        let Ok(result) = response_receiver.await else {
+        let Ok(result) =
+            crate::metrics::meter_writer_stage(operation, "client_response", response_receiver)
+                .await
+        else {
             anyhow::bail!("MidenClient::with: failed to get a response - receiver is closed");
         };
         result
     }
 }
 
+/// Bound a sync attempt while holding the actual client, so a timeout drops
+/// its future before the serialized owner serves another request. This never
+/// cancels a detached writer or invents a failure after an external submit.
+pub(crate) async fn sync_state_bounded(client: &mut MidenClientLib) -> anyhow::Result<SyncSummary> {
+    let timeout = Duration::from_secs(
+        std::env::var("MIDEN_SYNC_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|seconds| *seconds > 0)
+            .unwrap_or(120),
+    );
+    sync_with_deadline(client.sync_state(), timeout).await
+}
+
+async fn sync_with_deadline<F>(future: F, timeout: Duration) -> anyhow::Result<SyncSummary>
+where
+    F: Future<Output = Result<SyncSummary, ClientError>>,
+{
+    match tokio::time::timeout(
+        timeout,
+        crate::metrics::meter_writer_stage("client", "sync", future),
+    )
+    .await
+    {
+        Ok(result) => result.map_err(Into::into),
+        Err(_) => {
+            metrics::counter!("miden_sync_timeouts_total").increment(1);
+            anyhow::bail!(
+                "Miden sync timed out after {}s (MIDEN_SYNC_TIMEOUT_SECS)",
+                timeout.as_secs()
+            );
+        }
+    }
+}
+
 /// Poll until a transaction is committed on the Miden node.
 ///
-/// Returns `true` if committed within the given number of attempts.
-/// Connection errors during sync are retried up to 3 times per attempt.
+/// Returns `true` if observed within `max_attempts * poll_interval` elapsed time,
+/// including sync RPC retries. `false` is an observation timeout, not evidence
+/// that submission failed: callers must retain any durable note handoff.
 pub async fn wait_for_transaction_commit(
     client: &mut MidenClientLib,
     txn_id: miden_protocol::transaction::TransactionId,
     max_attempts: usize,
     poll_interval: Duration,
 ) -> anyhow::Result<bool> {
-    for _ in 0..max_attempts {
+    let budget = poll_interval.saturating_mul(u32::try_from(max_attempts).unwrap_or(u32::MAX));
+    match tokio::time::timeout(
+        budget,
+        crate::metrics::meter_writer_stage(
+            "client",
+            "commit_wait",
+            wait_for_transaction_commit_inner(client, txn_id, max_attempts, poll_interval),
+        ),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            metrics::counter!("miden_commit_wait_timeouts_total").increment(1);
+            tracing::warn!(%txn_id, timeout_secs = budget.as_secs_f64(), "Miden commit wait timed out, including sync RPC time");
+            Ok(false)
+        }
+    }
+}
+
+async fn wait_for_transaction_commit_inner(
+    client: &mut MidenClientLib,
+    txn_id: miden_protocol::transaction::TransactionId,
+    max_attempts: usize,
+    poll_interval: Duration,
+) -> anyhow::Result<bool> {
+    for attempt in 0..max_attempts {
+        tracing::debug!(target: "writer_diagnostics", %txn_id, attempt = attempt + 1,
+            max_attempts, "commit poll started");
         tokio::time::sleep(poll_interval).await;
 
         // Retry sync on connection errors (up to 3 retries per poll attempt)
@@ -1068,7 +1174,9 @@ pub async fn wait_for_transaction_commit(
             // it is what turns a nominally-20s commit wait into 40s+ and, via
             // the serialized claim queue, caps end-to-end delivery throughput.
             let sync_started = std::time::Instant::now();
-            let sync_result = client.sync_state().await;
+            let sync_result =
+                crate::metrics::meter_writer_stage("commit_wait", "sync", client.sync_state())
+                    .await;
             let sync_elapsed = sync_started.elapsed();
             ::metrics::histogram!("miden_sync_state_duration_seconds")
                 .record(sync_elapsed.as_secs_f64());
@@ -1130,6 +1238,79 @@ pub async fn wait_for_transaction_commit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn issue_210_sync_deadline_drops_work_before_releasing_the_client() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let flag = DropFlag(dropped.clone());
+        let future = async move {
+            let _flag = flag;
+            std::future::pending::<Result<SyncSummary, ClientError>>().await
+        };
+        let started = tokio::time::Instant::now();
+        let error = sync_with_deadline(future, Duration::from_secs(120))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out after 120s"));
+        assert_eq!(started.elapsed(), Duration::from_secs(120));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "timed-out work must not continue detached"
+        );
+    }
+
+    /// A real RPC deadline used to enter an infinite retry loop while owning
+    /// the serialized client. A listener that accepts no HTTP/2 traffic makes
+    /// this deterministic without relying on a public node.
+    #[tokio::test]
+    async fn issue_210_background_sync_returns_after_rpc_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint =
+            Endpoint::try_from(format!("http://{}", listener.local_addr().unwrap()).as_str())
+                .unwrap();
+        let mut client = crate::test_helpers::offline_miden_client_lib().await;
+        *client.test_rpc_api() = build_rpc_client(&endpoint, 25, None);
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), MidenClient::sync(&mut client)).await;
+        assert!(
+            result
+                .expect("a failed attempt must yield, not retry forever")
+                .is_err()
+        );
+        // The caller can immediately use the same client after the failed attempt.
+        client.get_sync_height().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn issue_210_commit_budget_includes_a_stalled_sync_rpc() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint =
+            Endpoint::try_from(format!("http://{}", listener.local_addr().unwrap()).as_str())
+                .unwrap();
+        let mut client = crate::test_helpers::offline_miden_client_lib().await;
+        *client.test_rpc_api() = build_rpc_client(&endpoint, 10_000, None);
+        let tx_id = miden_protocol::transaction::TransactionId::new(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_transaction_commit(&mut client, tx_id, 2, Duration::from_millis(25)),
+        )
+        .await
+        .expect("50ms commit budget must include the 10s RPC timeout")
+        .unwrap();
+        assert!(!result);
+        client.get_sync_height().await.unwrap();
+    }
 
     /// The default projector RPC must resolve to the same localhost endpoint as MidenClient.
     #[test]

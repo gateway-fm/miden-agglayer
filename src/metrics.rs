@@ -90,10 +90,56 @@ pub(crate) fn prometheus_builder() -> anyhow::Result<metrics_exporter_prometheus
                 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 60.0, 90.0, 120.0, 300.0,
             ],
         )
-        .context("set_buckets_for_metric (agglayer_writer_job_duration_seconds) failed")
+        .context("set_buckets_for_metric (agglayer_writer_job_duration_seconds) failed")?
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(
+                "miden_operation_stage_duration_seconds".to_string(),
+            ),
+            &[
+                0.001, 0.01, 0.1, 1.0, 5.0, 30.0, 60.0, 120.0, 300.0, 900.0, 3600.0,
+            ],
+        )
+        .context("stage duration histogram buckets")?
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(
+                "miden_client_queue_wait_seconds".to_string(),
+            ),
+            &[
+                0.001, 0.01, 0.1, 1.0, 5.0, 30.0, 60.0, 120.0, 300.0, 900.0, 3600.0,
+            ],
+        )
+        .context("client queue wait histogram buckets")
 }
 
 pub fn init_metrics() {
+    describe_gauge!(
+        "agglayer_writer_oldest_nonterminal_age_seconds",
+        "Age of the oldest queued/submitting job, sampled at least every 30s while the sweeper is healthy. Alert >300s for 1m, including when the queue is empty."
+    );
+    describe_histogram!(
+        "miden_operation_stage_duration_seconds",
+        "Operation stage elapsed time, including cancellation. Labels: operation, stage (bounded call-site names)."
+    );
+    describe_counter!(
+        "miden_operation_stages_total",
+        "Finished operation stages. Labels: operation, stage, outcome=ok|error|cancelled. Active waits emit periodic logs."
+    );
+    describe_histogram!(
+        "miden_client_queue_wait_seconds",
+        "Time from requesting the serialized client to starting the closure, including channel backpressure. Label: operation."
+    );
+    describe_counter!(
+        "miden_sync_timeouts_total",
+        "Sync attempts exceeding MIDEN_SYNC_TIMEOUT_SECS (default 120s)."
+    );
+    describe_counter!(
+        "miden_commit_wait_timeouts_total",
+        "Commit observation deadlines reached, including sync/RPC time. A timeout does not prove a transaction failed."
+    );
+    describe_counter!(
+        "claim_lease_renewals_total",
+        "Claim owner heartbeat results: outcome=renewed|stopped|error|timeout. Stopped includes prepared handoffs and lost ownership."
+    );
     describe_counter!("rpc_requests_total", "Total JSON-RPC requests by method");
     describe_counter!("claims_processed_total", "Total claims processed");
     describe_counter!(
@@ -856,6 +902,82 @@ pub fn record_proof_outcome(kind: ProofKind, outcome: ProofOutcome) {
     record_proof_metrics(kind, outcome, None);
 }
 
+/// Observe a wait without cancelling it or detaching work. Labels are static,
+/// bounded call-site names; transaction identity belongs in the enclosing span.
+/// Periodic events expose waits that never reach the completion histogram.
+pub(crate) async fn meter_writer_stage<F, T, E>(
+    operation: &'static str,
+    stage: &'static str,
+    future: F,
+) -> Result<T, E>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let mut observation = StageObservation {
+        operation,
+        stage,
+        stage_id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        started: tokio::time::Instant::now(),
+        outcome: "cancelled",
+    };
+    tracing::debug!(target: "writer_diagnostics", operation, stage,
+        stage_id = observation.stage_id, "stage started");
+    let period = std::time::Duration::from_secs(30);
+    let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Nested SDK execution futures are large. Keep each observed stage's
+    // state machine small instead of nesting their layouts in the writer.
+    use tracing::Instrument;
+    let span = tracing::debug_span!(target: "writer_diagnostics", "writer_stage",
+        operation, stage, stage_id = observation.stage_id);
+    let mut future = Box::pin(future.instrument(span));
+    loop {
+        tokio::select! {
+            result = &mut future => {
+                observation.outcome = if result.is_ok() { "ok" } else { "error" };
+                if result.is_err() {
+                    tracing::debug!(target: "writer_diagnostics", operation, stage,
+                        stage_id = observation.stage_id, error_type = std::any::type_name::<E>(),
+                        "stage failed; caller handles the error");
+                }
+                return result;
+            }
+            _ = heartbeat.tick() => {
+                tracing::warn!(target: "writer_diagnostics", operation, stage,
+                    stage_id = observation.stage_id,
+                    elapsed_secs = observation.started.elapsed().as_secs_f64(),
+                    "stage still running");
+            }
+        }
+    }
+}
+
+struct StageObservation {
+    operation: &'static str,
+    stage: &'static str,
+    stage_id: u64,
+    started: tokio::time::Instant,
+    outcome: &'static str,
+}
+
+impl Drop for StageObservation {
+    fn drop(&mut self) {
+        let elapsed_secs = self.started.elapsed().as_secs_f64();
+        tracing::debug!(target: "writer_diagnostics", operation = self.operation,
+            stage = self.stage, stage_id = self.stage_id, outcome = self.outcome,
+            elapsed_secs, "stage finished");
+        metrics::histogram!("miden_operation_stage_duration_seconds",
+            "operation" => self.operation, "stage" => self.stage)
+        .record(elapsed_secs);
+        metrics::counter!("miden_operation_stages_total",
+            "operation" => self.operation, "stage" => self.stage,
+            "outcome" => self.outcome)
+        .increment(1);
+    }
+}
+
 /// Wraps a proof-producing future and records both the duration
 /// histogram and the per-outcome counter on completion. Replaces the
 /// inline `__proof_start`/`__res` pattern at every submit site.
@@ -871,7 +993,7 @@ where
     E: std::fmt::Display,
 {
     let start = std::time::Instant::now();
-    let res = fut.await;
+    let res = meter_writer_stage(kind.as_label(), "prove", fut).await;
     let elapsed = start.elapsed().as_secs_f64();
     let outcome = match &res {
         Ok(_) => ProofOutcome::Ok,
@@ -1112,6 +1234,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn issue_210_debug_filter_exposes_start_heartbeat_and_cancellation() {
+        let _logging_guard = crate::logging::TEST_LOGGING_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use tracing::instrument::WithSubscriber;
+        #[derive(Clone)]
+        struct LogWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = LogWriter(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("info,writer_diagnostics=debug")
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        runtime.block_on(
+            async {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(65),
+                    meter_writer_stage(
+                        "claim",
+                        "diagnostic_test",
+                        std::future::pending::<Result<(), &str>>(),
+                    ),
+                )
+                .await;
+                assert!(result.is_err());
+                meter_writer_stage("claim", "finished_test", async { Ok::<_, &str>(()) })
+                    .await
+                    .unwrap();
+            }
+            .with_subscriber(subscriber),
+        );
+        let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("stage started"), "{logs}");
+        assert_eq!(logs.matches("stage still running").count(), 2, "{logs}");
+        assert!(logs.contains("elapsed_secs=60"), "{logs}");
+        assert!(logs.contains("outcome=\"cancelled\""), "{logs}");
+        assert!(logs.contains("outcome=\"ok\""), "{logs}");
+    }
+
     /// Every histogram we alert or capacity-plan on must render as real
     /// `_bucket{le="…"}` series. Without an explicit bucket set the Prometheus
     /// exporter falls back to rolling-summary quantiles, which cannot be
@@ -1132,6 +1312,8 @@ mod tests {
             metrics::histogram!("rpc_request_duration_seconds", "method" => "eth_getLogs")
                 .record(0.02);
             metrics::histogram!("miden_sync_state_duration_seconds").record(0.15);
+            metrics::histogram!("miden_operation_stage_duration_seconds").record(238.0);
+            metrics::histogram!("miden_client_queue_wait_seconds").record(120.0);
             metrics::histogram!(
                 "agglayer_writer_job_duration_seconds",
                 "kind" => "ger_insert",
@@ -1145,6 +1327,8 @@ mod tests {
             "miden_proof_duration_seconds",
             "rpc_request_duration_seconds",
             "miden_sync_state_duration_seconds",
+            "miden_operation_stage_duration_seconds",
+            "miden_client_queue_wait_seconds",
             "agglayer_writer_job_duration_seconds",
         ] {
             assert!(

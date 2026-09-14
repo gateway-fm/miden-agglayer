@@ -2369,6 +2369,106 @@ async fn test_pgstore_reverted_receipt_conditional() {
     );
 }
 
+/// Renewal is an atomic CAS against owner, fence, state and database time.
+#[tokio::test]
+async fn test_pgstore_issue_210_claim_renewal_preserves_fences() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let gi = U256::from(rand_u64());
+    let owner = alloy::primitives::keccak256(format!("owner-{gi}"));
+    let other = alloy::primitives::keccak256(format!("other-{gi}"));
+    let lease = std::time::Duration::from_secs(120);
+    let fence = store
+        .try_claim_fenced(gi, owner, lease)
+        .await
+        .unwrap()
+        .unwrap()
+        .fence;
+    let url = std::env::var("DATABASE_URL").unwrap();
+    let (db, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let connection = tokio::spawn(async move {
+        connection.await.unwrap();
+    });
+    let key = format!("{gi:#x}");
+    db.execute("UPDATE claimed_indices SET lease_expires_at = now() + interval '1 second' WHERE global_index = $1", &[&key]).await.unwrap();
+    assert!(
+        !store
+            .renew_claim_fenced(gi, other, fence, lease)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .renew_claim_fenced(gi, owner, fence + 1, lease)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .renew_claim_fenced(gi, owner, fence, lease)
+            .await
+            .unwrap()
+    );
+    let row = db.query_one("SELECT lease_expires_at > now() + interval '110 seconds' FROM claimed_indices WHERE global_index = $1", &[&key]).await.unwrap();
+    assert!(
+        row.get::<_, bool>(0),
+        "renewal must actually extend the deadline"
+    );
+    db.execute("UPDATE claimed_indices SET lease_expires_at = now() - interval '1 second' WHERE global_index = $1", &[&key]).await.unwrap();
+    assert!(
+        !store
+            .renew_claim_fenced(gi, owner, fence, lease)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .prepare_claim_submission_fenced(gi, owner, fence, owner, "expired", "expired-id", 100)
+            .await
+            .unwrap()
+    );
+    let successor = store
+        .try_reclaim_claim_fenced(gi, other, lease)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !store
+            .renew_claim_fenced(gi, owner, fence, lease)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .renew_claim_fenced(gi, other, successor.fence, lease)
+            .await
+            .unwrap()
+    );
+    let note = format!("renewed-{gi}");
+    assert!(
+        store
+            .prepare_claim_submission_fenced(gi, other, successor.fence, other, &note, &note, 100)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .renew_claim_fenced(gi, other, successor.fence, lease)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .unclaim_fenced(&gi, other, successor.fence)
+            .await
+            .unwrap()
+    );
+    connection.abort();
+}
+
 /// PostgreSQL claim reclaim is fenced through the atomic submitted-state + note-link seal.
 #[tokio::test]
 async fn test_pgstore_claim_reclaim_fences_stale_owner() {

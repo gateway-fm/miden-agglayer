@@ -11,6 +11,7 @@ historical cluster value.
 | [Runbook](runbook.md) | Production constraints, startup, safe shutdown, recovery choices, and incident procedures |
 | [Monitoring](monitoring.md) | Health/metrics endpoints, high-signal metrics, alerts, and dashboards |
 | [Diagnostics](diagnostics.md) | Read-only collection and symptom-to-cause investigation |
+| [Writer stalls](writer-stalls.md) | #210 causes, claim leases, phase traces and evidence collection |
 | [Quarantine](quarantine.md) | Handling B2AGG exits the projector deliberately cannot emit |
 | [Upgrade guide](../UPGRADE.md) | Version-neutral in-place upgrade and rollback procedure |
 
