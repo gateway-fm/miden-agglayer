@@ -20,7 +20,8 @@
 //!   monitor reports once and idles).
 //!
 //! Logs WARN when an account has fewer than `warn_txns` transactions left and
-//! ERROR at 0. Read-only; the proxy's tracked client state is what is read.
+//! ERROR at 0. Refreshes deployed network accounts from the node and sweeps
+//! wallet top-ups before reading balances.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -30,8 +31,8 @@ use miden_protocol::account::{Account, AccountId};
 use miden_protocol::asset::Asset;
 use tokio::sync::oneshot;
 
-use crate::fee_funding::{fee_snapshot, max_fee_per_txn};
-use crate::miden_client::MidenClient;
+use crate::fee_funding::{FeeSnapshot, fee_snapshot, max_fee_per_txn};
+use crate::miden_client::{MidenClient, MidenClientLib};
 use crate::store::Store;
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
@@ -53,6 +54,52 @@ pub fn fee_balance(account: &Account, fee_faucet_id: AccountId) -> u64 {
 /// Conservative "transactions before empty" at the per-transaction fee cap.
 pub fn txns_left(balance: u64, max_fee: u64) -> u64 {
     balance.checked_div(max_fee).unwrap_or(u64::MAX)
+}
+
+/// Refresh the balance independently of the proxy's transaction/sync activity.
+async fn poll_account(
+    client: &mut MidenClientLib,
+    name: &str,
+    id: AccountId,
+    snap: &FeeSnapshot,
+) -> anyhow::Result<Option<u64>> {
+    let Some(account) = client.get_account(id).await? else {
+        tracing::warn!(account = %name, id = %id.to_hex(), "fee-vault monitor: account not in the client store");
+        return Ok(None);
+    };
+    // A new account's cascade note belongs to its deployment procedure, and
+    // there is no on-chain state to import yet.
+    if account.is_new() {
+        return Ok(Some(fee_balance(&account, snap.fee_faucet_id)));
+    }
+    if miden_standards::account::auth::NetworkAccount::new(account).is_ok() {
+        // get_account() only reads the local store. External credits to the
+        // bridge/faucets can remain absent there even across syncs and GER
+        // injections, so fetch the node's full state on every monitor tick.
+        // Only network accounts are overwritten: wallets may have pending
+        // local transactions that are ahead of the node.
+        client.import_account_by_id(id).await?;
+    } else {
+        // The node refuses user-submitted transactions for deployed network
+        // accounts; their top-ups are consumed by the ntx-builder. Wallets
+        // need the proxy to sweep their fee-asset P2IDs.
+        match crate::fee_funding::consume_fee_notes(client, id, snap).await {
+            Ok(n) if n > 0 => {
+                tracing::info!(account = %name, notes = n, "consuming fee-asset top-up note(s) (#201)")
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(account = %name, error = %format!("{e:#}"), "could not consume a fee-asset top-up")
+            }
+        }
+    }
+    // Account is an owned snapshot, not a live handle: re-read after either
+    // the node refresh or the wallet sweep, including its local fee delta.
+    let account = client
+        .get_account(id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("monitored account {} disappeared", id.to_hex()))?;
+    Ok(Some(fee_balance(&account, snap.fee_faucet_id)))
 }
 
 pub struct FeeVaultMonitor {
@@ -146,31 +193,14 @@ impl FeeVaultMonitor {
                         return Ok(());
                     }
                     for (name, id) in targets {
-                        let Some(account) = client.get_account(id).await? else {
-                            tracing::warn!(account = %name, id = %id.to_hex(), "fee-vault monitor: account not in the client store");
-                            continue;
+                        let balance = match poll_account(client, &name, id, &snap).await {
+                            Ok(Some(balance)) => balance,
+                            Ok(None) => continue,
+                            Err(e) => {
+                                tracing::warn!(account = %name, id = %id.to_hex(), error = %format!("{e:#}"), "fee-vault monitor: could not refresh balance");
+                                continue;
+                            }
                         };
-                        // Sweep top-ups: a P2ID of the fee asset sent to this account
-                        // lands only once consumed. Not for an account still being
-                        // created — its cascade note is the deploy's to consume.
-                        // Deployed network accounts (bridge, faucets) cannot be swept
-                        // from here: the node refuses user-submitted transactions for
-                        // them, the ntx-builder consumes their top-ups (the funding
-                        // tool attaches the network target). Only wallets are swept.
-                        let network = miden_standards::account::auth::NetworkAccount::new(
-                            account.clone(),
-                        )
-                        .is_ok();
-                        match if account.is_new() || network {
-                            Ok(0)
-                        } else {
-                            crate::fee_funding::consume_fee_notes(client, id, &snap).await
-                        } {
-                            Ok(n) if n > 0 => tracing::info!(account = %name, notes = n, "consuming fee-asset top-up note(s) (#201)"),
-                            Ok(_) => {}
-                            Err(e) => tracing::warn!(account = %name, error = %format!("{e:#}"), "could not consume a fee-asset top-up"),
-                        }
-                        let balance = fee_balance(&account, snap.fee_faucet_id);
                         let left = txns_left(balance, max_fee);
                         metrics::gauge!("bridge_fee_vault_balance", "account" => name.clone())
                             .set(balance as f64);
@@ -216,6 +246,159 @@ impl FeeVaultMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use miden_client::testing::account_id::ACCOUNT_ID_FEE_FAUCET;
+    use miden_client::testing::mock::MockRpcApi;
+    use miden_client::testing::{Auth, MockChainBuilder};
+    use miden_protocol::Felt;
+    use miden_protocol::asset::FungibleAsset;
+    use miden_standards::account::auth::NetworkAccount;
+    use miden_standards::account::wallets::BasicWallet;
+    use miden_standards::note::P2idNote;
+
+    fn snapshot() -> FeeSnapshot {
+        FeeSnapshot {
+            verification_base_fee: 7,
+            fee_faucet_id: ACCOUNT_ID_FEE_FAUCET.try_into().unwrap(),
+        }
+    }
+
+    fn network_account() -> Account {
+        let allowed = std::collections::BTreeSet::from([P2idNote::script_root()]);
+        let policy = crate::fee_policy::zero_fee_policy_manager_for(
+            allowed.clone(),
+            snapshot().fee_faucet_id,
+        );
+        NetworkAccount::builder([7; 32], allowed, policy)
+            .unwrap()
+            .with_component(BasicWallet)
+            .build()
+            .unwrap()
+    }
+
+    fn credit(account: &mut Account, amount: u64) {
+        account
+            .vault_mut()
+            .add_asset(
+                FungibleAsset::new(snapshot().fee_faucet_id, amount)
+                    .unwrap()
+                    .into(),
+            )
+            .unwrap();
+        account.increment_nonce(Felt::ONE).unwrap();
+    }
+
+    async fn client_with_node_account(account: Account) -> MidenClientLib {
+        let mut client = crate::test_helpers::offline_miden_client_lib().await;
+        *client.test_rpc_api() = Arc::new(MockRpcApi::new(
+            MockChainBuilder::with_accounts([account])
+                .unwrap()
+                .build()
+                .unwrap(),
+        ));
+        client
+    }
+
+    /// PRST-4808: the node consumed the bridge's P2ID, but the tracked account
+    /// still held 53,319. No proxy transaction or background sync may be needed
+    /// for the next balance/runway sample to reflect that external credit.
+    #[tokio::test]
+    async fn network_top_up_refreshes_balance_without_proxy_activity() {
+        let mut cached = network_account();
+        credit(&mut cached, 53_319);
+        let mut on_chain = cached.clone();
+        credit(&mut on_chain, 537_600 - 105);
+        let mut client = client_with_node_account(on_chain.clone()).await;
+        client.add_account(&cached, false).await.unwrap();
+        assert_eq!(
+            fee_balance(
+                &client.get_account(cached.id()).await.unwrap().unwrap(),
+                snapshot().fee_faucet_id
+            ),
+            53_319,
+        );
+
+        let balance = poll_account(&mut client, "bridge", cached.id(), &snapshot())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(balance, 590_814);
+        assert_eq!(txns_left(balance, max_fee_per_txn(7)), 2_813);
+        assert_eq!(
+            client.get_account(cached.id()).await.unwrap(),
+            Some(on_chain)
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_keeps_pending_local_state_ahead_of_node() {
+        let on_chain = Account::builder([9; 32])
+            .with_components(Auth::IncrNonce)
+            .with_component(BasicWallet)
+            .build_existing()
+            .unwrap();
+        let mut pending = on_chain.clone();
+        credit(&mut pending, 1_000);
+        let mut client = client_with_node_account(on_chain).await;
+        client.add_account(&pending, false).await.unwrap();
+
+        assert_eq!(
+            poll_account(&mut client, "service", pending.id(), &snapshot())
+                .await
+                .unwrap(),
+            Some(1_000),
+        );
+        assert_eq!(
+            client.get_account(pending.id()).await.unwrap(),
+            Some(pending)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_network_refresh_does_not_return_a_cached_balance() {
+        let mut on_chain = network_account();
+        credit(&mut on_chain, 1_000);
+        let mut cached = on_chain.clone();
+        credit(&mut cached, 500);
+        let mut client = client_with_node_account(on_chain).await;
+        client.add_account(&cached, false).await.unwrap();
+
+        // The client refuses an import from a node whose nonce is behind the
+        // stored account. Surface that failure instead of sampling stale data.
+        let error = poll_account(&mut client, "bridge", cached.id(), &snapshot())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<miden_client::ClientError>(),
+            Some(miden_client::ClientError::AccountNonceTooLow),
+        ));
+    }
+
+    #[tokio::test]
+    async fn undeployed_and_untracked_accounts_need_no_node_refresh() {
+        let mut client = crate::test_helpers::offline_miden_client_lib().await;
+        let account = network_account();
+        assert_eq!(
+            poll_account(&mut client, "bridge", account.id(), &snapshot())
+                .await
+                .unwrap(),
+            None,
+        );
+        client.add_account(&account, false).await.unwrap();
+        assert_eq!(
+            poll_account(&mut client, "bridge", account.id(), &snapshot())
+                .await
+                .unwrap(),
+            Some(0),
+        );
+        assert!(
+            client
+                .get_account(account.id())
+                .await
+                .unwrap()
+                .unwrap()
+                .is_new()
+        );
+    }
 
     #[test]
     fn txns_left_is_conservative_and_zero_fee_safe() {
