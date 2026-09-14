@@ -136,12 +136,6 @@ mod tests {
         }
     }
 
-    /// Serializes the `RUST_LOG` critical section below. Cargo runs `#[test]`
-    /// fns in parallel and `RUST_LOG` is process-global, so without this lock a
-    /// sibling test can `set_var`/`remove_var` between our `set_var` and
-    /// `log_filter()` read — building the filter from the wrong directive and
-    /// silently dropping the events we expect to capture (`seen == []`).
-
     /// Build the production filter under a forced `RUST_LOG=debug` and run `f`
     /// against a `Registry` that captures every event. This mirrors what the
     /// real binary would do if an operator set `RUST_LOG=debug` on the pod.
