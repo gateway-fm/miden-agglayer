@@ -1175,9 +1175,8 @@ async fn test_pgstore_commit_b2agg_event_atomic_emits_log_once() {
 
 // ── RD-913 monitor trackers ─────────────────────────────────
 
-/// PgStore round-trip for monitor_burn_serials. INSERT … ON CONFLICT
-/// must report true on first observation and false on the duplicate,
-/// matching the InMemoryStore contract.
+/// PgStore round-trip for monitor_burn_serials: a repeated sighting of the
+/// same note is benign; only a different note reusing its serial is a collision.
 #[tokio::test]
 async fn test_pgstore_rd913_burn_serial_observe() {
     let Some(store) = pg_store().await else {
@@ -1188,10 +1187,27 @@ async fn test_pgstore_rd913_burn_serial_observe() {
     let mut serial = [0u8; 32];
     serial[..8].copy_from_slice(&rand_u64().to_be_bytes());
     assert!(!store.burn_serial_seen(&serial).await.unwrap());
-    assert!(store.burn_serial_observe(&serial).await.unwrap());
+    let note = [0xa1; 32];
+    let other_note = [0xb2; 32];
+    assert!(
+        store
+            .burn_serial_observe_for_note(&serial, &note)
+            .await
+            .unwrap()
+    );
     assert!(store.burn_serial_seen(&serial).await.unwrap());
-    // Second insert returns false (Cantina #5 duplicate signal).
-    assert!(!store.burn_serial_observe(&serial).await.unwrap());
+    assert!(
+        store
+            .burn_serial_observe_for_note(&serial, &note)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .burn_serial_observe_for_note(&serial, &other_note)
+            .await
+            .unwrap()
+    );
 }
 
 /// PgStore round-trip for monitor_twin_notes. Per-NoteId commitments
