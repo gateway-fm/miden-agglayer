@@ -80,12 +80,20 @@ owner. Background listeners are identified by their concrete type.
 | `client/sync` or `commit_wait/sync` | Full SDK sync; correlate with the active node RPC and SDK retry warnings |
 | `rpc_pace/<method>` | Local rate-governor wait, before the RPC starts |
 | `node_rpc/<method>` | Network call including SDK retries and server retry delays |
-| `post_sync` | Named listener; projector reconciliation, calldata backfill, block projection/cursor persistence and bridge scanner stages provide finer detail |
+| `post_sync` | Named listener; live scanner/projector waits can overlap client requests. Inspect the active `client_request` or `sync` stage to identify actual SDK ownership |
 | `l1_evidence` | GER awaiting the configured L1 observation policy |
 | `acquire_lease`, `faucet`, `build_note`, `execute`, `remote_sign` | Claim ownership, setup, execution or signer work before proving |
 | `prove` / `prove_fallback` | Proof generation; compare the existing prover metrics |
 | `prepare_handoff`, `submit`, `apply`, `commit_wait`, `confirm_handoff` | Exact submission boundary; preserve durable handoffs on uncertainty |
 | `dispatch` without a more specific active stage | Store work or another unclassified path; retain the surrounding logs and receipt state |
+
+`reconciliation::read_notes`, `reconciliation::read_account`,
+`reconciliation::import_notes`, and `consumed_notes::read_changes` identify the
+short queued SDK operations within live reconciliation. Compare their
+`Miden client request started` queue waits with writer waits. A long
+`scan_monitors`/`reconcile_notes` stage alone no longer means the client is
+held for its entire duration. See [consumed-note scanner diagnostics](consumed-note-scanner.md)
+for incremental-batch and fallback evidence.
 
 Stages nest: match start/end by `stage_id` within one process and follow the
 innermost unfinished stage. Missing heartbeats as well as missing completion

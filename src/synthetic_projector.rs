@@ -51,6 +51,7 @@ use crate::bridge_out::{
     B2AggConsumerClass, classify_b2agg_consumer, derive_bridge_out_tx_hash, is_b2agg_note,
     parse_b2agg_storage,
 };
+use crate::client_access::ClientAccess;
 use crate::miden_client::{
     MidenClientLib, SyncListener, ensure_complete_note_response, ordered_account_transactions,
 };
@@ -400,6 +401,10 @@ pub struct SyntheticProjector {
     audit_resolved: std::sync::Mutex<HashSet<([u8; 32], u64, u32)>>,
     /// Tick counter driving the every-[`AUDIT_EVERY_N_TICKS`] audit cadence.
     audit_tick_counter: AtomicU64,
+    /// The block metadata listeners captured this tip before any queued writes.
+    synced_tip: AtomicU64,
+    prepared_bridge_account: std::sync::Mutex<Option<miden_client::account::Account>>,
+    consumed_feed: crate::consumed_note_feed::ConsumedNoteFeed,
     /// Set by `CatchUpMode::Restore`. Restore fails closed where a live tick
     /// tolerates and retries, because it has no later tick to heal in.
     restore_posture: AtomicBool,
@@ -503,6 +508,9 @@ impl SyntheticProjector {
             projection_totals: std::sync::Mutex::new(Default::default()),
             audit_resolved: std::sync::Mutex::new(HashSet::new()),
             audit_tick_counter: AtomicU64::new(0),
+            synced_tip: AtomicU64::new(0),
+            prepared_bridge_account: std::sync::Mutex::new(None),
+            consumed_feed: crate::consumed_note_feed::ConsumedNoteFeed::new("projector"),
             claim_calldata_resolved: std::sync::Mutex::new(HashSet::new()),
         })
     }
@@ -537,29 +545,50 @@ impl SyntheticProjector {
 
     async fn resolve_pending_duplicate(
         &self,
-        client: &mut MidenClientLib,
+        client: &mut ClientAccess<'_>,
         pending: &PendingDuplicate,
     ) -> anyhow::Result<crate::applied_state::ExactNoteOutcome> {
+        let store = self.store.clone();
+        let bridge_id = self.bridge_id;
+        let note_id = pending.note_id.clone();
         match &pending.call {
             DecodedWriteCall::Ger { ger_bytes } => {
-                crate::applied_state::reconcile_ger_handoff_with_client(
-                    self.store.as_ref(),
-                    client,
-                    self.bridge_id,
-                    *ger_bytes,
-                    pending.note_id.clone(),
-                )
-                .await
+                let ger = *ger_bytes;
+                if store.is_ger_injected(&ger).await? {
+                    return Ok(crate::applied_state::ExactNoteOutcome::AppliedElsewhere);
+                }
+                client
+                    .call("projector::confirm_ger_handoff", move |client| {
+                        Box::pin(async move {
+                            crate::applied_state::reconcile_ger_snapshot_with_client(
+                                client, bridge_id, ger, note_id,
+                            )
+                            .await
+                        })
+                    })
+                    .await
             }
             DecodedWriteCall::Claim { params } => {
-                crate::applied_state::reconcile_claim_handoff_with_client(
-                    self.store.as_ref(),
-                    client,
-                    self.bridge_id,
-                    params.globalIndex,
-                    pending.note_id.clone(),
-                )
-                .await
+                let global_index = params.globalIndex;
+                if store
+                    .has_claim_event_for_global_index(&global_index.to_be_bytes::<32>())
+                    .await?
+                {
+                    return Ok(crate::applied_state::ExactNoteOutcome::AppliedElsewhere);
+                }
+                client
+                    .call("projector::confirm_claim_handoff", move |client| {
+                        Box::pin(async move {
+                            crate::applied_state::reconcile_claim_snapshot_with_client(
+                                client,
+                                bridge_id,
+                                global_index,
+                                note_id,
+                            )
+                            .await
+                        })
+                    })
+                    .await
             }
         }
     }
@@ -588,7 +617,7 @@ impl SyntheticProjector {
 
     async fn reconcile_pending_duplicate(
         &self,
-        client: &mut MidenClientLib,
+        client: &mut ClientAccess<'_>,
         tx_hash: TxHash,
     ) -> anyhow::Result<()> {
         let Some(pending) = self.load_pending_duplicate(tx_hash).await? else {
@@ -600,7 +629,7 @@ impl SyntheticProjector {
 
     async fn reconcile_pending_duplicates(
         &self,
-        client: &mut MidenClientLib,
+        client: &mut ClientAccess<'_>,
     ) -> anyhow::Result<()> {
         let after = *self
             .pending_duplicate_cursor
@@ -680,7 +709,7 @@ impl SyntheticProjector {
     /// full-history sweeps take 3+ hours regardless of node speed).
     async fn reconcile_notes(
         &self,
-        client: &mut MidenClientLib,
+        client: &mut ClientAccess<'_>,
         rpc: &Arc<dyn NodeRpcClient>,
         tip: u64,
         patience: ReconcilePatience,
@@ -707,7 +736,7 @@ impl SyntheticProjector {
     /// sweep is idempotent — known ids are skipped).
     async fn reconcile_notes_with(
         &self,
-        mut client: Option<&mut MidenClientLib>,
+        mut client: Option<&mut ClientAccess<'_>>,
         rpc: Option<&dyn NodeRpcClient>,
         fetcher: &Arc<dyn ReconcileFetcher>,
         tip: u64,
@@ -856,7 +885,7 @@ impl SyntheticProjector {
     /// fallback, and recovery for notes silently dropped after consumption.
     async fn import_reconcile_window(
         &self,
-        client: &mut MidenClientLib,
+        client: &mut ClientAccess<'_>,
         rpc: &dyn NodeRpcClient,
         from: u64,
         to: u64,
@@ -1306,7 +1335,7 @@ impl SyntheticProjector {
     /// removes the case where the account was one node fetch away.
     async fn bridge_account_for_let_gate(
         &self,
-        client: &mut MidenClientLib,
+        client: &mut ClientAccess<'_>,
     ) -> anyhow::Result<miden_client::account::Account> {
         let bridge_id = self.bridge_id;
         if let Some(account) = client
@@ -1353,9 +1382,10 @@ impl SyntheticProjector {
     /// Ground truth needs no new RPC: the miden-client STORE. The reconciler imports every
     /// B2AGG note body and `sync_state` eventually marks it `Consumed*` with a
     /// `consumed_block_height` — laggingly, which is fine for detection: only blocks at
-    /// least [`AUDIT_SETTLE_MARGIN`] behind the projector cursor are audited, and the full
-    /// consumed set is re-scanned each cycle (late-learned consumptions cannot escape),
-    /// de-duped via [`Self::audit_resolved`] so each cycle is O(new consumptions).
+    /// least [`AUDIT_SETTLE_MARGIN`] behind the projector cursor are audited. The
+    /// consumed-note change feed retains settling records until this audit runs;
+    /// late imports and enrichment re-enter through its transactional revision index.
+    /// [`Self::audit_resolved`] preserves the existing per-occurrence deduplication.
     ///
     /// For every consumed B2AGG note that SHOULD have emitted (mirrors the projector's own
     /// emit gates, so legitimately-skipped notes never false-alarm):
@@ -1488,7 +1518,7 @@ impl SyntheticProjector {
     /// transaction-input position. Stable commitment and NoteId tie-breakers keep replay
     /// deterministic.
     ///
-    /// `client` (the live `&mut MidenClientLib`) is threaded through to
+    /// `client` (the live `&mut ClientAccess<'_>`) is threaded through to
     /// `project_b2agg_note` for the Cantina #13 Layer-2 ERC-20 metadata
     /// recovery (`None` in unit tests, where the in-memory feed is supplied
     /// directly).
@@ -1499,7 +1529,7 @@ impl SyntheticProjector {
         consumed: &[InputNoteRecord],
         output_metadata: &HashMap<[u8; 32], NoteMetadata>,
         miden_block: u64,
-        client: Option<&mut MidenClientLib>,
+        client: Option<&mut ClientAccess<'_>>,
         within_tx_pos: &HashMap<NoteId, u32>,
     ) -> anyhow::Result<usize> {
         let block_notes: Vec<(Option<NoteId>, &InputNoteRecord)> = consumed
@@ -1543,7 +1573,7 @@ impl SyntheticProjector {
         block_notes: &[(Option<NoteId>, &InputNoteRecord)],
         output_metadata: &HashMap<[u8; 32], NoteMetadata>,
         miden_block: u64,
-        client: Option<&mut MidenClientLib>,
+        client: Option<&mut ClientAccess<'_>>,
         within_tx_pos: &HashMap<NoteId, u32>,
     ) -> anyhow::Result<usize> {
         // The order + dispatch live in the SHARED per-block unit
@@ -1611,12 +1641,16 @@ impl SyntheticProjector {
     /// seals until reconciliation reaches that same tip, because LET cardinality is a tip
     /// invariant.
     pub async fn tick(&self, client: &mut MidenClientLib) -> anyhow::Result<u64> {
+        self.tick_access(&mut ClientAccess::Exclusive(client)).await
+    }
+
+    async fn tick_access(&self, client: &mut ClientAccess<'_>) -> anyhow::Result<u64> {
         let tip = client
             .get_sync_height()
             .await
             .map_err(|e| anyhow::anyhow!("failed to get sync height: {e}"))?
             .as_u64();
-        self.tick_pass(client, tip, ReconcilePatience::LiveTick, true)
+        self.tick_pass(client, tip, ReconcilePatience::LiveTick, true, None)
             .await
     }
 
@@ -1625,10 +1659,11 @@ impl SyntheticProjector {
     /// producing node cannot drag a restore past its captured target.
     async fn tick_pass(
         &self,
-        client: &mut MidenClientLib,
+        client: &mut ClientAccess<'_>,
         tip: u64,
         reconcile_patience: ReconcilePatience,
         enforce_let_cardinality: bool,
+        bridge_account_snapshot: Option<miden_client::account::Account>,
     ) -> anyhow::Result<u64> {
         let mut cursor = self.cursor.load(Ordering::Acquire);
         // Reconcile even when projection is already at the tip so note imports do not stall
@@ -1694,23 +1729,22 @@ impl SyntheticProjector {
         }
         let live = matches!(reconcile_patience, ReconcilePatience::LiveTick);
         let restore_posture = self.restore_posture.load(Ordering::Acquire);
-        // Claim-calldata repair runs every live tick, before the at-tip return,
-        // so a historical ClaimEvent missing its calldata heals without waiting
-        // for new traffic. It is a whole-store read; restore skips it because it
-        // projects calldata inline and must stay bounded by the window.
-        let consumed: Vec<InputNoteRecord> = if live {
-            client
-                .get_input_notes(NoteFilter::Consumed)
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to get consumed input notes: {e}"))?
+        // Live repair/audit observe changed consumed records plus unfinished
+        // work. Recovery uses its authoritative bounded block feed instead.
+        let batch = if live {
+            Some(self.consumed_feed.load(client, false, &[]).await?)
         } else {
-            Vec::new()
+            None
         };
+        let consumed = batch
+            .as_ref()
+            .map(|batch| batch.notes.as_slice())
+            .unwrap_or(&[]);
         if live
             && let Err(e) = crate::metrics::meter_writer_stage(
                 "projector",
                 "backfill_claim_calldata",
-                self.backfill_synthetic_claim_calldata(&consumed, cursor),
+                self.backfill_synthetic_claim_calldata(consumed, cursor),
             )
             .await
         {
@@ -1720,6 +1754,9 @@ impl SyntheticProjector {
             );
         }
         if cursor >= tip {
+            if let Some(batch) = &batch {
+                self.commit_consumed_batch(batch);
+            }
             return Ok(cursor);
         }
         // Design: docs/design/UNIFIED-PROJECTOR.md. Cantina #7: the within-tx
@@ -1754,7 +1791,9 @@ impl SyntheticProjector {
         // signal (`faucet_registry_reconciler`) and must never be adopted.
         if restore_posture {
             let report = crate::faucet_bootstrap::rebuild_missing_faucet_identities(
-                client,
+                client.exclusive().ok_or_else(|| {
+                    anyhow::anyhow!("restore bootstrap requires exclusive client ownership")
+                })?,
                 &self.store,
                 self.bridge_id,
                 &self.network_rpcs,
@@ -1809,7 +1848,12 @@ impl SyntheticProjector {
         // restore pass leaves beyond `pass_tip` are legitimately not yet
         // reserved; the equality gate therefore runs on the final pass only.
         // The prefix checks are window-local and always run.
-        let bridge_account = self.bridge_account_for_let_gate(client).await?;
+        let bridge_account = match bridge_account_snapshot {
+            Some(account) => account,
+            // Offline restore owns the SDK throughout. If the live snapshot
+            // lacked the account, retain the existing fail-closed re-import.
+            None => self.bridge_account_for_let_gate(client).await?,
+        };
         let on_chain = miden_base_agglayer::AggLayerBridge::read_let_num_leaves(&bridge_account);
         let accounted = self.store.get_accounted_deposit_count().await?;
         let note_keys: Vec<String> = auth_b2agg.iter().map(|(id, _)| id.to_hex()).collect();
@@ -1908,18 +1952,21 @@ impl SyntheticProjector {
         // blocks. Reuses this tick's already-fetched `consumed` feed — zero extra queries.
         // Non-fatal by construction: an audit failure warns and retries next cycle, it never
         // blocks projection.
-        // Live only: a whole-store read, and meaningless mid-rebuild.
+        // Live only; unresolved observations remain queued until an audit runs.
         if live
             && self
                 .audit_tick_counter
                 .fetch_add(1, Ordering::Relaxed)
                 .is_multiple_of(AUDIT_EVERY_N_TICKS)
-            && let Err(e) = self.audit_completeness(&consumed, cursor).await
+            && let Err(e) = self.audit_completeness(consumed, cursor).await
         {
             tracing::warn!(
                 error = %format!("{e:#}"),
                 "completeness auditor failed (non-fatal — retried next cycle)"
             );
+        }
+        if let Some(batch) = &batch {
+            self.commit_consumed_batch(batch);
         }
         let synthetic_tip = self.store.get_latest_block_number().await?;
         tracing::info!(
@@ -1929,6 +1976,45 @@ impl SyntheticProjector {
             "synthetic projector tick: caught up to the Miden tip"
         );
         Ok(cursor)
+    }
+
+    fn commit_consumed_batch(&self, batch: &crate::consumed_note_feed::NoteBatch) {
+        let claims = self
+            .claim_calldata_resolved
+            .lock()
+            .expect("claim-calldata resolved set poisoned");
+        let audited = self
+            .audit_resolved
+            .lock()
+            .expect("audit-resolved set poisoned");
+        let mut occurrences = HashMap::<([u8; 32], u64), u32>::new();
+        let retry = batch
+            .notes
+            .iter()
+            .filter_map(|note| {
+                let key = note.details_commitment().as_bytes();
+                match BridgeInputKind::classify(note.details()) {
+                    BridgeInputKind::Claim => (!claims.contains(&key)).then_some(key),
+                    BridgeInputKind::B2agg => {
+                        let block = note.state().consumed_block_height()?.as_u64();
+                        if matches!(
+                            classify_b2agg_consumer(note.consumer_account(), self.bridge_id),
+                            B2AggConsumerClass::Reclaimed
+                        ) || parse_b2agg_storage(note.details().storage()).ok()?.0
+                            == self.local_network_id
+                        {
+                            return None;
+                        }
+                        let occurrence = occurrences.entry((key, block)).or_default();
+                        let unresolved = !audited.contains(&(key, block, *occurrence));
+                        *occurrence += 1;
+                        unresolved.then_some(key)
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        self.consumed_feed.commit(batch, retry);
     }
 
     /// For the restore report.
@@ -1951,6 +2037,15 @@ impl SyntheticProjector {
         self.store.reset_cursors_to_genesis().await?;
         self.reconcile_cursor.store(0, Ordering::Release);
         self.cursor.store(0, Ordering::Release);
+        self.consumed_feed.reset();
+        self.claim_calldata_resolved
+            .lock()
+            .expect("claim-calldata resolved set poisoned")
+            .clear();
+        self.audit_resolved
+            .lock()
+            .expect("audit-resolved set poisoned")
+            .clear();
         tracing::warn!(
             "projector cursors reset to genesis (discovery + projection, persisted + in-memory)"
         );
@@ -1965,9 +2060,19 @@ impl SyntheticProjector {
         target_tip: u64,
         mode: CatchUpMode,
     ) -> anyhow::Result<u64> {
+        self.catch_up_to_access(&mut ClientAccess::Exclusive(client), target_tip, mode)
+            .await
+    }
+
+    async fn catch_up_to_access(
+        &self,
+        client: &mut ClientAccess<'_>,
+        target_tip: u64,
+        mode: CatchUpMode,
+    ) -> anyhow::Result<u64> {
         match mode {
             CatchUpMode::Live => {
-                self.tick_pass(client, target_tip, ReconcilePatience::LiveTick, true)
+                self.tick_pass(client, target_tip, ReconcilePatience::LiveTick, true, None)
                     .await?;
                 Ok(self.cursor.load(Ordering::Acquire))
             }
@@ -1991,7 +2096,7 @@ impl SyntheticProjector {
     /// with discovery behind it would seal blocks whose notes it never saw.
     async fn drive_catch_up_to_tip(
         &self,
-        client: &mut MidenClientLib,
+        client: &mut ClientAccess<'_>,
         target_tip: u64,
     ) -> anyhow::Result<u64> {
         let cursor_pair = || {
@@ -2009,6 +2114,7 @@ impl SyntheticProjector {
                 pass_tip,
                 ReconcilePatience::Recovery,
                 pass_tip == target_tip,
+                None,
             )
             .await?;
             let now = cursor_pair();
@@ -2364,13 +2470,49 @@ pub(crate) fn bridge_consumed_nullifiers(
 
 #[async_trait::async_trait]
 impl SyncListener for SyntheticProjector {
-    fn on_sync(&self, _summary: &SyncSummary) {
-        // no-op — projection happens in `on_post_sync`, where we hold the live
-        // client needed to fetch consumed notes and run Cantina #13 recovery.
+    fn on_sync(&self, summary: &SyncSummary) {
+        self.synced_tip
+            .store(summary.block_num.as_u64(), Ordering::Release);
     }
 
     async fn on_post_sync(&self, client: &mut MidenClientLib) -> anyhow::Result<()> {
         self.tick(client).await?;
+        Ok(())
+    }
+
+    fn uses_queued_client(&self) -> bool {
+        true
+    }
+
+    async fn prepare_post_sync(&self, client: &mut MidenClientLib) -> anyhow::Result<()> {
+        let account = client.get_account(self.bridge_id).await?;
+        *self
+            .prepared_bridge_account
+            .lock()
+            .expect("bridge snapshot poisoned") = account;
+        Ok(())
+    }
+
+    async fn on_post_sync_queued(
+        &self,
+        client: crate::miden_client::ClientQueue,
+    ) -> anyhow::Result<()> {
+        let tip = self.synced_tip.load(Ordering::Acquire);
+        let snapshot = self
+            .prepared_bridge_account
+            .lock()
+            .expect("bridge snapshot poisoned")
+            .take();
+        tracing::debug!(target: "writer_diagnostics", tip, bridge_snapshot_available = snapshot.is_some(),
+            "projector using captured sync snapshot");
+        self.tick_pass(
+            &mut ClientAccess::Queued(client),
+            tip,
+            ReconcilePatience::LiveTick,
+            true,
+            snapshot,
+        )
+        .await?;
         Ok(())
     }
 }
@@ -2682,7 +2824,7 @@ mod tests {
     }
 
     /// Build a projector for the deterministic-core tests. The cursor/tip loop
-    /// (`tick`) needs a live `&mut MidenClientLib`, so the unit tests drive the
+    /// (`tick`) needs a live `&mut ClientAccess<'_>`, so the unit tests drive the
     /// `project_notes` core directly with an in-memory consumed-note feed and a
     /// `None` recovery client.
     async fn test_projector(
@@ -3166,7 +3308,7 @@ mod tests {
         let mut client = crate::test_helpers::offline_miden_client_lib().await;
 
         let err = projector
-            .bridge_account_for_let_gate(&mut client)
+            .bridge_account_for_let_gate(&mut ClientAccess::Exclusive(&mut client))
             .await
             .expect_err("an offline client cannot produce the bridge account");
         let rendered = format!("{err:#}");
@@ -4644,6 +4786,72 @@ mod tests {
     /// per-cycle `missing` tally returns to 0; the metric counter stays cumulative). A
     /// verified note is equally never re-checked.
     #[tokio::test]
+    async fn incremental_audit_retains_settling_notes_and_rebuilds_after_reset() {
+        use miden_client::store::Store as SdkStore;
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+        let mut client = crate::test_helpers::offline_miden_client_lib().await;
+        let sdk = miden_client_sqlite_store::SqliteStore::new(client.store_identifier().into())
+            .await
+            .unwrap();
+        sdk.upsert_input_notes(&[b2agg_note_with_amount(50, None, 44)])
+            .await
+            .unwrap();
+        let mut access = ClientAccess::Exclusive(&mut client);
+        let first = projector
+            .consumed_feed
+            .load(&mut access, false, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            projector
+                .audit_completeness(&first.notes, 53)
+                .await
+                .unwrap()
+                .settling,
+            1
+        );
+        projector.commit_consumed_batch(&first);
+        let retry = projector
+            .consumed_feed
+            .load(&mut access, false, &[])
+            .await
+            .unwrap();
+        assert_eq!(retry.notes.len(), 1);
+        let audited = projector
+            .audit_completeness(&retry.notes, 50 + AUDIT_SETTLE_MARGIN)
+            .await
+            .unwrap();
+        assert_eq!(audited.missing, 1);
+        projector.commit_consumed_batch(&retry);
+        assert!(
+            projector
+                .consumed_feed
+                .load(&mut access, false, &[])
+                .await
+                .unwrap()
+                .notes
+                .is_empty()
+        );
+        projector.reset_cursors_to_genesis().await.unwrap();
+        let replay = projector
+            .consumed_feed
+            .load(&mut access, false, &[])
+            .await
+            .unwrap();
+        assert_eq!(replay.notes.len(), 1);
+        assert_eq!(
+            projector
+                .audit_completeness(&replay.notes, 50 + AUDIT_SETTLE_MARGIN)
+                .await
+                .unwrap()
+                .audited,
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn completeness_auditor_alarms_once_per_note() {
         let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
         register_faucet(&store).await;
@@ -4911,7 +5119,10 @@ mod tests {
         assert!(!store.is_ger_injected(&combined_zero_ger).await.unwrap());
         let mut unavailable_miden = crate::test_helpers::offline_miden_client_lib().await;
         projector
-            .reconcile_pending_duplicate(&mut unavailable_miden, tx_hash)
+            .reconcile_pending_duplicate(
+                &mut ClientAccess::Exclusive(&mut unavailable_miden),
+                tx_hash,
+            )
             .await
             .expect("durable ClaimEvent must avoid unavailable Miden state");
 

@@ -7,6 +7,7 @@
 
 use crate::miden_client::MidenClientLib;
 use crate::service_state::ServiceState;
+#[cfg(not(test))]
 use crate::store::Store;
 use alloy::primitives::U256;
 use anyhow::Context;
@@ -267,6 +268,7 @@ fn classify_exact_note(applied: bool, note: NoteObservation) -> ExactNoteOutcome
     }
 }
 
+#[cfg(not(test))]
 pub(crate) async fn reconcile_ger_handoff_with_client(
     store: &dyn Store,
     client: &mut MidenClientLib,
@@ -279,6 +281,15 @@ pub(crate) async fn reconcile_ger_handoff_with_client(
         // normal projection persists the event and its linked receipt atomically.
         return Ok(ExactNoteOutcome::AppliedElsewhere);
     }
+    reconcile_ger_snapshot_with_client(client, bridge_id, ger, note_id).await
+}
+
+pub(crate) async fn reconcile_ger_snapshot_with_client(
+    client: &mut MidenClientLib,
+    bridge_id: AccountId,
+    ger: [u8; 32],
+    note_id: String,
+) -> anyhow::Result<ExactNoteOutcome> {
     let snapshot =
         bridge_snapshot_with_client(client, bridge_id, Some(ger), None, Some(note_id)).await?;
     Ok(classify_exact_note(
@@ -287,6 +298,7 @@ pub(crate) async fn reconcile_ger_handoff_with_client(
     ))
 }
 
+#[cfg(not(test))]
 pub(crate) async fn reconcile_claim_handoff_with_client(
     store: &dyn Store,
     client: &mut MidenClientLib,
@@ -302,6 +314,15 @@ pub(crate) async fn reconcile_claim_handoff_with_client(
         // normal projection persists the event and its linked receipt atomically.
         return Ok(ExactNoteOutcome::AppliedElsewhere);
     }
+    reconcile_claim_snapshot_with_client(client, bridge_id, global_index, note_id).await
+}
+
+pub(crate) async fn reconcile_claim_snapshot_with_client(
+    client: &mut MidenClientLib,
+    bridge_id: AccountId,
+    global_index: U256,
+    note_id: String,
+) -> anyhow::Result<ExactNoteOutcome> {
     let snapshot =
         bridge_snapshot_with_client(client, bridge_id, None, Some(global_index), Some(note_id))
             .await?;
