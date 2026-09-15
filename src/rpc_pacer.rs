@@ -182,25 +182,36 @@ fn shared_pacer() -> Option<Arc<Pacer>> {
 /// impl would only be able to print the pacer anyway.
 pub struct PacedRpcClient {
     inner: Arc<dyn NodeRpcClient>,
-    pacer: Arc<Pacer>,
+    pacer: Option<Arc<Pacer>>,
 }
 
 impl PacedRpcClient {
-    /// `None` when pacing is not configured, so the caller keeps the bare
-    /// client rather than paying for a wrapper that does nothing.
-    pub fn new(inner: Arc<dyn NodeRpcClient>) -> Option<Self> {
-        shared_pacer().map(|pacer| Self { inner, pacer })
+    /// Instrument every node handle, including deployments without pacing.
+    pub fn new(inner: Arc<dyn NodeRpcClient>) -> Self {
+        Self {
+            inner,
+            pacer: shared_pacer(),
+        }
     }
 
-    async fn gate(&self) {
-        let waited = self.pacer.acquire().await;
-        ::metrics::counter!("miden_rpc_paced_calls_total").increment(1);
-        if !waited.is_zero() {
-            // Micros, and the NAME says micros. Incrementing a `_seconds_total`
-            // counter by `as_micros()` reported a 100ms wait as 100000 seconds.
-            ::metrics::counter!("miden_rpc_pace_wait_micros_total")
-                .increment(waited.as_micros() as u64);
+    async fn call<F, T>(&self, method: &'static str, future: F) -> Result<T, RpcError>
+    where
+        F: std::future::Future<Output = Result<T, RpcError>>,
+    {
+        if let Some(pacer) = &self.pacer {
+            let waited = crate::metrics::meter_writer_stage("rpc_pace", method, async {
+                Ok::<_, RpcError>(pacer.acquire().await)
+            })
+            .await?;
+            ::metrics::counter!("miden_rpc_paced_calls_total").increment(1);
+            if !waited.is_zero() {
+                ::metrics::counter!("miden_rpc_pace_wait_micros_total")
+                    .increment(waited.as_micros() as u64);
+            }
         }
+        // Includes the SDK's retries and retry-after sleeps, which are outside
+        // its per-request gRPC timeout. Never log URLs, auth metadata or payloads.
+        crate::metrics::meter_writer_stage("node_rpc", method, future).await
     }
 }
 
@@ -218,8 +229,11 @@ impl NodeRpcClient for PacedRpcClient {
     async fn get_transaction_encryption_key(
         &self,
     ) -> Result<AttestedTransactionEncryptionKey, RpcError> {
-        self.gate().await;
-        self.inner.get_transaction_encryption_key().await
+        self.call(
+            "get_transaction_encryption_key",
+            self.inner.get_transaction_encryption_key(),
+        )
+        .await
     }
 
     async fn submit_proven_transaction(
@@ -227,10 +241,12 @@ impl NodeRpcClient for PacedRpcClient {
         proven_transaction: ProvenTransaction,
         sealed_transaction_inputs: SealedTransactionInputs,
     ) -> Result<BlockNumber, RpcError> {
-        self.gate().await;
-        self.inner
-            .submit_proven_transaction(proven_transaction, sealed_transaction_inputs)
-            .await
+        self.call(
+            "submit_proven_transaction",
+            self.inner
+                .submit_proven_transaction(proven_transaction, sealed_transaction_inputs),
+        )
+        .await
     }
 
     async fn submit_proven_batch(
@@ -239,10 +255,12 @@ impl NodeRpcClient for PacedRpcClient {
         proposed_batch: ProposedBatch,
         transaction_inputs: Vec<SealedTransactionInputs>,
     ) -> Result<BlockNumber, RpcError> {
-        self.gate().await;
-        self.inner
-            .submit_proven_batch(proven_batch, proposed_batch, transaction_inputs)
-            .await
+        self.call(
+            "submit_proven_batch",
+            self.inner
+                .submit_proven_batch(proven_batch, proposed_batch, transaction_inputs),
+        )
+        .await
     }
 
     async fn get_block_header_by_number(
@@ -250,10 +268,12 @@ impl NodeRpcClient for PacedRpcClient {
         block_num: Option<BlockNumber>,
         include_mmr_proof: bool,
     ) -> Result<(BlockHeader, Option<MmrProof>), RpcError> {
-        self.gate().await;
-        self.inner
-            .get_block_header_by_number(block_num, include_mmr_proof)
-            .await
+        self.call(
+            "get_block_header_by_number",
+            self.inner
+                .get_block_header_by_number(block_num, include_mmr_proof),
+        )
+        .await
     }
 
     async fn get_block_by_number(
@@ -261,15 +281,16 @@ impl NodeRpcClient for PacedRpcClient {
         block_num: BlockNumber,
         include_proof: bool,
     ) -> Result<ProvenBlock, RpcError> {
-        self.gate().await;
-        self.inner
-            .get_block_by_number(block_num, include_proof)
-            .await
+        self.call(
+            "get_block_by_number",
+            self.inner.get_block_by_number(block_num, include_proof),
+        )
+        .await
     }
 
     async fn get_notes_by_id(&self, note_ids: &[NoteId]) -> Result<Vec<FetchedNote>, RpcError> {
-        self.gate().await;
-        self.inner.get_notes_by_id(note_ids).await
+        self.call("get_notes_by_id", self.inner.get_notes_by_id(note_ids))
+            .await
     }
 
     async fn sync_chain_mmr(
@@ -277,10 +298,11 @@ impl NodeRpcClient for PacedRpcClient {
         current_block_height: BlockNumber,
         upper_bound: SyncTarget,
     ) -> Result<ChainMmrInfo, RpcError> {
-        self.gate().await;
-        self.inner
-            .sync_chain_mmr(current_block_height, upper_bound)
-            .await
+        self.call(
+            "sync_chain_mmr",
+            self.inner.sync_chain_mmr(current_block_height, upper_bound),
+        )
+        .await
     }
 
     async fn sync_notes(
@@ -289,8 +311,11 @@ impl NodeRpcClient for PacedRpcClient {
         block_to: BlockNumber,
         note_tags: &BTreeSet<NoteTag>,
     ) -> Result<Vec<SyncNotesBlock>, RpcError> {
-        self.gate().await;
-        self.inner.sync_notes(block_from, block_to, note_tags).await
+        self.call(
+            "sync_notes",
+            self.inner.sync_notes(block_from, block_to, note_tags),
+        )
+        .await
     }
 
     async fn sync_nullifiers(
@@ -299,10 +324,11 @@ impl NodeRpcClient for PacedRpcClient {
         block_from: BlockNumber,
         block_to: BlockNumber,
     ) -> Result<Vec<NullifierUpdate>, RpcError> {
-        self.gate().await;
-        self.inner
-            .sync_nullifiers(prefix, block_from, block_to)
-            .await
+        self.call(
+            "sync_nullifiers",
+            self.inner.sync_nullifiers(prefix, block_from, block_to),
+        )
+        .await
     }
 
     async fn get_account(
@@ -310,13 +336,16 @@ impl NodeRpcClient for PacedRpcClient {
         account_id: AccountId,
         request: GetAccountRequest,
     ) -> Result<(BlockNumber, AccountProof), RpcError> {
-        self.gate().await;
-        self.inner.get_account(account_id, request).await
+        self.call("get_account", self.inner.get_account(account_id, request))
+            .await
     }
 
     async fn get_note_script_by_root(&self, root: Word) -> Result<Option<NoteScript>, RpcError> {
-        self.gate().await;
-        self.inner.get_note_script_by_root(root).await
+        self.call(
+            "get_note_script_by_root",
+            self.inner.get_note_script_by_root(root),
+        )
+        .await
     }
 
     async fn sync_storage_maps(
@@ -325,10 +354,12 @@ impl NodeRpcClient for PacedRpcClient {
         block_to: BlockNumber,
         account_id: AccountId,
     ) -> Result<StorageMapInfo, RpcError> {
-        self.gate().await;
-        self.inner
-            .sync_storage_maps(block_from, block_to, account_id)
-            .await
+        self.call(
+            "sync_storage_maps",
+            self.inner
+                .sync_storage_maps(block_from, block_to, account_id),
+        )
+        .await
     }
 
     async fn sync_account_vault(
@@ -337,10 +368,12 @@ impl NodeRpcClient for PacedRpcClient {
         block_to: BlockNumber,
         account_id: AccountId,
     ) -> Result<AccountVaultInfo, RpcError> {
-        self.gate().await;
-        self.inner
-            .sync_account_vault(block_from, block_to, account_id)
-            .await
+        self.call(
+            "sync_account_vault",
+            self.inner
+                .sync_account_vault(block_from, block_to, account_id),
+        )
+        .await
     }
 
     async fn sync_transactions(
@@ -349,20 +382,22 @@ impl NodeRpcClient for PacedRpcClient {
         block_to: BlockNumber,
         account_ids: Vec<AccountId>,
     ) -> Result<Vec<TransactionRecord>, RpcError> {
-        self.gate().await;
-        self.inner
-            .sync_transactions(block_from, block_to, account_ids)
-            .await
+        self.call(
+            "sync_transactions",
+            self.inner
+                .sync_transactions(block_from, block_to, account_ids),
+        )
+        .await
     }
 
     async fn get_network_id(&self) -> Result<NetworkId, RpcError> {
-        self.gate().await;
-        self.inner.get_network_id().await
+        self.call("get_network_id", self.inner.get_network_id())
+            .await
     }
 
     async fn get_rpc_limits(&self) -> Result<RpcLimits, RpcError> {
-        self.gate().await;
-        self.inner.get_rpc_limits().await
+        self.call("get_rpc_limits", self.inner.get_rpc_limits())
+            .await
     }
 
     fn has_rpc_limits(&self) -> Option<RpcLimits> {
@@ -375,16 +410,22 @@ impl NodeRpcClient for PacedRpcClient {
     }
 
     async fn get_status_unversioned(&self) -> Result<RpcStatusInfo, RpcError> {
-        self.gate().await;
-        self.inner.get_status_unversioned().await
+        self.call(
+            "get_status_unversioned",
+            self.inner.get_status_unversioned(),
+        )
+        .await
     }
 
     async fn get_network_note_status(
         &self,
         note_id: NoteId,
     ) -> Result<NetworkNoteStatusInfo, RpcError> {
-        self.gate().await;
-        self.inner.get_network_note_status(note_id).await
+        self.call(
+            "get_network_note_status",
+            self.inner.get_network_note_status(note_id),
+        )
+        .await
     }
 }
 

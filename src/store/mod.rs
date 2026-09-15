@@ -1105,6 +1105,15 @@ pub trait Store: Send + Sync + 'static {
         owner_tx_hash: TxHash,
         lease: std::time::Duration,
     ) -> anyhow::Result<Option<ClaimFence>>;
+    /// Renew only this live executing owner and fence. Never revive an expired
+    /// lease, replace a successor, or reopen a prepared submission.
+    async fn renew_claim_fenced(
+        &self,
+        global_index: U256,
+        owner_tx_hash: TxHash,
+        fence: u64,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<bool>;
     /// Atomically seal the current fence and persist an exact prepared note
     /// identity before the first external submission side effect.
     #[allow(clippy::too_many_arguments)]

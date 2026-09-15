@@ -542,6 +542,13 @@ impl WriterWorkerHandle {
 /// goes terminal. That is the gauge a drain/quiesce check must read.
 fn publish_inflight_gauges(inflight: &DashMap<TxHash, InFlightEntry>) {
     ::metrics::gauge!("agglayer_writer_inflight_jobs").set(inflight.len() as f64);
+    let oldest = inflight
+        .iter()
+        .filter(|e| !e.state.is_terminal())
+        .map(|e| e.created_at.elapsed())
+        .max()
+        .unwrap_or_default();
+    ::metrics::gauge!("agglayer_writer_oldest_nonterminal_age_seconds").set(oldest.as_secs_f64());
     ::metrics::gauge!("agglayer_writer_nonterminal_jobs")
         .set(inflight.iter().filter(|e| !e.state.is_terminal()).count() as f64);
 }
@@ -723,6 +730,8 @@ impl WriterWorker {
                         }
                     }
                 }
+
+                publish_inflight_gauges(&sweeper_inflight);
 
                 for (hash, signer, nonce) in &to_renew {
                     let signer = format!("{signer:#x}");
@@ -918,8 +927,20 @@ impl WriterWorker {
         let dispatch_service = self.service.clone();
         // Kept so a fee-starved job can be parked and re-dispatched verbatim.
         let retry_copy = job.clone();
-        let result =
-            supervise_dispatch(async move { dispatch_job(&dispatch_service, job).await }).await;
+        use tracing::Instrument;
+        let span = tracing::info_span!("writer_job", %hash, %job_id, %signer, kind = kind.as_str());
+        let result = supervise_dispatch(
+            async move {
+                crate::metrics::meter_writer_stage(
+                    kind.as_str(),
+                    "dispatch",
+                    dispatch_job(&dispatch_service, job),
+                )
+                .await
+            }
+            .instrument(span),
+        )
+        .await;
         match result {
             Ok(()) => {
                 // Best-effort: read the freshly-bumped tip to attribute the
@@ -1732,6 +1753,7 @@ mod tests {
         for want in [
             "agglayer_writer_queue_depth 0",
             "agglayer_writer_nonterminal_jobs 0",
+            "agglayer_writer_oldest_nonterminal_age_seconds 0",
         ] {
             assert!(
                 rendered.lines().any(|l| l == want),

@@ -1944,6 +1944,31 @@ impl Store for InMemoryStore {
         }))
     }
 
+    async fn renew_claim_fenced(
+        &self,
+        global_index: U256,
+        owner_tx_hash: TxHash,
+        fence: u64,
+        lease: std::time::Duration,
+    ) -> anyhow::Result<bool> {
+        let mut claimed = self.claimed.write();
+        let now = self.claim_clock_now();
+        let Some(record) = claimed.get_mut(&global_index) else {
+            return Ok(false);
+        };
+        if record.state != ClaimState::Executing
+            || record.owner_tx_hash != Some(owner_tx_hash)
+            || record.fence != fence
+            || !record
+                .lease_expires_at
+                .is_some_and(|deadline| deadline > now)
+        {
+            return Ok(false);
+        }
+        record.lease_expires_at = Some(now + lease);
+        Ok(true)
+    }
+
     async fn prepare_claim_submission_fenced(
         &self,
         global_index: U256,

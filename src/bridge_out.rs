@@ -1533,10 +1533,13 @@ impl SyncListener for BridgeOutScanner {
     }
 
     async fn on_post_sync(&self, client: &mut MidenClientLib) -> anyhow::Result<()> {
-        let consumed_notes = client
-            .get_input_notes(NoteFilter::Consumed)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
+        let consumed_notes = crate::metrics::meter_writer_stage(
+            "bridge_scanner",
+            "load_consumed_notes",
+            client.get_input_notes(NoteFilter::Consumed),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
 
         // Cantina #23 + #19 — the per-note pass is MONITOR-ONLY: it records into
         // the twin (#6) / forged-MINT (#2/#4) trackers and
@@ -1546,9 +1549,15 @@ impl SyncListener for BridgeOutScanner {
         // consumed B2AGG note, which raced `restore()` (#23) and misnumbered
         // synthetic blocks (#19). The SyntheticProjector is now the sole
         // emitter/tip-advancer.
-        let landed_claim_ids = self
-            .scan_consumed_notes_monitors(&consumed_notes)
+        tracing::debug!(target: "writer_diagnostics", notes = consumed_notes.len(), "bridge monitor scan started");
+        let landed_claim_ids =
+            crate::metrics::meter_writer_stage("bridge_scanner", "scan_monitors", async {
+                Ok::<_, std::convert::Infallible>(
+                    self.scan_consumed_notes_monitors(&consumed_notes).await,
+                )
+            })
             .await
+            .expect("infallible monitor scan")
             .landed_claim_ids;
 
         // Cantina #4 ownership monitor — on a slower cadence (every N ticks)
@@ -1558,7 +1567,12 @@ impl SyncListener for BridgeOutScanner {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.ownership_probe_every_n_ticks > 0
             && tick.is_multiple_of(self.ownership_probe_every_n_ticks)
-            && let Err(e) = self.run_faucet_ownership_check(client).await
+            && let Err(e) = crate::metrics::meter_writer_stage(
+                "bridge_scanner",
+                "faucet_ownership",
+                self.run_faucet_ownership_check(client),
+            )
+            .await
         {
             tracing::warn!(
                 target: "bridge_out::ownership",

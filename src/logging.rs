@@ -244,4 +244,16 @@ mod tests {
             );
         });
     }
+    #[test]
+    fn issue_210_production_filter_keeps_writer_diagnostics() {
+        with_debug_filter(|capture| {
+            tracing::debug!(target: "writer_diagnostics", "operator enabled phase tracing");
+            let seen = capture.seen.lock().unwrap();
+            assert!(
+                seen.iter()
+                    .any(|(target, level)| target == "writer_diagnostics"
+                        && *level == tracing::Level::DEBUG)
+            );
+        });
+    }
 }

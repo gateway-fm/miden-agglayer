@@ -3,7 +3,7 @@
 //! Requires:
 //! - `--features postgres`
 //! - `DATABASE_URL` env var pointing to a PostgreSQL instance
-//! - The schema from `migrations/001_initial.sql` applied
+//! - All numbered SQL migrations from `migrations/` applied
 //!
 //! Run with:
 //!   DATABASE_URL=postgres://... cargo test --features postgres pgstore
@@ -551,7 +551,10 @@ async fn test_pgstore_success_supersedes_prior_failure() {
     };
     reset_state(&store).await;
 
-    let tx_hash = TxHash::from([0x5Bu8; 32]);
+    // The full suite shares a database; another regression uses [0x5b; 32].
+    let mut hash = [0x5Bu8; 32];
+    hash[..8].copy_from_slice(&rand_u64().to_be_bytes());
+    let tx_hash = TxHash::from(hash);
     // Attach a ClaimEvent-shaped log so the override's materialisation is checked.
     let mut entry = dummy_txn_entry();
     entry.logs = vec![alloy::primitives::LogData::new_unchecked(
@@ -612,11 +615,17 @@ async fn test_pgstore_txn_commit_concurrent_begin_single_snapshot() {
     reset_state(&store).await;
     let store = std::sync::Arc::new(store);
 
+    // Keep these rows separate from exact handoffs created by other tests.
+    // A failure after a handoff intentionally remains pending, which is a
+    // different invariant from the unsubmitted begin/commit race tested here.
+    let run = rand_u64().to_be_bytes();
     let mut handles = Vec::new();
     for i in 0..64u8 {
         let store = store.clone();
         handles.push(tokio::spawn(async move {
-            let tx_hash = TxHash::from([i; 32]);
+            let mut hash = [i; 32];
+            hash[..8].copy_from_slice(&run);
+            let tx_hash = TxHash::from(hash);
             // Racer A: begin then a failure commit.
             let a = {
                 let store = store.clone();
@@ -1175,9 +1184,8 @@ async fn test_pgstore_commit_b2agg_event_atomic_emits_log_once() {
 
 // ── RD-913 monitor trackers ─────────────────────────────────
 
-/// PgStore round-trip for monitor_burn_serials. INSERT … ON CONFLICT
-/// must report true on first observation and false on the duplicate,
-/// matching the InMemoryStore contract.
+/// PgStore round-trip for monitor_burn_serials: a repeated sighting of the
+/// same note is benign; only a different note reusing its serial is a collision.
 #[tokio::test]
 async fn test_pgstore_rd913_burn_serial_observe() {
     let Some(store) = pg_store().await else {
@@ -1188,10 +1196,27 @@ async fn test_pgstore_rd913_burn_serial_observe() {
     let mut serial = [0u8; 32];
     serial[..8].copy_from_slice(&rand_u64().to_be_bytes());
     assert!(!store.burn_serial_seen(&serial).await.unwrap());
-    assert!(store.burn_serial_observe(&serial).await.unwrap());
+    let note = [0xa1; 32];
+    let other_note = [0xb2; 32];
+    assert!(
+        store
+            .burn_serial_observe_for_note(&serial, &note)
+            .await
+            .unwrap()
+    );
     assert!(store.burn_serial_seen(&serial).await.unwrap());
-    // Second insert returns false (Cantina #5 duplicate signal).
-    assert!(!store.burn_serial_observe(&serial).await.unwrap());
+    assert!(
+        store
+            .burn_serial_observe_for_note(&serial, &note)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .burn_serial_observe_for_note(&serial, &other_note)
+            .await
+            .unwrap()
+    );
 }
 
 /// PgStore round-trip for monitor_twin_notes. Per-NoteId commitments
@@ -2369,6 +2394,106 @@ async fn test_pgstore_reverted_receipt_conditional() {
     );
 }
 
+/// Renewal is an atomic CAS against owner, fence, state and database time.
+#[tokio::test]
+async fn test_pgstore_issue_210_claim_renewal_preserves_fences() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let gi = U256::from(rand_u64());
+    let owner = alloy::primitives::keccak256(format!("owner-{gi}"));
+    let other = alloy::primitives::keccak256(format!("other-{gi}"));
+    let lease = std::time::Duration::from_secs(120);
+    let fence = store
+        .try_claim_fenced(gi, owner, lease)
+        .await
+        .unwrap()
+        .unwrap()
+        .fence;
+    let url = std::env::var("DATABASE_URL").unwrap();
+    let (db, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let connection = tokio::spawn(async move {
+        connection.await.unwrap();
+    });
+    let key = format!("{gi:#x}");
+    db.execute("UPDATE claimed_indices SET lease_expires_at = now() + interval '1 second' WHERE global_index = $1", &[&key]).await.unwrap();
+    assert!(
+        !store
+            .renew_claim_fenced(gi, other, fence, lease)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .renew_claim_fenced(gi, owner, fence + 1, lease)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .renew_claim_fenced(gi, owner, fence, lease)
+            .await
+            .unwrap()
+    );
+    let row = db.query_one("SELECT lease_expires_at > now() + interval '110 seconds' FROM claimed_indices WHERE global_index = $1", &[&key]).await.unwrap();
+    assert!(
+        row.get::<_, bool>(0),
+        "renewal must actually extend the deadline"
+    );
+    db.execute("UPDATE claimed_indices SET lease_expires_at = now() - interval '1 second' WHERE global_index = $1", &[&key]).await.unwrap();
+    assert!(
+        !store
+            .renew_claim_fenced(gi, owner, fence, lease)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .prepare_claim_submission_fenced(gi, owner, fence, owner, "expired", "expired-id", 100)
+            .await
+            .unwrap()
+    );
+    let successor = store
+        .try_reclaim_claim_fenced(gi, other, lease)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !store
+            .renew_claim_fenced(gi, owner, fence, lease)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .renew_claim_fenced(gi, other, successor.fence, lease)
+            .await
+            .unwrap()
+    );
+    let note = format!("renewed-{gi}");
+    assert!(
+        store
+            .prepare_claim_submission_fenced(gi, other, successor.fence, other, &note, &note, 100)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .renew_claim_fenced(gi, other, successor.fence, lease)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .unclaim_fenced(&gi, other, successor.fence)
+            .await
+            .unwrap()
+    );
+    connection.abort();
+}
+
 /// PostgreSQL claim reclaim is fenced through the atomic submitted-state + note-link seal.
 #[tokio::test]
 async fn test_pgstore_claim_reclaim_fences_stale_owner() {
@@ -2423,13 +2548,20 @@ async fn test_pgstore_different_tx_cannot_take_over() {
     let lease = std::time::Duration::from_secs(90);
     let base = rand_u64();
     let addr = format!("0x{:040x}", base as u128);
-    let ha = TxHash::from([(base % 251) as u8 + 10; 32]);
-    let hb = TxHash::from([(base % 241) as u8 + 11; 32]);
+    let mut hash_a = [0xa1; 32];
+    hash_a[..8].copy_from_slice(&base.to_be_bytes());
+    let mut hash_b = hash_a;
+    hash_b[31] = 0xb1;
+    let ha = TxHash::from(hash_a);
+    let hb = TxHash::from(hash_b);
 
     let NonceReservation::Won { fence } = store.reserve_nonce(&addr, 1, ha, lease).await.unwrap()
     else {
         panic!("fresh must win");
     };
+    // Ambiguity starts at durable admission. A pre-admission failure without
+    // a transaction row is deliberately reclaimable by a different hash.
+    store.txn_begin(ha, dummy_txn_entry()).await.unwrap();
     store
         .release_reservation(&addr, 1, ha, fence, false)
         .await

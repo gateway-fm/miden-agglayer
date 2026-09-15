@@ -255,21 +255,25 @@ impl TransactionAuthenticator for ProxyKeystore {
                 })?;
                 // The commitment word IS the message the signer hashes; see
                 // `remote_signer`'s digest-compatibility notes.
-                let signature = backend
-                    .client
-                    .sign(identifier, signing_info.to_commitment())
-                    .await
-                    .inspect_err(|_| {
-                        // Signer loss AFTER startup is otherwise invisible: the
-                        // boot check has already passed and there is no fallback
-                        // path to notice.
-                        metrics::counter!("remote_signer_signature_failures_total").increment(1);
-                    })
-                    .map_err(|err| {
-                        AuthenticationError::other(format!(
-                            "remote signer failed to sign for {identifier}: {err:#}"
-                        ))
-                    })?;
+                let signature = crate::metrics::meter_writer_stage(
+                    "client",
+                    "remote_sign",
+                    backend
+                        .client
+                        .sign(identifier, signing_info.to_commitment()),
+                )
+                .await
+                .inspect_err(|_| {
+                    // Signer loss AFTER startup is otherwise invisible: the
+                    // boot check has already passed and there is no fallback
+                    // path to notice.
+                    metrics::counter!("remote_signer_signature_failures_total").increment(1);
+                })
+                .map_err(|err| {
+                    AuthenticationError::other(format!(
+                        "remote signer failed to sign for {identifier}: {err:#}"
+                    ))
+                })?;
                 metrics::counter!("remote_signer_signatures_total").increment(1);
                 Ok(Signature::EcdsaK256Keccak(signature))
             }

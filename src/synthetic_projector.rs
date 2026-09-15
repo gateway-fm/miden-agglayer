@@ -1633,9 +1633,13 @@ impl SyntheticProjector {
         let mut cursor = self.cursor.load(Ordering::Acquire);
         // Reconcile even when projection is already at the tip so note imports do not stall
         // while block production is paused.
-        if let Err(e) = self
-            .reconcile_notes(client, &self.node_rpc, tip, reconcile_patience)
-            .await
+        tracing::debug!(target: "writer_diagnostics", cursor, tip, "projector pass started");
+        if let Err(e) = crate::metrics::meter_writer_stage(
+            "projector",
+            "reconcile_notes",
+            self.reconcile_notes(client, &self.node_rpc, tip, reconcile_patience),
+        )
+        .await
         {
             match reconcile_patience {
                 ReconcilePatience::LiveTick => tracing::warn!(
@@ -1654,7 +1658,13 @@ impl SyntheticProjector {
         }
         // Receipt polling is store-only. Resolve confirmed duplicates here, on
         // the existing single-flight projector task, with a bounded batch.
-        if let Err(error) = self.reconcile_pending_duplicates(client).await {
+        if let Err(error) = crate::metrics::meter_writer_stage(
+            "projector",
+            "reconcile_duplicates",
+            self.reconcile_pending_duplicates(client),
+        )
+        .await
+        {
             tracing::warn!(
                 error = %format!("{error:#}"),
                 "pending duplicate reconciliation failed (transient — will retry next tick)"
@@ -1697,9 +1707,12 @@ impl SyntheticProjector {
             Vec::new()
         };
         if live
-            && let Err(e) = self
-                .backfill_synthetic_claim_calldata(&consumed, cursor)
-                .await
+            && let Err(e) = crate::metrics::meter_writer_stage(
+                "projector",
+                "backfill_claim_calldata",
+                self.backfill_synthetic_claim_calldata(&consumed, cursor),
+            )
+            .await
         {
             tracing::warn!(
                 error = %format!("{e:#}"),
@@ -1863,13 +1876,29 @@ impl SyntheticProjector {
         while cursor < tip {
             let next = cursor + 1;
             let bucket = by_block.get(&next).unwrap_or(&no_notes);
-            self.project_block_notes(bucket, &output_metadata, next, Some(client), &within_tx_pos)
-                .await?;
+            tracing::debug!(target: "writer_diagnostics", block = next, tip, notes = bucket.len(), "projector block started");
+            crate::metrics::meter_writer_stage(
+                "projector",
+                "project_block",
+                self.project_block_notes(
+                    bucket,
+                    &output_metadata,
+                    next,
+                    Some(client),
+                    &within_tx_pos,
+                ),
+            )
+            .await?;
             // Advance the cursor only after the block is fully projected, so a
             // crash mid-block re-projects (idempotently) rather than skipping.
             // Persist BEFORE updating the in-memory cursor so the durable cursor
             // never runs ahead of fully-projected state.
-            self.store.set_projector_cursor(next).await?;
+            crate::metrics::meter_writer_stage(
+                "projector",
+                "persist_cursor",
+                self.store.set_projector_cursor(next),
+            )
+            .await?;
             self.cursor.store(next, Ordering::Release);
             cursor = next;
         }

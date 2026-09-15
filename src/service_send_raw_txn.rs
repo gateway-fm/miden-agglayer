@@ -525,11 +525,11 @@ pub(crate) async fn worker_handle_claim_asset(
     // `InFlight`, so no interleaving hard-rejects a landed gi.
     let tx_nonce = envelope_nonce(&txn_envelope);
     let signer_str = format!("{signer:#x}");
-    let claim_fence = match acquire_claim_lock(
-        &service.store,
-        params.globalIndex,
-        txn_hash,
-        claim_resubmit_ttl(),
+    let claim_lease = claim_resubmit_ttl();
+    let claim_fence = match crate::metrics::meter_writer_stage(
+        "claim",
+        "acquire_lease",
+        acquire_claim_lock(&service.store, params.globalIndex, txn_hash, claim_lease),
     )
     .await?
     {
@@ -580,6 +580,7 @@ pub(crate) async fn worker_handle_claim_asset(
         params.globalIndex,
         txn_hash,
         claim_fence,
+        claim_lease,
     );
 
     // RD-860 / #185 — an unresolvable-destination claim is accepted-and-reverted
@@ -670,16 +671,17 @@ pub(crate) async fn worker_handle_claim_asset(
 
 /// How long a `try_claim` record may sit WITHOUT its ClaimEvent landing before it is
 /// treated as an orphaned (crashed-mid-flight) submission and superseded on the next
-/// retry. Env-tunable via `CLAIM_RESUBMIT_TTL_SECS`; the default comfortably covers the
-/// slowest legitimate in-flight path (Miden proof + commit, tens of seconds)
-/// while unwedging a crash-orphaned deposit within ~2 sponsor retries.
+/// retry. Env-tunable via `CLAIM_RESUBMIT_TTL_SECS`. This is a renewable ownership
+/// lease, not an upper bound on claim duration: queueing, sync and RPC retries can
+/// exceed the default 120s even when proving is fast. ClaimGuard renews live work;
+/// a crashed owner stops renewing and becomes reclaimable after this interval.
 pub(crate) fn claim_resubmit_ttl() -> std::time::Duration {
     const DEFAULT_SECS: u64 = 120;
     let secs = std::env::var("CLAIM_RESUBMIT_TTL_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_SECS);
-    std::time::Duration::from_secs(secs)
+    std::time::Duration::from_secs(secs.max(3))
 }
 
 /// #55 BLOCKER 1 — how long a won `(signer, nonce)` admission lease is owned before
@@ -1059,6 +1061,9 @@ impl ClaimSubmissionFence {
             )
             .await?
         {
+            tracing::warn!(target: "writer_diagnostics", global_index = %self.global_index,
+                owner_tx_hash = %self.owner_tx_hash, fence = self.fence,
+                "claim submission refused: lease expired or ownership/state changed");
             anyhow::bail!(
                 "claim ownership fence lost before submission for global_index {}",
                 self.global_index
@@ -1084,6 +1089,7 @@ impl ClaimSubmissionFence {
 }
 
 pub(crate) struct ClaimGuard {
+    renewal: AbortTaskOnDrop,
     store: Option<std::sync::Arc<dyn crate::store::Store>>,
     global_index: alloy::primitives::U256,
     owner_tx_hash: TxHash,
@@ -1096,8 +1102,47 @@ impl ClaimGuard {
         global_index: alloy::primitives::U256,
         owner_tx_hash: TxHash,
         fence: u64,
+        lease: std::time::Duration,
     ) -> Self {
+        use tracing::Instrument;
+        let renewal_store = store.clone();
+        let period = std::cmp::max(std::time::Duration::from_millis(1), lease / 3);
+        tracing::debug!(target: "writer_diagnostics", %global_index, %owner_tx_hash,
+            fence, lease_secs = lease.as_secs_f64(), "claim lease acquired; starting renewal");
+        let renewal = AbortTaskOnDrop::new(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let result = tokio::time::timeout(period, renewal_store.renew_claim_fenced(
+                    global_index, owner_tx_hash, fence, lease,
+                )).await;
+                let outcome = match result {
+                    Ok(Ok(true)) => "renewed",
+                    Ok(Ok(false)) => {
+                        tracing::debug!(target: "writer_diagnostics", %global_index, %owner_tx_hash,
+                            fence, "claim lease renewal stopped: sealed, released, expired or replaced");
+                        ::metrics::counter!("claim_lease_renewals_total", "outcome" => "stopped").increment(1);
+                        break;
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(target: "writer_diagnostics", %global_index, %owner_tx_hash,
+                            fence, %error, "claim lease renewal failed");
+                        "error"
+                    }
+                    Err(_) => {
+                        tracing::warn!(target: "writer_diagnostics", %global_index, %owner_tx_hash,
+                            fence, "claim lease renewal timed out");
+                        "timeout"
+                    }
+                };
+                ::metrics::counter!("claim_lease_renewals_total", "outcome" => outcome).increment(1);
+                tracing::debug!(target: "writer_diagnostics", %global_index, %owner_tx_hash,
+                    fence, outcome, "claim lease renewal completed");
+            }
+        }.instrument(tracing::Span::current())));
         Self {
+            renewal,
             store: Some(store),
             global_index,
             owner_tx_hash,
@@ -1115,10 +1160,12 @@ impl ClaimGuard {
     }
 
     fn commit(mut self) {
+        self.renewal.abort();
         self.store = None;
     }
 
     async fn release_explicitly(mut self) {
+        self.renewal.abort();
         if let Some(store) = self.store.take() {
             let _ = store
                 .unclaim_fenced(&self.global_index, self.owner_tx_hash, self.fence)
@@ -1129,6 +1176,7 @@ impl ClaimGuard {
 
 impl Drop for ClaimGuard {
     fn drop(&mut self) {
+        self.renewal.abort();
         if let Some(store) = self.store.take() {
             let global_index = self.global_index;
             let owner_tx_hash = self.owner_tx_hash;
@@ -1762,6 +1810,9 @@ async fn service_send_raw_txn_inner(
             // (it is queued), so in practice this is the past-nonce path — which
             // is exactly the one claimtxman can self-heal from.
             if tx_nonce < expected_nonce {
+                tracing::debug!(target: "writer_diagnostics", %txn_hash, %signer_str,
+                    tx_nonce, expected_nonce, admitted = false,
+                    "rejected past-nonce hash; no receipt will be created for this submission");
                 anyhow::bail!(
                     "nonce too low: next nonce {expected_nonce}, tx nonce {tx_nonce} (R4 replay / out-of-order guard for {signer_str})"
                 );
@@ -6242,6 +6293,134 @@ mod tests {
         let _ = shutdown.send(());
     }
 
+    /// Reproduce the 238s testnet job against the real lease/fence boundary.
+    /// A fast local proof cannot exercise this: delay the whole claim instead.
+    #[tokio::test(start_paused = true)]
+    async fn issue_210_live_claim_can_prepare_after_238_seconds() {
+        let concrete = std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let store: std::sync::Arc<dyn crate::store::Store> = concrete.clone();
+        let gi = U256::from(210);
+        let owner = TxHash::from([0xaa; 32]);
+        let other = TxHash::from([0xbb; 32]);
+        let lease = std::time::Duration::from_secs(120);
+        let fence = store
+            .try_claim_fenced(gi, owner, lease)
+            .await
+            .unwrap()
+            .unwrap()
+            .fence;
+        let guard = ClaimGuard::new(store.clone(), gi, owner, fence, lease);
+        tokio::task::yield_now().await;
+        for seconds in [40, 40, 40, 40, 40, 38] {
+            let elapsed = std::time::Duration::from_secs(seconds);
+            concrete.test_backdate_claim(gi, elapsed);
+            tokio::time::advance(elapsed).await;
+            tokio::task::yield_now().await;
+            assert!(
+                store
+                    .try_reclaim_claim_fenced(gi, other, lease)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a live claim must retain ownership beyond its original 120s lease"
+            );
+        }
+        guard
+            .submission_fence()
+            .prepare("note-238", "id-238", 100)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .renew_claim_fenced(gi, owner, fence, lease)
+                .await
+                .unwrap(),
+            "prepared handoff must stop renewal without reopening the claim"
+        );
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            store
+                .get_note_link_for_tx(&format!("{owner:#x}"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("note-238")
+        );
+        assert!(
+            store
+                .try_reclaim_claim_fenced(gi, other, lease)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_210_expired_claim_cannot_renew_or_prepare_even_without_a_successor() {
+        let concrete = crate::store::memory::InMemoryStore::new();
+        let gi = U256::from(211);
+        let owner = TxHash::from([0xaa; 32]);
+        let lease = std::time::Duration::from_secs(120);
+        let fence = concrete
+            .try_claim_fenced(gi, owner, lease)
+            .await
+            .unwrap()
+            .unwrap()
+            .fence;
+        concrete.test_backdate_claim(gi, std::time::Duration::from_secs(238));
+        assert!(
+            !concrete
+                .renew_claim_fenced(gi, owner, fence, lease)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !concrete
+                .prepare_claim_submission_fenced(
+                    gi,
+                    owner,
+                    fence,
+                    owner,
+                    "expired",
+                    "expired-id",
+                    100
+                )
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_210_claim_guard_cancellation_stops_renewal_and_releases_only_its_fence() {
+        let store: std::sync::Arc<dyn crate::store::Store> =
+            std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let gi = U256::from(212);
+        let owner = TxHash::from([0xaa; 32]);
+        let lease = std::time::Duration::from_secs(120);
+        let fence = store
+            .try_claim_fenced(gi, owner, lease)
+            .await
+            .unwrap()
+            .unwrap()
+            .fence;
+        let guard = ClaimGuard::new(store.clone(), gi, owner, fence, lease);
+        let abort = guard.renewal.0.as_ref().unwrap().abort_handle();
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert!(
+            abort.is_finished(),
+            "a detached heartbeat would keep crashed work alive forever"
+        );
+        assert!(
+            store
+                .try_claim_fenced(gi, owner, lease)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
     /// A stale claim owner cannot seal or release a successor after lease reclaim.
     #[tokio::test]
     async fn claim_reclaim_is_fenced_through_external_submission_boundary() {
@@ -6264,6 +6443,18 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(b.fence > a.fence);
+        assert!(
+            !store
+                .renew_claim_fenced(gi, tx_a, a.fence, ttl)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .renew_claim_fenced(gi, tx_b, b.fence, ttl)
+                .await
+                .unwrap()
+        );
         assert!(
             !store
                 .prepare_claim_submission_fenced(
