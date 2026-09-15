@@ -1239,6 +1239,33 @@ async fn wait_for_transaction_commit_inner(
 mod tests {
     use super::*;
 
+    /// This is the nested submit/proof path used by fee-vault funding. It
+    /// must stay small before polling, including the real pinned SDK future.
+    #[tokio::test]
+    async fn funding_submission_futures_stay_small_before_first_poll() {
+        use miden_client::transaction::TransactionRequestBuilder;
+        let mut client = crate::test_helpers::offline_miden_client_lib().await;
+        let account_id =
+            miden_protocol::account::AccountId::from_hex("0xcc0000000000dd010000ee000000ff")
+                .unwrap();
+        let submit = submit_new_transaction(
+            &mut client,
+            account_id,
+            TransactionRequestBuilder::new().build().unwrap(),
+        );
+        let submit_bytes = std::mem::size_of_val(&submit);
+        assert!(
+            submit_bytes < 4096,
+            "guarded SDK submit occupies {submit_bytes} bytes"
+        );
+        let proof = crate::metrics::meter_proof(crate::metrics::ProofKind::Init, submit);
+        let proof_bytes = std::mem::size_of_val(&proof);
+        assert!(
+            proof_bytes < 4096,
+            "funding proof wrapper occupies {proof_bytes} bytes"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn issue_210_sync_deadline_drops_work_before_releasing_the_client() {
         let dropped = Arc::new(AtomicBool::new(false));
