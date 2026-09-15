@@ -7,7 +7,7 @@
 use crate::client_access::ClientAccess;
 use miden_client::store::{InputNoteRecord, InputNoteState, NoteFilter};
 use miden_client::utils::Deserializable;
-use miden_protocol::note::NoteDetailsCommitment;
+use miden_protocol::note::{NoteDetailsCommitment, NoteId};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OpenFlags, params};
 use std::collections::BTreeSet;
@@ -99,6 +99,22 @@ impl ConsumedNoteFeed {
                         .into_iter()
                         .filter(InputNoteRecord::is_consumed),
                 );
+            }
+            // Claim submission stores the full NoteId. Legacy monitor rows
+            // and retry/change keys use details commitments. Query both
+            // indexes for explicit tracker IDs, then deduplicate the records.
+            let mut seen: BTreeSet<_> =
+                notes.iter().map(|note| note.details_commitment()).collect();
+            for chunk in extra.chunks(READ_BATCH) {
+                let ids = chunk
+                    .iter()
+                    .map(|key| NoteId::read_from_bytes(key))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for note in client.get_input_notes(NoteFilter::List(ids)).await? {
+                    if note.is_consumed() && seen.insert(note.details_commitment()) {
+                        notes.push(note);
+                    }
+                }
             }
             notes
         };
@@ -444,8 +460,13 @@ mod tests {
             .await
             .unwrap();
         let batch = feed.load(&mut access, false, &[]).await.unwrap();
-        assert_eq!(batch.notes, vec![enriched]);
+        assert_eq!(batch.notes, vec![enriched.clone()]);
         feed.commit(&batch, []);
+        let by_id = feed
+            .load(&mut access, false, &[enriched.id().unwrap().as_bytes()])
+            .await
+            .unwrap();
+        assert_eq!(by_id.notes, vec![enriched]);
         assert!(
             feed.load(&mut access, false, &[])
                 .await
