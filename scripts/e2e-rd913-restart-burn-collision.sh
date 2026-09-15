@@ -63,7 +63,9 @@ pass() { echo -e "${GREEN}[$(date +%H:%M:%S)] PASS:${NC} $*"; }
 step() { echo -e "${CYAN}[$(date +%H:%M:%S)] STEP:${NC} $*"; }
 
 pgquery() {
-    PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -t -A -c "$1" 2>/dev/null
+    # Keep RETURNING rows, but suppress command tags such as "INSERT 0 0".
+    # Otherwise a correctly rejected duplicate looks like a non-empty result.
+    PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -q -t -A -c "$1" 2>/dev/null
 }
 
 wait_for() {
