@@ -965,6 +965,18 @@ struct ScanOutcome {
     registry_degraded: bool,
 }
 
+impl ScanOutcome {
+    fn record_landed_claim(&mut self, note: &InputNoteRecord) {
+        // Keep legacy details keys, and recognize the full NoteId that
+        // claim.rs actually writes into the expected-MINT tracker.
+        self.landed_claim_ids
+            .insert(note.details_commitment().as_bytes());
+        if let Some(id) = note.id() {
+            self.landed_claim_ids.insert(id.as_bytes());
+        }
+    }
+}
+
 impl BridgeOutScanner {
     /// Cantina #23 / #19 — client-free, **MONITOR-ONLY** pass over the
     /// consumed-note set. Preserves the existing all-note twin observation,
@@ -1046,9 +1058,7 @@ impl BridgeOutScanner {
                 if let Some(landed_claim) = cache.observations.get(&key) {
                     outcome.cached += 1;
                     if *landed_claim {
-                        outcome
-                            .landed_claim_ids
-                            .insert(note.details_commitment().as_bytes());
+                        outcome.record_landed_claim(note);
                     }
                 } else {
                     work.push((note, key, NoteProvenanceFacts::from_note(note), true));
@@ -1179,7 +1189,7 @@ impl BridgeOutScanner {
                 // landed" signal for this proxy's expected-MINT tracker.
                 MonitoredNoteKind::Claim => {
                     if facts.consumer == Some(self.bridge_account_id) {
-                        outcome.landed_claim_ids.insert(id_bytes);
+                        outcome.record_landed_claim(note);
                     }
                 }
                 // Cantina #5 — unchanged from main. PR #123 does not alter
@@ -3216,7 +3226,7 @@ mod tests {
             [0; 20],
             embedded_address(ids.local_service),
             100,
-            None,
+            Some(ids.local_service),
             Some(ids.bridge),
             Some(ids.bridge),
         );
@@ -3258,6 +3268,10 @@ mod tests {
         assert_eq!(store.monitor_calls("claim_mint_expected_get"), before);
         store
             .expected_mint_record(&[9; 32], &claim.details_commitment().as_bytes())
+            .await
+            .unwrap();
+        store
+            .expected_mint_record(&[10; 32], &claim.id().unwrap().as_bytes())
             .await
             .unwrap();
         scanner.run_post_sync(&mut access).await.unwrap();
@@ -3364,8 +3378,8 @@ mod tests {
         for (note, landed) in [
             (&unknown, 0),
             (&attributed, 1),
-            (&with_metadata, 1),
-            (&twin, 1),
+            (&with_metadata, 2),
+            (&twin, 2),
         ] {
             let out = scanner
                 .scan_consumed_notes_monitors(std::slice::from_ref(note))
@@ -3591,7 +3605,13 @@ mod tests {
                     (1, 1, 0)
                 );
                 assert!(evicted.forged_mint_alerts.is_empty());
-                assert_eq!(evicted.landed_claim_ids.len(), 1);
+                assert_eq!(
+                    evicted.landed_claim_ids,
+                    std::collections::HashSet::from([
+                        notes[0].details_commitment().as_bytes(),
+                        notes[0].id().unwrap().as_bytes(),
+                    ])
+                );
             }
         }
     }
