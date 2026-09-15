@@ -94,6 +94,8 @@ test-scripts: ## Syntax-check + run the shell guard test harnesses (no docker ne
 	bash -n scripts/e2e-full-db-loss-recovery.sh
 	bash -n scripts/test-quiesce-predicate.sh
 	bash scripts/test-quiesce-predicate.sh
+	bash -n scripts/e2e-recovery-readiness.sh
+	python3 scripts/test-recovery-readiness.py
 
 .PHONY: test-e2e
 test-e2e: ## Spin up the stack WITH the L2B overlay, run ALL E2E tiers (incl. L2<->L2 + Miden-origin), tear down (fully self-contained)
