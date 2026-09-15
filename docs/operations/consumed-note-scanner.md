@@ -105,7 +105,8 @@ window. Trace logging can be noisy while a historical backlog is unresolved.
   retain the existing grace/retry behavior and terminal alert deduplication.
 - CLAIM history is recorded before MINT reconciliation, including on a cold
   replay after DB loss. Active expected-MINT tracker IDs are read explicitly,
-  so an already-consumed CLAIM re-registered later is still recognized.
+  using both the full NoteId emitted by claim submission and legacy details
+  commitments, so an already-consumed CLAIM re-registered later is recognized.
 - Durable security tracker tables remain authoritative. Restart rebuilds the
   reader from inventory. Neither note bodies nor recovery history is deleted.
 - Restore pauses future listeners and waits for an active pass to finish
