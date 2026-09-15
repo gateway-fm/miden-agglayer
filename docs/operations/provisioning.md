@@ -310,6 +310,11 @@ asset; send it and init continues.
 consumed by the proxy on its next monitor tick; one to the bridge or a faucet by the
 ntx-builder (see below). Either way the note pays for its own consume, so an empty
 vault recovers without a restart.
+Each monitor tick refreshes deployed bridge and faucet accounts from the node,
+so their metrics reflect consumed top-ups even when the proxy is otherwise idle.
+Wallet balances are re-read after the sweep, so their top-ups appear in that tick.
+If a refresh fails, the proxy logs `fee-vault monitor: could not refresh balance`
+and retries on the next tick; the affected gauges retain their last sample.
 
 **What a dry `service` / `ger_manager` does to in-flight work.** A claim or GER
 insert whose signer cannot pay the fee is NOT failed: the proxy holds the accepted
