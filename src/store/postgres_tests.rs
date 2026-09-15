@@ -2658,6 +2658,7 @@ async fn cantina7_pg_reservation_and_emitted_accounting() {
 #[tokio::test]
 async fn cantina136_derived_hash_survives_pg_round_trip() {
     use alloy::consensus::{Signed, TxEnvelope, TxLegacy};
+    use alloy::eips::{Decodable2718, Encodable2718};
     use alloy::primitives::TxKind;
     let Some(store) = pg_store().await else {
         return;
@@ -2683,9 +2684,12 @@ async fn cantina136_derived_hash_survives_pg_round_trip() {
         Signature::new(U256::from(1), U256::from(1), false),
         tx_hash,
     ));
-    // Sanity: the envelope's RLP-recomputed hash is NOT the derived key (that is the trap).
+    // new_unchecked caches the supplied derived hash. Recompute it by decoding
+    // the persisted bytes, exactly as PgStore does, before checking the fixture.
+    let encoded = envelope.encoded_2718();
+    let decoded = TxEnvelope::decode_2718(&mut &encoded[..]).unwrap();
     assert_ne!(
-        format!("{:#x}", envelope.tx_hash()),
+        format!("{:#x}", decoded.tx_hash()),
         derived,
         "fixture: the derived key must differ from the RLP hash"
     );
@@ -2935,11 +2939,12 @@ async fn register_faucet_colliding_origin_is_a_reported_noop_195() {
         return;
     };
     use miden_protocol::account::AccountId;
-    // Origin/network exclusive to this test so the shared DB stays re-run-safe.
+    // Both the origin and faucet IDs are exclusive to this test: faucet_id is
+    // also unique, so reusing another test's IDs collides even at a new origin.
     let origin = [0x9Au8; 20];
     let net = 7u32;
-    let faucet_a = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
-    let faucet_b = AccountId::from_hex("0xaa0000000000bc110000bc000000de").unwrap();
+    let faucet_a = AccountId::from_hex("0xac0000019500dd110000ee000000fc").unwrap();
+    let faucet_b = AccountId::from_hex("0xaa0000019500bc110000bc000000de").unwrap();
     let entry = |id| crate::store::FaucetEntry {
         faucet_id: id,
         origin_address: origin,
