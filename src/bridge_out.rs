@@ -593,6 +593,55 @@ fn mint_observation_key(note: &InputNoteRecord) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Include every input to the monitors, including attribution/metadata which
+/// can arrive after an old note is imported during recovery. No block cursor:
+/// historical notes must remain discoverable on every inventory read.
+fn monitor_observation_key(note: &InputNoteRecord) -> [u8; 32] {
+    let mut hasher = Keccak256::new();
+    hasher.update(b"miden-agglayer/consumed-monitor/v1\0");
+    hasher.update(mint_observation_key(note));
+    match note.commitment() {
+        Some(commitment) => {
+            hasher.update([1]);
+            hasher.update(commitment.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    match note.consumer_account() {
+        Some(consumer) => {
+            hasher.update([1]);
+            hasher.update(consumer.to_hex().as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hasher.finalize().into()
+}
+
+/// Disposable acceleration only. Durable tracker tables remain authoritative;
+/// a restart or eviction replays checks. Values retain the CLAIM consumption
+/// signal needed by expected-MINT tracking even when expensive work is skipped.
+struct CompletedMonitorCache {
+    registry: Option<[u8; 32]>,
+    observations: lru::LruCache<[u8; 32], bool>,
+}
+
+fn monitor_registry_key(faucets: &[crate::store::FaucetEntry]) -> [u8; 32] {
+    // Membership alone is insufficient: reconciliation also resolves the
+    // origin-token route. Sort so DB row order does not invalidate the cache.
+    let mut routes: Vec<_> = faucets
+        .iter()
+        .map(|f| (f.origin_network, f.origin_address, f.faucet_id.to_hex()))
+        .collect();
+    routes.sort_unstable();
+    let mut hasher = Keccak256::new();
+    for (network, address, faucet) in routes {
+        hasher.update(network.to_be_bytes());
+        hasher.update(address);
+        hasher.update(faucet.as_bytes());
+    }
+    hasher.finalize().into()
+}
+
 /// Decode the real AggLayer MINT representation.
 ///
 /// MINT notes have an empty outer `NoteAssets`; the standard MINT script reads
@@ -693,6 +742,7 @@ pub struct BridgeOutScanner {
     /// Bounded CLAIM hot set used only to avoid re-hashing historical storage.
     /// Eviction safely falls back to the idempotent persistent write.
     claim_serial_recorded: parking_lot::Mutex<lru::LruCache<[u8; 32], ()>>,
+    completed_monitors: parking_lot::Mutex<CompletedMonitorCache>,
 }
 
 impl BridgeOutScanner {
@@ -726,6 +776,10 @@ impl BridgeOutScanner {
             mint_scan_state: parking_lot::Mutex::new(monitor_cache()),
             forged_mint_pending: parking_lot::Mutex::new(std::collections::HashMap::new()),
             claim_serial_recorded: parking_lot::Mutex::new(monitor_cache()),
+            completed_monitors: parking_lot::Mutex::new(CompletedMonitorCache {
+                registry: None,
+                observations: monitor_cache(),
+            }),
         }
     }
 
@@ -891,6 +945,11 @@ pub(crate) fn dump_note_for_quarantine(note: &InputNoteRecord) -> String {
 /// alert decisions directly instead of scraping global metrics.
 #[derive(Debug, Default)]
 struct ScanOutcome {
+    scanned: usize,
+    cached: usize,
+    retryable: usize,
+    twin_alerts: Vec<[u8; 32]>,
+    burn_serial_alerts: Vec<[u8; 32]>,
     /// CLAIM note ids seen consumed this tick (fed to the Cantina #7
     /// expected-MINT tracker).
     landed_claim_ids: std::collections::HashSet<[u8; 32]>,
@@ -927,7 +986,9 @@ impl BridgeOutScanner {
         &self,
         consumed_notes: &[InputNoteRecord],
     ) -> ScanOutcome {
+        let started = std::time::Instant::now();
         let mut outcome = ScanOutcome::default();
+        let mut registry_key = None;
 
         // Deployment scoping inputs. A `list_faucets()` failure is a DEGRADED
         // state, not an empty registry: collapsing it to an empty set would
@@ -937,7 +998,10 @@ impl BridgeOutScanner {
         // monitor continues to run until the registry is readable again.
         let registered_faucets: Option<std::collections::HashSet<AccountId>> =
             match self.store.list_faucets().await {
-                Ok(v) => Some(v.into_iter().map(|f| f.faucet_id).collect()),
+                Ok(v) => {
+                    registry_key = Some(monitor_registry_key(&v));
+                    Some(v.into_iter().map(|f| f.faucet_id).collect())
+                }
                 Err(e) => {
                     outcome.registry_degraded = true;
                     metrics::counter!("bridge_monitor_registry_unavailable_total").increment(1);
@@ -953,6 +1017,34 @@ impl BridgeOutScanner {
                 }
             };
 
+        let registry_changed;
+        // Build the work list before inserting completions. This avoids a
+        // sequential scan evicting not-yet-visited cache hits when history is
+        // larger than the cache, and keeps locks out of asynchronous work.
+        let mut work = Vec::new();
+        {
+            let mut cache = self.completed_monitors.lock();
+            registry_changed = cache.registry != registry_key;
+            if registry_changed || registry_key.is_none() {
+                cache.observations.clear();
+                cache.registry = registry_key;
+            }
+            for note in consumed_notes {
+                let key = monitor_observation_key(note);
+                if let Some(landed_claim) = cache.observations.get(&key) {
+                    outcome.cached += 1;
+                    if *landed_claim {
+                        outcome
+                            .landed_claim_ids
+                            .insert(note.details_commitment().as_bytes());
+                    }
+                } else {
+                    work.push((note, key, NoteProvenanceFacts::from_note(note), true));
+                }
+            }
+        }
+        outcome.scanned = work.len();
+
         // ── Pass 1 — Cantina #4 claim history. Every CLAIM consumed by our
         // tracked bridge account records the canonical
         // future MINT whose serial is the claim's PROOF_DATA_KEY, with its
@@ -967,8 +1059,7 @@ impl BridgeOutScanner {
         // NetworkAccountTarget is routing metadata and cannot authorize a
         // claim history row on its own; miden-client retains `Some(bridge)` for
         // notes consumed by our tracked bridge even in ConsumedExternal state.
-        for note in consumed_notes {
-            let facts = NoteProvenanceFacts::from_note(note);
+        for (note, _, facts, complete) in &mut work {
             if facts.kind != MonitoredNoteKind::Claim
                 || facts.consumer != Some(self.bridge_account_id)
             {
@@ -993,6 +1084,7 @@ impl BridgeOutScanner {
                         // Claim-script note with non-CLAIM-shaped/undecodable
                         // storage — nothing derivable. Its (hypothetical) MINT
                         // stays unmatched, which alerts: fail-closed.
+                        *complete = false;
                         continue;
                     }
                 };
@@ -1005,6 +1097,7 @@ impl BridgeOutScanner {
                     self.claim_serial_recorded.lock().put(id_bytes, ());
                 }
                 Err(e) => {
+                    *complete = false;
                     // Not cached on failure — retried next tick. Until it
                     // lands, the corresponding MINT only accrues grace ticks.
                     tracing::warn!(
@@ -1018,7 +1111,7 @@ impl BridgeOutScanner {
         }
 
         // ── Pass 2 — per-note monitors.
-        for note in consumed_notes {
+        for (note, key, facts, mut complete) in work {
             let id_bytes: [u8; 32] = note.details_commitment().as_bytes();
             if let Some(commitment_word) = note.commitment() {
                 let commitment_bytes: [u8; 32] = commitment_word.as_bytes();
@@ -1026,6 +1119,7 @@ impl BridgeOutScanner {
                 // consumed note is observed before deployment provenance gates.
                 match self.twin_notes.record(id_bytes, commitment_bytes).await {
                     Ok(crate::twin_note_detector::Outcome::TwinDetected { prior_commitments }) => {
+                        outcome.twin_alerts.push(id_bytes);
                         metrics::counter!("bridge_twin_note_detected_total").increment(1);
                         tracing::error!(
                             target: "bridge_out::twin",
@@ -1038,6 +1132,7 @@ impl BridgeOutScanner {
                     Ok(crate::twin_note_detector::Outcome::New)
                     | Ok(crate::twin_note_detector::Outcome::LegitimateDuplicate) => {}
                     Err(e) => {
+                        complete = false;
                         tracing::warn!(
                             target: "bridge_out::twin",
                             note_id = ?note.details_commitment(),
@@ -1048,7 +1143,6 @@ impl BridgeOutScanner {
                     }
                 }
             }
-            let facts = NoteProvenanceFacts::from_note(note);
             let foreign = matches!(
                 note_provenance(&facts, registered_faucets.as_ref(), self.bridge_account_id,),
                 Provenance::Foreign
@@ -1057,11 +1151,12 @@ impl BridgeOutScanner {
             if foreign && facts.kind == MonitoredNoteKind::Mint {
                 // Positively another deployment's note — excluded from the
                 // local #2/#4 MINT monitors. No
-                // process-lifetime skip set is kept: this full-history scan
-                // must remain memory-bounded.
+                // unbounded skip set is kept: completed observations live in
+                // the bounded cache and registry changes force re-evaluation.
                 self.forged_mint_pending
                     .lock()
                     .remove(&mint_observation_key(note));
+                self.finish_monitor_observation(key, false, complete, &mut outcome);
                 continue;
             }
 
@@ -1085,6 +1180,7 @@ impl BridgeOutScanner {
                     let owner: [u8; 32] = note.details_commitment().as_bytes();
                     match self.burn_serials.record(serial.as_bytes(), owner).await {
                         Ok(crate::burn_serial_tracker::Outcome::Duplicate) => {
+                            outcome.burn_serial_alerts.push(id_bytes);
                             metrics::counter!("bridge_burn_serial_collision_total").increment(1);
                             tracing::error!(
                                 target: "bridge_out::burn",
@@ -1096,6 +1192,7 @@ impl BridgeOutScanner {
                         }
                         Ok(crate::burn_serial_tracker::Outcome::New) => {}
                         Err(e) => {
+                            complete = false;
                             tracing::warn!(
                                 target: "bridge_out::burn",
                                 note_id = ?note.details_commitment(),
@@ -1111,14 +1208,15 @@ impl BridgeOutScanner {
                 MonitoredNoteKind::Burn => {}
                 // Cantina #2 + #4 — MINT monitors, see `scan_mint_monitors`.
                 MonitoredNoteKind::Mint => {
-                    self.scan_mint_monitors(
-                        note,
-                        id_bytes,
-                        &facts,
-                        registered_faucets.as_ref(),
-                        &mut outcome,
-                    )
-                    .await;
+                    complete &= self
+                        .scan_mint_monitors(
+                            note,
+                            id_bytes,
+                            &facts,
+                            registered_faucets.as_ref(),
+                            &mut outcome,
+                        )
+                        .await;
                 }
                 MonitoredNoteKind::B2Agg | MonitoredNoteKind::Other => {}
             }
@@ -1178,9 +1276,52 @@ impl BridgeOutScanner {
                     );
                 }
             }
+            self.finish_monitor_observation(
+                key,
+                facts.kind == MonitoredNoteKind::Claim
+                    && facts.consumer == Some(self.bridge_account_id),
+                complete,
+                &mut outcome,
+            );
         }
 
+        tracing::debug!(
+            target: "bridge_out::scan",
+            total = consumed_notes.len(),
+            scanned = outcome.scanned,
+            cached = outcome.cached,
+            retryable = outcome.retryable,
+            cache_entries = self.completed_monitors.lock().observations.len(),
+            registry_changed,
+            registry_degraded = outcome.registry_degraded,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "consumed-note monitor pass completed"
+        );
         outcome
+    }
+
+    fn finish_monitor_observation(
+        &self,
+        key: [u8; 32],
+        landed_claim: bool,
+        complete: bool,
+        outcome: &mut ScanOutcome,
+    ) {
+        if complete && !outcome.registry_degraded {
+            self.completed_monitors
+                .lock()
+                .observations
+                .put(key, landed_claim);
+        } else {
+            outcome.retryable += 1;
+            tracing::trace!(
+                target: "bridge_out::scan",
+                observation = %hex::encode(key),
+                checks_complete = complete,
+                registry_degraded = outcome.registry_degraded,
+                "consumed-note observation left retryable"
+            );
+        }
     }
 
     /// Cantina #2 + #4 for one consumed OURS MINT.
@@ -1227,7 +1368,7 @@ impl BridgeOutScanner {
         facts: &NoteProvenanceFacts,
         registered_faucets: Option<&std::collections::HashSet<AccountId>>,
         outcome: &mut ScanOutcome,
-    ) {
+    ) -> bool {
         let state_key = mint_observation_key(note);
         // Cantina #2 — the storage asset faucet is the authoritative consuming
         // faucet: standard `mint_and_send` rejects unless the active faucet owns
@@ -1277,7 +1418,7 @@ impl BridgeOutScanner {
         }
         let state = self.mint_state(&state_key);
         if state.forged_alerted {
-            return;
+            return true;
         }
         // Cantina #4 — reconcile against the recorded claim→MINT IDENTITY.
         let serial: [u8; 32] = note.details().recipient().serial_num().as_bytes();
@@ -1288,6 +1429,7 @@ impl BridgeOutScanner {
                 match self.observed_mint_matches_expected(note, &expected).await {
                     MintIdentityCheck::Match => {
                         self.forged_mint_pending.lock().remove(&state_key);
+                        return true;
                     }
                     MintIdentityCheck::Mismatch {
                         field,
@@ -1348,6 +1490,9 @@ impl BridgeOutScanner {
                 );
             }
         }
+        // Unresolved identities and store failures must continue to retry.
+        // Terminal alerts keep the existing bounded one-shot semantics.
+        self.mint_state(&state_key).forged_alerted
     }
 
     /// Compare an observed MINT's canonical storage identity against the
@@ -1481,6 +1626,15 @@ impl BridgeOutScanner {
             *ticks = ticks.saturating_add(1);
             *ticks
         };
+        tracing::trace!(
+            target: "bridge_out::forged_mint",
+            note_id = ?note.details_commitment(),
+            serial = %hex::encode(serial),
+            reason,
+            ticks,
+            grace_ticks = self.forged_mint_grace_ticks,
+            "MINT identity unresolved; advancing grace"
+        );
         if ticks >= self.forged_mint_grace_ticks {
             self.forged_mint_pending.lock().remove(&state_key);
             self.update_mint_state(state_key, |state| state.forged_alerted = true);
@@ -2927,6 +3081,432 @@ mod tests {
         }
         let store: std::sync::Arc<dyn crate::store::Store> = concrete.clone();
         (concrete, BridgeOutScanner::new(store, 7, bridge))
+    }
+
+    #[tokio::test]
+    async fn monitor_cache_large_history_avoids_repeated_store_work() {
+        let ids = prov_ids();
+        let (store, scanner) = scanner_with_faucets(&[ids.faucet_a], ids.bridge).await;
+        // Larger than the twin detector's 10k cache, comparable to the 14.8k
+        // consumed notes in the production report. Seed durable claim history
+        // as if older CLAIMs had already been reconciled.
+        let mut notes = Vec::new();
+        for n in 0..15_000u32 {
+            let serial = miden_protocol::Word::from([miden_protocol::Felt::from(n); 4]);
+            store
+                .claim_mint_expected_record(
+                    &serial.as_bytes(),
+                    &crate::store::ExpectedMint {
+                        minted_amount: 100,
+                        destination_address: embedded_address(ids.local_service),
+                        origin_network: 0,
+                        origin_address: [0; 20],
+                    },
+                )
+                .await
+                .unwrap();
+            notes.push(mint_note_with_asset(
+                serial,
+                ids.faucet_a,
+                100,
+                ids.local_service,
+                Some(ids.bridge),
+                Some(ids.faucet_a),
+                Some(ids.faucet_a),
+            ));
+        }
+        let started = std::time::Instant::now();
+        let cold = scanner.scan_consumed_notes_monitors(&notes).await;
+        let cold_elapsed = started.elapsed();
+        assert_eq!((cold.scanned, cold.cached, cold.retryable), (15_000, 0, 0));
+        assert!(cold.forged_mint_alerts.is_empty());
+        let started = std::time::Instant::now();
+        for _ in 0..3 {
+            let warm = scanner.scan_consumed_notes_monitors(&notes).await;
+            assert_eq!((warm.scanned, warm.cached, warm.retryable), (0, 15_000, 0));
+        }
+        eprintln!(
+            "15k-note monitor history: cold={cold_elapsed:?}, three warm passes={:?}; \
+            warm tracker writes/identity reads/route reads=0",
+            started.elapsed()
+        );
+        for op in [
+            "twin_note_observe",
+            "claim_mint_expected_get",
+            "get_faucet_by_origin",
+        ] {
+            assert_eq!(
+                store.monitor_calls(op),
+                15_000,
+                "warm passes must not call {op}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_cache_recovers_late_claim_and_preserves_landed_signal() {
+        let ids = prov_ids();
+        let (store, scanner) = scanner_with_faucets(&[ids.faucet_a], ids.bridge).await;
+        let (claim, serial, _) = claim_note_realistic(
+            0,
+            [0; 20],
+            embedded_address(ids.local_service),
+            100,
+            None,
+            Some(ids.bridge),
+            Some(ids.bridge),
+        );
+        let mint = mint_note_with_asset(
+            serial,
+            ids.faucet_a,
+            100,
+            ids.local_service,
+            None,
+            Some(ids.faucet_a),
+            Some(ids.faucet_a),
+        );
+        let early = scanner
+            .scan_consumed_notes_monitors(std::slice::from_ref(&mint))
+            .await;
+        assert_eq!(early.retryable, 1);
+        // Old CLAIM imported later, deliberately after the MINT in inventory.
+        let notes = [mint, claim];
+        let repaired = scanner.scan_consumed_notes_monitors(&notes).await;
+        assert_eq!(repaired.retryable, 0);
+        assert!(repaired.forged_mint_alerts.is_empty());
+        let claim_id = notes[1].details_commitment().as_bytes();
+        store
+            .expected_mint_record(&[9; 32], &claim_id)
+            .await
+            .unwrap();
+        let warm = scanner.scan_consumed_notes_monitors(&notes).await;
+        assert_eq!(warm.cached, 2);
+        assert_eq!(
+            scanner
+                .expected_mints
+                .tick(&warm.landed_claim_ids, 1)
+                .await
+                .unwrap(),
+            vec![([9; 32], crate::expected_mint_tracker::MintStatus::Landed)]
+        );
+        // Restart with retained durable state replays safely.
+        let restarted = BridgeOutScanner::new(store, 7, ids.bridge);
+        let replay = restarted.scan_consumed_notes_monitors(&notes).await;
+        assert_eq!(replay.scanned, 2);
+        assert!(replay.forged_mint_alerts.is_empty());
+        // Full DB loss: cold scanner rebuilds claim history from the inventory
+        // before checking MINTs. No old cache/cursor can suppress recovery.
+        let (_, empty) = scanner_with_faucets(&[ids.faucet_a], ids.bridge).await;
+        let rebuilt = empty.scan_consumed_notes_monitors(&notes).await;
+        assert_eq!((rebuilt.scanned, rebuilt.retryable), (2, 0));
+        assert!(rebuilt.forged_mint_alerts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn monitor_cache_rechecks_late_consumer_and_metadata() {
+        let ids = prov_ids();
+        let (store, scanner) = scanner_with_faucets(&[ids.faucet_a], ids.bridge).await;
+        let make = |sender, consumer| {
+            claim_note_realistic(
+                0,
+                [0; 20],
+                embedded_address(ids.local_service),
+                100,
+                sender,
+                Some(ids.bridge),
+                consumer,
+            )
+            .0
+        };
+        let unknown = make(None, None);
+        let attributed = make(None, Some(ids.bridge));
+        let with_metadata = make(Some(ids.local_service), Some(ids.bridge));
+        let twin = make(Some(ids.foreign_service), Some(ids.bridge));
+        assert_eq!(unknown.details_commitment(), twin.details_commitment());
+        for (note, landed) in [
+            (&unknown, 0),
+            (&attributed, 1),
+            (&with_metadata, 1),
+            (&twin, 1),
+        ] {
+            let out = scanner
+                .scan_consumed_notes_monitors(std::slice::from_ref(note))
+                .await;
+            assert_eq!(out.scanned, 1, "enriched old records must be checked");
+            if std::ptr::eq(note, &twin) {
+                assert_eq!(out.twin_alerts, vec![twin.details_commitment().as_bytes()]);
+            }
+            assert_eq!(out.landed_claim_ids.len(), landed);
+        }
+        assert_eq!(store.monitor_calls("claim_mint_expected_record"), 1);
+        assert_eq!(
+            store
+                .twin_note_commitments(&twin.details_commitment().as_bytes())
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "new metadata must reach the durable twin detector"
+        );
+    }
+
+    /// Run against a dedicated migrated database, never a deployment's DB:
+    /// cargo test --features postgres monitor_cache_pg_restart -- --ignored
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL pointing to a dedicated migrated test database"]
+    async fn monitor_cache_pg_restart_replays_durable_history() {
+        let url = std::env::var("DATABASE_URL").expect("dedicated test database required");
+        let ids = prov_ids();
+        let store = Arc::new(crate::store::postgres::PgStore::new(&url).await.unwrap());
+        let (registry, _) = scanner_with_faucets(&[ids.faucet_a], ids.bridge).await;
+        store
+            .register_faucet(registry.list_faucets().await.unwrap().remove(0))
+            .await
+            .unwrap();
+        let (claim, serial, expected) = claim_note_realistic(
+            0,
+            [0; 20],
+            embedded_address(ids.local_service),
+            100,
+            Some(ids.local_service),
+            Some(ids.bridge),
+            Some(ids.bridge),
+        );
+        let mint = mint_note_with_asset(
+            serial,
+            ids.faucet_a,
+            100,
+            ids.local_service,
+            Some(ids.bridge),
+            Some(ids.faucet_a),
+            Some(ids.faucet_a),
+        );
+        let notes = [mint, claim];
+        {
+            let scanner = BridgeOutScanner::new(store.clone(), 7, ids.bridge);
+            let cold = scanner.scan_consumed_notes_monitors(&notes).await;
+            assert_eq!((cold.scanned, cold.retryable), (2, 0));
+            assert!(cold.forged_mint_alerts.is_empty());
+            assert_eq!(scanner.scan_consumed_notes_monitors(&notes).await.cached, 2);
+        }
+        drop(store);
+        let reopened = Arc::new(crate::store::postgres::PgStore::new(&url).await.unwrap());
+        assert_eq!(
+            reopened
+                .claim_mint_expected_get(&serial.as_bytes())
+                .await
+                .unwrap(),
+            Some(expected)
+        );
+        let scanner = BridgeOutScanner::new(reopened.clone(), 7, ids.bridge);
+        let replay = scanner.scan_consumed_notes_monitors(&notes).await;
+        assert_eq!((replay.scanned, replay.retryable), (2, 0));
+        assert!(replay.forged_mint_alerts.is_empty());
+        assert!(replay.twin_alerts.is_empty());
+        assert_eq!(
+            reopened
+                .twin_note_commitments(&notes[1].details_commitment().as_bytes())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // An old note's newly recovered metadata must still reach the
+        // persistent detector after replay has warmed the completion cache.
+        let twin = claim_note_realistic(
+            0,
+            [0; 20],
+            embedded_address(ids.local_service),
+            100,
+            Some(ids.foreign_service),
+            Some(ids.bridge),
+            Some(ids.bridge),
+        )
+        .0;
+        assert_eq!(
+            scanner
+                .scan_consumed_notes_monitors(&[twin])
+                .await
+                .twin_alerts,
+            vec![notes[1].details_commitment().as_bytes()]
+        );
+    }
+
+    #[tokio::test]
+    async fn monitor_cache_registry_changes_and_outages_recheck_foreign_notes() {
+        let ids = prov_ids();
+        let (store, scanner) = scanner_with_faucets(&[], ids.bridge).await;
+        let (claim, serial, _) = claim_note_realistic(
+            0,
+            [0; 20],
+            embedded_address(ids.local_service),
+            100,
+            None,
+            Some(ids.bridge),
+            Some(ids.bridge),
+        );
+        let mint = mint_note_with_asset(
+            serial,
+            ids.faucet_a,
+            100,
+            ids.local_service,
+            None,
+            Some(ids.faucet_a),
+            None,
+        );
+        let notes = [mint, claim];
+        scanner.scan_consumed_notes_monitors(&notes).await;
+        assert_eq!(scanner.scan_consumed_notes_monitors(&notes).await.cached, 2);
+        store.set_fail_list_faucets(true);
+        let degraded = scanner.scan_consumed_notes_monitors(&notes).await;
+        assert_eq!(
+            (degraded.scanned, degraded.cached, degraded.retryable),
+            (2, 0, 2)
+        );
+        store.set_fail_list_faucets(false);
+        let (registry, _) = scanner_with_faucets(&[ids.faucet_a], ids.bridge).await;
+        store
+            .register_faucet(registry.list_faucets().await.unwrap().remove(0))
+            .await
+            .unwrap();
+        let recovered = scanner.scan_consumed_notes_monitors(&notes).await;
+        assert_eq!((recovered.scanned, recovered.retryable), (2, 0));
+        assert!(recovered.forged_mint_alerts.is_empty());
+        assert_eq!(scanner.scan_consumed_notes_monitors(&notes).await.cached, 2);
+    }
+
+    #[test]
+    fn monitor_registry_fingerprint_binds_routes_and_ignores_row_order() {
+        // Route resolution, not just the set of registered IDs, determines
+        // whether a MINT matches the producing CLAIM.
+        let entry = |id, address| crate::store::FaucetEntry {
+            faucet_id: id,
+            origin_address: [address; 20],
+            origin_network: 0,
+            symbol: "TKN".into(),
+            origin_decimals: 8,
+            miden_decimals: 8,
+            scale: 0,
+            metadata: vec![],
+        };
+        let ids = prov_ids();
+        let a = entry(ids.faucet_a, 1);
+        let b = entry(ids.faucet_b, 2);
+        assert_eq!(
+            monitor_registry_key(&[a.clone(), b.clone()]),
+            monitor_registry_key(&[b, a])
+        );
+        assert_ne!(
+            monitor_registry_key(&[entry(ids.faucet_a, 1), entry(ids.faucet_b, 2)]),
+            monitor_registry_key(&[entry(ids.faucet_b, 1), entry(ids.faucet_a, 2)])
+        );
+    }
+
+    #[tokio::test]
+    async fn monitor_cache_retries_store_failures_and_evicted_history() {
+        let ids = prov_ids();
+        for operation in [
+            "twin_note_observe",
+            "claim_mint_expected_record",
+            "claim_mint_expected_get",
+            "get_faucet_by_origin",
+        ] {
+            let (store, scanner) = scanner_with_faucets(&[ids.faucet_a], ids.bridge).await;
+            let (claim, serial, _) = claim_note_realistic(
+                0,
+                [0; 20],
+                embedded_address(ids.local_service),
+                100,
+                Some(ids.local_service),
+                Some(ids.bridge),
+                Some(ids.bridge),
+            );
+            let mint = mint_note_with_asset(
+                serial,
+                ids.faucet_a,
+                100,
+                ids.local_service,
+                Some(ids.bridge),
+                Some(ids.faucet_a),
+                Some(ids.faucet_a),
+            );
+            let notes = [claim, mint];
+            store.fail_monitor_operation(operation, true);
+            let failed = scanner.scan_consumed_notes_monitors(&notes).await;
+            assert!(failed.retryable > 0, "must retry {operation}");
+            assert!(failed.forged_mint_alerts.is_empty());
+            store.fail_monitor_operation(operation, false);
+            let recovered = scanner.scan_consumed_notes_monitors(&notes).await;
+            assert_eq!(recovered.retryable, 0, "recovered {operation}");
+            assert!(recovered.forged_mint_alerts.is_empty());
+            assert_eq!(scanner.scan_consumed_notes_monitors(&notes).await.cached, 2);
+            scanner
+                .completed_monitors
+                .lock()
+                .observations
+                .resize(NonZeroUsize::new(1).unwrap());
+            for _ in 0..3 {
+                let evicted = scanner.scan_consumed_notes_monitors(&notes).await;
+                assert_eq!(
+                    (evicted.scanned, evicted.cached, evicted.retryable),
+                    (1, 1, 0)
+                );
+                assert!(evicted.forged_mint_alerts.is_empty());
+                assert_eq!(evicted.landed_claim_ids.len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_cache_retries_burn_store_failure_and_checks_new_collision() {
+        let ids = prov_ids();
+        let (store, scanner) = scanner_with_faucets(&[ids.faucet_a], ids.bridge).await;
+        let make = |value| {
+            build_monitor_note(
+                miden_standards::note::BurnNote::script(),
+                NoteStorage::new(vec![miden_protocol::Felt::from(value)]).unwrap(),
+                NoteAssets::new(vec![]).unwrap(),
+                miden_protocol::Word::default(),
+                Some(ids.bridge),
+                Some(ids.faucet_a),
+                Some(ids.faucet_a),
+            )
+        };
+        let first = make(1u32);
+        store.fail_monitor_operation("burn_serial_observe_for_note", true);
+        assert_eq!(
+            scanner
+                .scan_consumed_notes_monitors(std::slice::from_ref(&first))
+                .await
+                .retryable,
+            1
+        );
+        store.fail_monitor_operation("burn_serial_observe_for_note", false);
+        assert_eq!(
+            scanner
+                .scan_consumed_notes_monitors(std::slice::from_ref(&first))
+                .await
+                .retryable,
+            0
+        );
+        let collision = make(2u32);
+        assert_ne!(first.details_commitment(), collision.details_commitment());
+        let out = scanner
+            .scan_consumed_notes_monitors(&[first, collision.clone()])
+            .await;
+        assert_eq!((out.scanned, out.cached), (1, 1));
+        let collision_id = collision.details_commitment().as_bytes();
+        assert_eq!(out.burn_serial_alerts, vec![collision_id]);
+        // Cold tracker after restart must detect against the retained DB too.
+        let restarted = BridgeOutScanner::new(store, 7, ids.bridge);
+        assert_eq!(
+            restarted
+                .scan_consumed_notes_monitors(&[collision])
+                .await
+                .burn_serial_alerts,
+            vec![collision_id]
+        );
     }
 
     #[test]

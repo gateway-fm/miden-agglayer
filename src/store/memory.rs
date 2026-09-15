@@ -177,6 +177,11 @@ pub struct InMemoryStore {
     #[cfg(test)]
     fail_list_faucets: std::sync::atomic::AtomicBool,
 
+    #[cfg(test)]
+    monitor_test_calls: Mutex<HashMap<&'static str, usize>>,
+    #[cfg(test)]
+    monitor_test_failures: Mutex<HashSet<&'static str>>,
+
     // Synthetic projector cursor (synthetic-indexer redesign, Phase 2a) —
     // last fully-projected Miden block height. Field-backed mirror of the
     // PgStore `service_state.projector_cursor` column. See
@@ -240,6 +245,35 @@ const fn assert_sync<T: Send + Sync>() {}
 const _: () = assert_sync::<InMemoryStore>();
 
 impl InMemoryStore {
+    #[cfg(test)]
+    pub(crate) fn monitor_calls(&self, operation: &'static str) -> usize {
+        self.monitor_test_calls
+            .lock()
+            .get(operation)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_monitor_operation(&self, operation: &'static str, fail: bool) {
+        let mut failures = self.monitor_test_failures.lock();
+        if fail {
+            failures.insert(operation);
+        } else {
+            failures.remove(operation);
+        }
+    }
+
+    #[cfg(test)]
+    fn monitor_test_call(&self, operation: &'static str) -> anyhow::Result<()> {
+        *self.monitor_test_calls.lock().entry(operation).or_default() += 1;
+        anyhow::ensure!(
+            !self.monitor_test_failures.lock().contains(operation),
+            "injected monitor store failure: {operation}"
+        );
+        Ok(())
+    }
+
     /// Test hook — see the `fail_list_faucets` field. Makes every subsequent
     /// `list_faucets()` call fail until reset, so tests can drive the
     /// registry-degraded fail-closed monitor path.
@@ -288,6 +322,10 @@ impl InMemoryStore {
             monitor_claim_mint_serials: RwLock::new(HashMap::new()),
             #[cfg(test)]
             fail_list_faucets: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            monitor_test_calls: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            monitor_test_failures: Mutex::new(HashSet::new()),
             projector_cursor: RwLock::new(0),
             reconcile_cursor: RwLock::new(0),
             nonce_ledger_rebuilt: RwLock::new(false),
@@ -2532,6 +2570,8 @@ impl Store for InMemoryStore {
         origin_address: &[u8; 20],
         origin_network: u32,
     ) -> anyhow::Result<Option<FaucetEntry>> {
+        #[cfg(test)]
+        self.monitor_test_call("get_faucet_by_origin")?;
         let faucets = self.faucets.read();
         Ok(faucets
             .iter()
@@ -2566,6 +2606,8 @@ impl Store for InMemoryStore {
         serial: &[u8; 32],
         note_id: &[u8; 32],
     ) -> anyhow::Result<bool> {
+        #[cfg(test)]
+        self.monitor_test_call("burn_serial_observe_for_note")?;
         let mut map = self.monitor_burn_serials.write();
         match map.get(serial) {
             // Same note seen again — benign, and the common case: the monitor
@@ -2594,6 +2636,8 @@ impl Store for InMemoryStore {
         note_id: &[u8; 32],
         commitment: &[u8; 32],
     ) -> anyhow::Result<bool> {
+        #[cfg(test)]
+        self.monitor_test_call("twin_note_observe")?;
         let mut map = self.monitor_twin_notes.write();
         let entry = map.entry(*note_id).or_default();
         if entry.contains(commitment) {
@@ -2609,6 +2653,8 @@ impl Store for InMemoryStore {
         serial: &[u8; 32],
         identity: &crate::store::ExpectedMint,
     ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        self.monitor_test_call("claim_mint_expected_record")?;
         // First-write-wins to mirror Postgres `ON CONFLICT DO NOTHING`.
         self.monitor_claim_mint_serials
             .write()
@@ -2621,6 +2667,8 @@ impl Store for InMemoryStore {
         &self,
         serial: &[u8; 32],
     ) -> anyhow::Result<Option<crate::store::ExpectedMint>> {
+        #[cfg(test)]
+        self.monitor_test_call("claim_mint_expected_get")?;
         Ok(self.monitor_claim_mint_serials.read().get(serial).cloned())
     }
 
