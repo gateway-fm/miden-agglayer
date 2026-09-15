@@ -15,7 +15,8 @@
 # nonzero claims_awaiting_calldata) until every ClaimEvent's calldata is
 # re-persisted, so consumers are never released onto an empty-input claim. This
 # test proves:
-#   1. readiness is WITHHELD (503) while a claim's calldata is missing;
+#   1. repair either finishes before HTTP binds or withholds readiness (503);
+#      a controlled durable-backlog probe also proves the live HTTP gate;
 #   2. before readiness flips, the repair completes and eth_getTransactionByHash
 #      returns the COMPLETE ORIGINAL claimAsset calldata — byte-for-byte, never
 #      0x or a fabricated placeholder;
@@ -57,7 +58,15 @@ pgi_bridge() {
     out=$(docker exec "$BRIDGE_PG_CONTAINER" psql -U bridge_user -d bridge_db -tAX -c "$1") || return 1
     printf '%s' "$out"
 }
-proxy_health_code() { curl -s -m5 -o /dev/null -w '%{http_code}' "$L2_RPC/health" 2>/dev/null || echo 000; }
+proxy_health_response() {
+    local response
+    if response="$(curl -s -m5 -w $'\n%{http_code}' "$L2_RPC/health" 2>/dev/null)"; then
+        printf '%s' "$response"
+    else
+        printf '{}\n000'
+    fi
+}
+proxy_health_code() { local response; response="$(proxy_health_response)"; printf '%s' "${response##*$'\n'}"; }
 proxy_health_body() { curl -s -m5 "$L2_RPC/health" 2>/dev/null || echo '{}'; }
 # eth_getTransactionByHash → the `input` field (calldata), lowercased.
 tx_input() {
@@ -148,10 +157,9 @@ pass "Consumers gated OFF (aggkit, bridge-service, bridge-autoclaim stopped) for
 # Blank only CLAIM_TX's calldata envelope — the LATEST landed claim, which is freshly
 # produced and reliably reconstructable. (An earlier attempt blanked ALL claims to widen
 # the recovering window, but that swept in older/foreign claims the backfill cannot
-# re-consume/reconstruct, stalling /health at backlog>0 forever. It is also unnecessary:
-# the withhold is observable via the DEGRADED node-reconnect window now that that /health
-# body reports claims_awaiting_calldata — step 1 asserts the PROPERTY, 503+backlog>=1,
-# not the transient `recovering` label.)
+# re-consume/reconstruct, stalling /health at backlog>0 forever.) A remote-signer
+# boot can repair this claim before binding HTTP; step 1 verifies that ordering
+# explicitly, then separately exercises the running endpoint's backlog gate.
 DELETED="$(pgi "WITH d AS (DELETE FROM transactions WHERE lower(tx_hash) = '$CLAIM_TX' RETURNING 1) SELECT COUNT(*) FROM d")"
 [[ "$DELETED" == "1" ]] || fail "#148: expected to blank exactly 1 claim tx envelope, deleted '$DELETED'"
 pgq "UPDATE service_state SET reconcile_cursor = 0 WHERE id = 1" >/dev/null \
@@ -191,42 +199,22 @@ MIDEN_NODE_GIT_URL="${MIDEN_NODE_GIT_URL:-x}" MIDEN_NODE_GIT_REF="${MIDEN_NODE_G
 PROXY_STARTED_AFTER="$(docker inspect -f '{{.State.StartedAt}}' "$AGGLAYER_CONTAINER" 2>/dev/null || echo unknown)"
 [[ "$PROXY_STARTED_AFTER" != "$PROXY_STARTED_BEFORE" ]] \
     || fail "#148: the proxy container did not restart (StartedAt unchanged at $PROXY_STARTED_BEFORE) — nothing re-seeded the repair backlog, so any /health reading is from the pre-induce process"
-# Wait for the HTTP server itself to be up (health responds at all, even 503),
-# so a connection-refused during boot is not mistaken for readiness.
-for _i in $(seq 1 90); do
-    [[ "$(proxy_health_code)" != "000" ]] && break
-    sleep 2
-done
-
-# BOOT EVIDENCE. main.rs seeds the durable repair backlog ONCE, before the HTTP
-# server can serve, and logs exactly one of two lines. Which one it logged
-# decides product-vs-test for every outcome below, so capture it before
-# asserting anything:
-#   "recovery readiness gated: ..."  claims_awaiting_calldata=N  (N>=1)
-#   "claim-calldata repair backlog empty — recovery readiness open"
-SEED_LOG="$(docker logs --since "$PROXY_STARTED_BEFORE" "$AGGLAYER_CONTAINER" 2>&1 \
-    | grep -E 'recovery readiness gated|claim-calldata repair backlog empty' | tail -1 || true)"
-SEEDED_BACKLOG="$(sed -n 's/.*claims_awaiting_calldata[= ]*\([0-9]\+\).*/\1/p' <<<"$SEED_LOG" | tail -1)"
-log "#148 boot evidence: seed log line: ${SEED_LOG:-<none captured>}"
-log "#148 boot evidence: backlog table now: $(pgi "SELECT COUNT(*) FROM claim_calldata_repair_pending" 2>/dev/null || echo '<unreadable>')"
-log "#148 boot evidence: /health right now: $(proxy_health_code) $(proxy_health_body)"
-
-# ── 1. Readiness is WITHHELD while the claim calldata is missing ──────────────
-# The gating PROPERTY: while any historical ClaimEvent still lacks its calldata, /health is
-# 503 with claims_awaiting_calldata >= 1; it flips to 200 only once repair completes. We
-# assert THAT, not the specific sub-status label: a correct fast client can transition
-# `degraded` (node not yet alive, backlog>0) straight to 200 without ever exposing the
-# `recovering` (alive=true, backlog>0) sub-state (the same initial tick that flips alive
-# true also drains a small backlog) — so requiring the `recovering` label is unsatisfiable
-# for a healthy impl (PR #151 blocker). BOTH 503 sub-states now report the backlog, so
-# "503 AND claims_awaiting_calldata>=1" is the reliable, observable withhold signal (the
-# node-reconnect window is not sub-second). Single-curl capture (code+body atomically),
-# polled tightly, deadline-bounded for the eventual 200.
-SAW_WITHHELD=0; READY=0
+# Poll from restart without a separate boot wait that could discard a 503.
+# A remote-signer boot queues custody verification behind the initial sync, so
+# the reconciler may repair everything BEFORE service::serve binds HTTP. That
+# is safe, but cannot produce a visible 503. Require exact-claim boot evidence
+# for that path; never infer successful repair from a connection failure.
+SAW_WITHHELD=0; READY=0; LAST_CODE=''
+HEALTH_TRACE="$R_EVIDENCE_DIR/recovery-health-$$.log"
+BOOT_LOG="$R_EVIDENCE_DIR/recovery-boot-$$.log"
 RECOV_DEADLINE=$(( $(date +%s) + 600 ))
 while [[ $(date +%s) -lt $RECOV_DEADLINE ]]; do
-    RESP="$(curl -s -m5 -w $'\n%{http_code}' "$L2_RPC/health" 2>/dev/null || printf '{}\n000')"
+    RESP="$(proxy_health_response)"
     CODE="${RESP##*$'\n'}"; BODY="${RESP%$'\n'*}"
+    if [[ "$CODE" != "$LAST_CODE" ]]; then
+        printf '%s code=%s body=%s\n' "$(date -u +%FT%TZ)" "$CODE" "$BODY" | tee -a "$HEALTH_TRACE"
+        LAST_CODE="$CODE"
+    fi
     if [[ "$CODE" == "503" ]]; then
         if echo "$BODY" | python3 -c "import json,sys;sys.exit(0 if (json.load(sys.stdin).get('claims_awaiting_calldata',0) or 0) >= 1 else 1)" 2>/dev/null; then
             SAW_WITHHELD=1
@@ -236,22 +224,16 @@ while [[ $(date +%s) -lt $RECOV_DEADLINE ]]; do
     fi
     sleep 0.3
 done
-if [[ "$SAW_WITHHELD" != "1" ]]; then
-    log "#148 diagnosis: seed line was: ${SEED_LOG:-<none>}"
-    log "#148 diagnosis: seeded backlog was: ${SEEDED_BACKLOG:-<unparsed>}"
-    docker logs --since "$PROXY_STARTED_BEFORE" "$AGGLAYER_CONTAINER" 2>&1 | tail -40 | sed 's/^/    | /'
-    if [[ "${SEEDED_BACKLOG:-0}" -ge 1 ]]; then
-        fail "#148: the backlog WAS seeded (claims_awaiting_calldata=$SEEDED_BACKLOG) but /health was never \
-observed at 503 — either the repair closed the window before the socket accepted a poll, or the gate is \
-not wired to the seeded backlog. Boot log above decides which."
-    fi
-    fail "#148: never observed /health=503 with claims_awaiting_calldata>=1 — the readiness gate did NOT \
-hold while calldata was missing. The seed reported NO backlog at boot (line: ${SEED_LOG:-<none>}), so the \
-gate had nothing to gate: seeding, not serving, is where to look."
-fi
-pass "1. Readiness WITHHELD: /health=503 (claims_awaiting_calldata>=1) while the claim calldata was missing"
+docker logs --since "$PROXY_STARTED_AFTER" "$AGGLAYER_CONTAINER" > "$BOOT_LOG" 2>&1
+BOOT_ARGS=()
+[[ "$SAW_WITHHELD" == "0" ]] || BOOT_ARGS+=(--saw-withheld)
+python3 "$SCRIPT_DIR/lib-recovery-readiness.py" "$BOOT_LOG" "$CLAIM_TX" "${BOOT_ARGS[@]}" \
+    | tee "$R_EVIDENCE_DIR/recovery-boot-$$.json" \
+    || fail "#148: boot did not prove a seeded backlog plus either HTTP 503 or exact-claim repair before HTTP started; see $BOOT_LOG and $HEALTH_TRACE"
 [[ "$READY" == "1" ]] || fail "#148: /health never returned to 200 after the calldata repair (repair stalled?)"
-pass "1b. Readiness flipped to 200 once the calldata repair completed"
+[[ "$(pgi "SELECT COUNT(*) FROM claim_calldata_repair_pending")" == "0" ]] \
+    || fail "#148: /health returned 200 while the durable repair backlog was nonempty"
+pass "1. Startup repair protected: observed 503 with backlog, or proved exact-claim repair before HTTP bound; ready with backlog=0"
 
 # ── 2. Repaired calldata is the COMPLETE ORIGINAL (byte-for-byte, not 0x) ─────
 POST_CALLDATA="$(tx_input "$CLAIM_TX")"
@@ -260,6 +242,38 @@ POST_CALLDATA="$(tx_input "$CLAIM_TX")"
 [[ "$POST_CALLDATA" == "$ORIG_CALLDATA" ]] \
     || fail "#148: recovered claimAsset calldata differs from the original (a reconstructed placeholder, not the truth): orig(${#ORIG_CALLDATA})=$ORIG_CALLDATA post(${#POST_CALLDATA})=$POST_CALLDATA"
 pass "2. eth_getTransactionByHash returns the COMPLETE ORIGINAL claimAsset calldata (byte-for-byte, ${#POST_CALLDATA} chars, not 0x)"
+
+# Exercise the live readiness route regardless of how quickly startup repaired
+# the real loss above. This is an explicitly induced backlog entry for the SAME
+# real claim, whose calldata is now repaired. It proves HTTP consults the durable
+# gate; it is not presented as another on-chain repair. Consumers remain stopped.
+# Remove only the row this probe inserted, including on failure/interruption.
+GATE_PROBE_ACTIVE=0
+cleanup_gate_probe() {
+    if [[ "$GATE_PROBE_ACTIVE" == "1" ]]; then
+        pgq "DELETE FROM claim_calldata_repair_pending WHERE tx_hash = '$CLAIM_TX'" >/dev/null \
+            || log "#148: failed to remove test backlog entry for $CLAIM_TX"
+    fi
+}
+trap cleanup_gate_probe EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+GATE_PROBE_ACTIVE=1
+[[ "$(pgi "WITH inserted AS (INSERT INTO claim_calldata_repair_pending (tx_hash) VALUES ('$CLAIM_TX') RETURNING 1) SELECT COUNT(*) FROM inserted")" == "1" ]] \
+    || fail "#148: could not insert the controlled backlog probe"
+RESP="$(proxy_health_response)"
+CODE="${RESP##*$'\n'}"; BODY="${RESP%$'\n'*}"
+printf '%s controlled-backlog code=%s body=%s\n' "$(date -u +%FT%TZ)" "$CODE" "$BODY" | tee -a "$HEALTH_TRACE"
+[[ "$CODE" == "503" ]] \
+    || fail "#148: live /health did not withhold readiness with a controlled durable backlog: $CODE $BODY"
+echo "$BODY" | python3 -c "import json,sys;sys.exit(0 if (json.load(sys.stdin).get('claims_awaiting_calldata',0) or 0) >= 1 else 1)" \
+    || fail "#148: live /health=503 omitted the pending calldata count"
+[[ "$(pgi "WITH removed AS (DELETE FROM claim_calldata_repair_pending WHERE tx_hash = '$CLAIM_TX' RETURNING 1) SELECT COUNT(*) FROM removed")" == "1" ]] \
+    || fail "#148: controlled backlog entry disappeared before probe cleanup"
+GATE_PROBE_ACTIVE=0
+[[ "$(proxy_health_code)" == "200" ]] \
+    || fail "#148: live /health did not return to 200 after removing the controlled backlog"
+pass "2b. Live HTTP gate: controlled durable backlog returned 503 with count>=1, then 200 after cleanup"
 
 # ── 3. No FOREIGN-deployment ClaimEvent appeared during recovery ─────────────
 # The re-sweep must re-derive exactly the same claims — no spurious/foreign
