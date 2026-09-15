@@ -12,6 +12,7 @@ historical cluster value.
 | [Monitoring](monitoring.md) | Health/metrics endpoints, high-signal metrics, alerts, and dashboards |
 | [Diagnostics](diagnostics.md) | Read-only collection and symptom-to-cause investigation |
 | [Writer stalls](writer-stalls.md) | #210 causes, claim leases, phase traces and evidence collection |
+| [Consumed-note scanner](consumed-note-scanner.md) | Slow monitor passes, cache diagnostics, and recovery invariants |
 | [Quarantine](quarantine.md) | Handling B2AGG exits the projector deliberately cannot emit |
 | [Upgrade guide](../UPGRADE.md) | Version-neutral in-place upgrade and rollback procedure |
 
