@@ -127,8 +127,15 @@ lookup and receipt lookup return null. After the fix, the send returns `-32005`;
 after expiring that test reservation, the identical envelope succeeds, lookup
 returns it, a success receipt appears and repeated submission advances the nonce
 only once. A separate regression verifies that a durable live owner's lease is
-not stolen. Run PostgreSQL tests only against an isolated test database with the
-numbered migrations applied:
+not stolen. The concurrent HTTP regression sends bursts of 32 identical requests
+to one active proxy before and after natural lease expiry, then recreates process
+state and verifies that the completed transaction remains queryable without
+being dispatched again. It checks one lease takeover and one nonce advance.
+This matches the supported single-active-proxy topology; active-active execution
+across proxies remains the separate scope of #142.
+
+Run PostgreSQL tests only against an isolated test database with the numbered
+migrations applied:
 
 ```sh
 cargo test --locked --features postgres --lib reservation_only -- --nocapture
