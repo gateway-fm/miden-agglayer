@@ -673,6 +673,11 @@ pub fn init_metrics() {
          Alert: p99 >60s for 10 min → page (aggkit's WaitTxToBeMined=2m)."
     );
     describe_counter!(
+        "rpc_nonce_reservation_unadmitted_retry_total",
+        "Same-hash sends rejected retryably because a valid nonce reservation \
+         exists without a durable transaction envelope. Prevents ACK-then-not-found after restart."
+    );
+    describe_counter!(
         "agglayer_writer_queue_full_rejections_total",
         "RD-940: eth_sendRawTransaction requests rejected because the \
          writer-worker mpsc channel was at capacity. Wire response is \

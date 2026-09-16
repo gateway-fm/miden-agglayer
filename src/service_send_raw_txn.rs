@@ -10,6 +10,13 @@ use alloy::eips::Decodable2718;
 use alloy::primitives::{Address, LogData, TxHash};
 use alloy_core::sol_types::SolCall;
 
+/// A same-hash owner holds the admission lease, but has not saved the envelope.
+/// This is retryable, not a successful mempool admission. Returning the hash
+/// here can strand claimtxman after a process dies before `txn_begin_if_absent`.
+#[derive(Debug, thiserror::Error)]
+#[error("transaction admission is still in progress; retry the same signed transaction")]
+pub(crate) struct AdmissionInProgressError;
+
 struct TransactionData {
     pub hash: TxHash,
     pub input: alloy::primitives::Bytes,
@@ -687,8 +694,10 @@ pub(crate) fn claim_resubmit_ttl() -> std::time::Duration {
 /// #55 BLOCKER 1 — how long a won `(signer, nonce)` admission lease is owned before
 /// another replica presenting the SAME hash may take it over on expiry. Kept comfortably
 /// BELOW aggkit's re-broadcast envelope so a rebroadcast after an owner crash can
-/// take over promptly, yet above the slowest legitimate admission (a sync claim
-/// publish). Env-tunable via `NONCE_RESERVATION_LEASE_SECS`.
+/// take over promptly. Live admissions renew it; it is not a claim-duration limit.
+/// Before an envelope is durable, same-hash retries must receive a retryable
+/// error, not an ACK that would stop rebroadcasts before the lease expires.
+/// Env-tunable via `NONCE_RESERVATION_LEASE_SECS`.
 pub(crate) fn reservation_lease() -> std::time::Duration {
     const DEFAULT_SECS: u64 = 90;
     let secs = std::env::var("NONCE_RESERVATION_LEASE_SECS")
@@ -750,6 +759,11 @@ async fn durably_admit_and_advance_nonce(
             },
         )
         .await?;
+    tracing::debug!(
+        target: "rpc::admission",
+        %txn_hash, signer = %signer_str, nonce = tx_nonce,
+        "signed transaction durably stored; advancing nonce before dispatch"
+    );
     let advanced = service
         .store
         .nonce_advance_cas(signer_str, tx_nonce)
@@ -1843,18 +1857,29 @@ async fn service_send_raw_txn_inner(
     {
         crate::store::NonceReservation::Won { fence } => fence,
         crate::store::NonceReservation::OwnedBySame => {
-            // The slot is currently owned+executing by THIS SAME tx under a valid
-            // lease (another replica is admitting it). Do NOT execute — dedup-return
-            // the hash; the owner produces the receipt. This is the authoritative
-            // single-executor guarantee that
-            // the process-local dedup reads (which can miss cross-replica) cannot give.
+            // A live lease proves exclusive ownership, not durable admission.
+            // The owner may have crashed before saving the envelope. ACKing in
+            // that window makes claimtxman stop sending and poll an unknown hash
+            // forever; lease expiry alone cannot recover an absent envelope.
+            // Re-read after reserve_nonce: a different replica may have saved it
+            // since our optimistic lookup. Never steal its still-valid lease.
+            let durable = service.store.txn_get(txn_hash).await?.is_some();
             tracing::debug!(
-                target: "rpc::reserve",
-                %txn_hash, nonce = tx_nonce,
-                "reservation owned by this same tx under a valid executing lease — \
-                 dedup-returning hash, NOT executing"
+                target: "rpc::admission",
+                %txn_hash, signer = %signer_str, nonce = tx_nonce,
+                durable_transaction = durable,
+                "same-hash nonce reservation checked for durable admission"
             );
-            return Ok(txn_hash);
+            if durable {
+                return Ok(txn_hash);
+            }
+            ::metrics::counter!("rpc_nonce_reservation_unadmitted_retry_total").increment(1);
+            tracing::warn!(
+                target: "rpc::admission",
+                %txn_hash, signer = %signer_str, nonce = tx_nonce,
+                "nonce reservation exists without a durable transaction; rejecting retryably instead of acknowledging an unknown hash"
+            );
+            return Err(AdmissionInProgressError.into());
         }
         crate::store::NonceReservation::HeldByOther(other) => {
             // A DIFFERENT tx owns/owned this (signer, nonce) slot — this submission
@@ -1868,6 +1893,13 @@ async fn service_send_raw_txn_inner(
             );
         }
     };
+
+    tracing::debug!(
+        target: "rpc::admission",
+        %txn_hash, signer = %signer_str, nonce = tx_nonce,
+        fence = reservation_fence,
+        "nonce reservation acquired; durable admission has not completed"
+    );
 
     // Keep ownership live while sync publication or request-thread admission is
     // running. Without renewal, a slow proof can outlive the lease and let a
@@ -1909,6 +1941,12 @@ async fn service_send_raw_txn_inner(
         tx_nonce,
     )
     .await;
+    tracing::debug!(
+        target: "rpc::admission",
+        %txn_hash, signer = %signer_str, nonce = tx_nonce,
+        fence = reservation_fence, accepted = admission.is_ok(),
+        "transaction admission finished"
+    );
     reservation_heartbeat.abort();
     if let Err(release_err) = service
         .store
@@ -6291,6 +6329,124 @@ mod tests {
         assert_eq!(concrete.nonce_get(&signer_str).await.unwrap(), 1);
         assert!(handle.is_inflight(&tx_hash));
         let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn reservation_only_dedup_preserves_durable_live_owner() {
+        let concrete = std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let service = crate::test_helpers::create_test_service_with_store(concrete.clone());
+        let (raw, signer) = encode_legacy_tx(
+            insertGlobalExitRootCall {
+                root: FixedBytes::from([0x91; 32]),
+            }
+            .abi_encode(),
+        );
+        let bytes = hex_decode_prefixed(&raw).unwrap();
+        let envelope = TxEnvelope::decode_2718(&mut bytes.as_slice()).unwrap();
+        let hash = unwrap_txn_envelope(envelope.clone()).unwrap().hash;
+        let signer_str = format!("{signer:#x}");
+        assert!(matches!(
+            concrete
+                .reserve_nonce(&signer_str, 0, hash, reservation_lease())
+                .await
+                .unwrap(),
+            crate::store::NonceReservation::Won { .. }
+        ));
+        concrete
+            .txn_begin_if_absent(
+                hash,
+                TxnEntry {
+                    id: None,
+                    envelope,
+                    signer,
+                    expires_at: None,
+                    logs: vec![],
+                },
+            )
+            .await
+            .unwrap();
+
+        // Another replica may ACK the stored envelope, but must neither steal
+        // the lease nor advance the live owner's nonce or execute its job.
+        assert_eq!(service_send_raw_txn(service, raw).await.unwrap(), hash);
+        assert_eq!(concrete.nonce_get(&signer_str).await.unwrap(), 0);
+        assert!(concrete.txn_receipt(hash).await.unwrap().is_none());
+        assert_eq!(
+            concrete
+                .reserve_nonce(&signer_str, 0, hash, reservation_lease())
+                .await
+                .unwrap(),
+            crate::store::NonceReservation::OwnedBySame
+        );
+    }
+
+    /// The chaos restart left only an executing nonce reservation. A same-hash
+    /// retry before lease expiry must not ACK: no envelope exists to serve or
+    /// recover, and claimtxman stops sending once it receives a successful hash.
+    #[tokio::test]
+    async fn reservation_only_retry_rejects_until_expiry_then_recovers() {
+        let concrete = std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
+        let service = crate::test_helpers::create_test_service_with_store(concrete.clone());
+        let calldata = claimAssetCall {
+            smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
+            smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
+            globalIndex: U256::from(198),
+            mainnetExitRoot: FixedBytes::ZERO,
+            rollupExitRoot: FixedBytes::ZERO,
+            originNetwork: 0,
+            originTokenAddress: Address::ZERO,
+            destinationNetwork: 1,
+            destinationAddress: Address::ZERO,
+            amount: U256::ZERO,
+            metadata: Default::default(),
+        }
+        .abi_encode();
+        let (raw, signer) = encode_legacy_tx(calldata);
+        let bytes = hex_decode_prefixed(&raw).unwrap();
+        let envelope = TxEnvelope::decode_2718(&mut bytes.as_slice()).unwrap();
+        let hash = unwrap_txn_envelope(envelope).unwrap().hash;
+        let signer_str = format!("{signer:#x}");
+        let reservation = concrete
+            .reserve_nonce(&signer_str, 0, hash, reservation_lease())
+            .await
+            .unwrap();
+        assert!(matches!(
+            reservation,
+            crate::store::NonceReservation::Won { .. }
+        ));
+
+        // A new ServiceState models a different process: shared durable store,
+        // no owner task, no local inflight cache or per-signer mutex from the dead one.
+        let restarted = crate::test_helpers::create_test_service_with_store(concrete.clone());
+        let result = service_send_raw_txn(restarted.clone(), raw.clone()).await;
+        assert!(concrete.txn_get(hash).await.unwrap().is_none());
+        assert!(concrete.txn_receipt(hash).await.unwrap().is_none());
+        assert!(
+            concrete
+                .get_queued_txn(&signer_str, 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(concrete.nonce_get(&signer_str).await.unwrap(), 0);
+        assert!(
+            result.is_err(),
+            "reservation-only retry ACKed a hash that lookup cannot find: {result:?}"
+        );
+
+        // Expiry must still permit the exact same transaction to recover, once.
+        concrete.test_expire_reservation_lease(&signer_str, 0);
+        assert_eq!(
+            service_send_raw_txn(restarted.clone(), raw.clone())
+                .await
+                .unwrap(),
+            hash
+        );
+        assert!(concrete.txn_get(hash).await.unwrap().is_some());
+        assert!(concrete.txn_receipt(hash).await.unwrap().is_some());
+        assert_eq!(concrete.nonce_get(&signer_str).await.unwrap(), 1);
+        assert_eq!(service_send_raw_txn(service, raw).await.unwrap(), hash);
+        assert_eq!(concrete.nonce_get(&signer_str).await.unwrap(), 1);
     }
 
     /// Reproduce the 238s testnet job against the real lease/fence boundary.

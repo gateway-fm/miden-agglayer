@@ -114,6 +114,10 @@ for an unaccepted transaction. Capture both the originally accepted hash and
 the rejected hash, along with the sender's nonce and RPC error; do not weaken
 the replay guard or manufacture a success/failure receipt.
 
+For a successful send followed by repeated transaction lookup `not found`, see
+[acknowledged transaction missing after restart](transaction-not-found.md). A
+nonce reservation without a stored envelope is a separate admission crash gap.
+
 ## Alert while the operation is still running
 
 Alert on `agglayer_writer_oldest_nonterminal_age_seconds > 300` for one minute

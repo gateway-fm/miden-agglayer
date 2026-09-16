@@ -509,6 +509,20 @@ async fn json_rpc_handler(service: ServiceState, request: JsonRpcExtractor) -> J
                 );
                 return Err(JsonRpcResponse::error(answer_id, error));
             }
+            // Like writer backpressure, an admission owner with no durable
+            // envelope is transient. Do not ACK a hash that lookup cannot serve.
+            if let Err(err) = &result
+                && err
+                    .downcast_ref::<crate::service_send_raw_txn::AdmissionInProgressError>()
+                    .is_some()
+            {
+                let error = JsonRpcError::new(
+                    JsonRpcErrorReason::ServerError(-32005),
+                    err.to_string(),
+                    serde_json::Value::Null,
+                );
+                return Err(JsonRpcResponse::error(answer_id, error));
+            }
             json_rpc_response_from_result(result, answer_id, ServiceErrorCode::SendRawTransaction)
         }
 
