@@ -2061,14 +2061,10 @@ async fn drain_queued(service: &ServiceState, signer_str: &str) {
         .await
         {
             Ok(_) => {
-                // #146 (review) — `Ok(hash)` alone does NOT prove durable
-                // admission: a NonceReservation::OwnedBySame can be returned from
-                // a still-valid lease whose `txn_begin_if_absent` never ran (a
-                // crash mid-promotion followed by a restart inside the lease
-                // window). Deleting on that would destroy the ONLY durable copy
-                // of the envelope — no queue row, no transaction row, nothing for
-                // #156 to recover. Confirm the transaction row exists first;
-                // otherwise keep the queue row and let the next sweep retry.
+                // Keep the parked envelope until durable admission is confirmed.
+                // The RPC path now rejects reservation-only retries, but retain
+                // this check at the deletion boundary so a future early-success
+                // path cannot discard the only recoverable signed envelope.
                 match service.store.txn_get(parked.tx_hash).await {
                     Ok(Some(_)) => {}
                     Ok(None) => {
