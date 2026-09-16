@@ -2317,12 +2317,16 @@ async fn test_pgstore_reverted_receipt_conditional() {
     let Some(store) = pg_store().await else {
         return;
     };
-    let base = rand_u64();
-    let signer = Address::from([(base % 251) as u8 + 3; 20]);
+    let signer = PrivateKeySigner::random().address();
+    // Repeated-byte "random" hashes offer fewer than 256 identities and can
+    // collide with another case or another test in this shared database.
+    let case_hash = |case: &str| {
+        alloy::primitives::keccak256(format!("reverted_receipt_conditional:{signer:#x}:{case}"))
+    };
     let signer_str = format!("{signer:#x}");
 
     // (a) SUCCESS receipt must survive.
-    let tx_ok = TxHash::from([(base % 239) as u8 + 4; 32]);
+    let tx_ok = case_hash("success");
     store
         .txn_begin(tx_ok, dummy_txn_entry_for(signer))
         .await
@@ -2347,7 +2351,7 @@ async fn test_pgstore_reverted_receipt_conditional() {
     );
 
     // (b) PENDING receipt must stay pending.
-    let tx_pending = TxHash::from([(base % 233) as u8 + 5; 32]);
+    let tx_pending = case_hash("pending");
     store
         .txn_begin(tx_pending, dummy_txn_entry_for(signer))
         .await
@@ -2374,7 +2378,7 @@ async fn test_pgstore_reverted_receipt_conditional() {
     );
 
     // (c) ABSENT hash → reverted receipt IS written.
-    let tx_new = TxHash::from([(base % 229) as u8 + 6; 32]);
+    let tx_new = case_hash("absent");
     store
         .commit_reverted_receipt_and_advance_nonce(
             tx_new,
