@@ -752,6 +752,17 @@ allocation. Correlate `rpc_claim_ger_not_seen_total`,
 indexer cursor. Repair L1 RPC/indexer/aggoracle lag; the claimant can retry
 cheaply after GER injection.
 
+### Settled deposit stuck at `ready_for_claim=false`
+
+When the certificate is settled and both source bridge-service indexers have
+caught up, a missed L2 GER notification can still leave a deposit unclaimable.
+A restart or simultaneous L1/L2 rebuild can reproduce the race. Follow the
+[ordered bridge-service index resync playbook](bridge-service-resync.md):
+back up and audit the index, replay L1 before L2 with automatic claiming
+disabled, then restore normal settings and verify the original claim end to
+end. This preserves Miden/L1/L2 chains, proxy stores and certificate state and
+uses the unchanged bridge-service image.
+
 ### Synthetic tip or completeness failure
 
 Compare Miden tip, reconciler cursor, projector cursor, synthetic tip, and
