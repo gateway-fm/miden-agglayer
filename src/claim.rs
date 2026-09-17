@@ -446,13 +446,38 @@ async fn provision_faucet(
     //     bridge-out-valid on Miden but unresolvable locally). Import the existing
     //     identity instead. Coexists with the Cantina #1 cross-network refusal above
     //     (which already rejected a different-network same-address collision).
-    if let Some(bridge_account) = client.get_account(accounts.bridge.0).await.ok().flatten()
-        && let Some((existing_id, conversion)) =
-            crate::metadata_recovery::find_registered_faucet_for_origin(
-                bridge_account.storage(),
-                &token_address.0.0,
-                origin_network,
+    // FAIL CLOSED (#196): only deploy a new faucet when we can POSITIVELY confirm
+    // the origin has no faucet on the bridge. If the bridge account can't be read,
+    // or a faucet IS registered for this origin but we can't import it, DEFER the
+    // claim (it retries) rather than deploy — the previous fail-soft version fell
+    // through to deploy on either hiccup, creating a duplicate generation whose old
+    // generation's exits are unresolvable forever (the split-brain this guard exists
+    // to prevent). A deferred claim under transient bridge unavailability is strictly
+    // better than a permanent, unrecoverable split-brain.
+    let bridge_account = client
+        .get_account(accounts.bridge.0)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "faucet provisioning for {token_address} (network {origin_network}): reading the \
+                 bridge account failed ({e}); deferring rather than risk deploying a duplicate \
+                 faucet (#196)"
             )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "faucet provisioning for {token_address} (network {origin_network}): bridge \
+                 account {} is not available locally; deferring rather than risk deploying a \
+                 duplicate faucet (#196) — it must be re-imported first",
+                accounts.bridge.0
+            )
+        })?;
+    if let Some((existing_id, conversion)) =
+        crate::metadata_recovery::find_registered_faucet_for_origin(
+            bridge_account.storage(),
+            &token_address.0.0,
+            origin_network,
+        )
     {
         tracing::warn!(
             token_address = %token_address,
@@ -462,7 +487,10 @@ async fn provision_faucet(
              row — importing the existing faucet identity instead of deploying a replacement \
              (prevents split-brain)"
         );
-        match faucet_ops::rebuild_faucet_entry_from_chain(
+        // The origin PROVABLY has a faucet on the bridge. Failing to import it is
+        // NOT a license to deploy (that guarantees the split-brain); propagate so
+        // the claim retries when the faucet account is fetchable (#196).
+        let mut entry = faucet_ops::rebuild_faucet_entry_from_chain(
             client,
             &bridge_account,
             existing_id,
@@ -470,37 +498,29 @@ async fn provision_faucet(
             None,
         )
         .await
-        {
-            Ok(mut entry) => {
-                // The claimAsset metadata IS the authoritative preimage for this token
-                // (same abi.encode(name,symbol,decimals) whose keccak is the faucet's
-                // MetadataHash), so prefer it over the on-chain recovery result — capped
-                // exactly like the auto-create path (Cantina #13).
-                entry.metadata = cap_stored_faucet_metadata(metadata, &token_address);
-                let (miden_decimals, origin_token_decimals) =
-                    (entry.miden_decimals, entry.origin_decimals);
-                store.register_faucet(entry).await?;
-                ::metrics::counter!("faucet_recovered_existing_total").increment(1);
-                return Ok(Faucet {
-                    id: existing_id,
-                    decimals: miden_decimals,
-                    origin_token_decimals,
-                });
-            }
-            Err(e) => {
-                // Fail soft: if we cannot import the existing identity (e.g. the faucet
-                // account isn't fetchable), fall through to deploy rather than block the
-                // claim. This can re-introduce a second generation, so surface it loudly.
-                ::metrics::counter!("faucet_recover_existing_failed_total").increment(1);
-                tracing::warn!(
-                    faucet_id = %existing_id,
-                    error = ?e,
-                    "Cantina #6: failed to import existing faucet identity; falling back to deploy \
-                     (WARNING: may create a second generation)"
-                );
-            }
-        }
+        .map_err(|e| {
+            ::metrics::counter!("faucet_recover_existing_failed_total").increment(1);
+            anyhow::anyhow!(
+                "faucet provisioning for {token_address} (network {origin_network}): origin has a \
+                 registered faucet {existing_id} on the bridge but its identity could not be \
+                 imported ({e}); deferring rather than deploying a duplicate (#196)"
+            )
+        })?;
+        // The claimAsset metadata IS the authoritative preimage for this token
+        // (same abi.encode(name,symbol,decimals) whose keccak is the faucet's
+        // MetadataHash), so prefer it over the on-chain recovery result — capped
+        // exactly like the auto-create path (Cantina #13).
+        entry.metadata = cap_stored_faucet_metadata(metadata, &token_address);
+        let (miden_decimals, origin_token_decimals) = (entry.miden_decimals, entry.origin_decimals);
+        store.register_faucet(entry).await?;
+        ::metrics::counter!("faucet_recovered_existing_total").increment(1);
+        return Ok(Faucet {
+            id: existing_id,
+            decimals: miden_decimals,
+            origin_token_decimals,
+        });
     }
+    // Bridge readable AND no faucet registered for this origin → safe to deploy below.
 
     // 3. Auto-create: parse token metadata from claimAsset call.
     //    `parse_token_metadata` already rejects `origin_decimals >
