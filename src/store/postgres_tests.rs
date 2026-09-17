@@ -2317,12 +2317,16 @@ async fn test_pgstore_reverted_receipt_conditional() {
     let Some(store) = pg_store().await else {
         return;
     };
-    let base = rand_u64();
-    let signer = Address::from([(base % 251) as u8 + 3; 20]);
+    let signer = PrivateKeySigner::random().address();
+    // Repeated-byte "random" hashes offer fewer than 256 identities and can
+    // collide with another case or another test in this shared database.
+    let case_hash = |case: &str| {
+        alloy::primitives::keccak256(format!("reverted_receipt_conditional:{signer:#x}:{case}"))
+    };
     let signer_str = format!("{signer:#x}");
 
     // (a) SUCCESS receipt must survive.
-    let tx_ok = TxHash::from([(base % 239) as u8 + 4; 32]);
+    let tx_ok = case_hash("success");
     store
         .txn_begin(tx_ok, dummy_txn_entry_for(signer))
         .await
@@ -2347,7 +2351,7 @@ async fn test_pgstore_reverted_receipt_conditional() {
     );
 
     // (b) PENDING receipt must stay pending.
-    let tx_pending = TxHash::from([(base % 233) as u8 + 5; 32]);
+    let tx_pending = case_hash("pending");
     store
         .txn_begin(tx_pending, dummy_txn_entry_for(signer))
         .await
@@ -2374,7 +2378,7 @@ async fn test_pgstore_reverted_receipt_conditional() {
     );
 
     // (c) ABSENT hash → reverted receipt IS written.
-    let tx_new = TxHash::from([(base % 229) as u8 + 6; 32]);
+    let tx_new = case_hash("absent");
     store
         .commit_reverted_receipt_and_advance_nonce(
             tx_new,
@@ -2983,4 +2987,321 @@ async fn register_faucet_colliding_origin_is_a_reported_noop_195() {
         store.register_faucet(entry(faucet_a)).await.unwrap(),
         "#195: re-registering the owning faucet_id refreshes and reports true"
     );
+}
+
+/// Exercise the real HTTP admission/read endpoints against PostgreSQL after a
+/// simulated process death between reserve_nonce and durable admission. A
+/// reservation alone cannot be acknowledged: it contains no signed envelope.
+#[tokio::test]
+async fn test_pgstore_reservation_only_ack_http_recovery() {
+    reservation_only_http_recovery(false).await;
+}
+
+/// Concurrent retries against one active proxy straddle natural lease expiry,
+/// without editing SQL timestamps. Restarting afterward must preserve lookup,
+/// receipt and nonce state without dispatching the completed transaction again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_pgstore_reservation_only_ack_concurrent_natural_expiry() {
+    reservation_only_http_recovery(true).await;
+}
+
+async fn reservation_rpc(
+    client: &reqwest::Client,
+    url: &str,
+    method: &str,
+    param: &str,
+) -> serde_json::Value {
+    client
+        .post(url)
+        .json(&serde_json::json!({"jsonrpc":"2.0", "id":1, "method":method, "params":[param]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+async fn reservation_retry_burst(
+    client: &reqwest::Client,
+    url: &str,
+    raw: &str,
+    check_accepted_lookup: bool,
+) -> Vec<serde_json::Value> {
+    let count = 32;
+    let barrier = Arc::new(tokio::sync::Barrier::new(count + 1));
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..count {
+        let client = client.clone();
+        let url = url.to_owned();
+        let raw = raw.to_owned();
+        let barrier = barrier.clone();
+        tasks.spawn(async move {
+            barrier.wait().await;
+            let response = reservation_rpc(&client, &url, "eth_sendRawTransaction", &raw).await;
+            if check_accepted_lookup && let Some(hash) = response["result"].as_str() {
+                let lookup = reservation_rpc(&client, &url, "eth_getTransactionByHash", hash).await;
+                assert_eq!(
+                    lookup["result"]["hash"], hash,
+                    "every ACK must be queryable"
+                );
+            }
+            response
+        });
+    }
+    barrier.wait().await;
+    let mut responses = Vec::with_capacity(count);
+    while let Some(response) = tasks.join_next().await {
+        responses.push(response.unwrap());
+    }
+    responses
+}
+
+struct ReservationHttpProxy {
+    url: String,
+    writer: Arc<crate::writer_worker::WriterWorkerHandle>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl ReservationHttpProxy {
+    async fn start() -> Self {
+        let store = Arc::new(pg_store().await.unwrap());
+        let mut service = crate::test_helpers::create_test_service_with_store(store);
+        let (writer, shutdown) = crate::writer_worker::WriterWorker::spawn(
+            service.clone(),
+            8,
+            std::time::Duration::from_secs(30),
+        );
+        let writer = Arc::new(writer);
+        service.writer_handle = Some(writer.clone());
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let app = crate::service::build_app(service, recorder.handle());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        Self {
+            url,
+            writer,
+            shutdown: Some(shutdown),
+            server,
+        }
+    }
+}
+
+impl Drop for ReservationHttpProxy {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        self.server.abort();
+    }
+}
+
+async fn reservation_only_http_recovery(concurrent: bool) {
+    use crate::claim::claimAssetCall;
+    use alloy::eips::Encodable2718;
+
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let store = Arc::new(store);
+    let key = PrivateKeySigner::random();
+    let signer = key.address();
+    let signer_str = format!("{signer:#x}");
+    let calldata = claimAssetCall {
+        smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
+        smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
+        globalIndex: U256::from(rand_u64()),
+        mainnetExitRoot: FixedBytes::ZERO,
+        rollupExitRoot: FixedBytes::ZERO,
+        originNetwork: 0,
+        originTokenAddress: Address::ZERO,
+        destinationNetwork: 1,
+        destinationAddress: Address::ZERO,
+        amount: U256::ZERO,
+        metadata: Default::default(),
+    }
+    .abi_encode();
+    let tx = TxLegacy {
+        chain_id: Some(1),
+        nonce: 0,
+        input: calldata.into(),
+        ..Default::default()
+    };
+    let signature = key.sign_hash_sync(&tx.signature_hash()).unwrap();
+    let envelope: TxEnvelope = tx.into_signed(signature).into();
+    let hash = *envelope.tx_hash();
+    let hash_str = format!("{hash:#x}");
+    let mut bytes = Vec::new();
+    envelope.encode_2718(&mut bytes);
+    let raw = format!("0x{}", hex::encode(bytes));
+    let lease = std::time::Duration::from_secs(if concurrent { 5 } else { 90 });
+    assert!(matches!(
+        store
+            .reserve_nonce(&signer_str, 0, hash, lease)
+            .await
+            .unwrap(),
+        super::NonceReservation::Won { .. }
+    ));
+
+    let reserved_at = tokio::time::Instant::now();
+    // New process state over the same PG records; no original admission owner.
+    let proxy = ReservationHttpProxy::start().await;
+    let url = &proxy.url;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let response = reservation_rpc(&client, url, "eth_sendRawTransaction", &raw).await;
+    let lookup = reservation_rpc(&client, url, "eth_getTransactionByHash", &hash_str).await;
+    let receipt = reservation_rpc(&client, url, "eth_getTransactionReceipt", &hash_str).await;
+    eprintln!(
+        "reservation-only HTTP reproduction: send={response}, lookup={lookup}, receipt={receipt}"
+    );
+    assert_eq!(lookup["result"], serde_json::Value::Null);
+    assert_eq!(receipt["result"], serde_json::Value::Null);
+    assert!(store.txn_get(hash).await.unwrap().is_none());
+    assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 0);
+    assert_eq!(
+        response["error"]["code"], -32005,
+        "must ask caller to retry instead of ACKing a missing transaction: {response}"
+    );
+    assert!(response.get("result").is_none());
+
+    // Inspect only this test's reservation; never reset shared tables.
+    let (pg, connection) = tokio_postgres::connect(
+        &std::env::var("DATABASE_URL").unwrap(),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    let connection = tokio::spawn(connection);
+    if concurrent {
+        let responses = reservation_retry_burst(&client, url, &raw, false).await;
+        for response in &responses {
+            assert_eq!(response["error"]["code"], -32005, "{response}");
+            assert!(response.get("result").is_none());
+        }
+        assert!(store.txn_get(hash).await.unwrap().is_none());
+        assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 0);
+        assert!(!proxy.writer.is_inflight(&hash));
+        let row = pg.query_one(
+            "SELECT fence_token, state, lease_expires_at > now() FROM nonce_reservations WHERE signer = $1 AND nonce = 0",
+            &[&signer_str],
+        ).await.unwrap();
+        assert_eq!(row.get::<_, i64>(0), 1, "retries must not steal the lease");
+        assert_eq!(row.get::<_, String>(1), "executing");
+        assert!(
+            row.get::<_, bool>(2),
+            "pre-expiry burst exceeded test lease"
+        );
+        tokio::time::sleep_until(reserved_at + lease + std::time::Duration::from_millis(100)).await;
+        let responses = reservation_retry_burst(&client, url, &raw, true).await;
+        let mut accepted = 0;
+        for response in &responses {
+            if response.get("result").is_some() {
+                assert_eq!(response["result"], hash_str);
+                accepted += 1;
+            } else {
+                // A competing request may arrive before the winner has saved
+                // its envelope; that remains retryable, never a false ACK.
+                assert_eq!(response["error"]["code"], -32005, "{response}");
+            }
+        }
+        assert!(
+            accepted > 0,
+            "at least one request must win expired admission"
+        );
+        eprintln!(
+            "concurrent reservation recovery: pre_expiry_rejected=32, post_expiry_accepted={accepted}, post_expiry_retryable={}",
+            responses.len() - accepted
+        );
+    } else {
+        assert_eq!(pg.execute("UPDATE nonce_reservations SET lease_expires_at = now() - interval '1 second' WHERE signer = $1 AND nonce = 0 AND tx_hash = $2", &[&signer_str, &hash_str]).await.unwrap(), 1);
+    }
+    {
+        assert_eq!(
+            reservation_rpc(&client, url, "eth_sendRawTransaction", &raw).await["result"],
+            hash_str
+        );
+        let found = reservation_rpc(&client, url, "eth_getTransactionByHash", &hash_str).await;
+        assert_eq!(found["result"]["hash"], hash_str);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let receipt =
+                    reservation_rpc(&client, url, "eth_getTransactionReceipt", &hash_str).await;
+                if !receipt["result"].is_null() {
+                    assert_eq!(receipt["result"]["status"], "0x1");
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("same-hash retry must finish after expiry");
+        assert_eq!(
+            reservation_rpc(&client, url, "eth_sendRawTransaction", &raw).await["result"],
+            hash_str
+        );
+    }
+    assert_eq!(
+        store.nonce_get(&signer_str).await.unwrap(),
+        1,
+        "repeated sends must not advance twice"
+    );
+    assert!(
+        proxy.writer.is_inflight(&hash),
+        "the recovered envelope reached the writer"
+    );
+    let row = pg
+        .query_one(
+            "SELECT fence_token FROM nonce_reservations WHERE signer = $1 AND nonce = 0",
+            &[&signer_str],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i64>(0), 2, "exactly one lease takeover");
+    drop(proxy);
+    let restarted = ReservationHttpProxy::start().await;
+    assert_eq!(
+        reservation_rpc(&client, &restarted.url, "eth_sendRawTransaction", &raw).await["result"],
+        hash_str
+    );
+    assert_eq!(
+        reservation_rpc(
+            &client,
+            &restarted.url,
+            "eth_getTransactionByHash",
+            &hash_str
+        )
+        .await["result"]["hash"],
+        hash_str
+    );
+    assert_eq!(
+        reservation_rpc(
+            &client,
+            &restarted.url,
+            "eth_getTransactionReceipt",
+            &hash_str
+        )
+        .await["result"]["status"],
+        "0x1"
+    );
+    assert!(
+        !restarted.writer.is_inflight(&hash),
+        "restart must deduplicate a terminal transaction"
+    );
+    assert_eq!(store.nonce_get(&signer_str).await.unwrap(), 1);
+    eprintln!(
+        "reservation-only HTTP recovery completed: hash={hash_str}, nonce=1, restart_deduplicated=true"
+    );
+    connection.abort();
 }

@@ -151,8 +151,9 @@ pub enum NonceReservation {
     /// clobber this owner's release.
     Won { fence: u64 },
     /// The slot is currently owned+executing by the SAME tx under a VALID lease
-    /// (another replica is admitting it). Do NOT execute — dedup-return the hash;
-    /// the owner produces the receipt.
+    /// (another replica may be admitting it). Do NOT execute or steal the lease.
+    /// ACK only if the transaction envelope is durably stored; otherwise return
+    /// a retryable error, since the owner may have died before saving it.
     OwnedBySame,
     /// A DIFFERENT tx owns/owned this slot. Hard reject — this submission must not
     /// execute.
@@ -1011,7 +1012,8 @@ pub trait Store: Send + Sync + 'static {
     /// nonce)` are resolved deterministically:
     ///   * a DIFFERENT tx → [`NonceReservation::HeldByOther`] (hard reject);
     ///   * the SAME tx while the owner's lease is VALID and `executing` →
-    ///     [`NonceReservation::OwnedBySame`] (dedup, do NOT execute);
+    ///     [`NonceReservation::OwnedBySame`] (do NOT execute; a reservation alone
+    ///     is insufficient to ACK without a durable transaction envelope);
     ///   * the SAME tx after lease expiry, `released_failure`, or
     ///     `released_success` → takeover:
     ///     [`NonceReservation::Won`] with a bumped fence (retry admission);
