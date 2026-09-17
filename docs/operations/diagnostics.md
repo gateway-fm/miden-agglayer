@@ -245,6 +245,14 @@ Confirm both `--l1-rpc-url` and `--ger-l1-address` are configured, then compare
 actual submitted GER. `--l1-indexer-from-block` is an explicit one-boot
 backfill override, not a normal permanent setting.
 
+If the covering certificate is already settled, also inspect the **source
+bridge-service** index and logs. A complete L1/L2 GER pair plus a persistently
+false `ready_for_claim`, HTTP 500 `not synchronized deposit`, and an earlier
+`L1GER not found on database yet` / skipped-notification message can identify
+the sovereign-chain notification race. Capture both indexers' status and the
+matching GER rows before choosing the
+[ordered bridge-service resync procedure](bridge-service-resync.md).
+
 ### Missing BridgeEvent or quarantine counter increased
 
 Query `unbridgeable_bridge_outs` first. A row is a deliberate fail-closed

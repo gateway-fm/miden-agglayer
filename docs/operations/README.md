@@ -9,6 +9,7 @@ historical cluster value.
 |---|---|
 | [Provisioning](provisioning.md) | Standing up a deployment: key custody, remote signer / KMS, roles, and the startup invariants |
 | [Runbook](runbook.md) | Production constraints, startup, safe shutdown, recovery choices, and incident procedures |
+| [Bridge-service resync](bridge-service-resync.md) | Recover a settled deposit stuck unready by replaying L1 before L2, preserving chains and component images |
 | [Monitoring](monitoring.md) | Health/metrics endpoints, high-signal metrics, alerts, and dashboards |
 | [Diagnostics](diagnostics.md) | Read-only collection and symptom-to-cause investigation |
 | [Writer stalls](writer-stalls.md) | #210 causes, claim leases, phase traces and evidence collection |
