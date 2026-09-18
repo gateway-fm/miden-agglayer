@@ -210,6 +210,7 @@ WATCHDOG_DIR="$DIR/evidence"; mkdir "$WATCHDOG_DIR"
 WATCHDOG_HEALS_FILE="$DIR/ledger"; : > "$WATCHDOG_HEALS_FILE"
 AK=aggkit; PG=pg; PROJECT=test; WATCHDOG_MAX_ATTEMPTS=2
 attempts=0; budget_reported=0; declare -A seen=()
+docker() { [[ "$1" == inspect ]] || return 99; echo '{"Status":"running"}'; }
 aggkit_probe_wedge() {
   [[ "$UNAVAILABLE" == 0 ]] || return 1
   WEDGE_MONITOR=monitor; WEDGE_GER=ger
@@ -228,6 +229,10 @@ cat "$WATCHDOG_HEALS_FILE"
             env["FORCE"] = "1"
             r = subprocess.run([BASH, "-c", body], env=env, text=True, capture_output=True, timeout=10)
             logs = [f.read_text() for f in (root/"evidence").glob('attempt-*/heal.log')]
+            for attempt in (root/"evidence").glob('attempt-*'):
+                self.assertTrue((attempt/"before-state.json").exists())
+                self.assertTrue((attempt/"container-state.json").exists())
+                self.assertTrue((attempt/"container-generation.txt").exists())
             return r, logs, (root/"ledger").read_text()
 
     def test_failed_attempts_are_bounded_and_diagnostics_retained(self):
