@@ -281,6 +281,22 @@ pub trait SyncListener: Send + Sync {
     async fn on_post_sync(&self, _client: &mut MidenClientLib) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Opt into short queued SDK operations while the surrounding reconciliation
+    /// future runs without borrowing the client. Listener ordering is preserved.
+    fn uses_queued_client(&self) -> bool {
+        false
+    }
+
+    /// Capture any account state tied to this sync before queued requests may
+    /// change the SDK store. Only short local reads belong in this hook.
+    async fn prepare_post_sync(&self, _client: &mut MidenClientLib) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn on_post_sync_queued(&self, _client: ClientQueue) -> anyhow::Result<()> {
+        anyhow::bail!("listener opted into queued access without implementing it")
+    }
 }
 
 /// The RESOLVED node URL `MidenClient::new` will actually connect to for the given CLI
@@ -435,6 +451,7 @@ pub struct MidenClient {
     /// counter). Released in a `Drop` guard so an error mid-restore still
     /// re-enables listeners.
     listeners_paused: Arc<AtomicBool>,
+    listener_pass: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     call_count: Arc<AtomicUsize>,
 }
@@ -510,11 +527,16 @@ impl MidenClient {
             };
 
         let (sender, receiver) = mpsc::channel::<Request>(1);
+        let listener_queue = ClientQueue {
+            sender: sender.clone(),
+        };
         let (done_sender, done_receiver) = oneshot::channel::<()>();
         let alive = Arc::new(AtomicBool::new(false));
         let alive_for_run = alive.clone();
         let listeners_paused = Arc::new(AtomicBool::new(false));
         let listeners_paused_for_run = listeners_paused.clone();
+        let listener_pass = Arc::new(tokio::sync::Mutex::new(()));
+        let listener_pass_for_run = listener_pass.clone();
 
         let runtime = tokio::runtime::Runtime::new()?;
         let task = thread::spawn(move || -> anyhow::Result<()> {
@@ -531,11 +553,13 @@ impl MidenClient {
                     prover_timeout_secs,
                     keystore_for_run.clone(),
                     &mut receiver,
+                    &listener_queue,
                     &mut done_receiver,
                     &sync_listeners,
                     debug_mode,
                     &alive_for_run,
                     &listeners_paused_for_run,
+                    &listener_pass_for_run,
                 )));
 
                 match result {
@@ -569,6 +593,7 @@ impl MidenClient {
             alive,
             local_prover_fallback,
             listeners_paused,
+            listener_pass,
             #[cfg(test)]
             call_count: Arc::new(AtomicUsize::new(0)),
         })
@@ -603,6 +628,18 @@ impl MidenClient {
         ListenerPauseGuard {
             flag: self.listeners_paused.clone(),
         }
+    }
+
+    /// After pausing, wait for the already-started listener pass to finish.
+    /// Restore must cross this barrier before changing stores or cursors: a
+    /// queued SDK operation no longer implies that the whole pass is idle.
+    pub async fn wait_for_listener_idle(&self) {
+        crate::metrics::meter_writer_stage("restore", "wait_listener_idle", async {
+            let _pass = self.listener_pass.lock().await;
+            Ok::<_, std::convert::Infallible>(())
+        })
+        .await
+        .expect("infallible listener barrier");
     }
 
     /// Cantina MA#23 — true while `on_post_sync` dispatch is suppressed.
@@ -662,6 +699,7 @@ impl MidenClient {
             alive: Arc::new(AtomicBool::new(true)),
             local_prover_fallback: None,
             listeners_paused: Arc::new(AtomicBool::new(false)),
+            listener_pass: Arc::new(tokio::sync::Mutex::new(())),
             call_count,
         }
     }
@@ -700,6 +738,7 @@ impl MidenClient {
                 alive: Arc::new(AtomicBool::new(true)),
                 local_prover_fallback: None,
                 listeners_paused: Arc::new(AtomicBool::new(false)),
+                listener_pass: Arc::new(tokio::sync::Mutex::new(())),
                 call_count,
             },
             release_sender,
@@ -853,17 +892,42 @@ impl MidenClient {
         result
     }
 
+    #[cfg(test)]
     async fn on_sync(
         result: anyhow::Result<SyncSummary>,
         client: &mut MidenClientLib,
         listeners: &[Arc<dyn SyncListener>],
         listeners_paused: &AtomicBool,
     ) -> anyhow::Result<()> {
+        Self::dispatch_sync(result, client, listeners, listeners_paused, None).await
+    }
+
+    async fn dispatch_sync(
+        result: anyhow::Result<SyncSummary>,
+        client: &mut MidenClientLib,
+        listeners: &[Arc<dyn SyncListener>],
+        listeners_paused: &AtomicBool,
+        mut requests: Option<(&ClientQueue, &mut mpsc::Receiver<Request>)>,
+    ) -> anyhow::Result<()> {
         let summary = result?;
         // Cantina MA#23 — sample once per sync tick so the pause/unpause
         // transitions don't interleave with this listener loop. Cheap and
         // race-resilient: a tick that begins while paused completes paused.
         let paused = listeners_paused.load(Ordering::Acquire);
+        if !paused && requests.is_some() {
+            // Snapshot all listeners before the first queued listener can
+            // serve a writer whose SDK operation syncs account state forward.
+            for listener in listeners {
+                if listener.uses_queued_client() {
+                    crate::metrics::meter_writer_stage(
+                        listener.diagnostic_name(),
+                        "snapshot_post_sync",
+                        listener.prepare_post_sync(client),
+                    )
+                    .await?;
+                }
+            }
+        }
         for listener in listeners {
             // `on_sync` is the cheap summary hook — keep firing it so
             // listeners can keep low-frequency tick-counter state in step
@@ -876,12 +940,23 @@ impl MidenClient {
                 ::metrics::counter!("miden_listener_skipped_paused_total").increment(1);
                 continue;
             }
-            crate::metrics::meter_writer_stage(
-                listener.diagnostic_name(),
-                "post_sync",
-                listener.on_post_sync(client),
-            )
-            .await?;
+            if listener.uses_queued_client()
+                && let Some((queue, receiver)) = requests.as_mut()
+            {
+                let task = crate::metrics::meter_writer_stage(
+                    listener.diagnostic_name(),
+                    "post_sync",
+                    listener.on_post_sync_queued((*queue).clone()),
+                );
+                finish_listener_with_requests(Box::pin(task), client, receiver).await?;
+            } else {
+                crate::metrics::meter_writer_stage(
+                    listener.diagnostic_name(),
+                    "post_sync",
+                    listener.on_post_sync(client),
+                )
+                .await?;
+            }
         }
         Ok(())
     }
@@ -895,11 +970,13 @@ impl MidenClient {
         prover_timeout_secs: u64,
         keystore: Arc<crate::proxy_keystore::ProxyKeystore>,
         receiver: &mut mpsc::Receiver<Request>,
+        listener_queue: &ClientQueue,
         done_receiver: &mut oneshot::Receiver<()>,
         sync_listeners: &[Arc<dyn SyncListener>],
         debug_mode: bool,
         alive: &AtomicBool,
         listeners_paused: &AtomicBool,
+        listener_pass: &tokio::sync::Mutex<()>,
     ) -> anyhow::Result<()> {
         // node client — retry build with exponential backoff
         let node_timeout_ms: u64 = 10_000;
@@ -981,7 +1058,8 @@ impl MidenClient {
         tokio::select! {
             result = Self::sync(&mut client) => {
                 let synced = result.is_ok();
-                if let Err(err) = Self::on_sync(result, &mut client, sync_listeners, listeners_paused).await {
+                let _listener_pass = listener_pass.lock().await;
+                if let Err(err) = Self::dispatch_sync(result, &mut client, sync_listeners, listeners_paused, Some((listener_queue, receiver))).await {
                     tracing::error!("MidenClient initial sync listener error: {err:#}");
                 }
                 alive.store(synced, Ordering::Release);
@@ -1007,7 +1085,8 @@ impl MidenClient {
                     tokio::select! {
                         result = Self::sync(&mut client) => {
                             alive.store(result.is_ok(), Ordering::Release);
-                            if let Err(err) = Self::on_sync(result, &mut client, sync_listeners, listeners_paused).await {
+                            let _listener_pass = listener_pass.lock().await;
+                            if let Err(err) = Self::dispatch_sync(result, &mut client, sync_listeners, listeners_paused, Some((listener_queue, receiver))).await {
                                 tracing::error!("MidenClient sync listener error: {err:#}");
                             }
                         },
@@ -1048,41 +1127,112 @@ impl MidenClient {
         ) -> Box<dyn Future<Output = anyhow::Result<()>> + 'c>,
         Fn: Send + 'static,
     {
-        let queued_at = std::time::Instant::now();
-        let span = tracing::Span::current();
-        let (response_sender, response_receiver) = oneshot::channel::<anyhow::Result<()>>();
+        send_client_request(&self.sender, operation, closure).await
+    }
+}
 
-        let request = Request {
-            response_sender,
-            closure: Box::new(move |client| {
-                use tracing::Instrument;
-                Box::pin(async move {
+/// A request-only handle; it never owns or shuts down the SDK client.
+#[derive(Clone)]
+pub struct ClientQueue {
+    sender: mpsc::Sender<Request>,
+}
+
+impl ClientQueue {
+    pub(crate) async fn call<T, F>(&self, operation: &'static str, call: F) -> anyhow::Result<T>
+    where
+        T: Send + 'static,
+        F: for<'c> FnOnce(
+            &'c mut MidenClientLib,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send + 'c>>,
+        F: Send + 'static,
+    {
+        let (result_sender, result_receiver) = oneshot::channel();
+        let dispatched = send_client_request(&self.sender, operation, move |client| {
+            Box::new(async move {
+                let result = call(client).await;
+                let failed = result.is_err();
+                // Preserve the typed error and its chain for the caller, while
+                // the request diagnostics also record the failed operation.
+                let _ = result_sender.send(result);
+                anyhow::ensure!(!failed, "queued SDK operation failed; see typed response");
+                Ok(())
+            })
+        })
+        .await;
+        match result_receiver.await {
+            Ok(result) => result,
+            Err(_) => {
+                dispatched?;
+                anyhow::bail!("queued client result was dropped")
+            }
+        }
+    }
+}
+
+async fn send_client_request<F>(
+    sender: &mpsc::Sender<Request>,
+    operation: &'static str,
+    closure: F,
+) -> anyhow::Result<()>
+where
+    F: for<'c> FnOnce(&'c mut MidenClientLib) -> Box<dyn Future<Output = anyhow::Result<()>> + 'c>,
+    F: Send + 'static,
+{
+    let queued_at = std::time::Instant::now();
+    let span = tracing::Span::current();
+    let (response_sender, response_receiver) = oneshot::channel::<anyhow::Result<()>>();
+
+    let request = Request {
+        response_sender,
+        closure: Box::new(move |client| {
+            use tracing::Instrument;
+            Box::pin(async move {
                     let wait = queued_at.elapsed().as_secs_f64();
                     metrics::histogram!("miden_client_queue_wait_seconds", "operation" => operation)
                         .record(wait);
                     tracing::debug!(target: "writer_diagnostics", operation, queue_wait_secs = wait, "Miden client request started");
                     crate::metrics::meter_writer_stage(operation, "client_request", Box::into_pin(closure(client))).await
                 }.instrument(span))
-            }),
-        };
-        if crate::metrics::meter_writer_stage(
-            operation,
-            "client_enqueue",
-            self.sender.send(request),
-        )
+        }),
+    };
+    if crate::metrics::meter_writer_stage(operation, "client_enqueue", sender.send(request))
         .await
         .is_err()
-        {
-            anyhow::bail!("MidenClient::with: failed to queue a request - receiver is closed");
-        }
+    {
+        anyhow::bail!("MidenClient::with: failed to queue a request - receiver is closed");
+    }
 
-        let Ok(result) =
-            crate::metrics::meter_writer_stage(operation, "client_response", response_receiver)
-                .await
-        else {
-            anyhow::bail!("MidenClient::with: failed to get a response - receiver is closed");
-        };
-        result
+    let Ok(result) =
+        crate::metrics::meter_writer_stage(operation, "client_response", response_receiver).await
+    else {
+        anyhow::bail!("MidenClient::with: failed to get a response - receiver is closed");
+    };
+    result
+}
+
+/// Keep a single ordered listener pass, but serve client requests while it
+/// waits on work that does not borrow the SDK. No detached task, overlapping
+/// projector, or concurrent SQLite owner is introduced.
+async fn finish_listener_with_requests<F>(
+    future: F,
+    client: &mut MidenClientLib,
+    receiver: &mut mpsc::Receiver<Request>,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = anyhow::Result<()>>,
+{
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            result = &mut future => return result,
+            request = receiver.recv() => {
+                let Some(request) = request else {
+                    return future.await;
+                };
+                let result = (request.closure)(client).await;
+                let _ = request.response_sender.send(result);
+            }
+        }
     }
 }
 
@@ -1238,6 +1388,181 @@ async fn wait_for_transaction_commit_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reconciliation_wait_does_not_block_client_requests() {
+        let mut client = crate::test_helpers::offline_miden_client_lib().await;
+        let (sender, mut receiver) = mpsc::channel(1);
+        let queue = ClientQueue { sender };
+        let (release, waiting) = oneshot::channel();
+        let listener_queue = queue.clone();
+        let listener = async move {
+            // The listener can borrow the SDK itself, then wait on off-client
+            // work while an unrelated request makes progress.
+            listener_queue
+                .call("test::listener", |client| {
+                    Box::pin(async move { client.get_sync_height().await.map_err(Into::into) })
+                })
+                .await?;
+            waiting.await?;
+            Ok(())
+        };
+        let request = async move {
+            let height = queue
+                .call("test::request", |client| {
+                    Box::pin(async move { client.get_sync_height().await.map_err(Into::into) })
+                })
+                .await
+                .unwrap();
+            assert_eq!(height.as_u64(), 0);
+            release.send(()).unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (result, ()) = tokio::join!(
+                finish_listener_with_requests(listener, &mut client, &mut receiver),
+                request
+            );
+            result.unwrap();
+        })
+        .await
+        .expect("client request must finish before reconciliation is released");
+    }
+
+    #[tokio::test]
+    async fn queued_dispatch_snapshots_before_requests_and_preserves_listener_order() {
+        use std::sync::Mutex;
+        struct Listener {
+            name: &'static str,
+            events: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl SyncListener for Listener {
+            fn on_sync(&self, summary: &SyncSummary) {
+                self.events.lock().unwrap().push(format!(
+                    "{}:sync:{}",
+                    self.name,
+                    summary.block_num.as_u64()
+                ));
+            }
+            fn uses_queued_client(&self) -> bool {
+                true
+            }
+            async fn prepare_post_sync(&self, _client: &mut MidenClientLib) -> anyhow::Result<()> {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}:snapshot", self.name));
+                Ok(())
+            }
+            async fn on_post_sync_queued(&self, queue: ClientQueue) -> anyhow::Result<()> {
+                let events = self.events.clone();
+                let name = self.name;
+                queue
+                    .call("test::ordered_listener", move |_client| {
+                        Box::pin(async move {
+                            events.lock().unwrap().push(format!("{name}:request"));
+                            Ok(())
+                        })
+                    })
+                    .await?;
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}:finished", self.name));
+                Ok(())
+            }
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let listeners: Vec<Arc<dyn SyncListener>> = ["scanner", "projector"]
+            .into_iter()
+            .map(|name| {
+                Arc::new(Listener {
+                    name,
+                    events: events.clone(),
+                }) as Arc<dyn SyncListener>
+            })
+            .collect();
+        let mut client = crate::test_helpers::offline_miden_client_lib().await;
+        let (sender, mut receiver) = mpsc::channel(1);
+        let queue = ClientQueue { sender };
+        let paused = AtomicBool::new(false);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            MidenClient::dispatch_sync(
+                Ok(SyncSummary::new_empty(
+                    miden_protocol::block::BlockNumber::from(42),
+                )),
+                &mut client,
+                &listeners,
+                &paused,
+                Some((&queue, &mut receiver)),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "scanner:snapshot",
+                "projector:snapshot",
+                "scanner:sync:42",
+                "scanner:request",
+                "scanner:finished",
+                "projector:sync:42",
+                "projector:request",
+                "projector:finished",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_client_preserves_typed_errors() {
+        let mut client = crate::test_helpers::offline_miden_client_lib().await;
+        let (sender, mut receiver) = mpsc::channel(1);
+        let queue = ClientQueue { sender };
+        let listener = async move {
+            let error = queue
+                .call("test::typed_error", |_client| {
+                    Box::pin(async {
+                        Err::<(), _>(
+                            std::io::Error::new(std::io::ErrorKind::Interrupted, "fixture").into(),
+                        )
+                    })
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::Interrupted
+            );
+            Ok(())
+        };
+        finish_listener_with_requests(listener, &mut client, &mut receiver)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_pause_waits_for_active_reconciliation_to_finish() {
+        let owner = MidenClient::new_test();
+        let pass = owner.listener_pass.lock().await;
+        let pause = owner.pause_listeners();
+        let idle = owner.wait_for_listener_idle();
+        tokio::pin!(idle);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut idle)
+                .await
+                .is_err()
+        );
+        drop(pass);
+        tokio::time::timeout(Duration::from_secs(1), idle)
+            .await
+            .unwrap();
+        assert!(owner.listeners_paused());
+        drop(pause);
+        assert!(!owner.listeners_paused());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn issue_210_sync_deadline_drops_work_before_releasing_the_client() {
