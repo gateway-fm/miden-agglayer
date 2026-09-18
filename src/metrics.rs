@@ -910,50 +910,56 @@ pub fn record_proof_outcome(kind: ProofKind, outcome: ProofOutcome) {
 /// Observe a wait without cancelling it or detaching work. Labels are static,
 /// bounded call-site names; transaction identity belongs in the enclosing span.
 /// Periodic events expose waits that never reach the completion histogram.
-pub(crate) async fn meter_writer_stage<F, T, E>(
+pub(crate) fn meter_writer_stage<F, T, E>(
     operation: &'static str,
     stage: &'static str,
     future: F,
-) -> Result<T, E>
+) -> impl std::future::Future<Output = Result<T, E>>
 where
     F: std::future::Future<Output = Result<T, E>>,
     E: std::fmt::Display,
 {
-    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let mut observation = StageObservation {
-        operation,
-        stage,
-        stage_id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        started: tokio::time::Instant::now(),
-        outcome: "cancelled",
-    };
-    tracing::debug!(target: "writer_diagnostics", operation, stage,
-        stage_id = observation.stage_id, "stage started");
-    let period = std::time::Duration::from_secs(30);
-    let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Nested SDK execution futures are large. Keep each observed stage's
-    // state machine small instead of nesting their layouts in the writer.
-    use tracing::Instrument;
-    let span = tracing::debug_span!(target: "writer_diagnostics", "writer_stage",
-        operation, stage, stage_id = observation.stage_id);
-    let mut future = Box::pin(future.instrument(span));
-    loop {
-        tokio::select! {
-            result = &mut future => {
-                observation.outcome = if result.is_ok() { "ok" } else { "error" };
-                if result.is_err() {
-                    tracing::debug!(target: "writer_diagnostics", operation, stage,
-                        stage_id = observation.stage_id, error_type = std::any::type_name::<E>(),
-                        "stage failed; caller handles the error");
+    // Allocate BEFORE constructing the async state machine. Boxing in an
+    // async fn's body is too late: the unpolled wrapper still embeds F, and
+    // nested proof/funding callers multiply debug-build stack frames.
+    let future_size_bytes = std::mem::size_of_val(&future);
+    let future = Box::pin(future);
+    async move {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let mut observation = StageObservation {
+            operation,
+            stage,
+            stage_id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            started: tokio::time::Instant::now(),
+            outcome: "cancelled",
+        };
+        tracing::debug!(target: "writer_diagnostics", operation, stage,
+            stage_id = observation.stage_id, future_size_bytes, "stage started");
+        let period = std::time::Duration::from_secs(30);
+        let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        use tracing::Instrument;
+        let span = tracing::debug_span!(target: "writer_diagnostics", "writer_stage",
+            operation, stage, stage_id = observation.stage_id);
+        let future = future.instrument(span);
+        tokio::pin!(future);
+        loop {
+            tokio::select! {
+                result = &mut future => {
+                    observation.outcome = if result.is_ok() { "ok" } else { "error" };
+                    if result.is_err() {
+                        tracing::debug!(target: "writer_diagnostics", operation, stage,
+                            stage_id = observation.stage_id, error_type = std::any::type_name::<E>(),
+                            "stage failed; caller handles the error");
+                    }
+                    return result;
                 }
-                return result;
-            }
-            _ = heartbeat.tick() => {
-                tracing::warn!(target: "writer_diagnostics", operation, stage,
-                    stage_id = observation.stage_id,
-                    elapsed_secs = observation.started.elapsed().as_secs_f64(),
-                    "stage still running");
+                _ = heartbeat.tick() => {
+                    tracing::warn!(target: "writer_diagnostics", operation, stage,
+                        stage_id = observation.stage_id,
+                        elapsed_secs = observation.started.elapsed().as_secs_f64(),
+                        "stage still running");
+                }
             }
         }
     }
@@ -992,20 +998,28 @@ impl Drop for StageObservation {
 /// (e.g. the bridge_out_tool consume-notes branch wants to split
 /// SubmitFailure from a real prover failure) should call
 /// `meter_proof_classified` or emit metrics inline.
-pub async fn meter_proof<F, T, E>(kind: ProofKind, fut: F) -> Result<T, E>
+pub fn meter_proof<F, T, E>(
+    kind: ProofKind,
+    fut: F,
+) -> impl std::future::Future<Output = Result<T, E>>
 where
     F: std::future::Future<Output = Result<T, E>>,
     E: std::fmt::Display,
 {
-    let start = std::time::Instant::now();
-    let res = meter_writer_stage(kind.as_label(), "prove", fut).await;
-    let elapsed = start.elapsed().as_secs_f64();
-    let outcome = match &res {
-        Ok(_) => ProofOutcome::Ok,
-        Err(e) => ProofOutcome::from_error(e),
-    };
-    record_proof_metrics(kind, outcome, Some(elapsed));
-    res
+    // Keep this wrapper small before its first poll as well. Timing still
+    // begins on first poll, and dropping the wrapper drops the owned work.
+    let stage = meter_writer_stage(kind.as_label(), "prove", fut);
+    async move {
+        let start = std::time::Instant::now();
+        let res = stage.await;
+        let elapsed = start.elapsed().as_secs_f64();
+        let outcome = match &res {
+            Ok(_) => ProofOutcome::Ok,
+            Err(e) => ProofOutcome::from_error(e),
+        };
+        record_proof_metrics(kind, outcome, Some(elapsed));
+        res
+    }
 }
 
 /// Records primary-attempt metrics. Returns the result unchanged so the
@@ -1068,6 +1082,88 @@ pub fn record_fallback_attempt<T, E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unpolled async wrapper must not keep the SDK future inline. Boxing
+    /// inside an `async fn` body happens only on first poll and leaves every
+    /// caller carrying the full input layout until then.
+    #[test]
+    fn observed_futures_do_not_embed_the_input_state_machine() {
+        struct LargeFuture([u8; 64 * 1024]);
+        impl std::future::Future for LargeFuture {
+            type Output = Result<usize, &'static str>;
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                std::task::Poll::Ready(Ok(self.0.len()))
+            }
+        }
+        let stage = meter_writer_stage("stack_test", "large", LargeFuture([0; 64 * 1024]));
+        let proof = meter_proof(ProofKind::Init, LargeFuture([0; 64 * 1024]));
+        let stage_bytes = std::mem::size_of_val(&stage);
+        let proof_bytes = std::mem::size_of_val(&proof);
+        eprintln!("unpolled wrappers: stage={stage_bytes} bytes, proof={proof_bytes} bytes");
+        assert!(
+            stage_bytes < 4096,
+            "stage embeds its input: {stage_bytes} bytes"
+        );
+        assert!(
+            proof_bytes < 4096,
+            "proof embeds its input: {proof_bytes} bytes"
+        );
+    }
+
+    /// Moving allocation out of the async body must preserve lazy execution,
+    /// cancellation, and borrowed/non-Send work on the serialized client.
+    #[tokio::test]
+    async fn observed_work_is_lazy_and_dropped_with_its_wrapper() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        struct Work {
+            polls: Rc<Cell<usize>>,
+            drops: Rc<Cell<usize>>,
+        }
+        impl std::future::Future for Work {
+            type Output = Result<(), &'static str>;
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                self.polls.set(self.polls.get() + 1);
+                std::task::Poll::Pending
+            }
+        }
+        impl Drop for Work {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+        let polls = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+        let work = || Work {
+            polls: polls.clone(),
+            drops: drops.clone(),
+        };
+        let unpolled = meter_proof(ProofKind::Init, work());
+        assert_eq!(polls.get(), 0);
+        drop(unpolled);
+        assert_eq!(polls.get(), 0);
+        assert_eq!(drops.get(), 1);
+
+        let mut pending = Box::pin(meter_proof(ProofKind::Init, work()));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(pending.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(polls.get() > 0);
+        drop(pending);
+        assert_eq!(
+            drops.get(),
+            2,
+            "cancellation must drop the owned work immediately"
+        );
+    }
 
     /// RED→GREEN regression for the live /metrics unreliability (reindex run:
     /// gauge frozen at 2000 while the true value was 156000; counters
@@ -1314,6 +1410,7 @@ mod tests {
         );
         let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
         assert!(logs.contains("stage started"), "{logs}");
+        assert!(logs.contains("future_size_bytes="), "{logs}");
         assert_eq!(logs.matches("stage still running").count(), 2, "{logs}");
         assert!(logs.contains("elapsed_secs=60"), "{logs}");
         for outcome in ["cancelled", "ok", "error"] {

@@ -69,7 +69,9 @@ failures record the outcome and error type; the caller retains error handling.
 
 Each observed operation emits `stage started` and `stage finished` with
 `operation`, `stage`, a process-local `stage_id`, elapsed seconds, and outcome
-`ok`, `error`, or `cancelled`. A still-pending stage emits a WARN every 30 seconds
+`ok`, `error`, or `cancelled`. Starts also include `future_size_bytes`: the
+size of the input future before boxing, not a measurement of total stack use.
+A still-pending stage emits a WARN every 30 seconds
 even with the default INFO filter. Writer events carry the `writer_job` span
 with transaction `hash`, `job_id`, signer and kind, propagated onto the client
 owner. Background listeners are identified by their concrete type.
@@ -133,3 +135,30 @@ Watch `miden_sync_timeouts_total`, `miden_commit_wait_timeouts_total`, and
 claim heartbeat can be normal after preparation; its debug event says why the
 renewal loop stopped. Preserve this evidence if the public-testnet tail remains
 after the hotfix; passing local E2E alone does not establish its incident cause.
+
+## Stack overflow while funding a new faucet
+
+The September 15 SSH debug-image run aborted during a new token's fee cascade:
+`cascade-funding from service (#201)` → `init/prove` →
+`client/execute_prove_submit` → `has overflowed its stack` /
+`fatal runtime error: stack overflow, aborting`. This is a process crash, so
+neither the stage heartbeat nor the client's normal error-restart loop can
+recover in-process. Container restarts and unfinished claims are downstream
+symptoms. Capture stderr as well as structured stdout logs.
+
+The phase wrappers introduced in #212 boxed their input **inside** an
+`async fn`. Before the first poll, that wrapper still stored the full input
+future inline. The proof wrapper nested another copy of that layout, and the
+unoptimized faucet call chain accumulated large stack frames. A regression
+fixture with a 64 KiB input produced a roughly 128 KiB proof wrapper. Moving
+boxing before construction of the async state machine reduces that wrapper
+to hundreds of bytes and bounds the real guarded SDK submission wrapper too.
+Execution, timing, span creation and heartbeat startup remain lazy; dropping
+the returned future still drops the owned operation without detached work.
+
+For another crash, retain the exact image digest and source revision, build
+profile/toolchain, complete stderr and surrounding `writer_diagnostics` events,
+container restart count/exit status, and a core dump or native backtrace if
+available. `future_size_bytes` helps compare unusually large stages across
+builds; it is not a stack high-water mark. A release-profile pass alone does
+not establish that a failing debug path is fixed.
