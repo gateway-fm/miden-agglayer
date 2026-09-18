@@ -24,11 +24,16 @@ watchdog_tick() {
     attempt_dir="$WATCHDOG_DIR/attempt-$attempts"
     mkdir -p "$attempt_dir" || return 1
     gzip -c "$WATCHDOG_DIR/latest.log" >"$attempt_dir/trigger.log.gz" || return 1
+    docker inspect -f '{{json .State}}' "$AK" >"$attempt_dir/before-state.json" 2>&1 || true
     echo "$(date -u +%FT%TZ) WATCHDOG-ATTEMPT: monitor=$WEDGE_MONITOR signed_hashes=$WEDGE_HASHES ger=$WEDGE_GER evidence=$attempt_dir" | tee -a "$WATCHDOG_HEALS_FILE"
     # Re-check under the healer's lock: admission may have completed since our
     # snapshot. FORCE=1 bypassed that protection in the old watchdog.
     if PROJECT="$PROJECT" FORCE=0 HEAL_DIAGNOSTIC_DIR="$attempt_dir" \
         "$SCRIPT_DIR/aggkit-preserve-heal.sh" aggkit >"$attempt_dir/heal.log" 2>&1; then rc=0; else rc=$?; fi
+    # The helper may exit during its lock/precheck, before installing its own
+    # diagnostic trap. Preserve lifecycle evidence for those outcomes too.
+    docker inspect -f '{{json .State}}' "$AK" >"$attempt_dir/container-state.json" 2>&1 || true
+    docker inspect -f '{{.Id}} {{.RestartCount}} {{.State.StartedAt}}' "$AK" >"$attempt_dir/container-generation.txt" 2>&1 || true
     case "$rc" in
         0) echo "$(date -u +%FT%TZ) WATCHDOG: preserve-heal SUCCEEDED evidence=$attempt_dir" ;;
         2) echo "$(date -u +%FT%TZ) WATCHDOG-SKIPPED: precheck no longer authorizes recovery evidence=$attempt_dir" ;;
