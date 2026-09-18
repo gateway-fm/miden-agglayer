@@ -795,7 +795,8 @@ esac
 # HEAL_ALLOW_DEFERRED_PROOF=1: on a quiet stack there may be no pending
 # injection for the heal to await, and this drill proves the injection pipeline
 # itself a few lines below (the NINJECTED1 -> INJ2 gate). The heal must still
-# fail on every NEGATIVE signal — crash loop, re-wedge, restore mismatch.
+# fail on persistent unhealthy state or a restore mismatch. Normal pending-tx
+# dedup chatter is not a re-wedge; signed admission and fresh traffic prove recovery.
 # `set -e` is active: a bare invocation that exits 3 aborts the WHOLE script
 # before `$?` is ever read, so the exit-3 contract below would never run — the
 # same shape as the psql subshell bug. `if ...; then ... else HEAL_RC=$?; fi`
@@ -816,7 +817,7 @@ case "$HEAL_RC" in
     # not evidence that none occurred, and exit 3 also covers the path where
     # NO target was extracted and no wait ran at all, so "watches one target"
     # would be wrong there too.
-    3) say "aggkit aggoracle heal restored the service but did not confirm an exact injection (it checks at most one extracted target; it does not observe all injections) — this drill proves the pipeline itself below" ;;
+    3) say "aggkit aggoracle heal restored the service but did not confirm a signed injection from its post-heal logs — this drill proves the pipeline itself below" ;;
     *)
         tail -20 "$EVIDENCE" || true
         fail "aggkit aggoracle heal FAILED (#113, rc=$HEAL_RC) — GER injection would stay frozen"

@@ -381,6 +381,34 @@ also destroys aggsender's cert lineage and the bridgesync cursors). Exit codes:
 `0` healed and an injection was observed, `2` no wedge to heal, `3` healed but
 unproven, anything else needs a look.
 
+The warning's `ID` identifies a **monitoring record**, not the signed transaction.
+The script correlates it with `signed tx sent to the network` and the matching
+`monitoredTxId`, then queries the proxy for the signed hash. `CertificateID`
+belongs to AggLayer certificates and must never be used for this probe. Dedup
+messages also occur during normal in-flight work; the automatic precheck requires
+at least 10 repetitions spanning 60 seconds, with a recent retry and no admitted
+signed hash. If the last 15 minutes of logs do not contain the broadcast mapping,
+it reports `no-signed-hash` and does not reset anything. Increase
+`AGGKIT_LOG_LOOKBACK` for an older incident; missing evidence is not proof of a wedge.
+
+The chaos runner prints `watchdog evidence: <directory>`. Its attempt directories
+retain `trigger.log.gz`, `precheck.log.gz`, `heal.log`, `container-state.json`,
+`container-generation.txt`, and `container.log.gz`. `/tmp/chaos-watchdog.out`
+records decisions including skipped/unavailable probes. Search for
+`WATCHDOG-ATTEMPT`, `WATCHDOG-FAILED`, `decision=`, `health=`, and `proof=`.
+The watchdog rechecks admission under the healer's lock and limits **attempts**
+(including failures) to six per soak stage. An absent mapping or failed database
+probe never authorizes recovery.
+
+After a verified state restore, the helper requires a new uninterrupted 25-second
+healthy window within 120 seconds. A transient startup failure during a proxy
+outage resets that window; it does not cause the helper to stop a subsequently
+recovered process. Persistent failures remain unconfirmed, retain staging and
+diagnostics, and leave Docker's restart policy active. Content/ownership restore
+mismatches still prevent startup. Only an admitted signed injection yields exit
+`0`; a quiet full-DB-loss drill may explicitly accept exit `3` and must prove fresh
+traffic itself. The release gate still requires delivery and exact-block events.
+
 **3. Verify GER injection actually resumed.** Neither step alone is sufficient
 — step 1 removes the proxy's veto, step 2 lets aggkit re-send — so verify the
 end state rather than either command's exit code:

@@ -86,6 +86,8 @@ test-scripts: ## Syntax-check + run the shell guard test harnesses (no docker ne
 	# itself — so it runs here rather than only inside a docker-bound e2e.
 	bash -n scripts/test-chaos-verdict.sh
 	bash scripts/test-chaos-verdict.sh
+	bash -n scripts/aggkit-watchdog.sh scripts/lib-aggkit-recovery.sh scripts/aggkit-preserve-heal.sh
+	python3 scripts/test-aggkit-recovery.py
 	# The gate in front of every recovery-drill fingerprint. Wrong-lax and it
 	# fingerprints a moving pipeline (spurious #88 data loss); wrong-strict and
 	# the drill never runs at all. Both have happened; both were invisible to
