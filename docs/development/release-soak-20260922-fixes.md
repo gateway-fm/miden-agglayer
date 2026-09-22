@@ -92,8 +92,29 @@ post-chaos liveness verdict, preserving the existing self-recovery requirement.
 - Linux `make test-scripts` passes, including the full GNU/Linux healer lifecycle
   tests, failed-send evidence, fee budget/ambiguous-transfer checks, and
   per-network bridge health/recovery tests.
-- Full restore against a copy of the growing-chain PG state with fresh SQLite
-  is pending explicit approval to copy that database. It is not claimed passed.
+- With explicit approval, the retained growing-chain PG database was copied
+  into an isolated PostgreSQL 16 instance on the same host. The original
+  988c18d application image reproduced #222: 81 global reservations minus
+  the first window's 64 leaves incorrectly expected index 17 instead of 0.
+- The fixed application at 4b9923d completed a fresh-SQLite restore to block
+  129,557 across 26 replay windows. All 427 event records, 81 reservation
+  bindings and 551 receipt status/block/transaction-ID records were preserved.
+  A separate read-only node-database audit verified 81 bridge, 174 claim and
+  172 GER events at their exact consumption blocks, with zero missing, extra
+  or late events. Each reservation also matched its canonical note/block.
+- A second fresh-SQLite replay passed to block 129,710 across another 26
+  windows, preserving the same records and passing the same independent
+  audit. Both runs used `--read-only`, empty keystores and the isolated
+  database. Neither attempted a chain submission. Live source event,
+  reservation and receipt records, and the failed soak verdict, were unchanged.
+- CI passed for implementation revision 4b9923d, including the main check,
+  CodeQL and the upstream API gate.
+
+The isolated validation manifests, original-image failure, replay-window logs
+and audits are retained on the SSH host under
+`~/soak-fix-20260922/restore-validation/`. The copied database is
+`soak-fix-pg-20260922/retained_restore`; the source is
+`miden-agglayer-agglayer-postgres-1/agglayer_store`.
 
 The live application remains 988c18d, its recorded harness remains 00fed23, and
 the old attempt remains FAILED with zero completed resumed cycles. These changes
