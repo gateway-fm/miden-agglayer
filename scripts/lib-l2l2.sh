@@ -814,29 +814,15 @@ _pf_port_owner_ok() {
     fi
 }
 
-# _pf_bridge_fresh — assert bridge-service is actively logging (newest log line
-# within PF_BRIDGE_FRESH_MAX seconds). A frozen synchronizer stops emitting lines
-# while the container stays "Up"; this is the liveness gate that catches it.
+# Check each synchronizer independently: L2 activity and stale sync.status
+# cannot mask a dead L1 loop. Empty chains still produce checkReorg iterations.
 _pf_bridge_fresh() {
-    local container="${1:-${COMPOSE_PROJECT_NAME}-bridge-service-1}" iso ts now age
-    local label="${2:-bridge-service}"
-    iso=$( ( set +o pipefail; docker logs --tail 8 "$container" 2>&1 | sed -r 's/\x1B\[[0-9;]*[mK]//g' \
-        | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z' | tail -1 ) || true )
-    if [[ -z "$iso" ]]; then
-        _pf_fail "$label liveness: no parseable log timestamp in recent output (frozen?)"
-        return
-    fi
-    ts=$(python3 -c "import datetime; print(int(datetime.datetime.fromisoformat('${iso}'.replace('Z','+00:00')).timestamp()))" 2>/dev/null || true)
-    now=$(date -u +%s)
-    if [[ -z "$ts" ]]; then
-        _pf_fail "$label liveness: unparsable log timestamp '$iso'"
-        return
-    fi
-    age=$(( now - ts ))
-    if [[ "$age" -le "${PF_BRIDGE_FRESH_MAX:-240}" ]]; then
-        _pf_pass "$label actively syncing (newest log line ${age}s ago)"
+    local container="$1" label="$2" report
+    shift 2
+    if report=$(python3 "$SCRIPT_DIR/bridge-sync-health.py" --container "$container" --networks "$@" 2>&1); then
+        _pf_pass "$label per-network iterations fresh: $report"
     else
-        _pf_fail "$label FROZEN — newest log line is ${age}s old (>${PF_BRIDGE_FRESH_MAX:-240}s); synchronizer wedged, deposits will never reach ready_for_claim"
+        _pf_fail "$label per-network synchronizer stalled or unavailable: $report"
     fi
 }
 
@@ -1015,8 +1001,8 @@ l2l2_validate_stack() {
     # ready_for_claim. Two liveness gates: (i) newest log line is fresh (catches a
     # total log-freeze); (ii) each synchronizer is near its chain tip (catches a
     # stuck-but-still-logging synchronizer).
-    _pf_bridge_fresh "${COMPOSE_PROJECT_NAME}-bridge-service-1"     "Miden bridge-service"
-    _pf_bridge_fresh "${COMPOSE_PROJECT_NAME}-bridge-service-l2b-1" "L2B bridge-service"
+    _pf_bridge_fresh "${COMPOSE_PROJECT_NAME}-bridge-service-1"     "Miden bridge-service" 0 1
+    _pf_bridge_fresh "${COMPOSE_PROJECT_NAME}-bridge-service-l2b-1" "L2B bridge-service" 0 2
     # net 0/1 on the base bridge_db (postgres); net 2 on the isolated L2B bridge_db (postgres-l2b)
     _pf_sync_lag 0 "$L1_RPC"  "L1 (Miden svc)"  "${COMPOSE_PROJECT_NAME}-postgres-1"
     # Network 1 (Miden, via the proxy's synthetic RPC) was the one network never

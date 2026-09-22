@@ -190,6 +190,16 @@ log "  MIXED LOADTEST — L1<->Miden ($N_L1_FWD/$N_L1_BACK) + L2<->L2 (fwd=$L2L2
 log "======================================================================"
 
 l2l2_ensure_stack
+if [[ "${E2E_FEE_STAGE_PREPARED:-0}" != 1 ]]; then
+    # MOP plus both COL origins, plus the child L1 load's new tokens.
+    _fee_tokens=3
+    [[ "$SKIP_L1_LOAD" == 1 ]] || _fee_tokens=$((_fee_tokens + ${NUM_ERC20:-9}))
+    python3 "$SCRIPT_DIR/e2e-fee-budget.py" --project "$COMPOSE_PROJECT_NAME" \
+        --new-faucets "$_fee_tokens" \
+        --operations "$((N_L1_FWD + N_L1_BACK + L2L2_FWD + L2L2_BACK + 4))" \
+        --l1-rpc "$L1_RPC" --proxy-rpc "$L2_RPC" || fail "stage fee budget unavailable"
+    export E2E_FEE_STAGE_PREPARED=1
+fi
 if [[ "${L2L2_PREFLIGHT_DONE:-0}" != "1" ]]; then l2l2_validate_stack; fi
 l2l2_miden_identities
 l2l2_deploy_nudge_token

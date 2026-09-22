@@ -192,6 +192,9 @@ impl FeeVaultMonitor {
                         charges_inner.store(false, std::sync::atomic::Ordering::Relaxed);
                         return Ok(());
                     }
+                    metrics::gauge!("bridge_fee_vault_expected_accounts").set(
+                        targets.iter().map(|(_, id)| *id)
+                            .collect::<std::collections::HashSet<_>>().len() as f64);
                     for (name, id) in targets {
                         let balance = match poll_account(client, &name, id, &snap).await {
                             Ok(Some(balance)) => balance,
@@ -201,6 +204,18 @@ impl FeeVaultMonitor {
                                 continue;
                             }
                         };
+                        // Stable identities disambiguate equal symbols on different
+                        // origin networks. A successful refresh timestamp lets stage
+                        // preflights reject cached samples during an outage.
+                        let id_hex = id.to_hex();
+                        let fee_hex = snap.fee_faucet_id.to_hex();
+                        metrics::gauge!("bridge_fee_vault_balance_by_id",
+                            "account_id" => id_hex.clone(), "fee_faucet" => fee_hex.clone())
+                            .set(balance as f64);
+                        metrics::gauge!("bridge_fee_vault_sample_timestamp_seconds",
+                            "account_id" => id_hex, "fee_faucet" => fee_hex)
+                            .set(std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64());
                         let left = txns_left(balance, max_fee);
                         metrics::gauge!("bridge_fee_vault_balance", "account" => name.clone())
                             .set(balance as f64);
