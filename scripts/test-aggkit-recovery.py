@@ -42,6 +42,10 @@ def broadcast(t, signed=SIGNED, monitor=MONITOR):
     return line(t, f"signed tx sent to the network: {signed}", monitoredTxId=monitor)
 
 
+def failed_send(t, signed=SIGNED, monitor=MONITOR):
+    return line(t, f"failed to send tx {signed} to network: pending lower nonce", monitoredTxId=monitor)
+
+
 def fixture(now=1000):
     return [broadcast(now - 110)] + [injection(now - 100 + i * 10) for i in range(10)] + [
         line(now - 1, f"recovery: last certificate from AggLayer: Height: 155, CertificateID: {CERT}", module="aggsender")
@@ -49,6 +53,81 @@ def fixture(now=1000):
 
 
 class Parsing(unittest.TestCase):
+    def test_fixture_does_not_evict_a_ger_after_one_transient_send_failure(self):
+        import tomllib
+        config = tomllib.loads((SCRIPTS.parent / "fixtures/aggkit-config.toml").read_text())
+        self.assertEqual(config["AggOracle"]["EVMSender"]["EthTxManager"]["EstimateGasMaxRetries"], 0)
+
+    def test_failed_send_is_a_signed_identity_not_a_monitor_id(self):
+        result = parser.evidence([failed_send(890)] + fixture()[1:], 1000)
+        self.assertEqual(result[:3], [MONITOR, GER, SIGNED])
+        self.assertEqual(result[-1], "candidate")
+
+    def test_incomplete_failed_send_message_does_not_authorize_recovery(self):
+        lines = [line(890, f"failed to send tx {SIGNED}", monitoredTxId=MONITOR)] + fixture()[1:]
+        self.assertEqual(parser.evidence(lines, 1000)[-1], "no-signed-hash")
+
+    def test_failed_replacement_and_successful_broadcast_are_both_probed(self):
+        result = parser.evidence(fixture() + [failed_send(999, signed=CERT)], 1000)
+        self.assertEqual(set(result[2].split(",")), {SIGNED, CERT})
+
+    def test_old_process_logs_cannot_supply_a_signed_identity(self):
+        self.assertEqual(parser.evidence(fixture(), 1000, since=895)[-1], "no-signed-hash")
+
+    def test_signed_identity_survives_log_window_but_retry_authority_does_not(self):
+        identities = {}
+        parser.evidence([failed_send(890)] + fixture()[1:], 1000, identities=identities)
+        result = parser.evidence(fixture(3000)[1:], 3000, identities=identities)
+        self.assertEqual(result[2], SIGNED)
+        self.assertEqual(result[-1], "candidate")
+        self.assertEqual(parser.evidence([injection(3100)], 3100, identities=identities)[-1], "insufficient-repeats")
+        self.assertEqual(parser.evidence([], 3100, identities=identities)[-1], "no-injection")
+
+    def test_cached_monitor_ger_conflict_fails_closed(self):
+        identities = {}
+        parser.evidence(fixture(), 1000, identities=identities)
+        lines = [injection(2900+i*10, ger=CERT) for i in range(10)]
+        self.assertEqual(parser.evidence(lines, 3000, identities=identities)[-1], "ambiguous-monitor")
+
+    def test_cli_discards_cache_after_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory)/"state.json"
+            def run(lines, generation):
+                return subprocess.run(["python3", str(SCRIPTS/"aggkit-log-evidence.py"), "--now", "1000",
+                    "--state", str(cache), "--generation", generation, "--since", "1970-01-01T00:00:00Z"],
+                    input="".join(lines), text=True, capture_output=True, check=True).stdout.strip().split("\t")
+            self.assertEqual(run([failed_send(890)]+fixture()[1:], "id:process1")[-1], "candidate")
+            self.assertEqual(run(fixture()[1:], "id:process1")[-1], "candidate")
+            self.assertEqual(run(fixture()[1:], "id:process2")[-1], "no-signed-hash")
+
+    def test_replacement_overflow_cannot_drop_hashes_and_authorize_heal(self):
+        lines = [failed_send(890, signed=f"0x{i:064x}") for i in range(65)] + fixture()[1:]
+        result = parser.evidence(lines, 1000)
+        self.assertEqual(result[-1], "ambiguous-monitor")
+        self.assertLessEqual(len(result[2].split(",")), 64)
+
+    def test_future_or_nonfinite_cache_timestamp_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)/"identities.json"
+            for last in [float('nan'), 1001]:
+                state.write_text(json.dumps({"generation": "process", "identities": {
+                    MONITOR: {"ger": GER, "hashes": [SIGNED], "ambiguous": False, "last": last}}}))
+                result = subprocess.run(["python3", str(SCRIPTS/"aggkit-log-evidence.py"),
+                    "--state", str(state), "--generation", "process", "--since", "1970-01-01T00:00:00Z",
+                    "--now", "1000"], input="".join(fixture()[1:]), text=True, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+
+    def test_archived_chaos_failed_send_regression(self):
+        lines = (SCRIPTS/"testdata/aggkit-failed-send.log").read_text().splitlines()
+        now = datetime.datetime.fromisoformat("2026-09-18T08:30:00+00:00").timestamp()
+        result = parser.evidence(lines, now)
+        self.assertEqual(result[:3], [
+            "0x366fcd1eac314513777d99e3884a8cbb82f55865a614b65a890deec3c2ffc53e",
+            "0x49363b87084fe4c6f35a5aa80e50dcaae61ebb514fcabc759a221f489bea0411",
+            "0x8aabba9d63e6fc87d164f99f4beff66ab8e72bef3c0f60a857ae7a47947066fa"])
+        self.assertEqual(result[-1], "candidate")
+
     def test_reproduces_old_certificate_selector_and_resolves_signed_hash(self):
         lines = fixture()
         self.assertEqual(re.findall(r"ID: (0x[a-f0-9]{64})", "".join(lines))[-1], CERT)
@@ -106,11 +185,16 @@ class ShellChecks(unittest.TestCase):
                               env={**os.environ, "LIB": str(SCRIPTS/"lib-aggkit-recovery.sh"), **(env or {})},
                               text=True, capture_output=True, timeout=10)
 
-    def probe(self, known, lines=None, fail=False):
+    def probe(self, known, lines=None, fail=False, restart=False):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
             (path/"input").write_text("".join(lines or fixture(time.time())))
             r = self.run_shell('''docker() {
+  if [[ "$1" == inspect ]]; then
+    if [[ "$RESTART" == 1 && -f "$DIR/query" ]]; then echo 'newid running false 1 1970-01-01T00:00:00Z';
+    else echo 'id running false 0 1970-01-01T00:00:00Z'; fi
+    return
+  fi
   if [[ "$1" == logs ]]; then cat "$DIR/input"; return; fi
   if [[ "$1" == exec ]]; then
     printf '%s\\n' "$@" > "$DIR/query"
@@ -120,7 +204,7 @@ class ShellChecks(unittest.TestCase):
   echo "UNEXPECTED MUTATION $*" >&2; return 99
 }
 aggkit_probe_wedge aggkit pg "$DIR/snapshot"
-''', {"DIR": directory, "KNOWN": known, "FAIL_PROBE": str(int(fail))})
+''', {"DIR": directory, "KNOWN": known, "FAIL_PROBE": str(int(fail)), "RESTART": str(int(restart))})
             return r, (path/"query").read_text() if (path/"query").exists() else ""
 
     def test_known_signed_hash_skips_heal_even_when_monitor_is_unknown(self):
@@ -133,6 +217,15 @@ aggkit_probe_wedge aggkit pg "$DIR/snapshot"
     def test_real_absent_signed_hash_authorizes_heal(self):
         r, _ = self.probe("0")
         self.assertEqual(r.returncode, 0, r.stdout+r.stderr)
+
+    def test_restart_during_admission_probe_refuses_recovery(self):
+        r, _ = self.probe("0", restart=True)
+        self.assertEqual(r.returncode, 2, r.stdout+r.stderr)
+        self.assertIn("generation-changed", r.stdout)
+
+    def test_failed_send_that_was_actually_admitted_is_not_recovered(self):
+        r, _ = self.probe("1", [failed_send(time.time()-110)] + fixture(time.time())[1:])
+        self.assertEqual(r.returncode, 2, r.stdout+r.stderr)
 
     def test_failed_or_invalid_database_probe_never_authorizes_heal(self):
         for known, fail in [("0", True), ("", False), ("error", False)]:
