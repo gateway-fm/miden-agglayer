@@ -403,6 +403,10 @@ pub struct SyntheticProjector {
     /// Set by `CatchUpMode::Restore`. Restore fails closed where a live tick
     /// tolerates and retries, because it has no later tick to heal in.
     restore_posture: AtomicBool,
+    /// Canonical LET frontier of blocks replayed in this restore session. Unlike
+    /// the durable reservation total, this excludes leaves in future windows.
+    restore_next_deposit_index: AtomicU64,
+    restore_session_tip: AtomicU64,
     /// For the restore report only.
     faucet_identities_rebuilt: AtomicUsize,
     /// For the restore report only; counted here so the report comes from the
@@ -499,6 +503,8 @@ impl SyntheticProjector {
             reconcile_budget,
             pending_duplicate_cursor: std::sync::Mutex::new(None),
             restore_posture: AtomicBool::new(false),
+            restore_next_deposit_index: AtomicU64::new(0),
+            restore_session_tip: AtomicU64::new(0),
             faucet_identities_rebuilt: AtomicUsize::new(0),
             projection_totals: std::sync::Mutex::new(Default::default()),
             audit_resolved: std::sync::Mutex::new(HashSet::new()),
@@ -1531,6 +1537,7 @@ impl SyntheticProjector {
             miden_block,
             client,
             within_tx_pos,
+            None,
         )
         .await
     }
@@ -1538,6 +1545,7 @@ impl SyntheticProjector {
     /// Project the already-filtered notes consumed at `miden_block` into the
     /// single synthetic block `miden_block` (Miden-1:1), advancing the tip once
     /// after the block (write-before-advance), even when there are zero notes.
+    #[allow(clippy::too_many_arguments)]
     async fn project_block_notes(
         &self,
         block_notes: &[(Option<NoteId>, &InputNoteRecord)],
@@ -1545,6 +1553,7 @@ impl SyntheticProjector {
         miden_block: u64,
         client: Option<&mut MidenClientLib>,
         within_tx_pos: &HashMap<NoteId, u32>,
+        restore_frontier: Option<u64>,
     ) -> anyhow::Result<usize> {
         // The order + dispatch live in the SHARED per-block unit
         // (`projection::BlockProjection`) — the same code `--restore` replays
@@ -1588,7 +1597,12 @@ impl SyntheticProjector {
         // requires contiguous deposit indices and HALTS ("state is inconsistent") on a gap,
         // wedging every later Miden certificate. Fail-closed: refuse to seal past it so aggkit
         // sees a contiguous prefix and WAITS. See the shared unit's docs for what moved where.
-        if let Some((idx, note)) = self.store.first_unemitted_reservation().await? {
+        // Retained PG may contain crash reservations in blocks still ahead of
+        // this replay. They become mandatory at their canonical block, not at
+        // genesis. Live projection keeps the unconditional global gate.
+        if let Some((idx, note)) = self.store.first_unemitted_reservation().await?
+            && restore_frontier.is_none_or(|frontier| u64::from(idx) < frontier)
+        {
             ::metrics::counter!("bridge_unemitted_reservation_halt_total").increment(1);
             anyhow::bail!(
                 "projector halted (fail-closed): note {note} (LET index {idx}) is reserved \
@@ -1814,27 +1828,32 @@ impl SyntheticProjector {
         let accounted = self.store.get_accounted_deposit_count().await?;
         let note_keys: Vec<String> = auth_b2agg.iter().map(|(id, _)| id.to_hex()).collect();
         let existing = self.store.get_deposit_indices(&note_keys).await?;
-        let first_missing = note_keys
-            .iter()
-            .position(|key| !existing.contains_key(key))
-            .unwrap_or(note_keys.len());
-        if note_keys[first_missing..]
-            .iter()
-            .any(|key| existing.contains_key(key))
-        {
-            anyhow::bail!("LET reservations are not an execution-order prefix");
-        }
-        let prefix_start = accounted
-            .checked_sub(first_missing as u64)
-            .ok_or_else(|| anyhow::anyhow!("LET reservation accounting underflow"))?;
-        for (offset, key) in note_keys[..first_missing].iter().enumerate() {
-            let expected_index = u32::try_from(prefix_start + offset as u64)?;
-            if existing.get(key) != Some(&expected_index) {
-                anyhow::bail!(
-                    "LET reservation order mismatch for {key}: stored={:?}, expected={expected_index}",
-                    existing.get(key)
-                );
-            }
+        let restore_start =
+            restore_posture.then(|| self.restore_next_deposit_index.load(Ordering::Acquire));
+        let baseline = self.store.get_let_gate_baseline().await?;
+        tracing::debug!(target: "writer_diagnostics",
+            restore_posture, cursor, pass_tip = tip,
+            session_tip = self.restore_session_tip.load(Ordering::Acquire),
+            accounted, baseline, restore_start, window_leaves = note_keys.len(),
+            reserved_in_window = existing.len(), "checking LET reservation window");
+        let window_end =
+            validate_reservation_window(&note_keys, &existing, accounted, restore_start).map_err(
+                |error| {
+                    anyhow::anyhow!(
+                        "{error:#}; restore={restore_posture}, cursor={cursor}, pass_tip={tip}, \
+                 session_tip={}, accounted={accounted}, baseline={baseline}, \
+                 canonical_start={restore_start:?}, window_leaves={}",
+                        self.restore_session_tip.load(Ordering::Acquire),
+                        note_keys.len()
+                    )
+                },
+            )?;
+        if restore_posture && enforce_let_cardinality && on_chain != window_end {
+            anyhow::bail!(
+                "restore authoritative LET coverage mismatch: on-chain={on_chain}, \
+                 replayed={window_end}, baseline={baseline}, cursor={cursor}, pass_tip={tip}, \
+                 accounted={accounted}; retained reservations cannot replace missing authoritative leaves"
+            );
         }
         if enforce_let_cardinality {
             let unreserved = u64::try_from(note_keys.len() - existing.len())?;
@@ -1872,10 +1891,31 @@ impl SyntheticProjector {
         // gap) and a crash-reserved leaf is re-emitted by re-projection before the check (no
         // permanent halt). The old tick-start check here fired BEFORE that re-projection could
         // heal a crash, and only AFTER a block had already sealed with the gap exposed.
+        let mut restore_leaves_by_block = HashMap::<u64, u64>::new();
+        if restore_posture {
+            for (_, note) in &auth_b2agg {
+                let block = note
+                    .state()
+                    .consumed_block_height()
+                    .ok_or_else(|| anyhow::anyhow!("authoritative B2AGG has no consumed block"))?
+                    .as_u64();
+                *restore_leaves_by_block.entry(block).or_default() += 1;
+            }
+        }
         let no_notes: Vec<(Option<NoteId>, &InputNoteRecord)> = Vec::new();
         while cursor < tip {
             let next = cursor + 1;
             let bucket = by_block.get(&next).unwrap_or(&no_notes);
+            let restore_frontier = if restore_posture {
+                Some(
+                    self.restore_next_deposit_index
+                        .load(Ordering::Acquire)
+                        .checked_add(*restore_leaves_by_block.get(&next).unwrap_or(&0))
+                        .ok_or_else(|| anyhow::anyhow!("restore LET frontier overflow"))?,
+                )
+            } else {
+                None
+            };
             tracing::debug!(target: "writer_diagnostics", block = next, tip, notes = bucket.len(), "projector block started");
             crate::metrics::meter_writer_stage(
                 "projector",
@@ -1886,6 +1926,7 @@ impl SyntheticProjector {
                     next,
                     Some(client),
                     &within_tx_pos,
+                    restore_frontier,
                 ),
             )
             .await?;
@@ -1899,6 +1940,10 @@ impl SyntheticProjector {
                 self.store.set_projector_cursor(next),
             )
             .await?;
+            if let Some(frontier) = restore_frontier {
+                self.restore_next_deposit_index
+                    .store(frontier, Ordering::Release);
+            }
             self.cursor.store(next, Ordering::Release);
             cursor = next;
         }
@@ -1951,6 +1996,9 @@ impl SyntheticProjector {
         self.store.reset_cursors_to_genesis().await?;
         self.reconcile_cursor.store(0, Ordering::Release);
         self.cursor.store(0, Ordering::Release);
+        self.restore_posture.store(false, Ordering::Release);
+        self.restore_next_deposit_index.store(0, Ordering::Release);
+        self.restore_session_tip.store(0, Ordering::Release);
         tracing::warn!(
             "projector cursors reset to genesis (discovery + projection, persisted + in-memory)"
         );
@@ -1972,6 +2020,21 @@ impl SyntheticProjector {
                 Ok(self.cursor.load(Ordering::Acquire))
             }
             CatchUpMode::Restore => {
+                if !self.restore_posture.load(Ordering::Acquire) {
+                    anyhow::ensure!(
+                        self.cursor.load(Ordering::Acquire) == 0,
+                        "restore must start from genesis to establish the canonical LET frontier"
+                    );
+                    self.restore_next_deposit_index
+                        .store(self.store.get_let_gate_baseline().await?, Ordering::Release);
+                    self.restore_session_tip
+                        .store(target_tip, Ordering::Release);
+                } else {
+                    anyhow::ensure!(
+                        self.restore_session_tip.load(Ordering::Acquire) == target_tip,
+                        "restore session target changed during replay"
+                    );
+                }
                 self.restore_posture.store(true, Ordering::Release);
                 self.drive_catch_up_to_tip(client, target_tip).await
             }
@@ -2031,6 +2094,62 @@ impl SyntheticProjector {
             }
         }
     }
+}
+
+/// Validate the canonical order before any block in a window seals. Restore
+/// supplies the frontier accumulated from genesis; a live tick uses the tail of
+/// the global reservation total. Retained future reservations must never shift
+/// a restore window's starting index (#222).
+pub(crate) fn validate_reservation_window(
+    note_keys: &[String],
+    existing: &HashMap<String, u32>,
+    accounted: u64,
+    restore_start: Option<u64>,
+) -> anyhow::Result<u64> {
+    let first_missing = note_keys
+        .iter()
+        .position(|key| !existing.contains_key(key))
+        .unwrap_or(note_keys.len());
+    anyhow::ensure!(
+        !note_keys[first_missing..]
+            .iter()
+            .any(|key| existing.contains_key(key)),
+        "LET reservations are not an execution-order prefix (first_missing={first_missing})"
+    );
+    let prefix_start = match restore_start {
+        Some(start) => start,
+        None => accounted
+            .checked_sub(first_missing as u64)
+            .ok_or_else(|| anyhow::anyhow!("LET reservation accounting underflow"))?,
+    };
+    for (offset, key) in note_keys[..first_missing].iter().enumerate() {
+        let expected_index = u32::try_from(
+            prefix_start
+                .checked_add(offset as u64)
+                .ok_or_else(|| anyhow::anyhow!("LET reservation index overflow"))?,
+        )?;
+        anyhow::ensure!(
+            existing.get(key) == Some(&expected_index),
+            "LET reservation order mismatch for {key}: stored={:?}, expected={expected_index}, first_missing={first_missing}",
+            existing.get(key)
+        );
+    }
+    let reserved_end = prefix_start
+        .checked_add(first_missing as u64)
+        .ok_or_else(|| anyhow::anyhow!("LET reservation accounting overflow"))?;
+    anyhow::ensure!(
+        reserved_end <= accounted,
+        "LET reservations exceed global accounting"
+    );
+    // Appending must allocate exactly the next canonical index. A missing
+    // historical leaf followed by retained future reservations is corruption.
+    anyhow::ensure!(
+        first_missing == note_keys.len() || reserved_end == accounted,
+        "LET missing authoritative reservation before retained future leaves: canonical_next={reserved_end}, accounted={accounted}, first_missing={first_missing}"
+    );
+    prefix_start
+        .checked_add(note_keys.len() as u64)
+        .ok_or_else(|| anyhow::anyhow!("LET window frontier overflow"))
 }
 
 /// One restore catch-up iteration decision.
@@ -5012,7 +5131,7 @@ mod tests {
             .collect();
 
         let written = projector
-            .project_block_notes(&pairs, &HashMap::new(), 7, None, &within_tx_pos)
+            .project_block_notes(&pairs, &HashMap::new(), 7, None, &within_tx_pos, None)
             .await
             .unwrap();
         assert_eq!(written, 3);
@@ -5094,7 +5213,7 @@ mod tests {
             .map(|n| (id_of.get(&n.details_commitment().as_bytes()).copied(), n))
             .collect();
         let written = projector
-            .project_block_notes(&pairs, &HashMap::new(), 9, None, &within_tx_pos)
+            .project_block_notes(&pairs, &HashMap::new(), 9, None, &within_tx_pos, None)
             .await
             .unwrap();
         assert_eq!(written, 4);
@@ -5312,7 +5431,7 @@ mod tests {
             vec![(Some(id_a), &note_a), (Some(id_b), &note_b)];
 
         let written = projector
-            .project_block_notes(&pairs, &HashMap::new(), 6, None, &within_tx_pos)
+            .project_block_notes(&pairs, &HashMap::new(), 6, None, &within_tx_pos, None)
             .await
             .unwrap();
         assert_eq!(
@@ -5329,6 +5448,144 @@ mod tests {
         assert_eq!(
             logs.iter().map(bridge_deposit_count).collect::<Vec<_>>(),
             vec![0, 1]
+        );
+    }
+    /// Retained PG has all 14 indices, but the first restore window has only
+    /// ten leaves. Exercise the shared gate AND real per-block projection;
+    /// future crash reservations must wait until their block is replayed.
+    #[tokio::test]
+    async fn restore_retained_reservations_across_5000_block_windows() {
+        for baseline in [0, 97] {
+            let memory = StdArc::new(InMemoryStore::new());
+            memory.set_let_gate_baseline_for_test(baseline);
+            let store: StdArc<dyn Store> = memory;
+            register_faucet(&store).await;
+            let block_state = StdArc::new(BlockState::new());
+            let projector = test_projector(&store, &block_state).await;
+            let blocks = [
+                1, 200, 500, 800, 1200, 1800, 2400, 3000, 4000, 5000, 5001, 6000, 7000, 7489,
+            ];
+            let notes: Vec<_> = blocks
+                .iter()
+                .enumerate()
+                .map(|(i, &block)| b2agg_note_with_amount(block, Some(0), 100 + i as u64))
+                .collect();
+            let ids: Vec<_> = (0..14).map(|i| test_note_id(800 + i)).collect();
+            let keys: Vec<_> = ids.iter().map(NoteId::to_hex).collect();
+            for (i, key) in keys.iter().enumerate() {
+                assert_eq!(
+                    store.reserve_deposit_index(key).await.unwrap() as u64,
+                    baseline + i as u64
+                );
+            }
+            // Two complete replays must reuse the exact same indices and logs.
+            for _ in 0..2 {
+                projector.reset_cursors_to_genesis().await.unwrap();
+                let mut frontier = store.get_let_gate_baseline().await.unwrap();
+                for range in [0..10, 10..14] {
+                    let window = &keys[range.clone()];
+                    let existing = store.get_deposit_indices(window).await.unwrap();
+                    let accounted = store.get_accounted_deposit_count().await.unwrap();
+                    if range.start == 0 {
+                        // The old live-tail formula reproduces 14 - 10 = 4.
+                        assert!(
+                            validate_reservation_window(window, &existing, accounted, None)
+                                .is_err()
+                        );
+                    }
+                    let end =
+                        validate_reservation_window(window, &existing, accounted, Some(frontier))
+                            .unwrap();
+                    for i in range {
+                        frontier += 1;
+                        projector
+                            .project_block_notes(
+                                &[(Some(ids[i]), &notes[i])],
+                                &HashMap::new(),
+                                blocks[i] as u64,
+                                None,
+                                &HashMap::new(),
+                                Some(frontier),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    assert_eq!(frontier, end);
+                }
+                assert_eq!(frontier, baseline + 14);
+                assert!(store.first_unemitted_reservation().await.unwrap().is_none());
+                assert_eq!(
+                    store.get_accounted_deposit_count().await.unwrap(),
+                    baseline + 14
+                );
+                let logs = logs_in_range(&store, 0, 7489).await;
+                assert_eq!(logs.len(), 14);
+                assert_eq!(
+                    logs.iter().map(bridge_deposit_count).collect::<Vec<_>>(),
+                    (baseline as u32..baseline as u32 + 14).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    logs.iter().map(|log| log.block_number).collect::<Vec<_>>(),
+                    blocks.iter().map(|&block| block as u64).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_reservation_window_rejects_missing_and_reordered_history() {
+        let store = InMemoryStore::new();
+        let keys: Vec<String> = (0..14).map(|i| format!("leaf-{i}")).collect();
+        for key in &keys {
+            store.reserve_deposit_index(key).await.unwrap();
+        }
+        let existing = store.get_deposit_indices(&keys).await.unwrap();
+        let mut reordered = keys[..10].to_vec();
+        reordered.swap(0, 1);
+        assert!(validate_reservation_window(&reordered, &existing, 14, Some(0)).is_err());
+        // Missing body / skipped leaf at a window boundary cannot shift later indices.
+        assert!(validate_reservation_window(&keys[11..], &existing, 14, Some(10)).is_err());
+        let mut missing = keys[..10].to_vec();
+        missing[4] = "unreserved".into();
+        assert!(validate_reservation_window(&missing, &existing, 14, Some(0)).is_err());
+        // Even a missing tail of this window cannot append after retained future leaves.
+        missing = keys[..10].to_vec();
+        missing[9] = "unreserved".into();
+        assert!(validate_reservation_window(&missing, &existing, 14, Some(0)).is_err());
+        // A genuinely new tail may allocate only at the global frontier.
+        let suffix = vec![keys[13].clone(), "new-leaf".into()];
+        assert_eq!(
+            validate_reservation_window(&suffix, &existing, 14, Some(13)).unwrap(),
+            15
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_emitted_frontier_blocks_current_poison_but_waits_for_future_leaf() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+        store
+            .reserve_deposit_index("crash-reservation")
+            .await
+            .unwrap();
+        projector
+            .project_block_notes(&[], &HashMap::new(), 1, None, &HashMap::new(), Some(0))
+            .await
+            .unwrap();
+        assert_eq!(store.get_latest_block_number().await.unwrap(), 1);
+        let error = projector
+            .project_block_notes(&[], &HashMap::new(), 2, None, &HashMap::new(), Some(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("never emitted"));
+        assert_eq!(store.get_latest_block_number().await.unwrap(), 1);
+        // Live mode retains the unconditional gate.
+        assert!(
+            projector
+                .project_block_notes(&[], &HashMap::new(), 2, None, &HashMap::new(), None)
+                .await
+                .is_err()
         );
     }
 }
