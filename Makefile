@@ -88,6 +88,9 @@ test-scripts: ## Syntax-check + run the shell guard test harnesses (no docker ne
 	bash scripts/test-chaos-verdict.sh
 	bash -n scripts/aggkit-watchdog.sh scripts/lib-aggkit-recovery.sh scripts/aggkit-preserve-heal.sh
 	python3 scripts/test-aggkit-recovery.py
+	python3 scripts/test-e2e-fee-budget.py
+	python3 scripts/test-bridge-sync-health.py
+	bash -n scripts/e2e-chaos-soak.sh scripts/e2e-loadtest-mixed.sh scripts/e2e-bridge-loadtest.sh scripts/e2e-bridge-loadtest-isolated.sh scripts/lib-l2l2.sh
 	# The gate in front of every recovery-drill fingerprint. Wrong-lax and it
 	# fingerprints a moving pipeline (spurious #88 data loss); wrong-strict and
 	# the drill never runs at all. Both have happened; both were invisible to

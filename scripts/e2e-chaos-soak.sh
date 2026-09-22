@@ -74,6 +74,14 @@ source "$SCRIPT_DIR/lib-l2l2.sh"
 say "compose project detected: $COMPOSE_PROJECT_NAME"
 l2l2_ensure_stack || { say "L2B overlay bring-up FAILED"; exit 4; }
 PROJECT="$COMPOSE_PROJECT_NAME"
+# Budget BOTH the storm and the fresh post-chaos workload before injecting
+# faults. No replenishment is performed inside either measured workload.
+python3 "$SCRIPT_DIR/e2e-fee-budget.py" --project "$PROJECT" \
+    --new-faucets "$((2 * (${NUM_ERC20:-9} + 3)))" \
+    --operations "$((N + L2L2_FWD + L2L2_BACK + 12))" \
+    --l1-rpc "$L1_RPC" --proxy-rpc "$L2_RPC" \
+    --evidence "${CHAOS_LOG}.fees.json" || exit 4
+export E2E_FEE_STAGE_PREPARED=1
 say "stack up: $(docker ps --filter name=${PROJECT}- -q | wc -l) containers (proxy=$AGGLAYER_CONTAINER)"
 
 # Baseline the garbo-containment metrics + the persistent quarantine table.
@@ -96,7 +104,7 @@ chaos_cleanup() {
     [ "$CHAOS_CLEANUP_DONE" = "1" ] && return 0
     CHAOS_CLEANUP_DONE=1
     say "cleanup: stopping injectors and reversing any live faults"
-    for pid in "${SEEDER_PID:-}" "${GARBO_PID:-}" "${WATCHDOG_PID:-}"; do
+    for pid in "${SEEDER_PID:-}" "${GARBO_PID:-}" "${WATCHDOG_PID:-}" "${BRIDGE_WATCHDOG_PID:-}"; do
         [ -n "$pid" ] || continue
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
@@ -139,6 +147,11 @@ say "watchdog evidence: $WATCHDOG_DIR"
 PROJECT="$PROJECT" WATCHDOG_DIR="$WATCHDOG_DIR" WATCHDOG_HEALS_FILE="$WATCHDOG_HEALS_FILE" \
     bash "$SCRIPT_DIR/aggkit-watchdog.sh" >/tmp/chaos-watchdog.out 2>&1 &
 WATCHDOG_PID=$!
+# This separately records state-preserving bridge-service restarts. Fresh
+# per-network iterations are telemetry; delivery and exact-block gates decide PASS.
+python3 "$SCRIPT_DIR/bridge-sync-health.py" --watch --project "$PROJECT" \
+    --evidence "$WATCHDOG_DIR/bridge-sync" >"$WATCHDOG_DIR/bridge-sync.log" 2>&1 &
+BRIDGE_WATCHDOG_PID=$!
 
 # The mixed loadtest drives all the legit traffic; suppress its internal verify
 # (MIX_VERIFY=0) — the soak runs ONE authoritative verify post-heal. The new mixed
@@ -157,6 +170,7 @@ say "=== stopping injectors + restoring all faults ==="
 kill "$SEEDER_PID" 2>/dev/null || true; wait "$SEEDER_PID" 2>/dev/null || true
 kill "$GARBO_PID" 2>/dev/null || true;  wait "$GARBO_PID" 2>/dev/null || true
 kill "$WATCHDOG_PID" 2>/dev/null || true; wait "$WATCHDOG_PID" 2>/dev/null || true
+kill "$BRIDGE_WATCHDOG_PID" 2>/dev/null || true; wait "$BRIDGE_WATCHDOG_PID" 2>/dev/null || true
 # CLEAR the PID variables now that these children are reaped. The EXIT trap
 # runs on the SUCCESS path too, and a reaped PID can already have been reused
 # by an unrelated process on this shared host — signalling it would be someone
