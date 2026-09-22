@@ -3021,6 +3021,17 @@ impl Store for PgStore {
         }
     }
 
+    async fn get_let_gate_baseline(&self) -> anyhow::Result<u64> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_one(
+                "SELECT let_gate_baseline FROM service_state WHERE id = 1",
+                &[],
+            )
+            .await?;
+        Ok(u64::try_from(row.get::<_, i64>(0))?)
+    }
+
     async fn get_accounted_deposit_count(&self) -> anyhow::Result<u64> {
         let client = self.pool.get().await?;
         let row = client

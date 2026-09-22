@@ -2205,6 +2205,10 @@ impl Store for InMemoryStore {
             .map(|(note, (idx, _))| (*idx, note.clone())))
     }
 
+    async fn get_let_gate_baseline(&self) -> anyhow::Result<u64> {
+        Ok(*self.let_gate_baseline.read())
+    }
+
     async fn get_accounted_deposit_count(&self) -> anyhow::Result<u64> {
         self.let_gate_baseline
             .read()
