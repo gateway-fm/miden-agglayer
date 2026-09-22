@@ -29,6 +29,7 @@ watchdog_tick() {
     # Re-check under the healer's lock: admission may have completed since our
     # snapshot. FORCE=1 bypassed that protection in the old watchdog.
     if PROJECT="$PROJECT" FORCE=0 HEAL_DIAGNOSTIC_DIR="$attempt_dir" \
+        AGGKIT_EVIDENCE_STATE="${AGGKIT_EVIDENCE_STATE:-}" \
         "$SCRIPT_DIR/aggkit-preserve-heal.sh" aggkit >"$attempt_dir/heal.log" 2>&1; then rc=0; else rc=$?; fi
     # The helper may exit during its lock/precheck, before installing its own
     # diagnostic trap. Preserve lifecycle evidence for those outcomes too.
@@ -50,6 +51,9 @@ watchdog_main() {
     umask 077
     WATCHDOG_DIR="${WATCHDOG_DIR:-$(mktemp -d /tmp/chaos-watchdog.XXXXXX)}"
     mkdir -p "$WATCHDOG_DIR" || return 1
+    # Persist only identities within one container/process generation. A failed
+    # send can age out of the rolling log window while dedup retries continue.
+    AGGKIT_EVIDENCE_STATE="$WATCHDOG_DIR/signed-identities.json"
     : >"$WATCHDOG_HEALS_FILE"
     declare -A seen=()
     attempts=0; budget_reported=0

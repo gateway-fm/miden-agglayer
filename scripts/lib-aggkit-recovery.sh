@@ -2,6 +2,10 @@
 # Shared evidence and health checks for the watchdog and preserve-healer.
 AGGKIT_EVIDENCE_PARSER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/aggkit-log-evidence.py"
 
+aggkit_generation() {
+    docker inspect -f '{{.Id}} {{.State.Status}} {{.State.Restarting}} {{.RestartCount}} {{.State.StartedAt}}' "$1"
+}
+
 aggkit_known_hashes() {
     local pg="$1" hashes="$2" sql_hashes
     # Only signed transaction hashes emitted by the parser may reach SQL.
@@ -15,12 +19,23 @@ aggkit_known_hashes() {
 # absent. Return 2 for no action, 1 for an unavailable/invalid probe. The raw
 # snapshot and decision are retained by the caller, including skipped cases.
 aggkit_probe_wedge() {
-    local container="$1" pg="$2" snapshot="$3" record known
+    local container="$1" pg="$2" snapshot="$3" record known generation id state restarting restarts started
+    local -a cache_args=()
+    generation=$(aggkit_generation "$container") || return 1
+    read -r id state restarting restarts started <<<"$generation"
+    [[ "$state" == running && "$restarting" == false && "$restarts" =~ ^[0-9]+$ && -n "$started" ]] || return 2
     if ! docker logs --timestamps --since "${AGGKIT_LOG_LOOKBACK:-15m}" "$container" >"$snapshot" 2>&1; then
         log "decision=probe-unavailable probe=container-logs container=$container"
         return 1
     fi
+    [[ "$(aggkit_generation "$container")" == "$generation" ]] || {
+        log 'decision=generation-changed'; return 2;
+    }
+    if [[ -n "${AGGKIT_EVIDENCE_STATE:-}" ]]; then
+        cache_args=(--state "$AGGKIT_EVIDENCE_STATE" --generation "$generation")
+    fi
     record=$(python3 "$AGGKIT_EVIDENCE_PARSER" \
+        --since "$started" "${cache_args[@]}" \
         --min-repeats "${REPEATS_MIN:-10}" --min-age "${WEDGE_MIN_AGE:-60}" <"$snapshot") || return 1
     IFS=$'\t' read -r WEDGE_MONITOR WEDGE_GER WEDGE_HASHES repeats span age decision <<<"$record"
     log "decision=$decision monitor=$WEDGE_MONITOR ger=$WEDGE_GER signed_hashes=$WEDGE_HASHES repeats=$repeats span_s=$span last_retry_age_s=$age"
@@ -29,6 +44,10 @@ aggkit_probe_wedge() {
         log "decision=probe-unavailable probe=proxy-admission monitor=$WEDGE_MONITOR"
         return 1
     fi
+    [[ "$(aggkit_generation "$container")" == "$generation" ]] || {
+        log 'decision=generation-changed'; return 2;
+    }
+    WEDGE_GENERATION="$generation"
     log "decision=admission-probe monitor=$WEDGE_MONITOR known_signed_hashes=$known"
     [[ "$known" == 0 ]] || return 2
 }

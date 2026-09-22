@@ -145,6 +145,10 @@ on_signal() {
     exit 130
 }
 trap on_signal INT TERM
+if [[ "$FORCE" != 1 && "$(aggkit_generation "$C")" != "$WEDGE_GENERATION" ]]; then
+    log 'generation changed after the locked admission check; refusing recovery'
+    exit 2
+fi
 # Review 0814: the stop must be CONFIRMED before snapshotting — copying live
 # SQLite (mid-write WAL) and then destroying the source ships a corrupt-only
 # copy of the state.
