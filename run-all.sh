@@ -101,9 +101,9 @@ provision() {
   section "0a' · node pin"
   # Single source of truth is MIDEN_NODE_GIT_REF in the Makefile; this script
   # pins the same value and fails loudly if the two drift.
-  MIDEN_NODE_GIT_URL="https://github.com/mandrigin/node.git"
-  MIDEN_NODE_GIT_REF="fix/consumed-note-refs-inline-headers"
-  MIDEN_NODE_GIT_COMMIT="6e465a2186f76ea2f1fa6c0eb03140467fd1f824"
+  MIDEN_NODE_GIT_URL="https://github.com/0xMiden/node.git"
+  MIDEN_NODE_GIT_REF="v0.16.0"
+  MIDEN_NODE_GIT_COMMIT="d6ce8b14d4680e0187b877c1de5c1cdeea16e7e2"
   export MIDEN_NODE_GIT_URL MIDEN_NODE_GIT_REF MIDEN_NODE_GIT_COMMIT
   makefile_pin="$(git rev-parse --show-toplevel)/Makefile"
   grep -Fx "MIDEN_NODE_GIT_URL := $MIDEN_NODE_GIT_URL" "$makefile_pin" || \
@@ -131,21 +131,22 @@ provision() {
   # DISPOSABLE WORKTREE created at the pin-verified commit, so the cache's
   # working tree is never modified, never checked out, and no foreign edit
   # can ride into the images. A pre-existing cache may hold ANY version (this
-  # rig has had v0.15.0 there). Fetch the immutable commit from the configured
-  # repository and verify it before building, regardless of the cached origin.
-  if [ ! -d "$WORK/miden-node-src" ]; then
+  # rig has had v0.15.0 there), so every run re-fetches the tag from the
+  # CONFIGURED upstream (a fork's origin must not shadow it) and the tag is
+  # verified against the pinned upstream commit before anything is built.
+  if [ -d "$WORK/miden-node-src" ]; then
+    git -C "$WORK/miden-node-src" fetch --force "$MIDEN_NODE_GIT_URL" "refs/tags/$MIDEN_NODE_GIT_REF:refs/tags/$MIDEN_NODE_GIT_REF" || \
+      die "cannot fetch $MIDEN_NODE_GIT_REF from $MIDEN_NODE_GIT_URL into $WORK/miden-node-src"
+  else
     git clone "$MIDEN_NODE_GIT_URL" "$WORK/miden-node-src" || \
       die "cannot clone $MIDEN_NODE_GIT_URL"
   fi
-  git -C "$WORK/miden-node-src" fetch "$MIDEN_NODE_GIT_URL" "$MIDEN_NODE_GIT_COMMIT" || \
-    die "cannot fetch pinned node commit $MIDEN_NODE_GIT_COMMIT"
-  [ "$(git -C "$WORK/miden-node-src" rev-parse 'FETCH_HEAD^{commit}')" = "$MIDEN_NODE_GIT_COMMIT" ] || \
-    die "node fetch does not match pinned commit $MIDEN_NODE_GIT_COMMIT"
-
+  [ "$(git -C "$WORK/miden-node-src" rev-parse "refs/tags/$MIDEN_NODE_GIT_REF^{commit}")" = "$MIDEN_NODE_GIT_COMMIT" ] || \
+    die "$MIDEN_NODE_GIT_REF does not point at the pinned upstream commit $MIDEN_NODE_GIT_COMMIT — refusing to build (fork-supplied tag?)"
   git -C "$WORK/miden-node-src" worktree remove --force "$WORK/miden-node-build" 2>/dev/null || true
   git -C "$WORK/miden-node-src" worktree add --detach "$WORK/miden-node-build" "$MIDEN_NODE_GIT_COMMIT" >/dev/null 2>&1 || \
     die "cannot create build worktree at $WORK/miden-node-build"
-  # The node source is built from the exact pinned commit. The ntx-builder's remote-prover
+  # The node source is built UNMODIFIED (#180). The ntx-builder's remote-prover
   # timeout used to be a hardcoded 10s that this script sed-patched to 180s;
   # since node v0.16.0-rc.4 it is the `--tx-prover.timeout` flag
   # (0xMiden/node#2537), which docker-compose.e2e.yml passes. Refuse to build a
@@ -155,7 +156,7 @@ provision() {
   grep -q -- 'long = "tx-prover.timeout"' "$WORK/miden-node-build/bin/ntx-builder/src/commands/mod.rs" || \
     die "pinned node $MIDEN_NODE_GIT_REF has no --tx-prover.timeout flag (needs >= v0.16.0-rc.4) — refusing to build a node with a hardcoded 10s prover timeout"
   [ -z "$(git -C "$WORK/miden-node-build" status --porcelain)" ] || \
-    die "node build worktree $WORK/miden-node-build is not clean — the e2e stack builds the clean pinned checkout"
+    die "node build worktree $WORK/miden-node-build is not clean — the e2e stack builds the UNMODIFIED upstream checkout"
   [ -d "$WORK/zkevm-bridge-service" ] || git clone --depth 1 --branch fix/pending-bridges-rollup-disambiguation https://github.com/revitteth/zkevm-bridge-service.git "$WORK/zkevm-bridge-service"
   ok "repos present under $WORK"
 
@@ -176,7 +177,7 @@ provision() {
       # label (the source patch); they are for an older ref, so the ref/commit
       # labels alone already force a rebuild.
       if [ "$lv" = "$MIDEN_NODE_GIT_REF" ] && [ "$lr" = "$want_rev" ]; then
-        ok "$3 (cached; labels match $MIDEN_NODE_GIT_REF @ ${want_rev:0:12}, clean pinned source)"
+        ok "$3 (cached; labels match $MIDEN_NODE_GIT_REF @ ${want_rev:0:12}, unmodified upstream source)"
         return
       fi
       warn "$3 cached but stale (labels: ${lv:-none}/${lr:-none}) — rebuilding from $MIDEN_NODE_GIT_REF @ ${want_rev:0:12}"

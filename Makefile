@@ -220,9 +220,13 @@ install-tools: ## Install development tools
 # per-service `bootstrap`/`start` subcommands across separate binaries), and
 # the `02-with-account-files.toml` genesis sample no longer exists upstream —
 # the compose file mirrors the official rc.3+ runner (scripts/run-node.sh)
-# instead. Node images use the pinned checkout's own Dockerfile. The pin
-# includes the public inline-input consumed-note reference fix on v0.16.0.
-# The ntx-builder prover timeout remains a supported CLI flag.
+# instead. We pin to the v0.16.0 tag. E2E node images are built by
+# run-all.sh FROM THE UPSTREAM CHECKOUT'S OWN Dockerfile — there is no
+# repo-local node Dockerfile — and the checkout is built UNMODIFIED: since
+# node v0.16.0-rc.4 the ntx-builder's remote-prover timeout is a CLI flag
+# (`--tx-prover.timeout`, 0xMiden/node#2537), passed in docker-compose.e2e.yml,
+# so the source patch #180 tracked is gone. run-all.sh fails setup if the
+# pinned checkout lacks that flag.
 #
 # COMPATIBILITY: node v0.16.0's official Cargo.lock resolves
 # miden-protocol/standards/tx/agglayer 0.16.1 — the SAME protocol release our
@@ -239,11 +243,16 @@ install-tools: ## Install development tools
 # prints url/ref/commit for docs and compose flows.
 #
 # Bumping checklist: Makefile (REF + COMMIT) and run-all.sh (URL/REF/COMMIT).
-# v0.16.0 plus the consumed-note reference fix. Protocol and VM pins are unchanged.
-# This is a recorded node fork, not an unmodified upstream release.
-MIDEN_NODE_GIT_URL := https://github.com/mandrigin/node.git
-MIDEN_NODE_GIT_REF := fix/consumed-note-refs-inline-headers
-MIDEN_NODE_GIT_COMMIT := 6e465a2186f76ea2f1fa6c0eb03140467fd1f824
+MIDEN_NODE_GIT_URL := https://github.com/0xMiden/node.git
+# v0.16.0 (stable). Its lock pins protocol 0.16.1 (ours too) + VM 0.29.4 (ours
+# too). No source patch, no vendor patch: the prover timeout is a flag, the
+# node-store callback-vault-key bug is fixed upstream, and the AggLayer network
+# id is a runtime storage slot.
+MIDEN_NODE_GIT_REF := v0.16.0
+# The exact commit the tag points at (verified by `git ls-remote` at pin
+# time). run-all.sh checks the checkout's HEAD against this so a fork cannot
+# shadow the tag. Bump BOTH together.
+MIDEN_NODE_GIT_COMMIT := d6ce8b14d4680e0187b877c1de5c1cdeea16e7e2
 
 # Remote-custody overlay. Applies to the BASE e2e stack too, not just l2l2:
 # without it `make e2e-up` can only run local-keystore custody, and every
