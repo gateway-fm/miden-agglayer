@@ -254,6 +254,15 @@ for _ in $(seq 1 30); do
 done
 [[ "$BRIDGE_UP" == "true" ]] || die "Bridge service not reachable at $BRIDGE_SERVICE_URL"
 
+# Stage funding precedes wallet/token provisioning. A mixed/chaos parent
+# budgets its entire workload once, before faults, and passes this marker.
+if [[ "${E2E_FEE_STAGE_PREPARED:-0}" != 1 ]]; then
+    python3 "$SCRIPT_DIR/e2e-fee-budget.py" --project "$COMPOSE_PROJECT_NAME" \
+        --new-faucets "$NUM_ERC20" --operations "$N" \
+        --l1-rpc "$L1_RPC" --proxy-rpc "$L2_RPC" \
+        --evidence "${RESULTS_LOG}.fees.json" || die "stage fee budget unavailable"
+fi
+
 # ── Account IDs + DEST_ADDR (zero-padded L2 wallet) ───────────────────────────
 ACCOUNTS=$(docker exec "$AGGLAYER_CONTAINER" \
     cat /var/lib/miden-agglayer-service/bridge_accounts.toml 2>/dev/null) \

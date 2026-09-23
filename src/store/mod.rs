@@ -1337,6 +1337,9 @@ pub trait Store: Send + Sync + 'static {
     /// past such a leaf.
     async fn first_unemitted_reservation(&self) -> anyhow::Result<Option<(u32, String)>>;
 
+    /// Operator-audited legacy LET leaves absent from the reservation table.
+    async fn get_let_gate_baseline(&self) -> anyhow::Result<u64>;
+
     async fn get_accounted_deposit_count(&self) -> anyhow::Result<u64>;
     #[cfg(test)]
     async fn get_deposit_count(&self) -> anyhow::Result<u64>;

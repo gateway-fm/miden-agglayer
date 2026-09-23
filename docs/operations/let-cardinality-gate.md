@@ -23,6 +23,26 @@ older frontier. At the tip, a missing bridge account or either cardinality misma
 returns an error before any block is sealed. The normal projector retry runs the same
 check again; there is no strike counter or persisted halt state.
 
+## Retained PostgreSQL restore windows
+
+Restore reads at most 5,000 blocks per pass. Its reservation frontier starts at
+`let_gate_baseline` and advances by the authoritative B2AGG leaves in each fully
+projected block. It never derives a window's start by subtracting that window's
+reserved prefix from the global reservation total: retained PostgreSQL already
+includes future windows. For example, 14 retained reservations with 10 leaves in
+the first window must validate indices 0–9, not 4–13.
+
+Every reserved leaf must still have its canonical index. A missing reservation
+before retained future leaves, a reordered prefix, or incomplete authoritative
+coverage fails restore. The final pass checks both replayed coverage and global
+reservation accounting against the captured on-chain LET count. The emitted
+frontier permits future crash reservations only until their canonical block is
+reached; it still refuses to seal past any current un-emitted leaf.
+
+The in-memory frontier is advanced with the projection cursor. A new restore
+session must start at genesis, and retrying the same session retains its frontier
+and captured tip. No baseline is guessed or rewritten by this fix.
+
 ## Upgrade procedure
 
 Most deployments should leave `let_gate_baseline` at `0`. If an existing database has

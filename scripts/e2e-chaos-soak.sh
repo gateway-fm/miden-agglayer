@@ -74,6 +74,14 @@ source "$SCRIPT_DIR/lib-l2l2.sh"
 say "compose project detected: $COMPOSE_PROJECT_NAME"
 l2l2_ensure_stack || { say "L2B overlay bring-up FAILED"; exit 4; }
 PROJECT="$COMPOSE_PROJECT_NAME"
+# Budget BOTH the storm and the fresh post-chaos workload before injecting
+# faults. No replenishment is performed inside either measured workload.
+python3 "$SCRIPT_DIR/e2e-fee-budget.py" --project "$PROJECT" \
+    --new-faucets "$((2 * (${NUM_ERC20:-9} + 3)))" \
+    --operations "$((N + L2L2_FWD + L2L2_BACK + 12))" \
+    --l1-rpc "$L1_RPC" --proxy-rpc "$L2_RPC" \
+    --evidence "${CHAOS_LOG}.fees.json" || exit 4
+export E2E_FEE_STAGE_PREPARED=1
 say "stack up: $(docker ps --filter name=${PROJECT}- -q | wc -l) containers (proxy=$AGGLAYER_CONTAINER)"
 
 # Baseline the garbo-containment metrics + the persistent quarantine table.
@@ -96,7 +104,7 @@ chaos_cleanup() {
     [ "$CHAOS_CLEANUP_DONE" = "1" ] && return 0
     CHAOS_CLEANUP_DONE=1
     say "cleanup: stopping injectors and reversing any live faults"
-    for pid in "${SEEDER_PID:-}" "${GARBO_PID:-}" "${WATCHDOG_PID:-}"; do
+    for pid in "${SEEDER_PID:-}" "${GARBO_PID:-}" "${WATCHDOG_PID:-}" "${BRIDGE_WATCHDOG_PID:-}"; do
         [ -n "$pid" ] || continue
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
@@ -128,85 +136,22 @@ GARBO_DURATION="$GARBO_DURATION" GARBO_LOG="$GARBO_LOG" GARBO_SUMMARY="$GARBO_SU
     "$SCRIPT_DIR/chaos-garbo.sh" >/tmp/chaos-garbo.out 2>&1 &
 GARBO_PID=$!
 
-# ── aggkit lost-tx watchdog (production-mirroring; counted in the verdict) ────
-# When a seeder proxy-SIGKILL races an aggoracle GER send, the tx can die IN
-# TRANSIT: aggkit's ephemeral-monitoring DB marks it sent, but the proxy never
-# durably admitted it (no row, nothing for #157's recovery to re-drive). aggkit
-# then polls the unknown hash forever and never re-sends the deterministic ID —
-# GER injection freezes and every downstream leg stalls. That is an aggkit gap
-# (no rebroadcast-on-unknown-tx; upstream aggkit 0.8.3-rc1); in production a
-# watchdog alert + aggkit bounce is the documented mitigation, so the soak runs
-# the same watchdog: wedge signature = the SAME 'already exists in monitoring
-# DB' hash repeating for >60s while the proxy has no such transaction row.
-# Every bounce is logged and reported in the final verdict line.
-WATCHDOG_HEALS_FILE=/tmp/chaos-watchdog-heals; : > "$WATCHDOG_HEALS_FILE"
-(
-  declare -A seen
-  while true; do
-    sleep 30
-    # ONLY the base aggkit is watched here. aggkit-l2b submits its GER
-    # injections to anvil-l2b (fixtures/aggkit-l2b-config.toml), NOT to this
-    # proxy — so the "unknown to the proxy" probe below is trivially true for
-    # every healthy L2B transaction, and the preserve-healer it would call
-    # likewise reads the BASE proxy database. Watching aggkit-l2b through the
-    # base proxy's transactions table therefore produced a heal decision from
-    # evidence about a different chain entirely, and let unrelated base GER
-    # activity satisfy an L2B "recovery" proof.
-    #
-    # Wiring an L2B-aware watchdog needs an L2B-side admission probe; until
-    # then, not watching it is the honest option — a silent wrong answer is
-    # worse than a missing one. Tracked as the L2B watchdog follow-up.
-    for AK in "${PROJECT}-aggkit-1"; do
-      docker inspect "$AK" >/dev/null 2>&1 || continue
-      loops=$(docker logs "$AK" --since 60s 2>&1 | grep -c 'already exists in monitoring DB' || true)
-      [ "${loops:-0}" -ge 10 ] || continue
-      tx=$(docker logs "$AK" --since 60s 2>&1 | grep -oE 'ID: 0x[a-f0-9]{64}' | tail -1 | awk '{print $2}')
-      [ -n "$tx" ] || continue
-      known=$(docker exec "${PROJECT}-agglayer-postgres-1" psql -U agglayer -d agglayer_store -tAc \
-          "SELECT count(*) FROM transactions WHERE tx_hash='$tx'" 2>/dev/null || echo probe-failed)
-      [ "$known" = 0 ] || continue        # proxy knows it (or probe failed) -> #157 recovery's job, not ours
-      [ -z "${seen[$tx]:-}" ] || continue # one bounce per lost tx
-      seen[$tx]=1
-      total=$(grep -c 'WATCHDOG:' "$WATCHDOG_HEALS_FILE" 2>/dev/null | head -1)
-      total=${total:-0}
-      # Heal budget: past this it's a hard failure, not flakiness — and it must
-      # reach the final VERDICT (review 0814), not vanish in a skipped iteration.
-      if [ "$total" -ge 6 ]; then
-        grep -q 'WATCHDOG-BUDGET-EXHAUSTED' "$WATCHDOG_HEALS_FILE" \
-          || echo "$(date +%H:%M:%S) WATCHDOG-BUDGET-EXHAUSTED: $total heals consumed and wedges persist" \
-               | tee -a "$WATCHDOG_HEALS_FILE"
-        continue
-      fi
-      svc=aggkit; [ "$AK" = "${PROJECT}-aggkit-l2b-1" ] && svc=aggkit-l2b
-      # PR#164 #8: PRESERVE-HEAL instead of a blind force-recreate. The old
-      # recreate wiped the whole container fs to clear one poisoned file,
-      # destroying aggsender cert lineage (#89) and the bridgesync cursors
-      # (cold resync into anvil's 256-state wall permanently halts L2<->L2,
-      # #87). aggkit-preserve-heal.sh wipes ONLY ethtxmanager-aggoracle.sqlite
-      # and restores every other DB — the versioned, self-contained primitive.
-      # PR#164 re-review — count a heal only AFTER it actually succeeded. The old
-      # form logged the attempt into the heal ledger and swallowed the exit code
-      # with `|| true`, so a heal that failed (or refused to run, e.g. the new
-      # fail-closed staging guard) still consumed heal budget and still read as a
-      # successful intervention. Log the attempt separately from the outcome, and
-      # only the OUTCOME feeds the counted ledger.
-      echo "$(date +%H:%M:%S) WATCHDOG-ATTEMPT: $AK wedged on lost-in-transit tx $tx (unknown to proxy) — preserve-healing $svc"
-      if PROJECT="$PROJECT" FORCE=1 WEDGE_PATTERN='already exists in monitoring DB' \
-          WEDGE_TX="$tx" \
-          "$SCRIPT_DIR/aggkit-preserve-heal.sh" "$svc" >/dev/null 2>&1; then
-        echo "$(date +%H:%M:%S) WATCHDOG: preserve-heal of $svc SUCCEEDED (tx $tx)" \
-            | tee -a "$WATCHDOG_HEALS_FILE"
-      else
-        rc=$?
-        # Persisted into the ledger (review 0814): a failed heal must veto the
-        # verdict, not just scroll past in the watchdog log.
-        echo "$(date +%H:%M:%S) WATCHDOG-FAILED: preserve-heal of $svc returned rc=$rc (tx $tx) — NOT counted as a heal" \
-            | tee -a "$WATCHDOG_HEALS_FILE"
-      fi
-    done
-  done
-) >>/tmp/chaos-watchdog.out 2>&1 &
+# ── aggkit lost-tx watchdog ─────────────────────────────────────────────────
+# The monitoring ID and certificate ID are NOT signed transaction hashes.
+# Require an aged, repeated injection, resolve its signed hashes, and probe
+# those hashes before attempting recovery. Each attempt retains diagnostics.
+WATCHDOG_HEALS_FILE=/tmp/chaos-watchdog-heals
+WATCHDOG_DIR=$(mktemp -d "$(dirname "$CHAOS_LOG")/chaos-watchdog.XXXXXX") || exit 4
+: > "$WATCHDOG_HEALS_FILE"
+say "watchdog evidence: $WATCHDOG_DIR"
+PROJECT="$PROJECT" WATCHDOG_DIR="$WATCHDOG_DIR" WATCHDOG_HEALS_FILE="$WATCHDOG_HEALS_FILE" \
+    bash "$SCRIPT_DIR/aggkit-watchdog.sh" >/tmp/chaos-watchdog.out 2>&1 &
 WATCHDOG_PID=$!
+# This separately records state-preserving bridge-service restarts. Fresh
+# per-network iterations are telemetry; delivery and exact-block gates decide PASS.
+python3 "$SCRIPT_DIR/bridge-sync-health.py" --watch --project "$PROJECT" \
+    --evidence "$WATCHDOG_DIR/bridge-sync" >"$WATCHDOG_DIR/bridge-sync.log" 2>&1 &
+BRIDGE_WATCHDOG_PID=$!
 
 # The mixed loadtest drives all the legit traffic; suppress its internal verify
 # (MIX_VERIFY=0) — the soak runs ONE authoritative verify post-heal. The new mixed
@@ -225,6 +170,7 @@ say "=== stopping injectors + restoring all faults ==="
 kill "$SEEDER_PID" 2>/dev/null || true; wait "$SEEDER_PID" 2>/dev/null || true
 kill "$GARBO_PID" 2>/dev/null || true;  wait "$GARBO_PID" 2>/dev/null || true
 kill "$WATCHDOG_PID" 2>/dev/null || true; wait "$WATCHDOG_PID" 2>/dev/null || true
+kill "$BRIDGE_WATCHDOG_PID" 2>/dev/null || true; wait "$BRIDGE_WATCHDOG_PID" 2>/dev/null || true
 # CLEAR the PID variables now that these children are reaped. The EXIT trap
 # runs on the SUCCESS path too, and a reaped PID can already have been reused
 # by an unrelated process on this shared host — signalling it would be someone

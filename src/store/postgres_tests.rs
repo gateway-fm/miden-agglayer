@@ -3305,3 +3305,64 @@ async fn reservation_only_http_recovery(concurrent: bool) {
     );
     connection.abort();
 }
+
+/// Run against an isolated test database: the retained global reservation
+/// count must not shift the first window's execution-order prefix (#222).
+#[tokio::test]
+async fn test_pgstore_restore_retained_window_prefix() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let start = store.get_accounted_deposit_count().await.unwrap();
+    let keys: Vec<String> = (0..14)
+        .map(|i| {
+            format!(
+                "restore-window-{}-{i}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )
+        })
+        .collect();
+    for (i, key) in keys.iter().enumerate() {
+        assert_eq!(
+            u64::from(store.reserve_deposit_index(key).await.unwrap()),
+            start + i as u64
+        );
+    }
+    store.reset_cursors_to_genesis().await.unwrap();
+    for _ in 0..2 {
+        let accounted = store.get_accounted_deposit_count().await.unwrap();
+        let first = store.get_deposit_indices(&keys[..10]).await.unwrap();
+        assert!(
+            crate::synthetic_projector::validate_reservation_window(
+                &keys[..10],
+                &first,
+                accounted,
+                None
+            )
+            .is_err()
+        );
+        let frontier = crate::synthetic_projector::validate_reservation_window(
+            &keys[..10],
+            &first,
+            accounted,
+            Some(start),
+        )
+        .unwrap();
+        assert_eq!(frontier, start + 10);
+        let second = store.get_deposit_indices(&keys[10..]).await.unwrap();
+        assert_eq!(
+            crate::synthetic_projector::validate_reservation_window(
+                &keys[10..],
+                &second,
+                accounted,
+                Some(frontier)
+            )
+            .unwrap(),
+            start + 14
+        );
+    }
+    assert!(store.get_let_gate_baseline().await.unwrap() <= start);
+}

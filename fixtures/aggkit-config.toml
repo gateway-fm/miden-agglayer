@@ -39,6 +39,11 @@ GlobalExitRootL2 = "0xa40d5f56745a118d0906a34e69aec8c0db1cb8fa"
 WaitPeriodMonitorTx = "5s"
 
 [AggOracle.EVMSender.EthTxManager]
+# Aggkit v0.8.3-rc1 defaults to evicting a transaction after one failed
+# estimate/send. The oracle then deduplicates the GER and never requeues it.
+# Keep retrying transient proxy/node outages; harness deadlines and the
+# admission-aware watchdog still fail closed on a persistent wedge.
+EstimateGasMaxRetries = 0
 FrequencyToMonitorTxs = "1s"
 WaitTxToBeMined = "2m"
 GasPriceMarginFactor = 1
