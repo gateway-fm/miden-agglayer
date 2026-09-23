@@ -912,7 +912,7 @@ async fn test_pgstore_has_claim_event_for_global_index_finds_both_sources() {
             0,
             &[0u8; 20],
             &[0u8; 20],
-            1234,
+            alloy::primitives::U256::from(1234),
         )
         .await
         .unwrap();
@@ -935,7 +935,7 @@ async fn test_pgstore_has_claim_event_for_global_index_finds_both_sources() {
             0,
             &[0u8; 20],
             &[0u8; 20],
-            5678,
+            alloy::primitives::U256::from(5678),
         )
         .await
         .unwrap();
@@ -964,6 +964,7 @@ async fn test_pgstore_commit_manual_claim_event_atomic() {
     // Use a high block_number namespaced by timestamp so tests don't fight.
     let block = (now_ns % 1_000_000) as u64 + 10_000;
     let tx_hash = format!("0xclaim_atomic_{now_ns}");
+    let amount = U256::from(100_000_000_000_000_000_000u128);
 
     store
         .commit_manual_claim_event_atomic(
@@ -976,7 +977,7 @@ async fn test_pgstore_commit_manual_claim_event_atomic() {
             0,
             &[0u8; 20],
             &[0u8; 20],
-            42,
+            amount,
         )
         .await
         .unwrap();
@@ -985,6 +986,9 @@ async fn test_pgstore_commit_manual_claim_event_atomic() {
     assert!(store.is_claim_note_processed(&note_id).await.unwrap());
     // ClaimEvent dedup query finds the row.
     assert!(store.has_claim_event_for_global_index(&gi).await.unwrap());
+    let logs = store.get_logs_for_tx(&tx_hash).await.unwrap();
+    let data = hex::decode(logs[0].data.trim_start_matches("0x")).unwrap();
+    assert_eq!(&data[128..160], &amount.to_be_bytes::<32>());
 
     // ── Reviewer concern #2 (write-before-seal): the atomic must NOT advance the tip. ──
     // `insert_pending_claim_calldata` leaves a PENDING envelope; the atomic finalises that
@@ -1024,7 +1028,7 @@ async fn test_pgstore_commit_manual_claim_event_atomic() {
             0,
             &[0u8; 20],
             &[0u8; 20],
-            42,
+            U256::MAX,
         )
         .await
         .unwrap();
@@ -1041,6 +1045,9 @@ async fn test_pgstore_commit_manual_claim_event_atomic() {
         .expect("the linked receipt is finalised inline by the atomic");
     assert!(res.is_ok());
     assert_eq!(blk, seal_block, "receipt block == ClaimEvent block");
+    let logs = store.get_logs_for_tx(&seal_hash_str).await.unwrap();
+    let data = hex::decode(logs[0].data.trim_start_matches("0x")).unwrap();
+    assert_eq!(&data[128..160], &[0xff; 32]);
 }
 
 /// Audit H1/H3 — a reservation assigns the index before the atomic BridgeEvent commit.
@@ -1876,7 +1883,7 @@ async fn test_pgstore_acquire_claim_lock_outcomes() {
             0,
             &[0u8; 20],
             &[0u8; 20],
-            1234,
+            alloy::primitives::U256::from(1234),
         )
         .await
         .unwrap();
@@ -2764,7 +2771,7 @@ async fn test_pgstore_claim_calldata_repair_backlog() {
             1,
             &[0u8; 20],
             &[0u8; 20],
-            100,
+            alloy::primitives::U256::from(100),
         )
         .await
         .unwrap();

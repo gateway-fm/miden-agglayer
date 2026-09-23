@@ -3370,7 +3370,7 @@ impl Store for PgStore {
         origin_network: u32,
         origin_address: &[u8; 20],
         destination_address: &[u8; 20],
-        amount: u64,
+        amount: U256,
     ) -> anyhow::Result<()> {
         let mut client = self.pool.get().await?;
         let txn = client.transaction().await?;
@@ -3418,12 +3418,12 @@ impl Store for PgStore {
                 )
                 .await?;
             let log_index: i64 = row.get(0);
-            let data = crate::log_synthesis::encode_claim_event_data_u64(
+            let data = crate::log_synthesis::encode_claim_event_data(
                 &global_index,
                 origin_network,
                 origin_address,
                 destination_address,
-                amount,
+                &amount.to_be_bytes::<32>(),
             );
             let topics_owned: [String; 1] = [crate::log_synthesis::CLAIM_EVENT_TOPIC.to_string()];
             let topics: Vec<&str> = topics_owned.iter().map(|s| s.as_str()).collect();

@@ -1227,7 +1227,7 @@ pub async fn project_claim_parts(
         synthetic_tx_hash = %tx_hash,
         global_index = %hex::encode(decoded.global_index),
         origin_network = decoded.origin_network,
-        amount = decoded.amount,
+        amount = %decoded.amount,
         block_number,
         "restore: synthesised ClaimEvent from consumed CLAIM note (MA#27)"
     );
@@ -3168,7 +3168,7 @@ mod tests {
                 0,
                 &[0xAB; 20],
                 &[0xCD; 20],
-                123_456_789,
+                alloy::primitives::U256::from(123_456_789),
             )
             .await
             .unwrap();
