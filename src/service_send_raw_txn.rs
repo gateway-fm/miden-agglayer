@@ -4442,7 +4442,7 @@ mod tests {
                 0,
                 &[0u8; 20],
                 &[0u8; 20],
-                1_000,
+                alloy::primitives::U256::from(1_000),
             )
             .await
             .unwrap();
@@ -4686,7 +4686,7 @@ mod tests {
                 0,
                 &[0u8; 20],
                 &[0u8; 20],
-                1_000,
+                alloy::primitives::U256::from(1_000),
             )
             .await
             .unwrap();
@@ -4979,7 +4979,7 @@ mod tests {
                 0,
                 &[0u8; 20],
                 &[0u8; 20],
-                1_000,
+                alloy::primitives::U256::from(1_000),
             )
             .await
             .expect("landing A's ClaimEvent");
@@ -5361,7 +5361,7 @@ mod tests {
                 0,
                 &[0u8; 20],
                 &[0u8; 20],
-                1_000,
+                alloy::primitives::U256::from(1_000),
             )
             .await
             .unwrap();

@@ -2746,6 +2746,14 @@ mod tests {
     /// Build a consumed CLAIM note with a valid `ClaimNoteStorage`, consumed at
     /// `block` with `tx_order`.
     fn claim_note(block: u32, tx_order: Option<u32>) -> InputNoteRecord {
+        claim_note_with_amount(block, tx_order, alloy::primitives::U256::from(1_000_000))
+    }
+
+    fn claim_note_with_amount(
+        block: u32,
+        tx_order: Option<u32>,
+        amount: alloy::primitives::U256,
+    ) -> InputNoteRecord {
         let mut gi_bytes = [0u8; 32];
         gi_bytes[23] = 1;
         gi_bytes[31] = 0x42;
@@ -2753,8 +2761,7 @@ mod tests {
         origin_addr[19] = 0xAB;
         let mut dest_addr = [0u8; 20];
         dest_addr[..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
-        let mut amount_bytes = [0u8; 32];
-        amount_bytes[28..32].copy_from_slice(&1_000_000u32.to_be_bytes());
+        let amount_bytes = amount.to_be_bytes::<32>();
 
         let claim_storage = ClaimNoteStorage {
             proof_data: ProofData {
@@ -3662,7 +3669,7 @@ mod tests {
                     0,
                     &[0u8; 20],
                     &[0u8; 20],
-                    1000,
+                    alloy::primitives::U256::from(1000),
                 )
                 .await
                 .unwrap();
@@ -4012,6 +4019,85 @@ mod tests {
         );
     }
 
+    /// --restore resets the cursors and reuses this projector while retaining
+    /// pending envelopes and Submitted handoffs. It must recover pre-upgrade
+    /// claims that the u64 decoder skipped, even after the cursor passed them.
+    #[tokio::test]
+    async fn retained_restore_recovers_large_claim_after_cursor_advanced() {
+        use alloy::consensus::Transaction;
+        use alloy::primitives::U256;
+        use alloy::sol_types::SolCall;
+        for amount in [U256::from(100_000_000_000_000_000_000u128), U256::MAX] {
+            let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+            let block_state = StdArc::new(BlockState::new());
+            let note = claim_note_with_amount(5, Some(0), amount);
+            let commitment = hex::encode(note.details_commitment().as_bytes());
+            let real_tx = format!("0x{}", "11".repeat(32));
+            let tx_hash = real_tx.parse().unwrap();
+            assert!(
+                crate::projection::insert_pending_claim_calldata(
+                    &store,
+                    note.details().storage(),
+                    &commitment,
+                    &real_tx,
+                )
+                .await
+                .unwrap()
+            );
+            store
+                .record_tx_note_link(&real_tx, &commitment)
+                .await
+                .unwrap();
+            store.set_projector_cursor(100).await.unwrap();
+            store.set_reconcile_cursor(100).await.unwrap();
+            store.set_latest_block_number(100).await.unwrap();
+            assert!(store.txn_receipt(tx_hash).await.unwrap().is_none());
+            assert!(!store.is_claim_note_processed(&commitment).await.unwrap());
+            assert_eq!(
+                store
+                    .get_note_handoff_for_tx(&real_tx)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                crate::store::NoteHandoffState::Submitted
+            );
+
+            // The restore driver's entry sequence preserves the retained store.
+            store.reset_cursors_to_genesis().await.unwrap();
+            let projector = test_projector(&store, &block_state).await;
+            for expected in [1, 0] {
+                assert_eq!(
+                    projector
+                        .project_notes(
+                            std::slice::from_ref(&note),
+                            &HashMap::new(),
+                            5,
+                            None,
+                            &HashMap::new(),
+                        )
+                        .await
+                        .unwrap(),
+                    expected
+                );
+            }
+            let logs = store.get_logs_for_tx(&real_tx).await.unwrap();
+            assert_eq!(logs.len(), 1);
+            assert_eq!(logs[0].block_number, 5);
+            assert_eq!(logs[0].block_hash, block_state.get_block_hash(5));
+            let data = hex::decode(logs[0].data.trim_start_matches("0x")).unwrap();
+            assert_eq!(&data[128..160], &amount.to_be_bytes::<32>());
+            let (receipt, block) = store.txn_receipt(tx_hash).await.unwrap().unwrap();
+            assert!(receipt.is_ok());
+            assert_eq!(block, 5);
+            assert!(store.is_claim_note_processed(&commitment).await.unwrap());
+            let transaction = store.txn_get(tx_hash).await.unwrap().unwrap();
+            let call =
+                crate::claim::claimAssetCall::abi_decode(transaction.envelope.input()).unwrap();
+            assert_eq!(call.amount, amount);
+        }
+    }
+
     /// #67 gaps 2+3 — HEAL a historical real-hash failure. A note that is already
     /// {processed + ClaimEvent under the REAL linked hash + MISSING transaction envelope} —
     /// the pre-upgrade crash window (crash between recording the link and persisting the
@@ -4049,7 +4135,7 @@ mod tests {
                 0,
                 &[0xAB; 20],
                 &[0xCD; 20],
-                1_000,
+                alloy::primitives::U256::from(1_000),
             )
             .await
             .unwrap();
@@ -5093,7 +5179,7 @@ mod tests {
                 0,
                 &[0u8; 20],
                 &[0u8; 20],
-                1,
+                alloy::primitives::U256::from(1),
             )
             .await
             .unwrap();
