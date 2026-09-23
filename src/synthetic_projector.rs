@@ -1751,7 +1751,7 @@ impl SyntheticProjector {
         // input position is the on-chain LET append order, the only correct
         // tiebreak for same-transaction B2AGG siblings.
         let mut within_tx_pos: HashMap<NoteId, u32> = HashMap::new();
-        let txs = self
+        let mut txs = self
             .node_rpc
             .sync_transactions(
                 BlockNumber::from((cursor + 1) as u32),
@@ -1760,6 +1760,12 @@ impl SyntheticProjector {
             )
             .await
             .map_err(|e| anyhow::anyhow!("sync_transactions({}..{}): {e}", cursor + 1, tip))?;
+        crate::transaction_headers::recover_input_headers(
+            &*self.node_rpc,
+            &mut txs,
+            self.bridge_id,
+        )
+        .await?;
         let consumed_refs = bridge_consumed_nullifiers(&txs, self.bridge_id)?;
         let fetcher = RpcNoteFetcher(&*self.node_rpc);
         let resolved = self
@@ -2466,10 +2472,9 @@ pub(crate) fn bridge_consumed_nullifiers(
 ) -> anyhow::Result<HashMap<Nullifier, ConsumedRef>> {
     let mut out = HashMap::new();
     for (block, order, tx) in ordered_account_transactions(txs, bridge_id)? {
-        // rc.1: the wire decoder strips input-note headers and instead returns
-        // explicit (nullifier -> note_id) refs per transaction for public
-        // inputs. Headers are still honoured when present (fixtures / a future
-        // decoder that retains them); refs are the production identity source.
+        // The SDK strips inline input headers from SyncTransactions. Missing
+        // identities are recovered from the stock block RPC before this step.
+        // Authenticated public inputs keep their explicit note references.
         let tx_refs: HashMap<Nullifier, miden_protocol::note::NoteId> =
             tx.trusted_consumed_note_refs().collect();
         for (pos, input) in tx.transaction_header.input_notes().iter().enumerate() {
