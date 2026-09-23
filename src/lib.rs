@@ -9,6 +9,8 @@ pub mod bridge_out;
 pub mod burn_serial_tracker;
 pub mod claim;
 pub mod claim_watcher;
+pub mod client_access;
+pub(crate) mod consumed_note_feed;
 pub mod exit;
 pub mod expected_mint_tracker;
 pub mod faucet_bootstrap;

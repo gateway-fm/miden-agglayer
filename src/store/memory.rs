@@ -2695,6 +2695,8 @@ impl Store for InMemoryStore {
     }
 
     async fn expected_mint_load_all(&self) -> anyhow::Result<Vec<([u8; 32], [u8; 32], u32, bool)>> {
+        #[cfg(test)]
+        self.monitor_test_call("expected_mint_load_all")?;
         let map = self.monitor_expected_mints.read();
         Ok(map
             .iter()
