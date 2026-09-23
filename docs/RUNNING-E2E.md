@@ -31,7 +31,7 @@ image:
 
 | Image | Source used by repository scripts |
 |---|---|
-| `miden-validator` | `https://github.com/mandrigin/node.git` at `6e465a2` (v0.16.0 + consumed-note references) |
+| `miden-validator` | `https://github.com/0xMiden/node.git` at `v0.16.0` |
 | `miden-node` | same checkout and ref |
 | `miden-ntx-builder` | same checkout and ref |
 | `miden-remote-prover` | same checkout and ref |
@@ -39,7 +39,7 @@ image:
 
 `run-all.sh` is the repository's supported bootstrap for a bare Ubuntu host. It
 installs/checks tools, clones companion repositories next to this checkout,
-builds missing images from the clean pinned node checkout, and
+builds missing images from the unmodified upstream node checkout, and
 generates missing fixtures:
 
 ```bash
