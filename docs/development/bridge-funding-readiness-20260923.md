@@ -12,6 +12,9 @@ all deposits are indexed but some remain unready. Six attempts at most fit
 inside the 600-second readiness window. A failed or ambiguous send stops the
 helper. Every attempt and observation is retained. A readiness timeout stops
 setup immediately; it no longer continues into 30 minutes of faucet polling.
+Temporary API outages and paused dependencies consume the same wait deadline
+without sending or consuming the nudge budget. Malformed identity evidence and
+ambiguous sends still stop the gate.
 
 The nudge is ordinary test traffic through unchanged components. It does not
 write readiness flags, rebuild an index, or certify delivery. Existing balance,
@@ -25,6 +28,6 @@ is retained in `~/bridge-readiness-live-20260923/` on the soak host. This expose
 a separate stale ClaimTxManager nonce after the earlier proxy database loss;
 its existing post-restore sender recovery requires separate claim validation.
 
-Eight regression cases cover exact funding identity, malformed evidence,
+Eleven regression cases cover exact funding identity, malformed evidence,
 already-ready deposits, recovery after a notification miss, unindexed deposits,
-ambiguous sends, and exhausted recovery budgets.
+ambiguous sends, exhausted recovery budgets, and temporary/persistent outages.

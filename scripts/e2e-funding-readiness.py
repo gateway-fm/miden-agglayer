@@ -15,7 +15,12 @@ from pathlib import Path
 import re
 import subprocess
 import time
+import urllib.error
 import urllib.request
+
+
+class Unavailable(RuntimeError):
+    """A fixture dependency is temporarily stopped or paused; no send occurred."""
 
 
 def funding_status(deposits, hashes, destination):
@@ -42,17 +47,29 @@ def wait_ready(sample, nudge, record, timeout=600, clock=time.monotonic,
     next_nudge = clock() + grace
     attempts = 0
     while clock() < deadline:
-        status = sample()  # Unreadable or malformed evidence cannot authorize a send.
+        try:
+            status = sample()
+        except (Unavailable, urllib.error.URLError, TimeoutError, ConnectionError) as error:
+            # Chaos intentionally makes endpoints unavailable. Preserve the
+            # original deadline and never authorize a nudge from unreadable data.
+            record({'event': 'sample-unavailable', 'reason': str(error)})
+            pause(min(5, max(0, deadline - clock())))
+            continue
         record({'event': 'sample', **status})
         if status['ready'] == status['expected'] and status['expected'] > 0:
             return {'status': 'funding-ready', 'nudge_attempts': attempts, **status}
         if (status['indexed'] == status['expected'] and status['unready']
                 and clock() >= next_nudge and attempts < budget):
-            attempts += 1
-            record({'event': 'nudge-intent', 'attempt': attempts})
-            nudge(attempts)  # An ambiguous/failed send stops; never retry it blindly.
-            record({'event': 'nudge-submitted', 'attempt': attempts})
-            next_nudge = clock() + interval
+            candidate = attempts + 1
+            record({'event': 'nudge-intent', 'attempt': candidate})
+            if nudge(candidate) is False:
+                record({'event': 'nudge-skipped', 'reason': 'dependency unavailable; no send'})
+                next_nudge = clock() + 15
+            else:
+                # An ambiguous/failed send raises; never retry it blindly.
+                attempts = candidate
+                record({'event': 'nudge-submitted', 'attempt': attempts})
+                next_nudge = clock() + interval
         pause(min(5, max(0, deadline - clock())))
     raise RuntimeError('funding readiness deadline expired; workload must not start')
 
@@ -89,13 +106,19 @@ def main():
         info = json.loads(fee.run('docker', 'inspect', f'{args.project}-{service}-1'))[0]
         labels = info['Config']['Labels']
         if (labels.get('com.docker.compose.project') != args.project
-                or labels.get('com.docker.compose.service') != service
-                or info['State']['Status'] != 'running' or info['State']['Paused']
-                or info['State']['Restarting']):
-            raise ValueError('fixture ownership/liveness mismatch: ' + service)
+                or labels.get('com.docker.compose.service') != service):
+            raise ValueError('fixture ownership mismatch: ' + service)
         return info
 
-    fee.validate_binding(owned('bridge-service'), args.bridge_url, 8080)
+    def running(info):
+        state = info['State']
+        return state['Status'] == 'running' and not state['Paused'] and not state['Restarting']
+
+    bridge = owned('bridge-service')
+    # Docker clears active port bindings while stopped. Check configured
+    # ownership now, then require the active binding on every readable sample.
+    fee.validate_binding({'NetworkSettings': {'Ports': bridge['HostConfig']['PortBindings']}},
+                         args.bridge_url, 8080)
     nudge_token = ''
 
     def nudge(attempt):
@@ -103,9 +126,14 @@ def main():
         # Only the local test topology may spend its fixture key. Recheck for
         # every attempt; never wake a similarly named foreign deployment.
         l2b = os.environ.get('L2B_RPC', 'http://localhost:9545')
-        fee.validate_binding(owned('anvil-l2b'), l2b, 8545)
-        fee.validate_chain(l2b, 31338)
-        owned('aggkit-l2b')
+        anvil, aggkit = owned('anvil-l2b'), owned('aggkit-l2b')
+        if not running(anvil) or not running(aggkit):
+            return False
+        fee.validate_binding(anvil, l2b, 8545)
+        try:
+            fee.validate_chain(l2b, 31338)
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            return False  # Only read requests occurred; safe to retry later.
         env = dict(os.environ, COMPOSE_PROJECT_NAME=args.project, NDG=nudge_token)
         script = '''set -euo pipefail
 PROJECT_DIR="$PWD"
@@ -127,6 +155,10 @@ printf 'NUDGE_TOKEN=%s\\n' "$NDG"
         nudge_token = match[1]
 
     def sample():
+        info = owned('bridge-service')
+        if not running(info):
+            raise Unavailable('bridge service stopped, paused or restarting')
+        fee.validate_binding(info, args.bridge_url, 8080)
         # The load provisions a fresh wallet and <=100 funding transactions.
         # Reject pagination rather than mistake a partial page for all deposits.
         url = args.bridge_url.rstrip('/') + '/bridges/' + args.destination + '?limit=100'
