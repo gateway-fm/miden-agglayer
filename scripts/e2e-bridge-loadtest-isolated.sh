@@ -354,6 +354,8 @@ submit_l1() {
 l1_status() { awk '$1=="status"{print $2; exit}' "$1"; }
 
 r "Setup 2/4: funding L2 wallet (1 large L1→L2 per token, batches of $PARALLEL)..."
+FUNDING_TXS="$OUT_DIR/funding-$STAMP.tx-hashes"
+: > "$FUNDING_TXS"
 fund_idx=0
 while [[ $fund_idx -lt $NUM_TOKENS ]]; do
     base_nonce=$(cast nonce --rpc-url "$L1_RPC" "$FUNDED_ADDR")
@@ -369,16 +371,24 @@ while [[ $fund_idx -lt $NUM_TOKENS ]]; do
     for ti in "${slots[@]}"; do
         st=$(l1_status "$TMP/fund_$ti")
         [[ "$st" == "1" ]] || die "funding L1 tx failed for ${T_LABEL[$ti]} (status=$st)"
+        tx=$(awk '$1=="transactionHash"{print $2; exit}' "$TMP/fund_$ti")
+        [[ "$tx" =~ ^0x[0-9a-fA-F]{64}$ ]] || die "funding receipt missing transaction hash for ${T_LABEL[$ti]}"
+        printf '%s\n' "$tx" >> "$FUNDING_TXS"
     done
     fund_idx=$((fund_idx + PARALLEL))
 done
 r "  all $NUM_TOKENS funding deposits submitted on L1"
 
-# Wait until all funding deposits are ready_for_claim on L2 (count >= NUM_TOKENS).
+# Match the deposits submitted above; old ready rows cannot satisfy funding.
+# A bounded certificate nudge retries the stock bridge's missed notification.
+# Failure stops setup here instead of spending another 30 minutes polling
+# faucet IDs for claims that cannot start. No gate or database flag is weakened.
 r "Setup 3/4: waiting for funding deposits to be ready_for_claim + auto-claimed..."
-wait_for "all funding deposits ready_for_claim" \
-    "[ \$(curl -sf '$BRIDGE_SERVICE_URL/bridges/$DEST_ADDR?limit=100' 2>/dev/null | python3 -c \"import json,sys; d=json.load(sys.stdin); print(len([x for x in d.get('deposits',[]) if x.get('ready_for_claim') and x.get('amount')!='0']))\" 2>/dev/null || echo 0) -ge $NUM_TOKENS ]" \
-    600 5 || r "  WARN: not all funding deposits ready within 600s (continuing)"
+python3 "$SCRIPT_DIR/e2e-funding-readiness.py" --project "$COMPOSE_PROJECT_NAME" \
+    --destination "$DEST_ADDR" --tx-hashes "$FUNDING_TXS" \
+    --bridge-url "$BRIDGE_SERVICE_URL" --evidence "$OUT_DIR/funding-$STAMP" \
+    >> "$VERBOSE_LOG" 2>&1 || die "funding deposits did not become ready; see $OUT_DIR/funding-$STAMP"
+r "  all $NUM_TOKENS funding deposits ready (bounded recovery evidence retained)"
 
 # Build token -> faucet_id map from admin_listFaucets (key on origin token addr).
 r "Setup 4/4: mapping tokens -> faucet ids + confirming L2 balances..."
