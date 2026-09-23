@@ -349,7 +349,7 @@ mod tests {
                 7,
                 &[1u8; 20],
                 &[2u8; 20],
-                1_000,
+                alloy::primitives::U256::from(1_000),
             )
             .await
             .unwrap();

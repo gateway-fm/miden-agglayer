@@ -14,6 +14,7 @@
 //! synthetic-event producer, so that watcher was removed in the cut-over; only
 //! the shared decoder remains.)
 
+use alloy::primitives::U256;
 use anyhow::Context;
 use miden_protocol::note::NoteStorage;
 use sha3::{Digest, Keccak256};
@@ -65,11 +66,8 @@ pub struct DecodedClaim {
     pub origin_network: u32,
     pub origin_address: [u8; 20],
     pub destination_address: [u8; 20],
-    /// Amount in origin-token units, low-order bits. The bridge contract's
-    /// ClaimEvent type-2 topic is u256, but in practice every legitimate value
-    /// fits u64 (max ETH supply ≈ 2^57 wei) — we surface overflows as a metric
-    /// and refuse to emit, rather than silently truncating.
-    pub amount: u64,
+    /// Amount in origin-token units, matching the ClaimEvent uint256 ABI.
+    pub amount: U256,
 }
 
 /// The COMPLETE original `claimAsset` inputs recovered from a consumed CLAIM note's
@@ -100,8 +98,7 @@ pub struct DecodedFullClaim {
     pub origin_address: [u8; 20],
     pub destination_network: u32,
     pub destination_address: [u8; 20],
-    /// Full U256 big-endian amount — calldata is `uint256`, so no u64 clamp here
-    /// (unlike [`DecodedClaim::amount`], which feeds the u64-typed event store).
+    /// Full U256 big-endian amount, matching the claimAsset uint256 ABI.
     pub amount: [u8; 32],
     pub metadata_hash: [u8; 32],
 }
@@ -154,8 +151,6 @@ fn unpack_u32_felts<const N: usize>(felts: &[miden_protocol::Felt]) -> anyhow::R
 /// Returns `Err` on any of:
 /// - storage felt count below [`MIN_FELT_COUNT`]
 /// - a felt holding a value outside `u32`
-/// - an amount field that doesn't fit `u64` (rejected so the watcher never
-///   silently truncates a large-value claim)
 pub fn parse_claim_event_from_storage(storage: &NoteStorage) -> anyhow::Result<DecodedClaim> {
     let items = storage.items();
     if items.len() < MIN_FELT_COUNT {
@@ -174,17 +169,7 @@ pub fn parse_claim_event_from_storage(storage: &NoteStorage) -> anyhow::Result<D
         unpack_u32_felts::<20>(&items[OFFSET_DESTINATION_ADDRESS..OFFSET_DESTINATION_ADDRESS + 5])?;
     let amount_bytes = unpack_u32_felts::<32>(&items[OFFSET_AMOUNT..OFFSET_AMOUNT + 8])?;
 
-    // Reject amounts that overflow u64 — the upper 24 bytes of the U256 BE
-    // representation must be zero. ClaimEvent's wire type is u256 but
-    // `Store::add_claim_event` takes u64; surfacing as Err keeps every
-    // overflow visible via the storage_decode_total counter rather than
-    // silently truncating.
-    if amount_bytes[..24].iter().any(|b| *b != 0) {
-        anyhow::bail!("CLAIM amount exceeds u64::MAX (top 24 bytes nonzero); refusing to truncate");
-    }
-    let mut amount_low = [0u8; 8];
-    amount_low.copy_from_slice(&amount_bytes[24..32]);
-    let amount = u64::from_be_bytes(amount_low);
+    let amount = U256::from_be_bytes(amount_bytes);
 
     Ok(DecodedClaim {
         global_index,
@@ -340,7 +325,7 @@ mod tests {
         assert_eq!(decoded.destination_address[..4], [0xDE, 0xAD, 0xBE, 0xEF]);
 
         // amount: 1_000_000.
-        assert_eq!(decoded.amount, 1_000_000);
+        assert_eq!(decoded.amount, U256::from(1_000_000));
     }
 
     #[test]
@@ -356,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_claim_storage_rejects_amount_overflow_u64() {
+    fn parse_claim_storage_preserves_amount_above_u64() {
         // Build a valid base storage, then patch the amount felts to encode a
         // U256 > u64::MAX. We rebuild a ClaimNoteStorage with a huge amount.
         let mut huge_amount = [0u8; 32];
@@ -380,8 +365,8 @@ mod tests {
             miden_claim_amount: Felt::ZERO,
         };
         let storage = NoteStorage::try_from(huge).expect("ok");
-        let err = parse_claim_event_from_storage(&storage).expect_err("overflow must err");
-        assert!(format!("{err:#}").contains("u64::MAX"));
+        let decoded = parse_claim_event_from_storage(&storage).unwrap();
+        assert_eq!(decoded.amount.to_be_bytes::<32>(), huge_amount);
     }
 
     #[test]
@@ -433,7 +418,7 @@ mod tests {
                 0,
                 &[0u8; 20],
                 &[0u8; 20],
-                1000,
+                alloy::primitives::U256::from(1000),
             )
             .await
             .unwrap();
@@ -457,7 +442,7 @@ mod tests {
                 0,
                 &[0u8; 20],
                 &[0u8; 20],
-                1000,
+                alloy::primitives::U256::from(1000),
             )
             .await
             .unwrap();
