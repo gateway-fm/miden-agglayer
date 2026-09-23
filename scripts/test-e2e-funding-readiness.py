@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 import unittest
+import urllib.error
 
 spec = importlib.util.spec_from_file_location('funding', Path(__file__).with_name('e2e-funding-readiness.py'))
 funding = importlib.util.module_from_spec(spec)
@@ -74,6 +75,34 @@ class FundingReadiness(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             self.run_wait(lambda: funding.funding_status([deposit()], {TX}, DEST), nudge)
         self.assertEqual(attempts, [1])
+
+    def test_temporary_api_outage_retries_without_authorizing_a_send(self):
+        row = deposit(); row['ready_for_claim'] = True
+        samples = [urllib.error.URLError('connection refused'), funding.Unavailable('paused'), row]
+        def sample():
+            value = samples.pop(0)
+            if isinstance(value, Exception): raise value
+            return funding.funding_status([value], {TX}, DEST)
+        result, records, elapsed = self.run_wait(sample, lambda _: self.fail('unexpected send'))
+        self.assertEqual(result['status'], 'funding-ready')
+        self.assertEqual(elapsed, 10)
+        self.assertEqual(sum(r['event'] == 'sample-unavailable' for r in records), 2)
+
+    def test_unavailable_dependency_skips_without_consuming_send_budget(self):
+        row = deposit(); candidates = []
+        def nudge(attempt):
+            candidates.append(attempt)
+            if len(candidates) == 1: return False
+            row['ready_for_claim'] = True
+        result, records, _ = self.run_wait(lambda: funding.funding_status([row], {TX}, DEST), nudge)
+        self.assertEqual(candidates, [1, 1])
+        self.assertEqual(result['nudge_attempts'], 1)
+        self.assertEqual(sum(r['event'] == 'nudge-skipped' for r in records), 1)
+
+    def test_persistent_outage_still_expires_at_original_deadline(self):
+        def sample(): raise funding.Unavailable('paused')
+        with self.assertRaisesRegex(RuntimeError, 'deadline'):
+            self.run_wait(sample, lambda _: self.fail('unexpected send'), timeout=20)
 
     def test_nudge_budget_does_not_turn_unready_into_success(self):
         attempts = []
