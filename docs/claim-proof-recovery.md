@@ -20,6 +20,7 @@ using the original uint256 amount and metadata hash. Gas estimation returns
 Admission rejects before reserving a nonce; the writer also checks persisted
 requests admitted by an older version. ClaimTxManager estimates before creating a
 monitor, so new invalid proofs leave the deposit available for a later valid proof.
+The existing zero-amount nonce no-op still creates no note and emits no claim event.
 
 For existing pending requests, recovery first refreshes bridge and exact-note
 state. An invalid proof with a definitely absent effect and an unconsumed exact

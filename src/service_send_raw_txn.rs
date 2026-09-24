@@ -512,17 +512,18 @@ pub(crate) async fn worker_handle_claim_asset(
         );
     }
 
-    // Recheck persisted/queued requests admitted by an older proxy too.
-    if !crate::applied_state::claim_terminal(service, params.globalIndex).await? {
-        crate::claim_proof::validate(&params)?;
-    }
-
     // Skip zero-amount claims (e.g., genesis batch deposit). These create
     // CLAIM notes that crash the NTX builder's faucet actor.
     if params.amount.is_zero() {
         tracing::info!("skipping zero-amount claim (genesis batch)");
         record_local_immediate_success(service, txn_hash, txn_envelope, signer, vec![]).await?;
         return Ok(());
+    }
+
+    // Recheck persisted/queued requests admitted by an older proxy too. The
+    // legacy zero-amount no-op above publishes no note and needs no proof.
+    if !crate::applied_state::claim_terminal(service, params.globalIndex).await? {
+        crate::claim_proof::validate(&params)?;
     }
 
     // #55 BLOCKER A — the AUTHORITATIVE landed classification runs FIRST, before
@@ -833,7 +834,7 @@ async fn validate_before_nonce_reservation(
 
     // One state-only bridge snapshot answers both compatibility questions.
     let already_claimed = claim_state_gate(service, params).await?;
-    if !already_claimed {
+    if !already_claimed && !params.amount.is_zero() {
         crate::claim_proof::validate(params)?;
     }
     Ok(())
@@ -2595,7 +2596,7 @@ mod tests {
         let service = create_test_service();
         let store = service.store.clone();
 
-        let calldata = valid_claim_bytes(claimAssetCall {
+        let calldata = claimAssetCall {
             smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
             smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
             globalIndex: U256::from(1u64),
@@ -2607,7 +2608,8 @@ mod tests {
             destinationAddress: Address::ZERO,
             amount: U256::ZERO,
             metadata: Default::default(),
-        });
+        }
+        .abi_encode();
         let (input_hex, signer) = encode_legacy_tx(calldata);
 
         let result = service_send_raw_txn(service, input_hex).await;
