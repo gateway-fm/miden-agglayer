@@ -1803,6 +1803,56 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn txn_fail_invalid_claim(
+        &self,
+        tx_hash: TxHash,
+        global_index: U256,
+        expected_commitment: Option<&str>,
+        reason: &str,
+        block_num: u64,
+    ) -> anyhow::Result<bool> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        let hash = format!("{tx_hash:#x}");
+        let gi = format!("{global_index:#x}");
+        let link = tx
+            .query_opt(
+                "SELECT note_commitment FROM tx_note_links WHERE tx_hash = $1 FOR UPDATE",
+                &[&hash],
+            )
+            .await?;
+        let commitment: Option<String> = link.map(|r| r.get(0));
+        if commitment.as_deref() != expected_commitment {
+            return Ok(false);
+        }
+        let claim = tx.query_opt(
+            "SELECT owner_tx_hash, claim_state FROM claimed_indices WHERE global_index = $1 FOR UPDATE", &[&gi]
+        ).await?;
+        if let Some(claim) = claim {
+            let owner: Option<String> = claim.get(0);
+            let state: String = claim.get(1);
+            if owner.as_deref() == Some(hash.as_str()) && state == "landed" {
+                return Ok(false);
+            }
+        }
+        let updated = tx.execute(
+            "UPDATE transactions SET status = 'failed', error_message = $2, block_number = $3, updated_at = now()
+             WHERE tx_hash = $1 AND status = 'pending'",
+            &[&hash, &reason, &(block_num as i64)]
+        ).await?;
+        if updated != 1 {
+            return Ok(false);
+        }
+        tx.execute("DELETE FROM transaction_logs WHERE tx_hash = $1", &[&hash])
+            .await?;
+        tx.execute(
+            "DELETE FROM claimed_indices WHERE global_index = $1 AND owner_tx_hash = $2 AND claim_state != 'landed'",
+            &[&gi, &hash]
+        ).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     async fn txn_receipt(
         &self,
         tx_hash: TxHash,
