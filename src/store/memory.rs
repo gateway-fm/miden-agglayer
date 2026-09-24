@@ -1474,6 +1474,45 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
+    async fn txn_fail_invalid_claim(
+        &self,
+        tx_hash: TxHash,
+        global_index: U256,
+        expected_commitment: Option<&str>,
+        reason: &str,
+        block_num: u64,
+    ) -> anyhow::Result<bool> {
+        let links = self.tx_note_links.read();
+        let hash = format!("{tx_hash:#x}");
+        if links.get(&hash).map(|h| h.note_commitment.as_str()) != expected_commitment {
+            return Ok(false);
+        }
+        let mut claimed = self.claimed.write();
+        if claimed
+            .get(&global_index)
+            .is_some_and(|r| r.owner_tx_hash == Some(tx_hash) && r.state == ClaimState::Landed)
+        {
+            return Ok(false);
+        }
+        let mut txns = self.transactions.lock();
+        let Some(receipt) = txns.get_mut(&tx_hash) else {
+            anyhow::bail!("Store: transaction {tx_hash} not found");
+        };
+        if receipt.result.is_some() {
+            return Ok(false);
+        }
+        receipt.result = Some(Err(reason.to_owned()));
+        receipt.block_num = block_num;
+        receipt.logs.clear();
+        if claimed
+            .get(&global_index)
+            .is_some_and(|r| r.owner_tx_hash == Some(tx_hash))
+        {
+            claimed.remove(&global_index);
+        }
+        Ok(true)
+    }
+
     async fn txn_receipt(
         &self,
         tx_hash: TxHash,

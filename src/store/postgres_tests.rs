@@ -41,6 +41,14 @@ async fn pg_store() -> Option<PgStore> {
     )
 }
 
+#[tokio::test]
+async fn pgstore_invalid_claim_fences_receipts_and_owners() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    crate::claim_proof_tests::invalid_claim_store_contract(&store).await;
+}
+
 /// Reset the service_state singleton to defaults before each test.
 async fn reset_state(store: &PgStore) {
     // We access the pool indirectly through the Store trait methods

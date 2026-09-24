@@ -11,7 +11,8 @@
 //! This is a compatibility shim, not a simulator: it only reads the landed
 //! projection and the local synchronized Miden bridge account. A spent claim
 //! returns `AlreadyClaimed()` before the GER check; otherwise an absent GER
-//! returns `GlobalExitRootInvalid()`. No transaction is executed or proved.
+//! returns `GlobalExitRootInvalid()`. An invalid deposit inclusion proof returns
+//! `InvalidSmtProof()`. No transaction is executed or proved.
 //! The literal `execution reverted` prefix is load-bearing for ClaimTxManager.
 
 use crate::claim::claimAssetCall;
@@ -33,6 +34,8 @@ alloy_core::sol! {
     // Selector: 0x646cf558.
     #[derive(Debug)]
     error AlreadyClaimed();
+    #[derive(Debug)]
+    error InvalidSmtProof();
 }
 
 /// The JSON-RPC error code geth uses for `execution reverted` responses
@@ -145,6 +148,19 @@ pub(crate) async fn service_estimate_gas(
                 global_exit_root_invalid_error(),
             ));
         }
+        if crate::claim_proof::validate(&call).is_err() {
+            return Err(JsonRpcResponse::error(
+                answer_id,
+                JsonRpcError::new(
+                    JsonRpcErrorReason::ApplicationError(EXECUTION_REVERTED_CODE),
+                    "execution reverted: InvalidSmtProof()".to_string(),
+                    serde_json::Value::String(format!(
+                        "0x{}",
+                        alloy::hex::encode(InvalidSmtProof::SELECTOR)
+                    )),
+                ),
+            ));
+        }
     }
 
     // Legacy stub for everything else (and for admitted claims): gas is
@@ -177,7 +193,7 @@ mod tests {
     }
 
     fn claim_calldata(mainnet: [u8; 32], rollup: [u8; 32]) -> String {
-        let calldata = claimAssetCall {
+        let mut call = claimAssetCall {
             smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
             smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
             globalIndex: U256::from(7u64),
@@ -189,9 +205,9 @@ mod tests {
             destinationAddress: Address::ZERO,
             amount: U256::from(1u64),
             metadata: Default::default(),
-        }
-        .abi_encode();
-        format!("0x{}", alloy::hex::encode(calldata))
+        };
+        crate::claim_proof::set_valid_root(&mut call);
+        format!("0x{}", alloy::hex::encode(call.abi_encode()))
     }
 
     fn estimate_request(data_hex: &str) -> JsonRpcExtractor {
@@ -202,6 +218,37 @@ mod tests {
             method: "eth_estimateGas".to_string(),
             id: Id::Num(1),
         }
+    }
+
+    #[tokio::test]
+    async fn estimate_rejects_real_invalid_proof_even_with_published_ger() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/claim-deposit-373.json")).unwrap();
+        let input = fixture["input"].as_str().unwrap();
+        let call = claimAssetCall::abi_decode(&hex_decode_prefixed(input).unwrap()).unwrap();
+        let service = create_test_service();
+        let ger = crate::ger::combined_ger(&call.mainnetExitRoot.0, &call.rollupExitRoot.0);
+        service
+            .store
+            .commit_ger_event_atomic(1, [0; 32], "0xseed", &ger, None, None, 0)
+            .await
+            .unwrap();
+        let response = service_estimate_gas(service.clone(), estimate_request(input))
+            .await
+            .unwrap_err();
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["error"]["code"], 3);
+        assert_eq!(
+            json["error"]["message"],
+            "execution reverted: InvalidSmtProof()"
+        );
+        assert_eq!(json["error"]["data"], "0xe0417cec");
+        assert!(
+            !crate::applied_state::claim_terminal(&service, call.globalIndex)
+                .await
+                .unwrap()
+        );
+        assert!(!service.store.is_claimed(&call.globalIndex).await.unwrap());
     }
 
     /// Applied claim wins over GER readiness and returns the exact AggKit shim shape.
@@ -317,7 +364,11 @@ mod tests {
     #[tokio::test]
     async fn estimate_gas_claim_published_ger_succeeds() {
         let service = create_test_service();
-        let ger = crate::ger::combined_ger(&[0xAA; 32], &[0xBB; 32]);
+        let call = claimAssetCall::abi_decode(
+            &hex_decode_prefixed(&claim_calldata([0xAA; 32], [0xBB; 32])).unwrap(),
+        )
+        .unwrap();
+        let ger = crate::ger::combined_ger(&call.mainnetExitRoot.0, &call.rollupExitRoot.0);
         service
             .store
             .commit_ger_event_atomic(1, [0u8; 32], "0xger-seed", &ger, None, None, 0)
@@ -340,7 +391,11 @@ mod tests {
     #[tokio::test]
     async fn estimate_gas_claim_seen_but_unpublished_ger_still_reverts() {
         let service = create_test_service();
-        let ger = crate::ger::combined_ger(&[0x11; 32], &[0x22; 32]);
+        let call = claimAssetCall::abi_decode(
+            &hex_decode_prefixed(&claim_calldata([0x11; 32], [0x22; 32])).unwrap(),
+        )
+        .unwrap();
+        let ger = crate::ger::combined_ger(&call.mainnetExitRoot.0, &call.rollupExitRoot.0);
         // Seen (indexer pre-populated) but NOT injected/published.
         service
             .store
