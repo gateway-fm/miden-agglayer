@@ -365,12 +365,44 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
                 }
             };
         }
-        // NotApplied, or Uncertain (the exact note is Missing/unsynced): do NOT
-        // finalise — fall through to the handoff-state machine, which polls a
-        // submitted note, clears+re-drives a provably-dead prepared note, or
-        // re-drives a pure orphan.
-        Ok(crate::applied_state::ExactNoteOutcome::NotApplied)
-        | Ok(crate::applied_state::ExactNoteOutcome::Uncertain) => {}
+        // A fresh absent effect plus a known unconsumed note (or no handoff)
+        // permits deterministic proof rejection. A valid proof still follows
+        // the usual handoff state machine; missing/unsynced notes stay uncertain.
+        Ok(crate::applied_state::ExactNoteOutcome::NotApplied) => {
+            if let DecodedWriteCall::Claim { params } = &decoded
+                && let Err(error) = crate::claim_proof::validate(params)
+            {
+                let reason = format!("claim rejected during recovery: {error}");
+                let block = match service.store.get_latest_block_number().await {
+                    Ok(block) => block,
+                    Err(_) => return Step::StopSigner,
+                };
+                match service
+                    .store
+                    .txn_fail_invalid_claim(
+                        tx.tx_hash,
+                        params.globalIndex,
+                        handoff.as_ref().map(|h| h.note_commitment.as_str()),
+                        &reason,
+                        block,
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        let _ = service.store.clear_recovery_backoff(tx.tx_hash).await;
+                        tracing::warn!(target: "recovery", tx_hash = %tx.tx_hash, global_index = %params.globalIndex,
+                            %error, "rejected invalid claim proof; deposit remains claimable with a valid proof");
+                        return Step::Continue;
+                    }
+                    Ok(false) => return Step::StopSigner,
+                    Err(error) => {
+                        tracing::warn!(target: "recovery", tx_hash = %tx.tx_hash, %error, "invalid claim finalization failed");
+                        return Step::StopSigner;
+                    }
+                }
+            }
+        }
+        Ok(crate::applied_state::ExactNoteOutcome::Uncertain) => {}
     }
 
     // 3. A CONFIRMED submission — a `Submitted` handoff or a recorded Miden tx id —
@@ -729,8 +761,7 @@ mod tests {
     }
 
     /// A `claimAsset` transaction really signed by `key` at `nonce` for
-    /// `global_index`. Proof fields are zeroed — recovery classification never
-    /// executes the proof; it only decodes the global index.
+    /// `global_index`, with a valid deterministic inclusion proof.
     fn signed_claim_tx(
         key: &PrivateKeySigner,
         nonce: u64,
@@ -738,7 +769,7 @@ mod tests {
         dest_marker: u8,
     ) -> (TxEnvelope, TxHash, Address) {
         use crate::claim::claimAssetCall;
-        let params = claimAssetCall {
+        let mut params = claimAssetCall {
             smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
             smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
             globalIndex: global_index,
@@ -751,6 +782,7 @@ mod tests {
             amount: alloy::primitives::U256::from(1000u64),
             metadata: Default::default(),
         };
+        crate::claim_proof::set_valid_root(&mut params);
         let txn = TxLegacy {
             nonce,
             input: params.abi_encode().into(),
@@ -768,6 +800,99 @@ mod tests {
 
     fn signer_hex(signer: Address) -> String {
         format!("{signer:#x}")
+    }
+
+    #[tokio::test]
+    async fn submitted_invalid_claim_reverts_without_poisoning_deposit_or_republishing() {
+        use alloy::primitives::U256;
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/claim-deposit-373.json")).unwrap();
+        let input = alloy::hex::decode(fixture["input"].as_str().unwrap()).unwrap();
+        let gi = crate::claim::claimAssetCall::abi_decode(&input)
+            .unwrap()
+            .globalIndex;
+        for legacy in [false, true] {
+            let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+            let key = PrivateKeySigner::random();
+            let txn = TxLegacy {
+                nonce: 0,
+                input: input.clone().into(),
+                chain_id: Some(1),
+                gas_price: 1,
+                ..Default::default()
+            };
+            let sig = key.sign_hash_sync(&txn.signature_hash()).unwrap();
+            let signed = txn.into_signed(sig);
+            let hash = *signed.hash();
+            let env: TxEnvelope = signed.into();
+            install_orphan(&store, &env, hash, key.address(), 0).await;
+            let hash_string = format!("{hash:#x}");
+            if legacy {
+                store
+                    .record_tx_note_link(&hash_string, "bad-note")
+                    .await
+                    .unwrap();
+            } else {
+                store
+                    .prepare_note_handoff(&hash_string, "bad-note", "0xexact-note", 100)
+                    .await
+                    .unwrap();
+                store
+                    .confirm_note_handoff(&hash_string, "bad-note")
+                    .await
+                    .unwrap();
+            }
+            store
+                .try_claim_fenced(gi, hash, Duration::from_secs(60))
+                .await
+                .unwrap()
+                .unwrap();
+            let service = with_writer(store.clone(), 64);
+            recover_orphaned_pending_txns(&service).await.unwrap();
+            let receipt = store.txn_receipt(hash).await.unwrap();
+            if legacy {
+                assert!(
+                    receipt.is_none(),
+                    "missing exact note identity remains uncertain"
+                );
+            } else {
+                assert!(receipt.unwrap().0.unwrap_err().contains("InvalidSmtProof"));
+                assert!(!store.is_claimed(&gi).await.unwrap());
+                assert!(
+                    store
+                        .try_claim_fenced(
+                            gi,
+                            alloy::primitives::keccak256(
+                                alloy::signers::local::PrivateKeySigner::random().address()
+                            ),
+                            Duration::from_secs(60)
+                        )
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            assert!(!service.writer_handle.as_ref().unwrap().is_inflight(&hash));
+            assert!(store.get_unclaimable_claim(&gi).await.unwrap().is_none());
+            assert!(
+                !store
+                    .has_claim_event_for_global_index(&gi.to_be_bytes::<32>())
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                store
+                    .get_note_handoff_for_tx(&hash_string)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                store.nonce_get(&signer_hex(key.address())).await.unwrap(),
+                1
+            );
+            assert_eq!(gi, (U256::from(1) << 64) | U256::from(373));
+        }
     }
 
     /// Model the exact durable state the issue targets: a `pending` row admitted

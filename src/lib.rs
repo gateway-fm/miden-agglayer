@@ -8,6 +8,9 @@ pub mod bridge_address;
 pub mod bridge_out;
 pub mod burn_serial_tracker;
 pub mod claim;
+mod claim_proof;
+#[cfg(test)]
+mod claim_proof_tests;
 pub mod claim_watcher;
 pub mod exit;
 pub mod expected_mint_tracker;

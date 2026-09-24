@@ -258,7 +258,12 @@ pub(crate) async fn claim_and_ger_applied(
 
 fn classify_exact_note(applied: bool, note: NoteObservation) -> ExactNoteOutcome {
     if !applied {
-        return ExactNoteOutcome::NotApplied;
+        return match note {
+            NoteObservation::Missing | NoteObservation::Consumed => ExactNoteOutcome::Uncertain,
+            NoteObservation::Unconsumed | NoteObservation::NotRequested => {
+                ExactNoteOutcome::NotApplied
+            }
+        };
     }
     match note {
         NoteObservation::Consumed => ExactNoteOutcome::AppliedByExactNote,
@@ -552,6 +557,12 @@ mod tests {
 
     #[test]
     fn exact_note_confirmation_never_guesses() {
+        for note in [NoteObservation::Missing, NoteObservation::Consumed] {
+            assert_eq!(
+                classify_exact_note(false, note),
+                ExactNoteOutcome::Uncertain
+            );
+        }
         assert_eq!(
             classify_exact_note(true, NoteObservation::Unconsumed),
             ExactNoteOutcome::AppliedElsewhere
