@@ -370,6 +370,7 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
         // the usual handoff state machine; missing/unsynced notes stay uncertain.
         Ok(crate::applied_state::ExactNoteOutcome::NotApplied) => {
             if let DecodedWriteCall::Claim { params } = &decoded
+                && !params.amount.is_zero()
                 && let Err(error) = crate::claim_proof::validate(params)
             {
                 let reason = format!("claim rejected during recovery: {error}");
