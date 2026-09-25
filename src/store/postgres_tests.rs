@@ -3381,3 +3381,12 @@ async fn test_pgstore_restore_retained_window_prefix() {
     }
     assert!(store.get_let_gate_baseline().await.unwrap() <= start);
 }
+
+#[tokio::test]
+async fn pgstore_faucet_identity_and_handoff_recovery() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    crate::faucet_provisioning::tests::store_contract(&store).await;
+    crate::faucet_provisioning::tests::restart_contract(&store).await;
+}

@@ -1457,6 +1457,30 @@ pub trait Store: Send + Sync + 'static {
         amount: U256,
     ) -> anyhow::Result<()>;
 
+    // === Runtime faucet provisioning (immutable identity + prepared sends) ===
+    async fn get_faucet_deployment(
+        &self,
+        key: &str,
+    ) -> anyhow::Result<Option<crate::faucet_provisioning::FaucetDeployment>>;
+    /// First writer wins the identity; a different binding is an error.
+    async fn reserve_faucet_deployment(
+        &self,
+        proposal: crate::faucet_provisioning::FaucetDeployment,
+    ) -> anyhow::Result<crate::faucet_provisioning::FaucetDeployment>;
+    async fn get_faucet_step(
+        &self,
+        key: &str,
+        step: crate::faucet_provisioning::FaucetStep,
+    ) -> anyhow::Result<Option<crate::faucet_provisioning::FaucetPreparedTx>>;
+    /// First writer wins each generation. Previous attempts remain immutable.
+    async fn prepare_faucet_step(
+        &self,
+        key: &str,
+        step: crate::faucet_provisioning::FaucetStep,
+        proposal: crate::faucet_provisioning::FaucetPreparedTx,
+        observed_height: u64,
+    ) -> anyhow::Result<crate::faucet_provisioning::FaucetPreparedTx>;
+
     // === Faucet registry ===
     /// Register or update a faucet entry (upsert by faucet_id).
     /// Register (or idempotently refresh) a faucet.

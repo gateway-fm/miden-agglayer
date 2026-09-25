@@ -213,8 +213,9 @@ pub async fn admin_register_faucet(
                     }
                 }
 
-                let account = faucet_ops::create_and_register_faucet(
+                let account = crate::faucet_provisioning::create_and_register_faucet(
                     client,
+                    store_for_closure.as_ref(),
                     &symbol_clone,
                     miden_decimals,
                     &origin_address,
