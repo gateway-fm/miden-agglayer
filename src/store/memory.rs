@@ -159,6 +159,13 @@ pub struct InMemoryStore {
 
     // Faucet registry
     faucets: RwLock<Vec<FaucetEntry>>,
+    faucet_deployments: RwLock<HashMap<String, crate::faucet_provisioning::FaucetDeployment>>,
+    faucet_steps: RwLock<
+        HashMap<
+            (String, crate::faucet_provisioning::FaucetStep),
+            Vec<crate::faucet_provisioning::FaucetPreparedTx>,
+        >,
+    >,
 
     // Monitor trackers (RD-913) — in-memory mirror of monitor_burn_serials,
     // monitor_twin_notes, monitor_expected_mints. With InMemoryStore the
@@ -316,6 +323,8 @@ impl InMemoryStore {
             #[cfg(test)]
             test_land_after_next_has_claim_miss: RwLock::new(None),
             faucets: RwLock::new(Vec::new()),
+            faucet_deployments: RwLock::new(HashMap::new()),
+            faucet_steps: RwLock::new(HashMap::new()),
             monitor_burn_serials: RwLock::new(HashMap::new()),
             monitor_twin_notes: RwLock::new(HashMap::new()),
             monitor_expected_mints: RwLock::new(HashMap::new()),
@@ -2551,6 +2560,68 @@ impl Store for InMemoryStore {
     }
 
     // ── Faucet registry ──────────────────────────────────────────
+
+    async fn get_faucet_deployment(
+        &self,
+        key: &str,
+    ) -> anyhow::Result<Option<crate::faucet_provisioning::FaucetDeployment>> {
+        Ok(self.faucet_deployments.read().get(key).cloned())
+    }
+
+    async fn reserve_faucet_deployment(
+        &self,
+        proposal: crate::faucet_provisioning::FaucetDeployment,
+    ) -> anyhow::Result<crate::faucet_provisioning::FaucetDeployment> {
+        let mut deployments = self.faucet_deployments.write();
+        let entry = deployments
+            .entry(proposal.key.clone())
+            .or_insert_with(|| proposal.clone());
+        anyhow::ensure!(
+            entry.binding == proposal.binding,
+            "faucet deployment binding mismatch"
+        );
+        Ok(entry.clone())
+    }
+
+    async fn get_faucet_step(
+        &self,
+        key: &str,
+        step: crate::faucet_provisioning::FaucetStep,
+    ) -> anyhow::Result<Option<crate::faucet_provisioning::FaucetPreparedTx>> {
+        Ok(self
+            .faucet_steps
+            .read()
+            .get(&(key.to_owned(), step))
+            .and_then(|v| v.last())
+            .cloned())
+    }
+
+    async fn prepare_faucet_step(
+        &self,
+        key: &str,
+        step: crate::faucet_provisioning::FaucetStep,
+        proposal: crate::faucet_provisioning::FaucetPreparedTx,
+        observed_height: u64,
+    ) -> anyhow::Result<crate::faucet_provisioning::FaucetPreparedTx> {
+        anyhow::ensure!(
+            self.faucet_deployments.read().contains_key(key),
+            "missing faucet deployment intent"
+        );
+        let mut all = self.faucet_steps.write();
+        let attempts = all.entry((key.to_owned(), step)).or_default();
+        if let Some(current) = attempts.last()
+            && current.generation == proposal.generation
+        {
+            return Ok(current.clone());
+        }
+        crate::faucet_provisioning::check_next_generation(
+            attempts.last(),
+            &proposal,
+            observed_height,
+        )?;
+        attempts.push(proposal.clone());
+        Ok(proposal)
+    }
 
     async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<bool> {
         let mut faucets = self.faucets.write();

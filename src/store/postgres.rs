@@ -58,6 +58,17 @@ fn parse_transaction_id(hex_str: &str) -> Option<TransactionId> {
     Some(TransactionId::from_raw(word))
 }
 
+fn faucet_prepared_from_row(
+    row: &tokio_postgres::Row,
+) -> anyhow::Result<crate::faucet_provisioning::FaucetPreparedTx> {
+    Ok(crate::faucet_provisioning::FaucetPreparedTx {
+        generation: u32::try_from(row.get::<_, i64>(0))?,
+        expiration_block: u64::try_from(row.get::<_, i64>(1))?,
+        executed: row.get(2),
+        proven: row.get(3),
+    })
+}
+
 #[async_trait::async_trait]
 impl Store for PgStore {
     // ── Block number ─────────────────────────────────────────────
@@ -3511,6 +3522,90 @@ impl Store for PgStore {
     }
 
     // ── Faucet registry ──────────────────────────────────────────
+
+    async fn get_faucet_deployment(
+        &self,
+        key: &str,
+    ) -> anyhow::Result<Option<crate::faucet_provisioning::FaucetDeployment>> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .query_opt(
+                "SELECT binding, initial_account FROM faucet_provisioning WHERE deployment_key=$1",
+                &[&key],
+            )
+            .await?
+            .map(|row| crate::faucet_provisioning::FaucetDeployment {
+                key: key.to_owned(),
+                binding: row.get(0),
+                initial_account: row.get(1),
+            }))
+    }
+
+    async fn reserve_faucet_deployment(
+        &self,
+        proposal: crate::faucet_provisioning::FaucetDeployment,
+    ) -> anyhow::Result<crate::faucet_provisioning::FaucetDeployment> {
+        let client = self.pool.get().await?;
+        client.execute("INSERT INTO faucet_provisioning(deployment_key,binding,initial_account) VALUES($1,$2,$3) ON CONFLICT DO NOTHING", &[&proposal.key, &proposal.binding, &proposal.initial_account]).await?;
+        let row = client
+            .query_one(
+                "SELECT binding,initial_account FROM faucet_provisioning WHERE deployment_key=$1",
+                &[&proposal.key],
+            )
+            .await?;
+        let saved = crate::faucet_provisioning::FaucetDeployment {
+            key: proposal.key,
+            binding: row.get(0),
+            initial_account: row.get(1),
+        };
+        anyhow::ensure!(
+            saved.binding == proposal.binding,
+            "faucet deployment binding mismatch"
+        );
+        Ok(saved)
+    }
+
+    async fn get_faucet_step(
+        &self,
+        key: &str,
+        step: crate::faucet_provisioning::FaucetStep,
+    ) -> anyhow::Result<Option<crate::faucet_provisioning::FaucetPreparedTx>> {
+        let client = self.pool.get().await?;
+        client.query_opt("SELECT generation,expiration_block,executed,proven FROM faucet_provisioning_steps WHERE deployment_key=$1 AND step=$2 ORDER BY generation DESC LIMIT 1", &[&key, &step.as_str()]).await?.map(|r| faucet_prepared_from_row(&r)).transpose()
+    }
+
+    async fn prepare_faucet_step(
+        &self,
+        key: &str,
+        step: crate::faucet_provisioning::FaucetStep,
+        proposal: crate::faucet_provisioning::FaucetPreparedTx,
+        observed_height: u64,
+    ) -> anyhow::Result<crate::faucet_provisioning::FaucetPreparedTx> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        // Serialize generation selection on the durable identity row, including
+        // the first step when no child row exists yet.
+        tx.query_one(
+            "SELECT deployment_key FROM faucet_provisioning WHERE deployment_key=$1 FOR UPDATE",
+            &[&key],
+        )
+        .await?;
+        let current = tx.query_opt("SELECT generation,expiration_block,executed,proven FROM faucet_provisioning_steps WHERE deployment_key=$1 AND step=$2 ORDER BY generation DESC LIMIT 1", &[&key, &step.as_str()]).await?.map(|r| faucet_prepared_from_row(&r)).transpose()?;
+        if let Some(current) = current.as_ref()
+            && current.generation == proposal.generation
+        {
+            return Ok(current.clone());
+        }
+        crate::faucet_provisioning::check_next_generation(
+            current.as_ref(),
+            &proposal,
+            observed_height,
+        )?;
+        let expiration = i64::try_from(proposal.expiration_block)?;
+        tx.execute("INSERT INTO faucet_provisioning_steps(deployment_key,step,generation,expiration_block,executed,proven) VALUES($1,$2,$3,$4,$5,$6)", &[&key, &step.as_str(), &i64::from(proposal.generation), &expiration, &proposal.executed, &proposal.proven]).await?;
+        tx.commit().await?;
+        Ok(proposal)
+    }
 
     async fn register_faucet(&self, entry: FaucetEntry) -> anyhow::Result<bool> {
         let client = self.pool.get().await?;
