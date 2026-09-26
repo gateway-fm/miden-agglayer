@@ -54,6 +54,11 @@ impl PerSignerLocks {
 #[derive(Clone)]
 pub struct ServiceState {
     pub miden_client: Arc<MidenClient>,
+    /// Coalesce overlapping account reads from RPC polling and writer checks.
+    /// Completed snapshots are never reused by a later request.
+    #[cfg(not(test))]
+    pub(crate) bridge_reads:
+        Arc<crate::coalesced_read::CoalescedRead<miden_protocol::account::Account>>,
     pub accounts: AccountsConfig,
     pub chain_id: u64,
     /// Rollup network ID from RollupManager (used for bridge's `networkID()` call).
@@ -165,6 +170,8 @@ impl ServiceState {
         let block_monitor = Arc::new(BlockMonitor::new(block_state.clone()));
         Self {
             miden_client: Arc::new(miden_client),
+            #[cfg(not(test))]
+            bridge_reads: Arc::new(crate::coalesced_read::CoalescedRead::default()),
             accounts,
             chain_id,
             network_id,
