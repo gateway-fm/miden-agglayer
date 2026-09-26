@@ -868,8 +868,12 @@ async fn dispatch_after_reservation(
     }
 
     if let crate::writer_worker::DecodedWriteCall::Ger { ger_bytes } = &decoded
-        && crate::applied_state::ger_applied(service, ger_bytes).await?
+        && service.store.is_ger_injected(ger_bytes).await?
     {
+        // A projected duplicate needs no client access. Leave the unprojected
+        // bridge-state check to the writer, after durable admission. Waiting on
+        // the shared client here can outlive a queue sweep's budget, abandon the
+        // nonce lease, and repeatedly delay every successor until lease expiry.
         durably_admit_and_advance_nonce(
             service,
             txn_hash,
@@ -1305,6 +1309,21 @@ pub(crate) async fn worker_handle_ger_insert(
     txn_envelope: TxEnvelope,
     signer: Address,
 ) -> anyhow::Result<()> {
+    // The bridge may already contain this root while its event projection is
+    // catching up. Preserve the authoritative duplicate check before creating a
+    // note, but perform the serialized client read only after the signed intent
+    // is durable and owned by the writer rather than a cancellable queue sweep.
+    if crate::applied_state::ger_applied(service, &ger_bytes).await? {
+        return handle_ger_result(
+            Ok(false),
+            txn_hash,
+            txn_envelope,
+            signer,
+            service,
+            ger_bytes,
+        )
+        .await;
+    }
     handle_ger_result(
         ger::insert_ger(
             ger_bytes,
@@ -6212,6 +6231,176 @@ mod tests {
             store.nonce_get(&signer_str).await.unwrap(),
             1,
             "the reclaimed retry must execute and advance the nonce"
+        );
+    }
+
+    /// A slow bridge-state read must not strand an unadmitted nonce lease.
+    #[tokio::test]
+    async fn ger_admission_does_not_wait_for_busy_client() {
+        assert_ger_admission_with_busy_client(false).await;
+    }
+
+    #[tokio::test]
+    async fn queued_ger_promotion_does_not_wait_for_busy_client() {
+        assert_ger_admission_with_busy_client(true).await;
+    }
+
+    async fn assert_ger_admission_with_busy_client(parked: bool) {
+        let mut service = create_test_service();
+        service.reject_unverified_ger = true;
+        let mainnet = [0x71; 32];
+        let rollup = [0x72; 32];
+        let ger = crate::ger::combined_ger(&mainnet, &rollup);
+        service
+            .store
+            .set_ger_exit_roots(&ger, mainnet, rollup, 100, 1_700_000_000)
+            .await
+            .unwrap();
+        let (handle, shutdown) = crate::writer_worker::WriterWorker::spawn(
+            service.clone(),
+            8,
+            std::time::Duration::from_secs(60),
+        );
+        service.writer_handle = Some(std::sync::Arc::new(handle));
+        let (raw, signer) =
+            encode_legacy_tx(insertGlobalExitRootCall { root: ger.into() }.abi_encode());
+        let bytes = hex_decode_prefixed(&raw).unwrap();
+        let envelope = TxEnvelope::decode_2718(&mut bytes.as_slice()).unwrap();
+        let hash = *envelope.tx_hash();
+        let signer_str = format!("{signer:#x}");
+        if parked {
+            service
+                .store
+                .queue_txn(
+                    &signer_str,
+                    0,
+                    hash,
+                    &envelope,
+                    3600,
+                    false,
+                    crate::store::QueueBounds {
+                        per_signer: 8,
+                        global: 8,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        // The real client read can wait behind a long-running writer operation.
+        // The queue sweep cancels its admission future at a fixed deadline.
+        // Model that read as unavailable; admission must still persist the
+        // signed envelope and advance the nonce before acknowledging/removing it.
+        let result = crate::applied_state::TEST_GER_SNAPSHOT
+            .scope(None, async {
+                tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                    if parked {
+                        drain_queued(&service, &signer_str).await;
+                    } else {
+                        assert_eq!(
+                            service_send_raw_txn(service.clone(), raw).await.unwrap(),
+                            hash
+                        );
+                    }
+                })
+                .await
+            })
+            .await;
+        let _ = shutdown.send(());
+        assert!(
+            result.is_ok(),
+            "GER admission waited for a serialized client read"
+        );
+        assert!(service.store.txn_get(hash).await.unwrap().is_some());
+        assert_eq!(service.store.nonce_get(&signer_str).await.unwrap(), 1);
+        assert!(
+            service
+                .store
+                .get_queued_txn(&signer_str, 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn ger_worker_waits_for_bridge_state_and_skips_unprojected_duplicate() {
+        let service = create_test_service();
+        let ger = [0x73; 32];
+        let (raw, signer) =
+            encode_legacy_tx(insertGlobalExitRootCall { root: ger.into() }.abi_encode());
+        let bytes = hex_decode_prefixed(&raw).unwrap();
+        let envelope = TxEnvelope::decode_2718(&mut bytes.as_slice()).unwrap();
+        let hash = *envelope.tx_hash();
+        durably_admit_and_advance_nonce(
+            &service,
+            hash,
+            &envelope,
+            signer,
+            &format!("{signer:#x}"),
+            0,
+        )
+        .await
+        .unwrap();
+
+        let unavailable = crate::applied_state::TEST_GER_SNAPSHOT
+            .scope(None, async {
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    worker_handle_ger_insert(&service, ger, hash, envelope.clone(), signer),
+                )
+                .await
+            })
+            .await;
+        assert!(unavailable.is_err());
+        assert!(
+            !service.miden_client.test_was_called(),
+            "no note may be published before the bridge read completes"
+        );
+        assert!(
+            service
+                .store
+                .txn_get(hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .result
+                .is_none()
+        );
+        assert!(!service.store.is_ger_injected(&ger).await.unwrap());
+
+        crate::applied_state::TEST_GER_SNAPSHOT
+            .scope(Some(true), async {
+                worker_handle_ger_insert(&service, ger, hash, envelope, signer)
+                    .await
+                    .unwrap();
+            })
+            .await;
+        assert!(
+            !service.miden_client.test_was_called(),
+            "an applied, unprojected root must not create another note"
+        );
+        assert_eq!(
+            service
+                .store
+                .nonce_get(&format!("{signer:#x}"))
+                .await
+                .unwrap(),
+            1
+        );
+        let receipt = service.store.txn_receipt(hash).await.unwrap().unwrap();
+        assert!(receipt.0.is_ok());
+        assert!(
+            service
+                .store
+                .get_logs_for_tx(&format!("{hash:#x}"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !service.store.is_ger_injected(&ger).await.unwrap(),
+            "only the projector may synthesize the original root's event"
         );
     }
 

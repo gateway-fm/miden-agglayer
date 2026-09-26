@@ -136,14 +136,30 @@ async fn bridge_snapshot_with_client(
 }
 
 #[cfg(test)]
+tokio::task_local! {
+    /// Override the stub's GER read in a single test future. `None` models a
+    /// serialized client that cannot answer before the admission sweep expires.
+    pub(crate) static TEST_GER_SNAPSHOT: Option<bool>;
+}
+
+#[cfg(test)]
 async fn bridge_snapshot(
     _service: &ServiceState,
     ger: Option<[u8; 32]>,
     claim: Option<U256>,
     note_id: Option<String>,
 ) -> anyhow::Result<BridgeSnapshot> {
+    let ger_applied = if ger.is_some() {
+        match TEST_GER_SNAPSHOT.try_with(|value| *value) {
+            Ok(None) => std::future::pending().await,
+            Ok(Some(applied)) => Some(applied),
+            Err(_) => Some(false),
+        }
+    } else {
+        None
+    };
     Ok(BridgeSnapshot {
-        ger_applied: ger.map(|_| false),
+        ger_applied,
         claim_applied: claim.map(|_| false),
         note: if note_id.is_some() {
             NoteObservation::Missing
