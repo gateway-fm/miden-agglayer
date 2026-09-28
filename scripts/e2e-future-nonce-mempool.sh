@@ -118,7 +118,7 @@ step "0. malformed nonzero claims must be rejected before nonce admission"
 for NONCE in 1 0; do
     BAD_RAW="$(mk_raw "$NONCE" d4 1)"
     [[ "$BAD_RAW" == 0x* ]] || fail "could not build the invalid-proof tx"
-    BAD_HASH="$(cast tx-hash "$BAD_RAW")"
+    BAD_HASH="$(cast keccak "$BAD_RAW")"
     BAD_REPLY="$(send_raw "$BAD_RAW")"
     [[ "$BAD_REPLY" == *InvalidSmtProof* ]] || fail "expected invalid-proof rejection: $BAD_REPLY"
     [[ "$(get_receipt "$BAD_HASH")" == null ]] || fail "rejected proof created a receipt"
@@ -130,7 +130,7 @@ pass "0. invalid nonzero proofs rejected at current and future nonces, with no a
 # ── 1. Future nonce (N+1 before N) is PARKED, not rejected ────────────────────
 step "1. submit nonce 1 (future) before nonce 0 — must be PARKED (accepted), not rejected"
 RAW1="$(mk_raw 1 "$ROOT1" 0)"; [[ "$RAW1" == 0x* ]] || fail "could not build the nonce-1 tx (cast mktx): $RAW1"
-HASH1="$(cast tx-hash "$RAW1" 2>/dev/null || true)"
+HASH1="$(cast keccak "$RAW1")"
 SEND1="$(send_raw "$RAW1")"
 echo "$SEND1" | grep -qiE 'nonce mismatch|nonce too high' && fail "future-nonce tx was REJECTED instead of parked — #146 not in effect: $SEND1"
 RET1="$(echo "$SEND1" | tr -d '"')"
