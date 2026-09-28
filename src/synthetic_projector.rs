@@ -1148,6 +1148,17 @@ impl SyntheticProjector {
                 );
             }
             out.resolved_nullifiers.insert(*nullifier);
+            // Event discovery uses tag 0. Account for other public inputs, such as
+            // bridge fee funding, without projecting them into proxy history.
+            if body.metadata.tag() != NoteTag::from(0u32) {
+                tracing::debug!(
+                    note_id = %note_id.to_hex(),
+                    block = cref.block,
+                    tag = ?body.metadata.tag(),
+                    "authoritative fetch: nonzero-tag bridge input is not an event"
+                );
+                continue;
+            }
             match BridgeInputKind::classify(&body.details) {
                 BridgeInputKind::B2agg => {
                     within_tx_pos.insert(*note_id, cref.within_tx_pos);
@@ -1740,7 +1751,7 @@ impl SyntheticProjector {
         // input position is the on-chain LET append order, the only correct
         // tiebreak for same-transaction B2AGG siblings.
         let mut within_tx_pos: HashMap<NoteId, u32> = HashMap::new();
-        let txs = self
+        let mut txs = self
             .node_rpc
             .sync_transactions(
                 BlockNumber::from((cursor + 1) as u32),
@@ -1749,6 +1760,12 @@ impl SyntheticProjector {
             )
             .await
             .map_err(|e| anyhow::anyhow!("sync_transactions({}..{}): {e}", cursor + 1, tip))?;
+        crate::transaction_headers::recover_input_headers(
+            &*self.node_rpc,
+            &mut txs,
+            self.bridge_id,
+        )
+        .await?;
         let consumed_refs = bridge_consumed_nullifiers(&txs, self.bridge_id)?;
         let fetcher = RpcNoteFetcher(&*self.node_rpc);
         let resolved = self
@@ -2375,10 +2392,9 @@ impl PublicNoteFetcher for RpcNoteFetcher<'_> {
 /// (`consumer == bridge`). The account-id re-check is fail-closed defense in
 /// depth against a node that ignores the server-side filter. Pure (no I/O) so
 /// it is unit-testable directly.
-/// An input with no recoverable identity is one the node cannot reconstruct
-/// (issue #167's erased-note boundary). Restore fails before sealing and names
-/// it, so the limitation is exposed rather than papered over; deliberately no
-/// override.
+/// An input without an identity cannot be classified by tag or script. This
+/// can indicate a node/client reference gap or an erased note. Restore fails
+/// before sealing instead of assuming the input cannot produce an event.
 fn ensure_authoritative_coverage(
     unresolved: &[(Nullifier, ConsumedRef)],
     window_from: u64,
@@ -2403,7 +2419,8 @@ fn ensure_authoritative_coverage(
         "restore: bridge consumption(s) at block {first_block} have no recoverable identity — \
          {} bridge-consumed input(s) in window {}..{} carry no transaction-header note \
          reference and no durable identity from the note sweep, so their bodies cannot be \
-         reconstructed from the node (issue #167 ERASED-note boundary). Restore refuses to \
+         classified by tag and script. This can be a node/client reference gap or an \
+         erased note; missing identity alone does not prove erasure. Restore refuses to \
          seal a divergent history. Offenders: [{}]{}. Re-run against a node/archive that \
          serves (nullifier, note_id) references or the notes' creation blocks.",
         offenders.len(),
@@ -2455,10 +2472,9 @@ pub(crate) fn bridge_consumed_nullifiers(
 ) -> anyhow::Result<HashMap<Nullifier, ConsumedRef>> {
     let mut out = HashMap::new();
     for (block, order, tx) in ordered_account_transactions(txs, bridge_id)? {
-        // rc.1: the wire decoder strips input-note headers and instead returns
-        // explicit (nullifier -> note_id) refs per transaction for public
-        // inputs. Headers are still honoured when present (fixtures / a future
-        // decoder that retains them); refs are the production identity source.
+        // The SDK strips inline input headers from SyncTransactions. Missing
+        // identities are recovered from the stock block RPC before this step.
+        // Authenticated public inputs keep their explicit note references.
         let tx_refs: HashMap<Nullifier, miden_protocol::note::NoteId> =
             tx.trusted_consumed_note_refs().collect();
         for (pos, input) in tx.transaction_header.input_notes().iter().enumerate() {
@@ -3164,6 +3180,62 @@ mod tests {
         let err = ensure_authoritative_coverage(&resolved.unresolved, 599, 602)
             .expect_err("an unresolved input halts restore");
         assert!(format!("{err:#}").contains("at block 602"));
+    }
+
+    #[tokio::test]
+    async fn nonzero_tag_inputs_are_accounted_without_projection() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+        let metadata = NoteMetadata::new(
+            PartialNoteMetadata::new(aid(BRIDGE), NoteType::Public)
+                .with_tag(NoteTag::from(0x5c10_0000u32)),
+            &NoteAttachments::default(),
+        );
+
+        // Even an event-shaped input is outside the tag-0 history contract.
+        for note in [claim_note(133078, Some(0)), b2agg_note(133078, Some(0))] {
+            let id = NoteId::new(note.details_commitment(), &metadata);
+            let nf = nullifier(0xf0);
+            let refs = HashMap::from([(
+                nf,
+                ConsumedRef {
+                    block: 133078,
+                    order: 0,
+                    note_id: Some(id),
+                    within_tx_pos: 0,
+                },
+            )]);
+            let mut fetcher = MockFetcher {
+                bodies: vec![FetchedBody {
+                    id,
+                    details: note.details().clone(),
+                    attachments: NoteAttachments::default(),
+                    nullifier: nf,
+                    metadata,
+                }],
+                also_returned: vec![],
+            };
+            let mut positions = HashMap::new();
+            let resolved = projector
+                .resolve_bridge_consumptions(&fetcher, refs.clone(), &mut positions)
+                .await
+                .unwrap();
+            ensure_authoritative_coverage(&resolved.unresolved, 130000, 135000).unwrap();
+            assert!(resolved.resolved_nullifiers.contains(&nf));
+            assert!(resolved.events.is_empty());
+            assert!(resolved.b2agg.is_empty());
+            assert!(positions.is_empty());
+
+            // A nonzero tag cannot excuse a wrong node reference.
+            fetcher.bodies[0].nullifier = nullifier(0xf1);
+            let error = projector
+                .resolve_bridge_consumptions(&fetcher, refs, &mut positions)
+                .await
+                .err()
+                .expect("the note body must still match the consumed nullifier");
+            assert!(error.to_string().contains("inconsistent"));
+        }
     }
 
     /// The ledger must hold CLAIM identities too, or a client-store loss
