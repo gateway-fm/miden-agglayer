@@ -303,9 +303,12 @@ async fn submit_update_ger_note(
         anyhow::bail!("UpdateGerNote tx {tx_id} not committed after 30s");
     }
     let tx_key = format!("{txn_hash:#x}");
-    if !store_for_confirm
-        .confirm_note_handoff(&tx_key, &note_commitment)
-        .await?
+    if !crate::metrics::meter_writer_stage(
+        "ger",
+        "confirm_handoff",
+        store_for_confirm.confirm_note_handoff(&tx_key, &note_commitment),
+    )
+    .await?
     {
         anyhow::bail!("GER note handoff changed before commit confirmation");
     }
