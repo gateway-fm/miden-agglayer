@@ -157,30 +157,10 @@ case "$test_filter" in
         # #146 — future-nonce mempool: park + promote out-of-order submissions.
         # A cheap, self-contained RPC-contract test on a throwaway signer.
         #
-        # RUNS LAST, AND MUST. Its vehicle is `claimAsset` with a destination
-        # that "only needs to be a plausible target" — i.e. an UNRESOLVABLE one,
-        # chosen because claimAsset is not preflighted and so reaches the park
-        # decision. That lands on RD-860's swallow path
-        # (src/service_send_raw_txn.rs:3004): the claim is recorded in
-        # `unclaimable_claims` and a synthetic ClaimEvent is emitted "so aggkit
-        # stops retrying".
-        #
-        # aggkit reads that event as a claim with an unclaim and STOPS
-        # CERTIFYING at it, permanently:
-        #
-        #   WARN flows/flow_base.go:670  found claim with unclaim after later
-        #        unfinalized claim at block 37, cutting certificate at block 36
-        #   INFO flows/builder_flow_pp.go:103  PPFlow - no bridges or claims
-        #        found for range: 1 - 36, so no certificate will be built
-        #
-        # At position 2 that wedged every later tier's settlement: `test-e2e`
-        # failed "Timed out: certificate settled" after 900s in 2 of 3 battery
-        # iterations, while the same bridge-out passed standalone every time.
-        # Bisected to this script alone (scripts/e2e-settlement-bisect.sh arm C).
-        # Nothing depends on it running early — it is self-contained and uses a
-        # throwaway signer — so it goes after every tier that needs a
-        # certificate. The PRODUCT interaction it exposes is a separate,
-        # pre-existing finding and is NOT fixed by this ordering.
+        # Uses supported zero-amount claim no-ops to test park/promote semantics
+        # without publishing notes or synthetic ClaimEvents. It also requires
+        # malformed nonzero proofs to fail before either admission or parking.
+        # Keep this isolated queue check last, after all bridge-delivery tiers.
         "$SCRIPT_DIR/e2e-future-nonce-mempool.sh"
         echo ""
         ;;
