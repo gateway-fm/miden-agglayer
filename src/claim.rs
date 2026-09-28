@@ -559,8 +559,9 @@ async fn provision_faucet(
     //    the L1 bridge contract exactly.
     let metadata_hash = MetadataHash::from_abi_encoded(metadata.as_ref());
 
-    let faucet_account = faucet_ops::create_and_register_faucet(
+    let faucet_account = crate::faucet_provisioning::create_and_register_faucet(
         client,
+        store,
         &symbol,
         miden_decimals,
         &token_address.0.0,
