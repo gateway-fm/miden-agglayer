@@ -862,6 +862,18 @@ pub trait Store: Send + Sync + 'static {
         result: Result<(), String>,
         block_num: u64,
     ) -> anyhow::Result<()>;
+    /// Reject an immutable, deterministically invalid claim after fresh recovery
+    /// reconciliation. Compare the handoff identity, retain its history, and
+    /// atomically release only this transaction's non-landed claim reservation.
+    /// Does not mark the deposit unclaimable, emit events, or overwrite a receipt.
+    async fn txn_fail_invalid_claim(
+        &self,
+        tx_hash: TxHash,
+        global_index: U256,
+        expected_commitment: Option<&str>,
+        reason: &str,
+        block_num: u64,
+    ) -> anyhow::Result<bool>;
     async fn txn_receipt(
         &self,
         tx_hash: TxHash,

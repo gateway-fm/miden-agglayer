@@ -520,6 +520,12 @@ pub(crate) async fn worker_handle_claim_asset(
         return Ok(());
     }
 
+    // Recheck persisted/queued requests admitted by an older proxy too. The
+    // legacy zero-amount no-op above publishes no note and needs no proof.
+    if !crate::applied_state::claim_terminal(service, params.globalIndex).await? {
+        crate::claim_proof::validate(&params)?;
+    }
+
     // #55 BLOCKER A — the AUTHORITATIVE landed classification runs FIRST, before
     // RD-860 (unresolvable-destination) and C6 (GER-observed). A landed globalIndex
     // must route to accept-and-revert regardless of destination-resolvability or
@@ -827,7 +833,10 @@ async fn validate_before_nonce_reservation(
     }
 
     // One state-only bridge snapshot answers both compatibility questions.
-    let _already_claimed = claim_state_gate(service, params).await?;
+    let already_claimed = claim_state_gate(service, params).await?;
+    if !already_claimed && !params.amount.is_zero() {
+        crate::claim_proof::validate(params)?;
+    }
     Ok(())
 }
 
@@ -2649,7 +2658,7 @@ mod tests {
         let store = service.store.clone();
 
         let global_index = U256::from(99u64);
-        let calldata = claimAssetCall {
+        let calldata = valid_claim_bytes(claimAssetCall {
             smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
             smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
             globalIndex: global_index,
@@ -2666,8 +2675,7 @@ mod tests {
             ),
             amount: U256::from(1_000u64),
             metadata: Default::default(),
-        }
-        .abi_encode();
+        });
         let (input_hex, _) = encode_legacy_tx(calldata);
 
         // GER is NOT pre-seeded — this is the test's whole point.
@@ -2727,7 +2735,7 @@ mod tests {
         let global_index = U256::from(77u64);
         let mainnet = [0xA7u8; 32];
         let rollup = [0xB7u8; 32];
-        let calldata = claimAssetCall {
+        let calldata = valid_claim_bytes(claimAssetCall {
             smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
             smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
             globalIndex: global_index,
@@ -2743,8 +2751,10 @@ mod tests {
             ),
             amount: U256::from(1_000u64),
             metadata: Default::default(),
-        }
-        .abi_encode();
+        });
+        let call = claimAssetCall::abi_decode(&calldata).unwrap();
+        let mainnet = call.mainnetExitRoot.0;
+        let rollup = call.rollupExitRoot.0;
         let (input_hex, signer) = encode_legacy_tx(calldata);
         let payload = crate::hex::hex_decode_prefixed(&input_hex).unwrap();
         let envelope = TxEnvelope::decode_2718(&mut payload.as_slice()).unwrap();
@@ -2821,7 +2831,7 @@ mod tests {
         );
         service.writer_handle = Some(std::sync::Arc::new(handle));
 
-        let calldata = claimAssetCall {
+        let calldata = valid_claim_bytes(claimAssetCall {
             smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
             smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
             globalIndex: U256::from(1u64),
@@ -2833,8 +2843,7 @@ mod tests {
             destinationAddress: Address::ZERO,
             amount: U256::ZERO,
             metadata: Default::default(),
-        }
-        .abi_encode();
+        });
         let (input_hex, _) = encode_legacy_tx(calldata);
 
         // No GER seeded — the zero-amount claim must still be accepted
@@ -2868,7 +2877,7 @@ mod tests {
         );
         let ready_input = encode_legacy_tx_signed(
             &signer,
-            claimAssetCall {
+            valid_claim_bytes(claimAssetCall {
                 smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
                 smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
                 globalIndex: U256::from(902u64),
@@ -2880,8 +2889,7 @@ mod tests {
                 destinationAddress: Address::ZERO,
                 amount: U256::ZERO,
                 metadata: Default::default(),
-            }
-            .abi_encode(),
+            }),
             2,
         );
 
@@ -3125,7 +3133,7 @@ mod tests {
         // test vectors). This ensures the claim gets PAST the RD-860 short-circuit and
         // fails inside publish_claim against the test MidenClient stub — exercising the
         // "ClaimEvent not emitted on publish_claim error" guarantee this test is for.
-        let calldata = claimAssetCall {
+        let calldata = valid_claim_bytes(claimAssetCall {
             smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
             smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
             globalIndex: global_index,
@@ -3139,29 +3147,9 @@ mod tests {
             ),
             amount: U256::from(1_000_000u64),
             metadata: Default::default(),
-        }
-        .abi_encode();
+        });
+        seed_claim_ger(&store, &calldata).await;
         let (input_hex, _) = encode_legacy_tx(calldata);
-
-        // C6 — pre-seed the GER as seen so the new pre-check passes; the
-        // test's intent is to exercise the publish-failure path, not the
-        // GER-not-yet-seen path. RD-862 follow-up: `handle_claim_asset` now
-        // gates on `is_ger_injected` (not `has_seen_ger`) since the
-        // L1InfoTreeIndexer pre-populates ger_entries rows before the GER is
-        // injected to L2. Mark BOTH so the gate passes.
-        let ger = crate::ger::combined_ger(&[0u8; 32], &[0u8; 32]);
-        store
-            .commit_ger_event_atomic(
-                1,
-                [0u8; 32],
-                "0xger-seed",
-                &ger,
-                Some([0u8; 32]),
-                Some([0u8; 32]),
-                0,
-            )
-            .await
-            .unwrap();
 
         let tx_hash = service_send_raw_txn(service, input_hex)
             .await
@@ -3215,7 +3203,7 @@ mod tests {
         // Non-zero-padded address with no store mapping — cannot be resolved by
         // `address_mapper::resolve_address`, so the short-circuit path fires.
         let dest = Address::from([0x42; 20]);
-        let calldata = claimAssetCall {
+        let calldata = valid_claim_bytes(claimAssetCall {
             smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
             smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
             globalIndex: global_index,
@@ -3227,8 +3215,7 @@ mod tests {
             destinationAddress: dest,
             amount: U256::from(1_000_000u64),
             metadata: Default::default(),
-        }
-        .abi_encode();
+        });
         let (input_hex, signer) = encode_legacy_tx(calldata);
 
         let result = service_send_raw_txn(service, input_hex).await;
@@ -3307,7 +3294,7 @@ mod tests {
     async fn test_claim_wrong_network_rejected() {
         let service = create_test_service();
 
-        let calldata = claimAssetCall {
+        let calldata = valid_claim_bytes(claimAssetCall {
             smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
             smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
             globalIndex: U256::from(9u64),
@@ -3319,8 +3306,7 @@ mod tests {
             destinationAddress: Address::ZERO,
             amount: U256::from(1u64),
             metadata: Default::default(),
-        }
-        .abi_encode();
+        });
         let (input_hex, _) = encode_legacy_tx(calldata);
 
         let result = service_send_raw_txn(service, input_hex).await;
@@ -4500,10 +4486,75 @@ mod tests {
         (format!("0x{}", ::hex::encode(encoded)), hash)
     }
 
+    fn valid_claim_bytes(mut call: claimAssetCall) -> Vec<u8> {
+        crate::claim_proof::set_valid_root(&mut call);
+        call.abi_encode()
+    }
+
+    #[tokio::test]
+    async fn invalid_inclusion_proof_is_rejected_before_nonce_or_writer_admission() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/claim-deposit-373.json")).unwrap();
+        let calldata =
+            ::hex::decode(fixture["input"].as_str().unwrap().trim_start_matches("0x")).unwrap();
+        let params = claimAssetCall::abi_decode(&calldata).unwrap();
+        let service = create_test_service();
+        let store = service.store.clone();
+        seed_claim_ger(&store, &calldata).await;
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let (input, hash) = encode_tx_signed_with_nonce(&key, calldata, 0);
+        let error = service_send_raw_txn(service.clone(), input)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("InvalidSmtProof"));
+        assert_eq!(
+            store
+                .nonce_get(&format!("{:#x}", key.address()))
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(store.txn_get(hash).await.unwrap().is_none());
+        assert!(!store.is_claimed(&params.globalIndex).await.unwrap());
+        assert!(
+            !crate::applied_state::claim_terminal(&service, params.globalIndex)
+                .await
+                .unwrap()
+        );
+        let mut corrected = params.clone();
+        crate::claim_proof::set_valid_root(&mut corrected);
+        seed_claim_ger(&store, &corrected.abi_encode()).await;
+        validate_before_nonce_reservation(
+            &service,
+            &crate::writer_worker::DecodedWriteCall::Claim {
+                params: Box::new(corrected),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn seed_claim_ger(store: &std::sync::Arc<dyn crate::store::Store>, data: &[u8]) {
+        let call = claimAssetCall::abi_decode(data).unwrap();
+        let ger = crate::ger::combined_ger(&call.mainnetExitRoot.0, &call.rollupExitRoot.0);
+        store
+            .commit_ger_event_atomic(
+                1,
+                [0; 32],
+                &format!("0xger-{}", ::hex::encode(ger)),
+                &ger,
+                Some(call.mainnetExitRoot.0),
+                Some(call.rollupExitRoot.0),
+                0,
+            )
+            .await
+            .unwrap();
+    }
+
     /// A valid `claimAsset` calldata for `create_test_service`'s network (1).
-    /// Zero exit roots pair with `seed_zero_ger` for the C6 gate.
+    /// Use `seed_claim_ger` when the test needs the proof's GER to be published.
     fn claim_calldata(global_index: U256, destination: Address, amount: U256) -> Vec<u8> {
-        claimAssetCall {
+        valid_claim_bytes(claimAssetCall {
             smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
             smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
             globalIndex: global_index,
@@ -4515,8 +4566,7 @@ mod tests {
             destinationAddress: destination,
             amount,
             metadata: Default::default(),
-        }
-        .abi_encode()
+        })
     }
 
     /// Zero-padded MidenAccountId — resolvable by `address_mapper` without a
@@ -4524,24 +4574,6 @@ mod tests {
     /// the real lock + publish path.
     fn resolvable_dest() -> Address {
         alloy::primitives::address!("0x00000000ac0000000000dd110000ee000000fc00")
-    }
-
-    /// Mark the all-zero mainnet/rollup GER pair injected so the C6 pre-check
-    /// passes (mirrors `test_claim_asset_no_event_on_failure`'s seeding).
-    async fn seed_zero_ger(store: &std::sync::Arc<dyn crate::store::Store>) {
-        let ger = crate::ger::combined_ger(&[0u8; 32], &[0u8; 32]);
-        store
-            .commit_ger_event_atomic(
-                1,
-                [0u8; 32],
-                "0xger-seed",
-                &ger,
-                Some([0u8; 32]),
-                Some([0u8; 32]),
-                0,
-            )
-            .await
-            .unwrap();
     }
 
     async fn count_claim_events(store: &std::sync::Arc<dyn crate::store::Store>) -> usize {
@@ -4642,7 +4674,6 @@ mod tests {
         let service = create_test_service();
         let store = service.store.clone();
         let miden = service.miden_client.clone();
-        seed_zero_ger(&store).await;
 
         let gi = U256::from(0x2002u64);
         store.try_claim(gi).await.expect("A's submission locks gi");
@@ -4651,6 +4682,7 @@ mod tests {
         let key_b = alloy::signers::local::PrivateKeySigner::random();
         let addr_b = key_b.address();
         let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
+        seed_claim_ger(&store, &calldata).await;
         let nonce_b = store.nonce_get(&format!("{addr_b:#x}")).await.unwrap();
         let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, nonce_b);
 
@@ -4756,7 +4788,6 @@ mod tests {
         let store: std::sync::Arc<dyn crate::store::Store> = concrete.clone();
         let service = crate::test_helpers::create_test_service_with_store(store.clone());
         let miden = service.miden_client.clone();
-        seed_zero_ger(&store).await;
 
         let gi = U256::from(0x3003u64);
         // Signer A's submission crashed mid-flight: lock record present, no
@@ -4773,6 +4804,7 @@ mod tests {
         // signer) submits the same gi through the FULL RPC path.
         let key_b = alloy::signers::local::PrivateKeySigner::random();
         let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
+        seed_claim_ger(&store, &calldata).await;
         let nonce_b = store
             .nonce_get(&format!("{:#x}", key_b.address()))
             .await
@@ -4814,8 +4846,8 @@ mod tests {
         service.allowed_signers = Some(vec![foreign]);
         let store = service.store.clone();
         let miden = service.miden_client.clone();
-        seed_zero_ger(&store).await;
         let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
+        seed_claim_ger(&store, &calldata).await;
         let nonce = store.nonce_get(&format!("{user_addr:#x}")).await.unwrap();
         let (input_hex, tx_hash) = encode_tx_signed_with_nonce(&user_key, calldata, nonce);
 
@@ -4853,7 +4885,6 @@ mod tests {
         service.allow_any_signer = false;
         service.allowed_signers = None;
         let store = service.store.clone();
-        seed_zero_ger(&store).await;
 
         let err = service_send_raw_txn(service, input_hex)
             .await
@@ -4882,7 +4913,6 @@ mod tests {
         service.allowed_signers = Some(vec![addr_c]);
         let store = service.store.clone();
         let miden = service.miden_client.clone();
-        seed_zero_ger(&store).await;
 
         // Leg 1 — REAL claim route: destination is a resolvable Miden-mapped
         // address that is NOT C. The claim passes every signer gate, acquires
@@ -4893,6 +4923,7 @@ mod tests {
         let gi_real = U256::from(0x5005u64);
         assert_ne!(resolvable_dest(), addr_c);
         let calldata = claim_calldata(gi_real, resolvable_dest(), U256::from(1_000_000u64));
+        seed_claim_ger(&store, &calldata).await;
         let nonce_real = store.nonce_get(&format!("{addr_c:#x}")).await.unwrap();
         let (input_hex, tx_real) = encode_tx_signed_with_nonce(&key_c, calldata, nonce_real);
         let accepted = service_send_raw_txn(service.clone(), input_hex)
@@ -4923,11 +4954,11 @@ mod tests {
         service2.allow_any_signer = false;
         service2.allowed_signers = Some(vec![addr_c]);
         let store = service2.store.clone();
-        seed_zero_ger(&store).await;
         let gi_swallow = U256::from(0x5006u64);
         let someone_else = Address::from([0x77u8; 20]);
         assert_ne!(someone_else, addr_c);
         let calldata = claim_calldata(gi_swallow, someone_else, U256::from(1_000_000u64));
+        seed_claim_ger(&store, &calldata).await;
         let nonce_swallow = store.nonce_get(&format!("{addr_c:#x}")).await.unwrap();
         let (input_hex, tx_hash) = encode_tx_signed_with_nonce(&key_c, calldata, nonce_swallow);
         let accepted = service_send_raw_txn(service2, input_hex)
@@ -4994,7 +5025,6 @@ mod tests {
         let service = create_test_service();
         let store = service.store.clone();
         let miden = service.miden_client.clone();
-        seed_zero_ger(&store).await;
 
         let gi = U256::from(0x5501u64);
         land_claim_for(&store, gi).await;
@@ -5006,6 +5036,7 @@ mod tests {
         let key_b = alloy::signers::local::PrivateKeySigner::random();
         let addr_b = key_b.address();
         let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
+        seed_claim_ger(&store, &calldata).await;
         let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 0);
 
         let accepted = service_send_raw_txn(service.clone(), input_b).await.expect(
@@ -5086,7 +5117,6 @@ mod tests {
     async fn anti_wedge_sequence_landed_then_normal_stays_in_lockstep() {
         let service = create_test_service();
         let store = service.store.clone();
-        seed_zero_ger(&store).await;
 
         // The sponsor key S.
         let key_s = alloy::signers::local::PrivateKeySigner::random();
@@ -5098,6 +5128,7 @@ mod tests {
 
         // S submits its (persisted) monitored tx for gi=X at nonce 0.
         let calldata_x = claim_calldata(gi_x, resolvable_dest(), U256::from(1_000_000u64));
+        seed_claim_ger(&store, &calldata_x).await;
         let (input_x, _tx_x) = encode_tx_signed_with_nonce(&key_s, calldata_x, 0);
         service_send_raw_txn(service.clone(), input_x)
             .await
@@ -5114,6 +5145,7 @@ mod tests {
         let gi_y = U256::from(0x5503u64);
         let calldata_y =
             claim_calldata(gi_y, Address::from([0x99u8; 20]), U256::from(1_000_000u64));
+        seed_claim_ger(&store, &calldata_y).await;
         let (input_y, _tx_y) = encode_tx_signed_with_nonce(&key_s, calldata_y, 1);
         let res_y = service_send_raw_txn(service.clone(), input_y).await;
         assert!(
@@ -5139,7 +5171,6 @@ mod tests {
     async fn accept_and_revert_rebroadcast_same_hash_no_duplicate_receipt() {
         let service = create_test_service();
         let store = service.store.clone();
-        seed_zero_ger(&store).await;
 
         let gi = U256::from(0x5504u64);
         land_claim_for(&store, gi).await;
@@ -5147,6 +5178,7 @@ mod tests {
         let key_b = alloy::signers::local::PrivateKeySigner::random();
         let addr_b = key_b.address();
         let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
+        seed_claim_ger(&store, &calldata).await;
         let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 0);
 
         // First submission → accept-and-revert (reverted receipt written).
@@ -5188,7 +5220,6 @@ mod tests {
     async fn landed_gi_stale_nonce_still_rejected_not_reverted() {
         let service = create_test_service();
         let store = service.store.clone();
-        seed_zero_ger(&store).await;
 
         let gi = U256::from(0x5505u64);
         land_claim_for(&store, gi).await;
@@ -5203,6 +5234,7 @@ mod tests {
                 .unwrap();
         }
         let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
+        seed_claim_ger(&store, &calldata).await;
         let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 0);
 
         let err = service_send_raw_txn(service.clone(), input_b)
@@ -5231,7 +5263,6 @@ mod tests {
     async fn landed_gi_future_nonce_parks_not_reverted() {
         let (service, _sd) = mempool_service();
         let store = service.store.clone();
-        seed_zero_ger(&store).await;
 
         let gi = U256::from(0x5506u64);
         land_claim_for(&store, gi).await;
@@ -5240,6 +5271,7 @@ mod tests {
         let key_b = alloy::signers::local::PrivateKeySigner::random();
         let signer_str = format!("{:#x}", key_b.address());
         let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
+        seed_claim_ger(&store, &calldata).await;
         let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 1);
 
         let parked = tokio::time::timeout(
@@ -5279,7 +5311,6 @@ mod tests {
             std::time::Duration::from_secs(60),
         );
         service.writer_handle = Some(std::sync::Arc::new(handle));
-        seed_zero_ger(&store).await;
 
         let gi = U256::from(0x5507u64);
         land_claim_for(&store, gi).await;
@@ -5288,6 +5319,7 @@ mod tests {
         let key_b = alloy::signers::local::PrivateKeySigner::random();
         let addr_b = key_b.address();
         let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
+        seed_claim_ger(&store, &calldata).await;
         let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 0);
 
         let accepted = service_send_raw_txn(service.clone(), input_b)
@@ -5384,7 +5416,6 @@ mod tests {
     async fn blocker1_landed_at_lock_boundary_accept_and_reverts_e2e() {
         let service = create_test_service();
         let store = service.store.clone();
-        seed_zero_ger(&store).await;
         let gi = U256::from(0x550bu64);
         // The landed state (locked + ClaimEvent) is present before B's submission
         // classifies it — i.e. A's claim has LANDED by the time B reaches the lock.
@@ -5393,6 +5424,7 @@ mod tests {
         let key_b = alloy::signers::local::PrivateKeySigner::random();
         let addr_b = key_b.address();
         let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
+        seed_claim_ger(&store, &calldata).await;
         let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 0);
 
         let accepted = service_send_raw_txn(service.clone(), input_b)
@@ -5425,13 +5457,13 @@ mod tests {
     async fn blocker2_crash_gap_rebroadcast_repairs_stale_nonce() {
         let service = create_test_service();
         let store = service.store.clone();
-        seed_zero_ger(&store).await;
 
         let key_b = alloy::signers::local::PrivateKeySigner::random();
         let addr_b = key_b.address();
         let signer_str = format!("{addr_b:#x}");
         let gi = U256::from(0x550cu64);
         let calldata = claim_calldata(gi, resolvable_dest(), U256::from(1_000_000u64));
+        seed_claim_ger(&store, &calldata).await;
         let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 0);
 
         // Reconstruct the envelope and persist a COMMITTED (reverted) receipt for
@@ -5503,6 +5535,7 @@ mod tests {
             Address::from([0x99u8; 20]),
             U256::from(1u64),
         );
+        seed_claim_ger(&store, &calldata_next).await;
         let (input_next, _) = encode_tx_signed_with_nonce(&key_b, calldata_next, 1);
         service_send_raw_txn(service, input_next)
             .await
@@ -5521,7 +5554,6 @@ mod tests {
     async fn blocker_a_landed_unresolvable_destination_accept_and_reverts_no_double_emit() {
         let service = create_test_service();
         let store = service.store.clone();
-        seed_zero_ger(&store).await;
         let gi = U256::from(0x55a1u64);
         land_claim_for(&store, gi).await;
         let events_before = count_claim_events(&store).await;
@@ -5531,6 +5563,7 @@ mod tests {
         let key_b = alloy::signers::local::PrivateKeySigner::random();
         let addr_b = key_b.address();
         let calldata = claim_calldata(gi, Address::from([0x99u8; 20]), U256::from(1_000_000u64));
+        seed_claim_ger(&store, &calldata).await;
         let (input_b, tx_b) = encode_tx_signed_with_nonce(&key_b, calldata, 0);
 
         let accepted = service_send_raw_txn(service.clone(), input_b).await.expect(
@@ -6383,7 +6416,7 @@ mod tests {
     async fn reservation_only_retry_rejects_until_expiry_then_recovers() {
         let concrete = std::sync::Arc::new(crate::store::memory::InMemoryStore::new());
         let service = crate::test_helpers::create_test_service_with_store(concrete.clone());
-        let calldata = claimAssetCall {
+        let calldata = valid_claim_bytes(claimAssetCall {
             smtProofLocalExitRoot: [FixedBytes::ZERO; 32],
             smtProofRollupExitRoot: [FixedBytes::ZERO; 32],
             globalIndex: U256::from(198),
@@ -6395,8 +6428,7 @@ mod tests {
             destinationAddress: Address::ZERO,
             amount: U256::ZERO,
             metadata: Default::default(),
-        }
-        .abi_encode();
+        });
         let (raw, signer) = encode_legacy_tx(calldata);
         let bytes = hex_decode_prefixed(&raw).unwrap();
         let envelope = TxEnvelope::decode_2718(&mut bytes.as_slice()).unwrap();
