@@ -11,8 +11,29 @@ use miden_protocol::note::{NoteDetailsCommitment, NoteId};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OpenFlags, params};
 use std::collections::BTreeSet;
+use std::path::Path;
 
 const READ_BATCH: usize = 256;
+
+/// Run before opening the singleton SDK client, with no existing store owner.
+/// The SDK validates its entire persisted schema on every open. Our index is
+/// disposable, so remove exactly its objects before that validation and let
+/// the first observer read rebuild it from the unchanged SDK note inventory.
+/// Unknown objects and SDK schema changes remain subject to SDK validation.
+pub(crate) fn prepare_store_for_client(path: &Path) -> anyhow::Result<()> {
+    let mut conn = crate::sqlite_pragmas::open_store_connection(path)?;
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "DROP TRIGGER IF EXISTS agglayer_note_insert_v1;
+         DROP TRIGGER IF EXISTS agglayer_note_update_v1;
+         DROP TRIGGER IF EXISTS agglayer_note_delete_v1;
+         DROP INDEX IF EXISTS agglayer_note_changes_revision_v1;
+         DROP TABLE IF EXISTS agglayer_note_changes_v1;
+         DROP TABLE IF EXISTS agglayer_note_change_state_v1;",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Mark {
@@ -355,6 +376,105 @@ mod tests {
             .await
             .unwrap();
         (client, store)
+    }
+
+    #[tokio::test]
+    async fn sdk_store_reopens_after_consumed_note_observation() {
+        let (mut client, store) = fixture().await;
+        let expected = note(42, true, true);
+        store
+            .upsert_input_notes(std::slice::from_ref(&expected))
+            .await
+            .unwrap();
+        let path = std::path::PathBuf::from(client.store_identifier());
+        let feed = ConsumedNoteFeed::default();
+        let batch = feed
+            .load(&mut ClientAccess::Exclusive(&mut client), false, &[])
+            .await
+            .unwrap();
+        assert_eq!(batch.notes, vec![expected.clone()]);
+        feed.commit(&batch, []);
+        drop(client);
+        drop(store);
+
+        // Match the production startup path before asking the pinned SDK to
+        // validate and reopen the existing store.
+        prepare_store_for_client(&path).unwrap();
+        let reopened = SqliteStore::new(path.clone())
+            .await
+            .unwrap_or_else(|error| panic!("SDK must reopen after an observer has run: {error:?}"));
+        assert_eq!(
+            reopened
+                .get_input_notes(NoteFilter::Consumed)
+                .await
+                .unwrap(),
+            vec![expected]
+        );
+
+        // Restart creates a new reader epoch and retains incremental tracking
+        // of later changes, including historical notes enriched after restart.
+        let mut conn = Connection::open(&path).unwrap();
+        let (mark, _) = read_changes(&mut conn, None).unwrap();
+        assert_ne!(Some(&mark.epoch), batch.mark.as_ref().map(|m| &m.epoch));
+        let enriched = note(43, true, true);
+        reopened
+            .upsert_input_notes(std::slice::from_ref(&enriched))
+            .await
+            .unwrap();
+        let (_, changes) = read_changes(&mut conn, Some(&mark)).unwrap();
+        assert!(changes.contains(&enriched.details_commitment().as_bytes()));
+        // Partial installation is also disposable, and preparation is safe
+        // to repeat before the SDK opens.
+        conn.execute_batch("DROP TRIGGER agglayer_note_update_v1")
+            .unwrap();
+        drop(conn);
+        drop(reopened);
+        prepare_store_for_client(&path).unwrap();
+        prepare_store_for_client(&path).unwrap();
+        let reopened = SqliteStore::new(path).await.unwrap();
+        assert_eq!(
+            reopened
+                .get_input_notes(NoteFilter::Consumed)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_cleanup_keeps_unknown_schema_drift_rejected() {
+        let (mut client, store) = fixture().await;
+        let path = std::path::PathBuf::from(client.store_identifier());
+        ConsumedNoteFeed::default()
+            .load(&mut ClientAccess::Exclusive(&mut client), false, &[])
+            .await
+            .unwrap();
+        drop(client);
+        drop(store);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agglayer_note_unknown_v2 (value TEXT);
+            INSERT INTO agglayer_note_unknown_v2 VALUES ('preserved');
+            ALTER TABLE input_notes ADD COLUMN future_observation BLOB;",
+        )
+        .unwrap();
+        drop(conn);
+        prepare_store_for_client(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT value FROM agglayer_note_unknown_v2", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "preserved"
+        );
+        drop(conn);
+        let error = match SqliteStore::new(path).await {
+            Ok(_) => panic!("startup must not bypass SDK schema validation"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:?}").contains("stored schema at version"));
     }
 
     #[tokio::test]
