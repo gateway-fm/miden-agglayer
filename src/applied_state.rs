@@ -176,6 +176,42 @@ async fn bridge_snapshot(
     claim: Option<U256>,
     note_id: Option<String>,
 ) -> anyhow::Result<BridgeSnapshot> {
+    if note_id.is_none() {
+        let client = service.miden_client.clone();
+        let bridge_id = service.accounts.0.bridge.0;
+        let bridge = service
+            .bridge_reads
+            .read(move |publisher| async move {
+                client
+                    .with_operation("bridge_state_read", move |client| {
+                        Box::new(async move {
+                            let bridge = client
+                                .get_account(bridge_id)
+                                .await
+                                .context("reading Miden bridge account")?
+                                .context(
+                                    "Miden bridge account is not available locally after sync",
+                                )?;
+                            // End sharing BEFORE releasing the client to a writer or sync.
+                            publisher.finish(Ok(bridge));
+                            Ok(())
+                        })
+                    })
+                    .await
+            })
+            .await?;
+        return Ok(BridgeSnapshot {
+            ger_applied: ger
+                .map(|root| {
+                    crate::network_accounts::is_ger_registered(ExitRoot::new(root), &bridge)
+                })
+                .transpose()?,
+            claim_applied: claim
+                .map(|gi| claim_is_set(bridge.storage(), gi))
+                .transpose()?,
+            note: NoteObservation::NotRequested,
+        });
+    }
     let result: Arc<Mutex<Option<BridgeSnapshot>>> = Arc::new(Mutex::new(None));
     let result_in = result.clone();
     let bridge_id = service.accounts.0.bridge.0;
