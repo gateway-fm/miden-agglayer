@@ -903,7 +903,7 @@ mod tests {
                 0,
                 &[0u8; 20],
                 &[0xC7u8; 20],
-                1000,
+                alloy::primitives::U256::from(1000),
             )
             .await
             .unwrap();
@@ -968,7 +968,7 @@ mod tests {
                 0,
                 &[0u8; 20],
                 &[0xC9u8; 20],
-                1000,
+                alloy::primitives::U256::from(1000),
             )
             .await
             .unwrap();

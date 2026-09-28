@@ -1442,7 +1442,7 @@ pub trait Store: Send + Sync + 'static {
         origin_network: u32,
         origin_address: &[u8; 20],
         destination_address: &[u8; 20],
-        amount: u64,
+        amount: U256,
     ) -> anyhow::Result<()>;
 
     // === Faucet registry ===
@@ -1479,17 +1479,17 @@ pub trait Store: Send + Sync + 'static {
         origin_network: u32,
         origin_address: &[u8; 20],
         destination_address: &[u8; 20],
-        amount: u64,
+        amount: U256,
     ) -> anyhow::Result<()> {
         let log = SyntheticLog {
             address: bridge_address.to_string(),
             topics: vec![crate::log_synthesis::CLAIM_EVENT_TOPIC.to_string()],
-            data: crate::log_synthesis::encode_claim_event_data_u64(
+            data: crate::log_synthesis::encode_claim_event_data(
                 global_index,
                 origin_network,
                 origin_address,
                 destination_address,
-                amount,
+                &amount.to_be_bytes::<32>(),
             ),
             block_number,
             block_hash,

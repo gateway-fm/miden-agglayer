@@ -2425,7 +2425,7 @@ impl Store for InMemoryStore {
         origin_network: u32,
         origin_address: &[u8; 20],
         destination_address: &[u8; 20],
-        amount: u64,
+        amount: U256,
     ) -> anyhow::Result<()> {
         // Link -> claim is the global handoff lock order. A ClaimEvent is the
         // terminal claim fence even on replay, so a publisher whose final read
@@ -2480,12 +2480,12 @@ impl Store for InMemoryStore {
         let mut log = SyntheticLog {
             address: bridge_address.to_string(),
             topics: vec![crate::log_synthesis::CLAIM_EVENT_TOPIC.to_string()],
-            data: crate::log_synthesis::encode_claim_event_data_u64(
+            data: crate::log_synthesis::encode_claim_event_data(
                 &global_index,
                 origin_network,
                 origin_address,
                 destination_address,
-                amount,
+                &amount.to_be_bytes::<32>(),
             ),
             block_number,
             block_hash,
@@ -3287,7 +3287,7 @@ mod tests {
                 1,
                 &[0x22; 20],
                 &[0x33; 20],
-                1000,
+                alloy::primitives::U256::from(1000),
             )
             .await
             .unwrap();
@@ -3547,7 +3547,7 @@ mod tests {
                 1,
                 &[0u8; 20],
                 &[0u8; 20],
-                100,
+                alloy::primitives::U256::from(100),
             )
             .await
             .unwrap();

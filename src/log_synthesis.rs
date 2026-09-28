@@ -371,18 +371,8 @@ pub struct GerEntry {
 
 /// Encode a synthetic ClaimEvent log's data section.
 ///
-/// On-chain ClaimEvent ABI declares `uint256 amount` — the full 32-byte
-/// slot. The previous signature accepted `amount: u64`, BE-encoded into
-/// the low 8 bytes, with zero padding for the rest. That works for any
-/// amount ≤ u64::MAX but silently truncates anything above (Cantina #12
-/// notes the protocol can technically hold ~2^123-bit values via the
-/// Miden Felt path; aggkit caps at 2^63 - 2^31, but the wire ABI must
-/// stay U256-shaped to align byte-for-byte with the on-chain emission).
-///
-/// X8 — take a 32-byte big-endian U256 directly. Callers that have a
-/// u64 (as today's claim path does) can call
-/// `encode_claim_event_data_u64` for ergonomic compatibility, which
-/// zero-extends the u64 into the U256 slot.
+/// The amount is the full uint256 in origin-token units. The Miden-scaled
+/// amount has a separate range limit and must not narrow this ABI field.
 pub fn encode_claim_event_data(
     global_index: &[u8; 32],
     origin_network: u32,
@@ -413,7 +403,7 @@ pub fn encode_claim_event_data(
     format!("0x{}", hex::encode(data))
 }
 
-/// Convenience wrapper for u64-shaped amounts (today's claim path).
+/// Convenience wrapper for callers with u64-shaped amounts.
 /// Zero-extends `amount` into a U256 slot.
 pub fn encode_claim_event_data_u64(
     global_index: &[u8; 32],
