@@ -706,15 +706,6 @@ impl MidenClient {
         })
     }
 
-    /// Returns the opt-in `LocalTransactionProver` fallback if the operator
-    /// set `--miden-prover-fallback-to-local` AND a remote prover is
-    /// configured. `None` when the active prover is already local (no
-    /// remote configured) or fallback was not opted into.
-    ///
-    /// Callers (currently `claim.rs`) should attempt `prove_transaction`
-    /// against the configured prover first, then retry against this
-    /// `Arc` when the result is a `ClientError::TransactionProvingError`.
-    /// See `src/claim.rs::publish_claim_internal` for the canonical use.
     /// #174 — wait for a submitted transaction to commit WITHOUT holding the
     /// actor across the wait.
     ///
@@ -746,20 +737,52 @@ impl MidenClient {
         max_attempts: usize,
         poll_interval: Duration,
     ) -> anyhow::Result<bool> {
+        let budget = poll_interval.saturating_mul(u32::try_from(max_attempts).unwrap_or(u32::MAX));
+        let deadline = tokio::time::Instant::now() + budget;
+        // Keep the released code's elapsed-time budget, including mailbox wait.
+        // The probe carries the same deadline into the actor, so an expired
+        // queued observation cannot start a late sync or retain client ownership.
+        match tokio::time::timeout_at(
+            deadline,
+            crate::metrics::meter_writer_stage(
+                "client",
+                "commit_wait",
+                self.await_transaction_commit_inner(txn_id, max_attempts, poll_interval, deadline),
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                metrics::counter!("miden_commit_wait_timeouts_total").increment(1);
+                tracing::warn!(%txn_id, timeout_secs = budget.as_secs_f64(), "Miden commit observation timed out, including mailbox and sync time");
+                Ok(false)
+            }
+        }
+    }
+
+    async fn await_transaction_commit_inner(
+        &self,
+        txn_id: miden_protocol::transaction::TransactionId,
+        max_attempts: usize,
+        poll_interval: Duration,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<bool> {
         // Local probe first, no sync: a repeat/retried wait, or a commit the
         // actor's ticker already observed, returns without a round-trip.
-        if self.probe_commit(txn_id, false).await? == CommitProbe::Committed {
+        if self.probe_commit(txn_id, false, deadline).await? == CommitProbe::Committed {
             return Ok(true);
         }
         for attempt in 1..=max_attempts {
             // OUTSIDE the actor: other requests run while we sleep.
             tokio::time::sleep(poll_interval).await;
-            match self.probe_commit(txn_id, true).await? {
+            match self.probe_commit(txn_id, true, deadline).await? {
                 CommitProbe::Committed => {
                     ::metrics::counter!("miden_commit_wait_probes_total", "outcome" => "committed")
                         .increment(1);
                     return Ok(true);
                 }
+                CommitProbe::TimedOut => return Ok(false),
                 CommitProbe::Pending => {
                     ::metrics::counter!("miden_commit_wait_probes_total", "outcome" => "pending")
                         .increment(1);
@@ -787,31 +810,16 @@ impl MidenClient {
         &self,
         txn_id: miden_protocol::transaction::TransactionId,
         sync_first: bool,
+        deadline: tokio::time::Instant,
     ) -> anyhow::Result<CommitProbe> {
         let slot: Arc<std::sync::Mutex<Option<CommitProbe>>> =
             Arc::new(std::sync::Mutex::new(None));
         let slot_inner = slot.clone();
-        self.with(move |client| {
+        self.with_operation("commit_probe", move |client| {
             Box::new(async move {
-                if sync_first && let Err(client_err) = sync_state_timed(client).await {
-                    match MidenClient::unwrap_connection_error(*client_err) {
-                        Ok(conn_err) => {
-                            tracing::warn!(
-                                "await_transaction_commit: sync connection error: {conn_err:?}"
-                            );
-                            *slot_inner.lock().expect("commit probe slot") =
-                                Some(CommitProbe::SyncUnavailable);
-                            return Ok(());
-                        }
-                        Err(other_err) => return Err(other_err),
-                    }
-                }
-                let committed = txn_committed_locally(client, txn_id).await?;
-                *slot_inner.lock().expect("commit probe slot") = Some(if committed {
-                    CommitProbe::Committed
-                } else {
-                    CommitProbe::Pending
-                });
+                let outcome =
+                    probe_commit_before_deadline(client, txn_id, sync_first, deadline).await?;
+                *slot_inner.lock().expect("commit probe slot") = Some(outcome);
                 Ok(())
             })
         })
@@ -820,6 +828,15 @@ impl MidenClient {
         outcome.ok_or_else(|| anyhow::anyhow!("commit probe completed without an outcome"))
     }
 
+    /// Returns the opt-in `LocalTransactionProver` fallback if the operator
+    /// set `--miden-prover-fallback-to-local` AND a remote prover is
+    /// configured. `None` when the active prover is already local (no
+    /// remote configured) or fallback was not opted into.
+    ///
+    /// Callers (currently `claim.rs`) should attempt `prove_transaction`
+    /// against the configured prover first, then retry against this
+    /// `Arc` when the result is a `ClientError::TransactionProvingError`.
+    /// See `src/claim.rs::publish_claim_internal` for the canonical use.
     pub fn local_prover_fallback(&self) -> Option<Arc<dyn TransactionProver + Send + Sync>> {
         self.local_prover_fallback.clone()
     }
@@ -1068,10 +1085,8 @@ impl MidenClient {
         }
     }
 
-    /// Startup sync with unbounded retries: the service must not come alive
-    /// against an unsynced store, so unlike the actor loop's
-    /// [`Self::sync_bounded`] passes this deliberately never gives up
-    /// (shutdown interrupts via the biased select at the call site).
+    /// One startup/background sync attempt using the existing RPC deadline.
+    /// The actor's health gate retries a failed startup before serving requests.
     async fn sync(client: &mut MidenClientLib) -> anyhow::Result<SyncSummary> {
         // Retry on the next background tick. Retrying here monopolizes the
         // sole client owner forever and prevents queued writes from running.
@@ -1119,43 +1134,24 @@ impl MidenClient {
     ) -> SyncPass {
         let mut backoff = BACKOFF_MIN;
         for attempt in 1..=SYNC_ATTEMPTS_PER_PASS {
-            // biased shutdown-first. Dropping `sync_state` mid-flight is
-            // acceptable ONLY because the process is exiting: sync_state is
-            // several sequential awaits (note transport, apply_state_sync,
-            // partial-MMR cache, pruning) and a drop between them leaves a
-            // non-atomic seam that the next `run` heals by rebuilding the
-            // client from sqlite. Do not reuse this pattern to cancel a sync
-            // anywhere the client keeps running.
+            // Keep the existing per-attempt sync deadline and race shutdown
+            // while this actor still exclusively owns the client. No sync
+            // future survives the return of this request/pass.
             let result = tokio::select! {
                 biased;
 
                 _ = &mut *done_receiver => return SyncPass::Shutdown,
-                result = client.sync_state() => result,
+                result = Self::sync(client) => result,
             };
             match result {
                 Ok(summary) => {
                     tracing::debug!(target: concat!(module_path!(), "::sync::debug"), "MidenClient::sync succeeded at block {}", summary.block_num);
                     return SyncPass::Committed(summary);
                 }
-                Err(client_err) => {
-                    match Self::unwrap_connection_error(client_err) {
-                        Ok(conn_err) => {
-                            metrics::counter!("miden_sync_errors_total", "kind" => "connection")
-                                .increment(1);
-                            tracing::error!(
-                                "MidenClient::sync_bounded connection error (attempt {attempt}/{}): {conn_err:?}",
-                                SYNC_ATTEMPTS_PER_PASS
-                            );
-                        }
-                        Err(other_err) => {
-                            metrics::counter!("miden_sync_errors_total", "kind" => "other")
-                                .increment(1);
-                            tracing::error!(
-                                "MidenClient::sync_bounded non-connection error (attempt {attempt}/{}): {other_err:#}",
-                                SYNC_ATTEMPTS_PER_PASS
-                            );
-                        }
-                    }
+                Err(error) => {
+                    // `sync` already classifies and counts the attempt error.
+                    tracing::warn!(attempt, max_attempts = SYNC_ATTEMPTS_PER_PASS,
+                        error = %format!("{error:#}"), "MidenClient bounded sync attempt failed");
                     if attempt < SYNC_ATTEMPTS_PER_PASS {
                         tokio::select! {
                             biased;
@@ -1357,7 +1353,7 @@ impl MidenClient {
         // bridge snapshot on claim admission) — deliberate: a snapshot the
         // node cannot currently confirm is not "serviceable". The
         // `miden_client_writes_held` gauge exposes the held state.
-        let mut sync_healthy = true;
+        let mut sync_healthy = alive.load(Ordering::Acquire);
         // Cross-pass backoff while held. `sync_bounded` only backs off WITHIN
         // a pass (1s, 2s); without this the outage steady state was a fresh
         // 3-attempt pass every ~4s + RPC timeouts, forever — ~15x the error
@@ -1379,6 +1375,7 @@ impl MidenClient {
                 {
                     SyncOutcome::Healthy => {
                         sync_healthy = true;
+                        alive.store(true, Ordering::Release);
                         hold_backoff = BACKOFF_MIN;
                         ::metrics::gauge!("miden_client_writes_held").set(0.0);
                         tracing::info!("MidenClient sync recovered; held requests resume");
@@ -1429,9 +1426,10 @@ impl MidenClient {
                         )
                         .await
                         {
-                            SyncOutcome::Healthy => {}
+                            SyncOutcome::Healthy => { alive.store(true, Ordering::Release); }
                             SyncOutcome::Failed => {
                                 sync_healthy = false;
+                            alive.store(false, Ordering::Release);
                                 tracing::warn!(
                                     "MidenClient forced sync pass failed; requests are held until a \
                                      fresh sync succeeds (stale-snapshot guard, #173 final review)"
@@ -1461,6 +1459,7 @@ impl MidenClient {
                         SyncOutcome::Healthy => { alive.store(true, Ordering::Release); }
                         SyncOutcome::Failed => {
                             sync_healthy = false;
+                            alive.store(false, Ordering::Release);
                             tracing::warn!(
                                 "MidenClient ticker sync pass failed; requests are held until a \
                                  fresh sync succeeds (stale-snapshot guard, #173 final review)"
@@ -1616,6 +1615,39 @@ enum CommitProbe {
     Pending,
     /// `sync_state` hit a connection failure; nothing can be concluded.
     SyncUnavailable,
+    /// The original observation deadline elapsed; no new sync may start.
+    TimedOut,
+}
+
+async fn probe_commit_before_deadline(
+    client: &mut MidenClientLib,
+    txn_id: miden_protocol::transaction::TransactionId,
+    sync_first: bool,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<CommitProbe> {
+    if tokio::time::Instant::now() >= deadline {
+        return Ok(CommitProbe::TimedOut);
+    }
+    let probe = async {
+        if sync_first && let Err(client_err) = sync_state_timed(client).await {
+            match MidenClient::unwrap_connection_error(*client_err) {
+                Ok(conn_err) => {
+                    tracing::warn!("commit probe sync unavailable: {conn_err:?}");
+                    return Ok(CommitProbe::SyncUnavailable);
+                }
+                Err(other_err) => return Err(other_err),
+            }
+        }
+        Ok(if txn_committed_locally(client, txn_id).await? {
+            CommitProbe::Committed
+        } else {
+            CommitProbe::Pending
+        })
+    };
+    match tokio::time::timeout_at(deadline, probe).await {
+        Ok(result) => result,
+        Err(_) => Ok(CommitProbe::TimedOut),
+    }
 }
 
 /// `sync_state` with the #106 timing instrumentation: records
@@ -1631,7 +1663,8 @@ async fn sync_state_timed(client: &mut MidenClientLib) -> Result<(), Box<ClientE
     // commit wait into 40s+ and, via the serialized claim queue, caps
     // end-to-end delivery throughput.
     let sync_started = std::time::Instant::now();
-    let sync_result = client.sync_state().await;
+    let sync_result =
+        crate::metrics::meter_writer_stage("commit_wait", "sync", client.sync_state()).await;
     let sync_elapsed = sync_started.elapsed();
     ::metrics::histogram!("miden_sync_state_duration_seconds").record(sync_elapsed.as_secs_f64());
     if sync_elapsed >= std::time::Duration::from_secs(2) {
@@ -1854,6 +1887,73 @@ mod tests {
         .expect("50ms commit budget must include the 10s RPC timeout")
         .unwrap();
         assert!(!result);
+        client.get_sync_height().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_commit_budget_includes_waiting_for_the_client() {
+        let (client, release) = MidenClient::new_test_blocked();
+        let tx_id = miden_protocol::transaction::TransactionId::new(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        let observed = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.await_transaction_commit(tx_id, 2, Duration::from_millis(25)),
+        )
+        .await;
+        // Always release the stub, including when the regression times out.
+        let _ = release.send(());
+        assert!(
+            !observed
+                .expect("mailbox wait must count against the 50ms budget")
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn actor_commit_probe_cannot_start_after_its_deadline() {
+        let mut client = crate::test_helpers::offline_miden_client_lib().await;
+        let tx_id = miden_protocol::transaction::TransactionId::new(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        let result =
+            probe_commit_before_deadline(&mut client, tx_id, true, tokio::time::Instant::now())
+                .await
+                .unwrap();
+        // The offline RPC would fail if an expired queued probe tried to sync.
+        assert_eq!(result, CommitProbe::TimedOut);
+        client.get_sync_height().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_commit_probe_releases_the_client_at_the_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint =
+            Endpoint::try_from(format!("http://{}", listener.local_addr().unwrap()).as_str())
+                .unwrap();
+        let mut client = crate::test_helpers::offline_miden_client_lib().await;
+        *client.test_rpc_api() = build_rpc_client(&endpoint, 10_000, None);
+        let tx_id = miden_protocol::transaction::TransactionId::new(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            probe_commit_before_deadline(&mut client, tx_id, true, deadline),
+        )
+        .await
+        .expect("probe must release ownership before the 10s RPC timeout")
+        .unwrap();
+        assert_eq!(result, CommitProbe::TimedOut);
         client.get_sync_height().await.unwrap();
     }
 
