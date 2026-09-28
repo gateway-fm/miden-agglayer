@@ -19,9 +19,10 @@ use miden_protocol::Felt;
 use miden_protocol::account::{Account, AccountId};
 use miden_protocol::asset::{Asset, FungibleAsset};
 use miden_protocol::block::BlockNumber;
-use miden_protocol::note::NoteType;
-use miden_protocol::transaction::ProvenTransaction;
+use miden_protocol::note::{NoteId, NoteType};
+use miden_protocol::transaction::{ProvenTransaction, RawOutputNote, RawOutputNotes};
 use miden_standards::interop::eth::EthAddress;
+use miden_standards::note::{P2idNote, TxFeeNote};
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,16 +301,7 @@ async fn step_effect(
     if step == FaucetStep::Deploy {
         return deployed_account(client, faucet).await;
     }
-    ensure!(
-        result.created_notes().num_notes() == 1,
-        "faucet handoff must contain exactly one output note"
-    );
-    let id = result
-        .created_notes()
-        .iter()
-        .next()
-        .context("missing faucet output note")?
-        .id();
+    let id = step_output_note_id(step, result.created_notes())?;
     match client.import_notes(&[NoteFile::NoteId(id)]).await {
         Ok(_) => Ok(true),
         Err(ClientError::NoteNotFoundOnChain(missing)) if missing == id => Ok(false),
@@ -322,6 +314,50 @@ async fn step_effect(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+/// Raw SDK outputs include the kernel's TX_FEE note. Its existence proves
+/// neither funding nor registration, so reconcile only the step's own note.
+/// Reject unknown or ambiguous outputs instead of guessing from order or tag.
+fn step_output_note_id(step: FaucetStep, notes: &RawOutputNotes) -> anyhow::Result<NoteId> {
+    let expected_script = match step {
+        FaucetStep::Fund => P2idNote::script_root(),
+        FaucetStep::Register => ConfigAggBridgeNote::script_root(),
+        FaucetStep::Deploy => anyhow::bail!("deployment is reconciled by account state"),
+    };
+    let mut intended = None;
+    let mut seen_fee = false;
+    for output in notes.iter() {
+        let RawOutputNote::Full(note) = output else {
+            anyhow::bail!("faucet handoff contains an incomplete output note");
+        };
+        ensure!(
+            note.metadata().note_type() == NoteType::Public,
+            "faucet handoff contains a non-public output note"
+        );
+        if note.script().root() == TxFeeNote::script_root() {
+            ensure!(
+                !seen_fee
+                    && note.metadata().tag() == TxFeeNote::TAG
+                    && note.storage().is_empty()
+                    && note.attachments().is_empty()
+                    && !note.assets().is_empty(),
+                "faucet handoff contains an invalid or duplicate fee note"
+            );
+            seen_fee = true;
+        } else {
+            ensure!(
+                note.script().root() == expected_script,
+                "faucet handoff contains an unexpected output note"
+            );
+            ensure!(
+                intended.is_none(),
+                "faucet handoff has ambiguous step outputs"
+            );
+            intended = Some(note.id());
+        }
+    }
+    intended.context("faucet handoff is missing its step output note")
 }
 
 fn decode_handoff(
