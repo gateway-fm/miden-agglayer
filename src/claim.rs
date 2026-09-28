@@ -1357,7 +1357,12 @@ async fn attempt_publish_claim(
         .await_transaction_commit(txn_id, 20, std::time::Duration::from_secs(1))
         .await?;
     if committed {
-        fence_for_confirm.confirm(&value.note_commitment).await?;
+        crate::metrics::meter_writer_stage(
+            "claim",
+            "confirm_handoff",
+            fence_for_confirm.confirm(&value.note_commitment),
+        )
+        .await?;
         tracing::info!("claim tx {txn_id} committed to block");
         // Cantina #7: mark Landed once the commit is confirmed. Aggkit's
         // miden-client operates on the proxy's service account — it CANNOT
