@@ -1365,9 +1365,9 @@ impl MidenClient {
         let mut backoff = BACKOFF_MIN;
         loop {
             let store_path = store_dir.join("store.sqlite3");
-            crate::sqlite_pragmas::open_store_connection(&store_path).with_context(|| {
-                format!("failed to configure sqlite store {}", store_path.display())
-            })?;
+            crate::consumed_note_feed::prepare_store_for_client(&store_path).with_context(
+                || format!("failed to configure sqlite store {}", store_path.display()),
+            )?;
             let mut builder = ClientBuilder::new()
                 .rpc(build_rpc_client(
                     &node_endpoint,
