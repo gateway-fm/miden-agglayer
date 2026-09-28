@@ -73,6 +73,7 @@ pub async fn restore(
     // BridgeEvent / ClaimEvent logs and race the deposit-counter cursor.
     // The guard auto-restores on any exit path (Ok / Err / panic).
     let _pause = miden_client.pause_listeners();
+    miden_client.wait_for_listener_idle().await;
 
     // Phase 0: Re-import every bridge_accounts.toml account from the live
     // Miden node into the local sqlite. Without this, `--reset-miden-store

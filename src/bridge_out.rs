@@ -8,11 +8,11 @@
 //! `derive_bridge_out_tx_hash`) plus the live `BridgeOutScanner`, whose remaining job is the
 //! Miden-facing security monitors. LET cardinality is enforced by the projector.
 
+use crate::client_access::ClientAccess;
 use crate::miden_client::{MidenClientLib, SyncListener};
 use anyhow::Context;
 use miden_base_agglayer::B2AggNote;
 use miden_client::store::InputNoteRecord;
-use miden_client::store::NoteFilter;
 use miden_client::sync::SyncSummary;
 use miden_protocol::account::AccountId;
 use miden_protocol::note::{NoteDetails, NoteStorage};
@@ -743,6 +743,7 @@ pub struct BridgeOutScanner {
     /// Eviction safely falls back to the idempotent persistent write.
     claim_serial_recorded: parking_lot::Mutex<lru::LruCache<[u8; 32], ()>>,
     completed_monitors: parking_lot::Mutex<CompletedMonitorCache>,
+    consumed_feed: crate::consumed_note_feed::ConsumedNoteFeed,
 }
 
 impl BridgeOutScanner {
@@ -776,6 +777,7 @@ impl BridgeOutScanner {
             mint_scan_state: parking_lot::Mutex::new(monitor_cache()),
             forged_mint_pending: parking_lot::Mutex::new(std::collections::HashMap::new()),
             claim_serial_recorded: parking_lot::Mutex::new(monitor_cache()),
+            consumed_feed: crate::consumed_note_feed::ConsumedNoteFeed::new("bridge_scanner"),
             completed_monitors: parking_lot::Mutex::new(CompletedMonitorCache {
                 registry: None,
                 observations: monitor_cache(),
@@ -948,6 +950,7 @@ struct ScanOutcome {
     scanned: usize,
     cached: usize,
     retryable: usize,
+    retryable_notes: Vec<[u8; 32]>,
     twin_alerts: Vec<[u8; 32]>,
     burn_serial_alerts: Vec<[u8; 32]>,
     /// CLAIM note ids seen consumed this tick (fed to the Cantina #7
@@ -960,6 +963,18 @@ struct ScanOutcome {
     /// `list_faucets()` failed → fail-closed: NOTHING was skipped as foreign
     /// this tick and the registry-membership #2 signal was suppressed.
     registry_degraded: bool,
+}
+
+impl ScanOutcome {
+    fn record_landed_claim(&mut self, note: &InputNoteRecord) {
+        // Keep legacy details keys, and recognize the full NoteId that
+        // claim.rs actually writes into the expected-MINT tracker.
+        self.landed_claim_ids
+            .insert(note.details_commitment().as_bytes());
+        if let Some(id) = note.id() {
+            self.landed_claim_ids.insert(id.as_bytes());
+        }
+    }
 }
 
 impl BridgeOutScanner {
@@ -982,9 +997,19 @@ impl BridgeOutScanner {
     ///
     /// Extracted as a testable seam so the monitor-only invariant is
     /// regression-locked by `finding_23_scanner_is_monitor_only`.
+    #[cfg(test)]
     async fn scan_consumed_notes_monitors(
         &self,
         consumed_notes: &[InputNoteRecord],
+    ) -> ScanOutcome {
+        self.scan_consumed_notes_with_registry(consumed_notes, self.store.list_faucets().await)
+            .await
+    }
+
+    async fn scan_consumed_notes_with_registry(
+        &self,
+        consumed_notes: &[InputNoteRecord],
+        registry: anyhow::Result<Vec<crate::store::FaucetEntry>>,
     ) -> ScanOutcome {
         let started = std::time::Instant::now();
         let mut outcome = ScanOutcome::default();
@@ -996,26 +1021,25 @@ impl BridgeOutScanner {
         // their burn/mint observations (fail-open). Fail closed instead:
         // without the registry, no note is classified Foreign, so every value
         // monitor continues to run until the registry is readable again.
-        let registered_faucets: Option<std::collections::HashSet<AccountId>> =
-            match self.store.list_faucets().await {
-                Ok(v) => {
-                    registry_key = Some(monitor_registry_key(&v));
-                    Some(v.into_iter().map(|f| f.faucet_id).collect())
-                }
-                Err(e) => {
-                    outcome.registry_degraded = true;
-                    metrics::counter!("bridge_monitor_registry_unavailable_total").increment(1);
-                    tracing::error!(
-                        target: "bridge_out::provenance",
-                        error = ?e,
-                        "faucet registry unreadable — provenance gates fail CLOSED this tick: \
-                         no monitor is suppressed, unproven notes remain unknown; \
-                         the registry-membership Cantina #2 signal is paused until the \
-                         registry is readable again"
-                    );
-                    None
-                }
-            };
+        let registered_faucets: Option<std::collections::HashSet<AccountId>> = match registry {
+            Ok(v) => {
+                registry_key = Some(monitor_registry_key(&v));
+                Some(v.into_iter().map(|f| f.faucet_id).collect())
+            }
+            Err(e) => {
+                outcome.registry_degraded = true;
+                metrics::counter!("bridge_monitor_registry_unavailable_total").increment(1);
+                tracing::error!(
+                    target: "bridge_out::provenance",
+                    error = ?e,
+                    "faucet registry unreadable — provenance gates fail CLOSED this tick: \
+                     no monitor is suppressed, unproven notes remain unknown; \
+                     the registry-membership Cantina #2 signal is paused until the \
+                     registry is readable again"
+                );
+                None
+            }
+        };
 
         let registry_changed;
         // Build the work list before inserting completions. This avoids a
@@ -1034,9 +1058,7 @@ impl BridgeOutScanner {
                 if let Some(landed_claim) = cache.observations.get(&key) {
                     outcome.cached += 1;
                     if *landed_claim {
-                        outcome
-                            .landed_claim_ids
-                            .insert(note.details_commitment().as_bytes());
+                        outcome.record_landed_claim(note);
                     }
                 } else {
                     work.push((note, key, NoteProvenanceFacts::from_note(note), true));
@@ -1156,7 +1178,7 @@ impl BridgeOutScanner {
                 self.forged_mint_pending
                     .lock()
                     .remove(&mint_observation_key(note));
-                self.finish_monitor_observation(key, false, complete, &mut outcome);
+                self.finish_monitor_observation(key, id_bytes, false, complete, &mut outcome);
                 continue;
             }
 
@@ -1167,7 +1189,7 @@ impl BridgeOutScanner {
                 // landed" signal for this proxy's expected-MINT tracker.
                 MonitoredNoteKind::Claim => {
                     if facts.consumer == Some(self.bridge_account_id) {
-                        outcome.landed_claim_ids.insert(id_bytes);
+                        outcome.record_landed_claim(note);
                     }
                 }
                 // Cantina #5 — unchanged from main. PR #123 does not alter
@@ -1278,6 +1300,7 @@ impl BridgeOutScanner {
             }
             self.finish_monitor_observation(
                 key,
+                id_bytes,
                 facts.kind == MonitoredNoteKind::Claim
                     && facts.consumer == Some(self.bridge_account_id),
                 complete,
@@ -1303,6 +1326,7 @@ impl BridgeOutScanner {
     fn finish_monitor_observation(
         &self,
         key: [u8; 32],
+        details_commitment: [u8; 32],
         landed_claim: bool,
         complete: bool,
         outcome: &mut ScanOutcome,
@@ -1314,6 +1338,7 @@ impl BridgeOutScanner {
                 .put(key, landed_claim);
         } else {
             outcome.retryable += 1;
+            outcome.retryable_notes.push(details_commitment);
             tracing::trace!(
                 target: "bridge_out::scan",
                 observation = %hex::encode(key),
@@ -1682,15 +1707,52 @@ enum MintIdentityCheck {
 
 #[async_trait::async_trait]
 impl SyncListener for BridgeOutScanner {
-    fn on_sync(&self, _summary: &SyncSummary) {
-        // no-op — scanning happens in on_post_sync where we have client access
-    }
+    fn on_sync(&self, _summary: &SyncSummary) {}
 
     async fn on_post_sync(&self, client: &mut MidenClientLib) -> anyhow::Result<()> {
-        let consumed_notes = crate::metrics::meter_writer_stage(
+        self.run_post_sync(&mut ClientAccess::Exclusive(client))
+            .await
+    }
+
+    fn uses_queued_client(&self) -> bool {
+        true
+    }
+
+    async fn on_post_sync_queued(
+        &self,
+        client: crate::miden_client::ClientQueue,
+    ) -> anyhow::Result<()> {
+        self.run_post_sync(&mut ClientAccess::Queued(client)).await
+    }
+}
+
+impl BridgeOutScanner {
+    async fn run_post_sync(&self, client: &mut ClientAccess<'_>) -> anyhow::Result<()> {
+        let registry = self.store.list_faucets().await;
+        let registry_key = registry
+            .as_ref()
+            .ok()
+            .map(|rows| monitor_registry_key(rows));
+        let mut force_full =
+            registry_key.is_none() || self.completed_monitors.lock().registry != registry_key;
+        // A CLAIM can be registered with the expected-MINT tracker after its
+        // consumption was already observed. Look up these active IDs explicitly.
+        let extra: Vec<_> = match self.store.expected_mint_load_all().await {
+            Ok(expected) => expected.into_iter().map(|(_, id, _, _)| id).collect(),
+            Err(error) => {
+                // Preserve monitor/projector progress if only this tracker is
+                // unavailable. Full inventory supplies every landed CLAIM if
+                // the tracker recovers before its tick below.
+                force_full = true;
+                tracing::warn!(target: "bridge_out::scan", error = %format!("{error:#}"),
+                    "expected-MINT tracker unreadable; reading full consumed inventory");
+                Vec::new()
+            }
+        };
+        let batch = crate::metrics::meter_writer_stage(
             "bridge_scanner",
             "load_consumed_notes",
-            client.get_input_notes(NoteFilter::Consumed),
+            self.consumed_feed.load(client, force_full, &extra),
         )
         .await
         .map_err(|e| anyhow::anyhow!("failed to get consumed notes: {e}"))?;
@@ -1703,16 +1765,19 @@ impl SyncListener for BridgeOutScanner {
         // consumed B2AGG note, which raced `restore()` (#23) and misnumbered
         // synthetic blocks (#19). The SyntheticProjector is now the sole
         // emitter/tip-advancer.
+        let consumed_notes = &batch.notes;
         tracing::debug!(target: "writer_diagnostics", notes = consumed_notes.len(), "bridge monitor scan started");
-        let landed_claim_ids =
+        let outcome =
             crate::metrics::meter_writer_stage("bridge_scanner", "scan_monitors", async {
                 Ok::<_, std::convert::Infallible>(
-                    self.scan_consumed_notes_monitors(&consumed_notes).await,
+                    self.scan_consumed_notes_with_registry(consumed_notes, registry)
+                        .await,
                 )
             })
             .await
-            .expect("infallible monitor scan")
-            .landed_claim_ids;
+            .expect("infallible monitor scan");
+        self.consumed_feed.commit(&batch, outcome.retryable_notes);
+        let landed_claim_ids = outcome.landed_claim_ids;
 
         // Cantina #4 ownership monitor — on a slower cadence (every N ticks)
         // FPI-query each registered faucet's owner storage slot.
@@ -1814,7 +1879,10 @@ impl BridgeOutScanner {
     /// or it is counted in `bridge_faucet_ownership_unchecked_total` with the
     /// reason. Coverage becomes assertable — `checked + unchecked` must equal
     /// the registered faucet count.
-    async fn run_faucet_ownership_check(&self, client: &mut MidenClientLib) -> anyhow::Result<()> {
+    async fn run_faucet_ownership_check(
+        &self,
+        client: &mut ClientAccess<'_>,
+    ) -> anyhow::Result<()> {
         let faucets = self.store.list_faucets().await?;
         for entry in faucets {
             let acct = match client.get_account(entry.faucet_id).await {
@@ -3144,6 +3212,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incremental_scanner_retries_old_mints_and_recovers_after_store_loss() {
+        use miden_client::store::Store as SdkStore;
+        let ids = prov_ids();
+        let (store, mut scanner) = scanner_with_faucets(&[ids.faucet_a], ids.bridge).await;
+        scanner.ownership_probe_every_n_ticks = 0;
+        let mut client = crate::test_helpers::offline_miden_client_lib().await;
+        let sdk = miden_client_sqlite_store::SqliteStore::new(client.store_identifier().into())
+            .await
+            .unwrap();
+        let (claim, serial, _) = claim_note_realistic(
+            0,
+            [0; 20],
+            embedded_address(ids.local_service),
+            100,
+            Some(ids.local_service),
+            Some(ids.bridge),
+            Some(ids.bridge),
+        );
+        let mint = mint_note_with_asset(
+            serial,
+            ids.faucet_a,
+            100,
+            ids.local_service,
+            None,
+            Some(ids.faucet_a),
+            Some(ids.faucet_a),
+        );
+        sdk.upsert_input_notes(&[mint]).await.unwrap();
+        let mut access = ClientAccess::Exclusive(&mut client);
+        scanner.run_post_sync(&mut access).await.unwrap();
+        assert_eq!(scanner.forged_mint_pending.lock().len(), 1);
+        // Nothing changed in SQLite: the unresolved old MINT still retries.
+        let before = store.monitor_calls("claim_mint_expected_get");
+        scanner.run_post_sync(&mut access).await.unwrap();
+        assert!(store.monitor_calls("claim_mint_expected_get") > before);
+        sdk.upsert_input_notes(std::slice::from_ref(&claim))
+            .await
+            .unwrap();
+        store.fail_monitor_operation("claim_mint_expected_record", true);
+        scanner.run_post_sync(&mut access).await.unwrap();
+        assert_eq!(scanner.forged_mint_pending.lock().len(), 1);
+        store.fail_monitor_operation("claim_mint_expected_record", false);
+        scanner.run_post_sync(&mut access).await.unwrap();
+        assert!(scanner.forged_mint_pending.lock().is_empty());
+        assert!(
+            store
+                .claim_mint_expected_get(&serial.as_bytes())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let before = store.monitor_calls("claim_mint_expected_get");
+        scanner.run_post_sync(&mut access).await.unwrap();
+        assert_eq!(store.monitor_calls("claim_mint_expected_get"), before);
+        store
+            .expected_mint_record(&[9; 32], &claim.details_commitment().as_bytes())
+            .await
+            .unwrap();
+        store
+            .expected_mint_record(&[10; 32], &claim.id().unwrap().as_bytes())
+            .await
+            .unwrap();
+        scanner.run_post_sync(&mut access).await.unwrap();
+        assert!(store.expected_mint_load_all().await.unwrap().is_empty());
+        // Persistent monitor state loss: a cold reader must rebuild CLAIM
+        // history before it judges the MINT, regardless of inventory ordering.
+        let (restored_store, mut restarted) =
+            scanner_with_faucets(&[ids.faucet_a], ids.bridge).await;
+        restarted.ownership_probe_every_n_ticks = 0;
+        restored_store.fail_monitor_operation("expected_mint_load_all", true);
+        // A failed tracker inventory must not suppress the other monitors or
+        // prevent the ordered projector from running after this listener.
+        restarted.run_post_sync(&mut access).await.unwrap();
+        assert!(
+            restored_store
+                .claim_mint_expected_get(&serial.as_bytes())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(restarted.forged_mint_pending.lock().is_empty());
+    }
+
+    #[tokio::test]
     async fn monitor_cache_recovers_late_claim_and_preserves_landed_signal() {
         let ids = prov_ids();
         let (store, scanner) = scanner_with_faucets(&[ids.faucet_a], ids.bridge).await;
@@ -3226,8 +3378,8 @@ mod tests {
         for (note, landed) in [
             (&unknown, 0),
             (&attributed, 1),
-            (&with_metadata, 1),
-            (&twin, 1),
+            (&with_metadata, 2),
+            (&twin, 2),
         ] {
             let out = scanner
                 .scan_consumed_notes_monitors(std::slice::from_ref(note))
@@ -3453,7 +3605,13 @@ mod tests {
                     (1, 1, 0)
                 );
                 assert!(evicted.forged_mint_alerts.is_empty());
-                assert_eq!(evicted.landed_claim_ids.len(), 1);
+                assert_eq!(
+                    evicted.landed_claim_ids,
+                    std::collections::HashSet::from([
+                        notes[0].details_commitment().as_bytes(),
+                        notes[0].id().unwrap().as_bytes(),
+                    ])
+                );
             }
         }
     }
