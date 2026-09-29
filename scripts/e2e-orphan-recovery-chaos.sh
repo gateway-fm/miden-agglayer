@@ -60,6 +60,7 @@ recovery_progress() {
 for c in "$NODE" "$PROXY" "$PG"; do
     docker inspect "$c" >/dev/null 2>&1 || fail "container $c not found — is the stack up?"
 done
+command -v timeout >/dev/null || fail "GNU timeout is required to bound the chaos recovery flow"
 
 SUCC_BEFORE="$(recovery_progress)"
 
@@ -86,15 +87,21 @@ chaos_injector() {
 log "starting the wrapped l1-to-l2 deposit/claim under chaos"
 L1L2_LOG="$(mktemp /tmp/chaos-l1l2.XXXXXX.log)"
 (
-    # Generous polling so the flow outlasts the chaos + recovery windows: the chaos
-    # rounds (~130s) can orphan the covering GER as a PREPARED-but-unconfirmed note,
+    # The three fault rounds take ~147s after the 45s setup delay. They can orphan
+    # the covering GER or claim as a PREPARED-but-unconfirmed note,
     # which recovery only re-drives once its inclusion window expires past the
     # authoritative reconcile cursor (~submission_note_expiration_delta blocks) — then
     # the fresh GER injects, the deposit becomes claimable, and the claim lands. Allow
-    # 15 min end-to-end so "healed by at most a proxy restart" is what we measure, not
-    # an arbitrary deadline shorter than the (bounded) self-heal latency.
-    RECV_POLL_TRIES=90 RECV_POLL_INTERVAL=10 \
-    env COMPOSE_PROJECT_NAME="$PROJECT" bash "$HERE/e2e-l1-to-l2.sh"
+    # one 15-minute wall-clock window INCLUDING setup, faults, all polling and
+    # wallet assertions. RECV_POLL_* alone does not configure this flow's claim
+    # or balance waits. Lift those inner limits only for this interrupted flow;
+    # timeout enforces a shared cap instead of granting each phase a new 15 min.
+    # Expiry is a failure even if the child exits successfully during cleanup.
+    # The post-chaos liveness flows below retain their ordinary limits.
+    timeout --kill-after=10s 900s env COMPOSE_PROJECT_NAME="$PROJECT" \
+        CLAIM_SUBMIT_TIMEOUT=900 CLAIM_COMMIT_TIMEOUT=900 BALANCE_ATTEMPTS=90 \
+        RECV_POLL_TRIES=90 RECV_POLL_INTERVAL=10 \
+        bash "$HERE/e2e-l1-to-l2.sh"
 ) > "$L1L2_LOG" 2>&1 &
 L1L2_PID=$!
 

@@ -86,6 +86,8 @@ test-scripts: ## Syntax-check + run the shell guard test harnesses (no docker ne
 	# itself — so it runs here rather than only inside a docker-bound e2e.
 	bash -n scripts/test-chaos-verdict.sh
 	bash scripts/test-chaos-verdict.sh
+	bash -n scripts/e2e-orphan-recovery-chaos.sh
+	python3 scripts/test-orphan-recovery-chaos.py
 	bash -n scripts/aggkit-watchdog.sh scripts/lib-aggkit-recovery.sh scripts/aggkit-preserve-heal.sh
 	python3 scripts/test-aggkit-recovery.py
 	python3 scripts/test-e2e-fee-budget.py
