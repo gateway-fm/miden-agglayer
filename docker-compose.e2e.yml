@@ -250,6 +250,32 @@ services:
 
   # The sequencer is the RPC the proxy + aggkit talk to. Named `miden-node` so
   # the existing `--miden-node=http://miden-node:57291` wiring is unchanged.
+  # v0.17: the sequencer refuses to start without a DEPLOYED fee collector
+  # (created by node-bootstrap-sequencer). Deploying proves and submits a
+  # transaction straight to the validator, so it runs as its own one-shot —
+  # retrying until the validator answers — and the sequencer starts only after
+  # it succeeds. Doing it inline in the sequencer's command held the public RPC
+  # closed for several seconds after the container "started", and the proxy
+  # (depends_on: service_started) crash-looped on "connection refused" until
+  # `compose up --wait` gave up. `deploy` is idempotent, so restarts are safe.
+  node-fee-collector:
+    image: miden-node
+    volumes:
+      - node_data:/data
+    depends_on:
+      node-bootstrap-sequencer:
+        condition: service_completed_successfully
+      validator:
+        condition: service_started
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        i=0
+        until miden-node fee-collector deploy --data-directory /data/node --validator.url http://validator:50101; do
+          i=$$((i+1)); [ "$$i" -ge 60 ] && { echo "fee collector deploy: validator never answered"; exit 1; }
+          sleep 2
+        done
+
   miden-node:
     image: miden-node
     restart: on-failure
@@ -260,12 +286,12 @@ services:
     depends_on:
       node-bootstrap-sequencer:
         condition: service_completed_successfully
+      node-fee-collector:
+        condition: service_completed_successfully
       validator:
         condition: service_started
     # v0.17 (mirrors upstream scripts/run-node.sh):
-    #  - the fee collector must be DEPLOYED (to the validator) before the
-    #    sequencer starts; `deploy` is idempotent, so it runs on every start and
-    #    a not-yet-listening validator just fails the container into a restart;
+    #  - the fee collector is deployed by node-fee-collector above;
     #  - `--batch.builder.wallet-account-id` is required (no default) — the
     #    account that receives batch-builder fees; upstream's dev constant;
     #  - the node now enforces an account ALLOWLIST; local/dev networks disable
@@ -277,8 +303,6 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        set -e
-        miden-node fee-collector deploy --data-directory /data/node --validator.url http://validator:50101
         exec miden-node sequencer \
           --rpc.listen=0.0.0.0:57291 \
           --data-directory=/data/node \
