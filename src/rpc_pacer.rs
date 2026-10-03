@@ -53,10 +53,11 @@ use miden_protocol::Word;
 use miden_protocol::account::AccountId;
 use miden_protocol::address::NetworkId;
 use miden_protocol::batch::{ProposedBatch, ProvenBatch};
-use miden_protocol::block::{BlockHeader, BlockNumber, ProvenBlock};
+use miden_protocol::block::{BlockHeader, BlockNumber, SignedBlock};
 use miden_protocol::crypto::merkle::mmr::MmrProof;
 use miden_protocol::note::{NoteId, NoteScript, NoteTag};
 use miden_protocol::transaction::ProvenTransaction;
+use miden_protocol::vm::ExecutionProof;
 use std::collections::BTreeSet;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -238,7 +239,7 @@ impl NodeRpcClient for PacedRpcClient {
 
     async fn submit_proven_transaction(
         &self,
-        proven_transaction: ProvenTransaction,
+        proven_transaction: &ProvenTransaction,
         sealed_transaction_inputs: SealedTransactionInputs,
     ) -> Result<BlockNumber, RpcError> {
         self.call(
@@ -251,8 +252,8 @@ impl NodeRpcClient for PacedRpcClient {
 
     async fn submit_proven_batch(
         &self,
-        proven_batch: ProvenBatch,
-        proposed_batch: ProposedBatch,
+        proven_batch: &ProvenBatch,
+        proposed_batch: &ProposedBatch,
         transaction_inputs: Vec<SealedTransactionInputs>,
     ) -> Result<BlockNumber, RpcError> {
         self.call(
@@ -280,10 +281,30 @@ impl NodeRpcClient for PacedRpcClient {
         &self,
         block_num: BlockNumber,
         include_proof: bool,
-    ) -> Result<ProvenBlock, RpcError> {
+    ) -> Result<(SignedBlock, Option<ExecutionProof>), RpcError> {
         self.call(
             "get_block_by_number",
             self.inner.get_block_by_number(block_num, include_proof),
+        )
+        .await
+    }
+
+    async fn register_account(
+        &self,
+        invitation_code: &str,
+        account_id: AccountId,
+    ) -> Result<(), RpcError> {
+        self.call(
+            "register_account",
+            self.inner.register_account(invitation_code, account_id),
+        )
+        .await
+    }
+
+    async fn is_account_allowed(&self, account_id: AccountId) -> Result<bool, RpcError> {
+        self.call(
+            "is_account_allowed",
+            self.inner.is_account_allowed(account_id),
         )
         .await
     }

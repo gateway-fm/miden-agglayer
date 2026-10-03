@@ -24,6 +24,7 @@ pub mod fee_funding;
 pub mod fee_policy;
 pub mod fee_vault_monitor;
 pub mod forged_mint_detector;
+pub mod genesis_accounts;
 pub mod ger;
 pub mod hex;
 pub mod init;

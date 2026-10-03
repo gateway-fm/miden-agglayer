@@ -76,10 +76,9 @@ impl FeeSnapshot {
 pub async fn fee_snapshot(client: &mut MidenClientLib) -> anyhow::Result<FeeSnapshot> {
     for block in [BlockNumber::GENESIS, client.get_sync_height().await?] {
         if let Some((header, _)) = client.get_block_header_by_num(block).await? {
-            let p = header.fee_parameters();
             return Ok(FeeSnapshot {
-                verification_base_fee: p.verification_base_fee(),
-                fee_faucet_id: p.fee_faucet_id(),
+                verification_base_fee: header.fee_parameters().verification_base_fee(),
+                fee_faucet_id: crate::fee_policy::fee_faucet_id_for_header(client, &header).await?,
             });
         }
     }
@@ -126,9 +125,10 @@ pub fn cascade_amount(fee: &FeeSnapshot) -> u64 {
 }
 
 fn carries_fee_asset(note: &Note, fee: &FeeSnapshot) -> bool {
-    note.assets()
-        .iter()
-        .any(|a| matches!(a, Asset::Fungible(f) if f.faucet_id() == fee.fee_faucet_id))
+    note.assets().iter().any(|a| {
+        a.as_fungible()
+            .is_some_and(|f| f.faucet_id() == fee.fee_faucet_id)
+    })
 }
 
 /// Poll until `account_id` has at least one consumable note carrying the fee
@@ -219,7 +219,7 @@ pub async fn fund_from_service(
     amount: u64,
     fee: &FeeSnapshot,
 ) -> anyhow::Result<()> {
-    let asset = Asset::Fungible(
+    let asset = Asset::from(
         FungibleAsset::new(fee.fee_faucet_id, amount)
             .map_err(|e| anyhow!("fee asset {amount} for {name}: {e:?}"))?,
     );

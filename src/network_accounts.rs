@@ -33,26 +33,25 @@
 //! differences are the extended allowlist (+P2ID, scheduled at zero fee) and
 //! the trailing `BasicWallet`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use anyhow::anyhow;
 use miden_base_agglayer::{
-    AggLayerBridge, AggLayerFaucet, AgglayerBridgeError, AgglayerFaucetError, BridgeRoles, ExitRoot,
+    AggLayerBridge, AggLayerFaucet, AgglayerBridgeError, BridgeRoles, ExitRoot,
 };
 use miden_client::note::NoteScriptRoot;
 use miden_protocol::account::{Account, AccountBuilder, AccountId, StorageMapKey};
-use miden_protocol::asset::TokenSymbol;
+use miden_protocol::asset::{AssetAmount, TokenSymbol};
 use miden_protocol::crypto::hash::poseidon2::Poseidon2;
 use miden_protocol::{Felt, Word};
 use miden_standards::account::access::{
-    Authority, Ownable2Step, Pausable, PausableManager, RoleBasedAccessControl, RoleConfig,
+    Authority, Ownable2Step, Ownable2StepError, Pausable, PausableManager, RoleBasedAccessControl,
+    RoleConfig,
 };
 use miden_standards::account::auth::NetworkAccount;
-use miden_standards::account::faucets::FungibleFaucet;
+use miden_standards::account::faucets::{FungibleFaucet, FungibleFaucetError, TokenName};
 use miden_standards::account::fees::ConstantFeeManager;
-use miden_standards::account::policies::{
-    BurnPolicy, MintPolicy, TokenPolicyManager, TransferPolicy,
-};
+use miden_standards::account::policies::{BurnPolicy, MintPolicy, TokenPolicyManager};
 use miden_standards::account::wallets::BasicWallet;
 use miden_standards::note::P2idNote;
 
@@ -100,6 +99,14 @@ pub fn bridge_account_builder(
 /// `AggLayerFaucet::account_builder`, P2ID-fundable. Component-for-component
 /// the upstream builder, with the extended allowlist and a trailing
 /// `BasicWallet`.
+///
+/// 0.17: the faucet is a standard [`FungibleFaucet`] owned (`Ownable2Step`) by
+/// the bridge; RBAC gains the `FEE_MNGR` role (note repricing moved off `ADMIN`
+/// upstream) and the `Authority` uses upstream's procedure-role map. As
+/// upstream, no send/receive policies are registered, so the account is created
+/// with asset callbacks disabled. `faucet_admin` holds both `ADMIN` and
+/// `FEE_MNGR`, preserving the 0.16 authority (where repricing was `ADMIN`).
+/// The token symbol doubles as the token name: the proxy has no separate name.
 #[allow(clippy::too_many_arguments)]
 pub fn faucet_account_builder(
     seed: impl Into<[u8; 32]>,
@@ -115,15 +122,28 @@ pub fn faucet_account_builder(
     let fee_policy_manager = zero_fee_policy_manager_for(allowed.clone(), fee_faucet_id);
     let symbol = TokenSymbol::new(token_symbol)
         .map_err(|e| anyhow!("faucet token symbol {token_symbol:?}: {e:?}"))?;
-    let faucet = AggLayerFaucet::new(symbol, decimals, max_supply, initial_supply)
+    let name = TokenName::new(token_symbol)
+        .map_err(|e| anyhow!("faucet token name {token_symbol:?}: {e:?}"))?;
+    let max_supply = AssetAmount::try_from(max_supply)
+        .map_err(|e| anyhow!("faucet max supply for {token_symbol}: {e:?}"))?;
+    let initial_supply = AssetAmount::try_from(initial_supply)
+        .map_err(|e| anyhow!("faucet initial supply for {token_symbol}: {e:?}"))?;
+    let faucet = FungibleFaucet::builder()
+        .name(name)
+        .symbol(symbol)
+        .decimals(decimals)
+        .max_supply(max_supply)
+        .token_supply(initial_supply)
+        .build()
         .map_err(|e| anyhow!("faucet metadata for {token_symbol}: {e:?}"))?;
-    let rbac = RoleBasedAccessControl::with_admins([faucet_admin])
-        .map_err(|e| anyhow!("faucet RBAC admin: {e:?}"))?;
+    let rbac = RoleBasedAccessControl::builder()
+        .role(RoleConfig::new(RoleBasedAccessControl::admin_role()).with_member(faucet_admin))
+        .role(RoleConfig::new(AggLayerFaucet::fee_manager_role()).with_member(faucet_admin))
+        .build()
+        .map_err(|e| anyhow!("faucet RBAC roles: {e:?}"))?;
     let token_policy_manager = TokenPolicyManager::builder()
         .active_mint_policy(MintPolicy::owner_only())
         .active_burn_policy(BurnPolicy::owner_only())
-        .active_send_policy(TransferPolicy::allow_all())
-        .active_receive_policy(TransferPolicy::allow_all())
         .build();
     let builder = NetworkAccount::builder(seed.into(), allowed, fee_policy_manager)
         .map_err(|e| anyhow!("faucet note allowlist: {e:?}"))?
@@ -131,7 +151,7 @@ pub fn faucet_account_builder(
         .with_component(Ownable2Step::new(bridge_account_id))
         .with_component(rbac)
         .with_component(Authority::RbacControlled {
-            procedure_roles: BTreeMap::new(),
+            procedure_roles: AggLayerFaucet::procedure_roles(),
         })
         .with_components(token_policy_manager)
         .with_component(ConstantFeeManager::for_basic_constant_fee_policy())
@@ -176,15 +196,29 @@ pub fn is_ger_registered(
     Ok(stored == registered)
 }
 
-/// `AggLayerFaucet::owner_account_id` without the code-commitment gate: the
-/// AggLayer-owned faucet's `Ownable2Step` slot IS the discriminator — a
-/// Miden-native operator faucet has none and fails here, as upstream's does.
-pub fn owner_account_id(faucet_account: &Account) -> Result<AccountId, AgglayerFaucetError> {
-    let ownership = Ownable2Step::try_from_storage(faucet_account.storage())
-        .map_err(AgglayerFaucetError::Ownable2StepError)?;
-    ownership
-        .owner()
-        .ok_or(AgglayerFaucetError::OwnershipRenounced)
+/// Why an AggLayer faucet's ownership or metadata could not be read. 0.17
+/// removed upstream's `AgglayerFaucetError` (the faucet is now a plain
+/// `FungibleFaucet`); these are the same cases, kept typed so callers can still
+/// tell "renounced" from "not an AggLayer faucet".
+#[derive(Debug, thiserror::Error)]
+pub enum FaucetReadError {
+    #[error("faucet has no readable Ownable2Step ownership: {0}")]
+    Ownable2Step(#[from] Ownable2StepError),
+    #[error("faucet ownership has been renounced")]
+    OwnershipRenounced,
+    #[error("faucet storage does not carry the AggLayer ownership slots")]
+    StorageSlotsMismatch,
+    #[error("faucet metadata could not be decoded: {0}")]
+    FungibleFaucet(#[from] FungibleFaucetError),
+}
+
+/// The AggLayer-owned faucet's owner, read from its `Ownable2Step` slot — the
+/// slot IS the discriminator: a Miden-native operator faucet has none and fails
+/// here. No code-commitment gate (the P2ID-fundable faucet has an extra
+/// component, see above).
+pub fn owner_account_id(faucet_account: &Account) -> Result<AccountId, FaucetReadError> {
+    let ownership = Ownable2Step::try_from_storage(faucet_account.storage())?;
+    ownership.owner().ok_or(FaucetReadError::OwnershipRenounced)
 }
 
 /// `AggLayerFaucet::try_faucet_from_account` without the code-commitment gate:
@@ -192,11 +226,10 @@ pub fn owner_account_id(faucet_account: &Account) -> Result<AccountId, AgglayerF
 /// the standard fungible-faucet metadata.
 pub fn try_faucet_from_account(
     faucet_account: &Account,
-) -> Result<FungibleFaucet, AgglayerFaucetError> {
+) -> Result<FungibleFaucet, FaucetReadError> {
     Ownable2Step::try_from_storage(faucet_account.storage())
-        .map_err(|_| AgglayerFaucetError::StorageSlotsMismatch)?;
-    FungibleFaucet::try_from(faucet_account.storage())
-        .map_err(AgglayerFaucetError::FungibleFaucetError)
+        .map_err(|_| FaucetReadError::StorageSlotsMismatch)?;
+    Ok(FungibleFaucet::try_from(faucet_account.storage())?)
 }
 
 #[cfg(test)]

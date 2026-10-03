@@ -245,15 +245,16 @@ install-tools: ## Install development tools
 #
 # Bumping checklist: Makefile (REF + COMMIT) and run-all.sh (URL/REF/COMMIT).
 MIDEN_NODE_GIT_URL := https://github.com/0xMiden/node.git
-# v0.16.0 (stable). Its lock pins protocol 0.16.1 (ours too) + VM 0.29.4 (ours
-# too). No source patch, no vendor patch: the prover timeout is a flag, the
-# node-store callback-vault-key bug is fixed upstream, and the AggLayer network
-# id is a runtime storage slot.
-MIDEN_NODE_GIT_REF := v0.16.0
+# v0.17.0 (stable). Its lock pins protocol 0.17.0 (ours too) + VM 0.35.0 (ours
+# too). No source patch, no vendor patch. v0.17 changed the bootstrap: genesis
+# imports the native faucet + funding account as files, the sequencer needs a
+# deployed fee collector and a batch-builder wallet id, and the node account
+# allowlist is disabled for e2e — all in docker-compose.e2e.yml.
+MIDEN_NODE_GIT_REF := v0.17.0
 # The exact commit the tag points at (verified by `git ls-remote` at pin
 # time). run-all.sh checks the checkout's HEAD against this so a fork cannot
 # shadow the tag. Bump BOTH together.
-MIDEN_NODE_GIT_COMMIT := d6ce8b14d4680e0187b877c1de5c1cdeea16e7e2
+MIDEN_NODE_GIT_COMMIT := 77e9c717fb16217fad2ba8b6b9fa28dd73211f2c
 
 # Remote-custody overlay. Applies to the BASE e2e stack too, not just l2l2:
 # without it `make e2e-up` can only run local-keystore custody, and every

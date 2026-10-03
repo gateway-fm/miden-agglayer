@@ -197,7 +197,7 @@ pub async fn create_and_register_faucet(
             account.id(),
             service_id,
             async |client: &mut MidenClientLib| {
-                let asset = Asset::Fungible(FungibleAsset::new(
+                let asset = Asset::from(FungibleAsset::new(
                     fee.fee_faucet_id,
                     crate::fee_funding::cascade_amount(&fee),
                 )?);

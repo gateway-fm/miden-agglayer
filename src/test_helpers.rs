@@ -136,20 +136,25 @@ pub fn test_tx_record(
     )>,
 ) -> miden_client::rpc::domain::transaction::TransactionRecord {
     use miden_client::rpc::generated as proto;
-    let header = proto::transaction::TransactionHeader {
-        transaction_id: None,
-        account_id: Some(account.into()),
-        initial_state_commitment: Some(initial.into()),
-        final_state_commitment: Some(final_state.into()),
-        input_notes: nullifiers
-            .into_iter()
-            .map(|n| proto::transaction::InputNoteCommitment {
-                nullifier: Some(n.as_word().into()),
-                header: None,
-            })
-            .collect(),
-        output_notes: vec![],
-    };
+    use miden_protocol::transaction::{InputNoteCommitment, InputNotes, TransactionHeader};
+    // 0.17: the canonical proto decode requires `transaction_id` (and checks it
+    // against the header), so build the real domain header — whose id is
+    // computed — and convert it, instead of hand-assembling the proto.
+    let header = TransactionHeader::new(
+        account,
+        initial,
+        final_state,
+        InputNotes::new(
+            nullifiers
+                .into_iter()
+                .map(InputNoteCommitment::from)
+                .collect(),
+        )
+        .expect("test input notes are valid"),
+        vec![],
+    )
+    .expect("test transaction header is valid");
+    let header = proto::transaction::TransactionHeader::from(&header);
     let record = proto::rpc::TransactionRecord {
         block_num: block,
         header: Some(header),
@@ -158,7 +163,7 @@ pub fn test_tx_record(
             .into_iter()
             .map(|(n, id)| proto::rpc::ConsumedNoteRef {
                 nullifier: Some(n.as_word().into()),
-                note_id: Some(id.into()),
+                note_id: Some((&id).into()),
             })
             .collect(),
     };
