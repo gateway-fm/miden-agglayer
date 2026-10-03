@@ -257,7 +257,15 @@ services:
   # it succeeds. Doing it inline in the sequencer's command held the public RPC
   # closed for several seconds after the container "started", and the proxy
   # (depends_on: service_started) crash-looped on "connection refused" until
-  # `compose up --wait` gave up. `deploy` is idempotent, so restarts are safe.
+  # `compose up --wait` gave up.
+  #
+  # It must also be a no-op once deployed — like the bootstrap one-shots and for
+  # the same reason: `compose start <svc>` RE-RUNS every completed one-shot in
+  # the dependency chain. Re-running `deploy` against a LIVE sequencer fails on
+  # the store's RocksDB lock ("While lock file: /data/node/nullifiertree/LOCK")
+  # — upstream: "stop any node process that uses the data directory" — which
+  # failed `compose start miden-agglayer` and killed the Cantina #6 restore
+  # scenario silently. Hence the marker, written only after a successful deploy.
   node-fee-collector:
     image: miden-node
     volumes:
@@ -270,11 +278,13 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
+        if [ -f /data/node/.fee-collector-deployed ]; then echo "fee collector already deployed"; exit 0; fi
         i=0
         until miden-node fee-collector deploy --data-directory /data/node --validator.url http://validator:50101; do
-          i=$$((i+1)); [ "$$i" -ge 60 ] && { echo "fee collector deploy: validator never answered"; exit 1; }
+          i=$$((i+1)); [ "$$i" -ge 60 ] && { echo "fee collector deploy: still failing after $$i attempts (see errors above)"; exit 1; }
           sleep 2
         done
+        touch /data/node/.fee-collector-deployed
 
   miden-node:
     image: miden-node
