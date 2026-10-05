@@ -178,18 +178,21 @@ mod tests {
     /// if the decode is completely broken — and a monitor that cannot read the
     /// slot reports exactly the same "no drift" as a healthy one.
     ///
-    /// This pins the decode itself against a faucet built by the real 0.16
-    /// builder, so a storage-layout or code-commitment change upstream breaks a
-    /// test instead of silently blinding the monitor in production.
+    /// This pins the decode itself against a faucet built by the real
+    /// production builder (`network_accounts::faucet_account_builder`, the path
+    /// `faucet_ops` deploys with) and read by the production decoder
+    /// (`network_accounts::owner_account_id`, the one `bridge_out` calls), so a
+    /// storage-layout change upstream breaks a test instead of silently
+    /// blinding the monitor in production.
     #[test]
-    fn cantina_4_owner_decodes_from_real_0_16_faucet_storage() {
+    fn cantina_4_owner_decodes_from_real_faucet_storage() {
         let bridge = aid("0xac0000000000dd110000ee000000fc");
-        // Same production builder path faucet_ops uses (rc.4): admin is any
-        // account (irrelevant to the owner decode), fees are zero against a
-        // dummy fee faucet — pure construction, no chain access.
+        // Same production builder path faucet_ops uses: admin is any account
+        // (irrelevant to the owner decode), fees are zero against a dummy fee
+        // faucet — pure construction, no chain access.
         let admin = aid("0xac0000000000dd110000ee000000ad");
         let fee_faucet = aid("0x9a0000000000dd110000ee000000fc");
-        let faucet = miden_base_agglayer::AggLayerFaucet::account_builder(
+        let faucet = crate::network_accounts::faucet_account_builder(
             Word::from([1u32, 2, 3, 4]),
             "TST",
             8,
@@ -197,16 +200,14 @@ mod tests {
             Felt::new(0).unwrap(),
             admin,
             bridge,
-            crate::fee_policy::zero_fee_policy_manager_for(
-                miden_base_agglayer::AggLayerFaucet::allowed_notes(),
-                fee_faucet,
-            ),
+            fee_faucet,
         )
+        .expect("agglayer faucet builder")
         .build()
         .expect("agglayer faucet account");
 
-        let observed = miden_base_agglayer::AggLayerFaucet::owner_account_id(&faucet)
-            .expect("0.16 faucet storage must decode to an owner");
+        let observed = crate::network_accounts::owner_account_id(&faucet)
+            .expect("AggLayer faucet storage must decode to an owner");
         assert_eq!(
             observed, bridge,
             "the builder sets Ownable2Step to the bridge; the decode must round-trip it"
@@ -250,7 +251,7 @@ mod tests {
             .expect("native faucet account");
 
         assert!(
-            miden_base_agglayer::AggLayerFaucet::owner_account_id(&account).is_err(),
+            crate::network_accounts::owner_account_id(&account).is_err(),
             "a native faucet has no AggLayer ownership slots — the decode must fail"
         );
         assert_eq!(

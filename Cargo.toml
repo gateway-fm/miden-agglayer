@@ -32,8 +32,8 @@ path = "src/bin/bridge_autoclaim.rs"
 [dev-dependencies]
 # testing exposes the generated proto types — the ONLY public construction
 # path for rpc TransactionRecord fixtures (consumed_note_refs is pub(crate)
-# upstream in 0.16.0).
-miden-client = { version = "=0.16.0", features = ["testing", "tonic"] }
+# upstream since 0.16.0).
+miden-client = { version = "=0.17.0", features = ["testing", "tonic"] }
 tempfile = "3.10"
 # test-util enables tokio's paused virtual clock (start_paused) — used by the
 # ger::poll_until_ready timing regression test to pin the exact sleep count
@@ -140,31 +140,34 @@ deadpool-postgres = { version = "0.14", optional = true }
 # pages, so it returns ALL matches with bounded memory. Only used on the pg path.
 futures-util = { version = "0.3", optional = true }
 
-# Release matrix (refreshed 2026-09-08: stable 0.16 line — node v0.16.0,
-# protocol 0.16.1, client 0.16.0):
+# Release matrix (refreshed 2026-10-03: stable 0.17 line — node v0.17.0,
+# protocol 0.17.0, client 0.17.0):
 #   - protocol crates (miden-protocol / miden-standards / miden-agglayer /
-#     miden-tx) = 0.16.1 (stable), exact pins kept aligned (never mix protocol
-#     releases). 0.16.1 is what miden-node v0.16.0 (its Cargo.lock) and
-#     miden-client 0.16.0 build against, so the BURN/MINT/CLAIM/B2AGG MAST
-#     roots agree across the node/client boundary by construction. This is a
-#     rc.9 -> 0.16.1 stabilization on the SAME 0.16 line (no API train jump);
-#     the e2e genesis is redeployed by the proxy's --init, so no committed
-#     account file needs regenerating. Do NOT jump to 0.17.x (needs VM 0.32,
-#     breaking train).
-#   - miden-client / miden-client-sqlite-store = 0.16.0 (stable), STOCK
+#     miden-tx) = 0.17.0 (stable), exact pins kept aligned (never mix protocol
+#     releases). 0.17.0 is exactly what miden-node v0.17.0's Cargo.lock
+#     resolves (verified against the tag), so the BURN/MINT/CLAIM/B2AGG MAST
+#     roots agree across the node/client boundary by construction.
+#   - miden-client / miden-client-sqlite-store = 0.17.0 (stable), STOCK
 #     crates.io release, no [patch.crates-io], no vendor/ (#177 stays closed).
-#     0.16.0 is rc.5 + the finalization; its submission-retry fix (endpoint-
-#     aware, rust-sdk#2441/#2489) is retained. Bumping the client forces the
-#     protocol bump: client 0.16.0 requires protocol ^0.16, which the rc.9
-#     prerelease does not satisfy. The caller-side backstop
+#     Requires a new client database (sqlite schema changed) — every e2e run
+#     starts from a fresh store anyway. The caller-side backstop
 #     (`submit_is_indeterminate` in src/bin/bridge_out_tool.rs) stays.
-#   - VM train (miden-assembly / miden-core / miden-processor) = 0.29, lock
-#     cohort at 0.29.4 — protocol 0.16.1 still requires ^0.29.1; do not jump to
-#     0.30/0.32 (breaking trains). The node v0.16.0 lock resolves 0.29.4.
-#   - services interact with a miden-node v0.16.0 e2e stack; the Makefile
+#   - VM train (miden-assembly / miden-core / miden-processor) = 0.35 (lock
+#     cohort 0.35.0) — what protocol 0.17.0 and the node v0.17.0 lock require.
+#   - services interact with a miden-node v0.17.0 e2e stack; the Makefile
 #     (MIDEN_NODE_GIT_REF) is the single source of truth for the node ref.
-#   - Rust toolchain 1.98.1 (rust-version above; protocol 0.16.1 / client
-#     0.16.0 MSRV).
+#   - Rust toolchain 1.98.1 (rust-version above; protocol 0.17.0 / client
+#     0.17.0 MSRV, unchanged from 0.16).
+# 0.17 port, in brief: the fee asset moved from the block header's
+# FeeParameters into the ProtocolConfig (header carries its commitment);
+# `Asset` became a struct (`as_fungible`, `Asset::from`); the AggLayer faucet is
+# a standard FungibleFaucet (FEE_MNGR role, upstream procedure-role map, no
+# transfer policies), BridgeRoles gained FEE_MNGR + PAUSER (both held by the
+# service account — its 0.16 ADMIN authority); P2ID storage gained a 2-felt
+# salt (MINT->P2ID storage is 24 items, was 22); NodeRpcClient returns a
+# SignedBlock + optional proof and submits by reference; AccountFile/NoteFile
+# moved to miden-objects (protobuf-encoded).
+#
 # Headline API changes ported in the rc.6 migration: create_bridge_account grew a
 # GER-remover role (4 args), duplicate GER injection now aborts with
 # ERR_GER_ALREADY_REGISTERED (was silent success), B2AGG notes must be
@@ -174,35 +177,35 @@ futures-util = { version = "0.3", optional = true }
 # MAST-root consistency note (carried over from the 0.14/0.15 pins): the
 # proxy-side `BurnNote::script_root()` MUST match the miden-node binary's, or
 # every L2→L1 bridge-out fails in the node's NTX `before_created` handler with
-# "note script with root <X> not found". The 0.16.1 base crates resolve
-# miden-assembly/core 0.29.x; keep these in lockstep with the deployed
-# miden-node v0.16.0 release and tighten to an exact patch if a root
+# "note script with root <X> not found". The 0.17.0 base crates resolve
+# miden-assembly/core 0.35.x; keep these in lockstep with the deployed
+# miden-node v0.17.0 release and tighten to an exact patch if a root
 # mismatch resurfaces during the e2e regression.
-miden-base-agglayer = { package = "miden-agglayer", version = "=0.16.1" }
+miden-base-agglayer = { package = "miden-agglayer", version = "=0.17.0" }
 miden-protocol = { default-features = false, features = [
   "std",
-], version = "=0.16.1" }
-miden-standards = { default-features = false, version = "=0.16.1" }
-miden-tx = { default-features = false, version = "=0.16.1" }
+], version = "=0.17.0" }
+miden-standards = { default-features = false, version = "=0.17.0" }
+miden-tx = { default-features = false, version = "=0.17.0" }
 
-miden-assembly = { default-features = false, version = "0.29" }
-miden-core = { default-features = false, version = "0.29" }
+miden-assembly = { default-features = false, version = "0.35" }
+miden-core = { default-features = false, version = "0.35" }
 # Typed inspection of the kernel's foreign-account staleness assertion
 # (ExecutionError::OperationError → OperationError::FailedAssertion) — the
 # type sits inside miden-tx's executor error but is not re-exported by
 # miden-tx/miden-client, and the generated kernel error constants are gated
 # behind miden-protocol's `testing` feature. Already in the tree via miden-tx;
-# cargo unifies this to the same 0.29 build.
+# cargo unifies this to the same 0.35 build.
 miden-processor = { default-features = false, features = [
   "std",
-], version = "0.29" }
+], version = "0.35" }
 
-# miden-client 0.16.0 — stock crates.io release (see the release matrix above
+# miden-client 0.17.0 — stock crates.io release (see the release matrix above
 # for why no patch is needed). sqlite-store pinned in lockstep.
 miden-client = { default-features = false, features = [
   "tonic",
-], version = "=0.16.0" }
-miden-client-sqlite-store = { version = "=0.16.0" }
+], version = "=0.17.0" }
+miden-client-sqlite-store = { version = "=0.17.0" }
 
 [features]
 default = []

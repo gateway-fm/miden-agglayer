@@ -77,9 +77,9 @@ services:
   # Images are built from 0xMiden/node @ the rev pinned in the Makefile
   # (MIDEN_NODE_GIT_REF) by run-all.sh phase 0c — one binary per image
   # (tags: miden-node / miden-validator / miden-ntx-builder
-  # / miden-remote-prover). Genesis is bootstrapped from our vendored agglayer
-  # config (fixtures/genesis/02-with-account-files.toml — chain parameters
-  # only; the proxy's --init deploys bridge + ETH/USDC faucets at runtime).
+  # / miden-remote-prover). Genesis imports two committed dev account files
+  # (fixtures/genesis/native_faucet.mac + faucet_operator.mac, see below); the
+  # proxy's --init deploys bridge + ETH/USDC faucets at runtime.
   # The bridge is deployed but left UNCONFIGURED — faucet registration
   # happens at runtime via the proxy's CONFIG_AGG_BRIDGE note.
   #
@@ -119,6 +119,19 @@ services:
   # fixture (fixtures/genesis/insecure-storage-key, participant 1 — the same
   # share run-node.sh feeds its validator 1). Public, deterministic, never
   # for production.
+  #
+  # NODE v0.17 GENESIS: `miden-validator genesis` no longer generates the native
+  # fee faucet and its pre-funded operator from a TOML (`--config` is gone). It
+  # IMPORTS them as account files: `--native-faucet` (a deployed fungible
+  # faucet) and `--funding-account` (a public wallet holding that faucet's
+  # supply), plus `--verification-base-fee` and `--timestamp` as flags. Both
+  # files are committed dev fixtures written by
+  # `bridge-out-tool --write-genesis-accounts fixtures/genesis`
+  # (src/genesis_accounts.rs, upstream's own harness recipe). The operator file
+  # carries its INSECURE signing key — public, deterministic, never for
+  # production — and is copied to /data/accounts/faucet_operator.mac, where the
+  # fee-funder sidecar has always read it. Base fee 7 mirrors the live testnet
+  # (#201: fees ENABLED in e2e so the battery exercises the real funding path).
   node-bootstrap-validator:
     image: miden-validator
     volumes:
@@ -137,8 +150,14 @@ services:
         miden-validator genesis \
           --genesis-block-directory /data/genesis \
           --accounts-directory /data/accounts \
-          --config /genesis/02-with-account-files.toml \
+          --native-faucet /genesis/native_faucet.mac \
+          --funding-account /genesis/faucet_operator.mac \
+          --verification-base-fee 7 \
+          --timestamp 1717344256 \
           --validator.key "$$VALIDATOR_PUBKEY"
+        # genesis writes only the accounts it generates; the imported funding
+        # account is the fee-funder's spend source, so place it where it reads.
+        cp /genesis/faucet_operator.mac /data/accounts/faucet_operator.mac
         miden-validator bootstrap \
           --data-directory /data/validator \
           --genesis /data/genesis/genesis.dat
@@ -159,6 +178,9 @@ services:
         rm -rf /data/node
         mkdir -p /data/node
         miden-node bootstrap --data-directory /data/node --genesis /data/genesis/genesis.dat
+        # v0.17: the sequencer reads fee-collector.mac from its data directory
+        # at startup (mandatory); created once here, deployed below.
+        miden-node fee-collector create --data-directory /data/node
         touch /data/node/.bootstrapped
 
   node-bootstrap-ntx:
@@ -228,13 +250,24 @@ services:
 
   # The sequencer is the RPC the proxy + aggkit talk to. Named `miden-node` so
   # the existing `--miden-node=http://miden-node:57291` wiring is unchanged.
-  miden-node:
+  # v0.17: the sequencer refuses to start without a DEPLOYED fee collector
+  # (created by node-bootstrap-sequencer). Deploying proves and submits a
+  # transaction straight to the validator, so it runs as its own one-shot —
+  # retrying until the validator answers — and the sequencer starts only after
+  # it succeeds. Doing it inline in the sequencer's command held the public RPC
+  # closed for several seconds after the container "started", and the proxy
+  # (depends_on: service_started) crash-looped on "connection refused" until
+  # `compose up --wait` gave up.
+  #
+  # It must also be a no-op once deployed — like the bootstrap one-shots and for
+  # the same reason: `compose start <svc>` RE-RUNS every completed one-shot in
+  # the dependency chain. Re-running `deploy` against a LIVE sequencer fails on
+  # the store's RocksDB lock ("While lock file: /data/node/nullifiertree/LOCK")
+  # — upstream: "stop any node process that uses the data directory" — which
+  # failed `compose start miden-agglayer` and killed the Cantina #6 restore
+  # scenario silently. Hence the marker, written only after a successful deploy.
+  node-fee-collector:
     image: miden-node
-    restart: on-failure
-    ports:
-      - "127.0.0.1:57291:57291"
-    environment:
-      RUST_LOG: "info,miden_node_ntx_builder=debug"
     volumes:
       - node_data:/data
     depends_on:
@@ -242,14 +275,51 @@ services:
         condition: service_completed_successfully
       validator:
         condition: service_started
+    entrypoint: ["/bin/sh", "-c"]
     command:
-      - miden-node
-      - sequencer
-      - --rpc.listen=0.0.0.0:57291
-      - --data-directory=/data/node
-      - --validator.url=http://validator:50101
-      - --ntx-builder.url=http://ntx-builder:50301
-      - --rpc.network-tx-auth-header-value=${MIDEN_NTX_AUTH:-e2e-ntx-secret}
+      - |
+        if [ -f /data/node/.fee-collector-deployed ]; then echo "fee collector already deployed"; exit 0; fi
+        i=0
+        until miden-node fee-collector deploy --data-directory /data/node --validator.url http://validator:50101; do
+          i=$$((i+1)); [ "$$i" -ge 60 ] && { echo "fee collector deploy: still failing after $$i attempts (see errors above)"; exit 1; }
+          sleep 2
+        done
+        touch /data/node/.fee-collector-deployed
+
+  miden-node:
+    image: miden-node
+    restart: on-failure
+    ports:
+      - "127.0.0.1:57291:57291"
+    volumes:
+      - node_data:/data
+    depends_on:
+      node-bootstrap-sequencer:
+        condition: service_completed_successfully
+      node-fee-collector:
+        condition: service_completed_successfully
+      validator:
+        condition: service_started
+    # v0.17 (mirrors upstream scripts/run-node.sh):
+    #  - the fee collector is deployed by node-fee-collector above;
+    #  - `--batch.builder.wallet-account-id` is required (no default) — the
+    #    account that receives batch-builder fees; upstream's dev constant;
+    #  - the node now enforces an account ALLOWLIST; local/dev networks disable
+    #    it (upstream default in run-node.sh), else every account the proxy
+    #    and the tests create is refused.
+    environment:
+      RUST_LOG: "info,miden_node_ntx_builder=debug"
+      MIDEN_NODE_DISABLE_ACCOUNT_ALLOWLIST: "true"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        exec miden-node sequencer \
+          --rpc.listen=0.0.0.0:57291 \
+          --data-directory=/data/node \
+          --validator.url=http://validator:50101 \
+          --ntx-builder.url=http://ntx-builder:50301 \
+          --batch.builder.wallet-account-id=0xcc0000000000dd010000ee000000ff \
+          --rpc.network-tx-auth-header-value=${MIDEN_NTX_AUTH:-e2e-ntx-secret}
 
   ntx-builder:
     image: miden-ntx-builder

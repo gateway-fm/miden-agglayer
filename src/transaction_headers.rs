@@ -35,7 +35,8 @@ pub(crate) async fn recover_input_headers(
         }
     }
     for (number, indices) in blocks {
-        let block = rpc
+        // 0.17: the block and its (optional) proof come back separately.
+        let (block, _proof) = rpc
             .get_block_by_number(number, false)
             .await
             .with_context(|| format!("recover input headers at block {number}"))?;
@@ -134,7 +135,8 @@ mod tests {
             )])
             .unwrap(),
             vec![],
-        );
+        )
+        .unwrap();
         (decoded, full, note)
     }
 
@@ -187,14 +189,16 @@ mod tests {
             ])
             .unwrap(),
             vec![],
-        );
+        )
+        .unwrap();
         let reversed = TransactionHeader::new(
             full.account_id(),
             full.initial_state_commitment(),
             full.final_state_commitment(),
             InputNotes::new(vec![second, first]).unwrap(),
             vec![],
-        );
+        )
+        .unwrap();
         assert!(restore_record_header(&mut record, &[reversed]).is_err());
     }
 

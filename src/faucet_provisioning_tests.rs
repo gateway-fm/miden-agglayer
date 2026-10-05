@@ -613,7 +613,7 @@ async fn faucet_note_reconciliation_uses_node_without_local_apply() {
         .add_existing_basic_faucet(Auth::IncrNonce, "FEE", 1000, Some(100))
         .unwrap()
         .id();
-    let asset = Asset::Fungible(FungibleAsset::new(fee_faucet, 100).unwrap());
+    let asset = Asset::from(FungibleAsset::new(fee_faucet, 100).unwrap());
     let funding = builder
         .add_p2id_note(fee_faucet, sender.id(), &[asset], NoteType::Public)
         .unwrap();

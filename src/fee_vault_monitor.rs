@@ -28,7 +28,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use miden_protocol::account::{Account, AccountId};
-use miden_protocol::asset::Asset;
 use tokio::sync::oneshot;
 
 use crate::fee_funding::{FeeSnapshot, fee_snapshot, max_fee_per_txn};
@@ -44,9 +43,11 @@ pub fn fee_balance(account: &Account, fee_faucet_id: AccountId) -> u64 {
     account
         .vault()
         .assets()
-        .find_map(|asset| match asset {
-            Asset::Fungible(f) if f.faucet_id() == fee_faucet_id => Some(f.amount().as_u64()),
-            _ => None,
+        .find_map(|asset| {
+            asset
+                .as_fungible()
+                .filter(|f| f.faucet_id() == fee_faucet_id)
+                .map(|f| f.amount().as_u64())
         })
         .unwrap_or(0)
 }

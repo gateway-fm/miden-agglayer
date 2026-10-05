@@ -152,10 +152,15 @@ async fn add_bridge(
     // account also carries the mandatory fee components — zero fees against
     // the chain's real fee faucet.
     let fee_faucet_id = crate::fee_policy::fee_faucet_id_from_chain(client).await?;
+    // 0.17 split note repricing (FEE_MNGR) and emergency pause (PAUSER) off
+    // ADMIN into their own roles; the service account keeps both, exactly the
+    // authority it had as ADMIN on 0.16.
     let roles = BridgeRoles::new(
         std::collections::BTreeSet::from([service_id]),
         std::collections::BTreeSet::from([ger_manager_id]),
         std::collections::BTreeSet::from([ger_manager_id]),
+        std::collections::BTreeSet::from([service_id]),
+        std::collections::BTreeSet::from([service_id]),
     )
     .map_err(|e| anyhow::anyhow!("bridge role construction failed: {e}"))?;
     let account = crate::network_accounts::bridge_account_builder(

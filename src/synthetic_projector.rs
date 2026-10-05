@@ -57,6 +57,7 @@ use crate::miden_client::{
 use crate::store::Store;
 use crate::writer_worker::DecodedWriteCall;
 use alloy::primitives::TxHash;
+use miden_client::note::NoteFile;
 use miden_client::rpc::NodeRpcClient;
 use miden_client::rpc::domain::note::FetchedNote;
 use miden_client::rpc::domain::transaction::TransactionRecord;
@@ -68,7 +69,6 @@ use miden_protocol::block::BlockNumber;
 use miden_protocol::note::{
     NoteAttachments, NoteDetails, NoteId, NoteMetadata, NoteTag, Nullifier,
 };
-use miden_standards::note::NoteFile;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};

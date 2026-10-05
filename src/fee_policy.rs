@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use miden_client::note::NoteScriptRoot;
 use miden_protocol::account::AccountId;
 use miden_protocol::asset::AssetAmount;
-use miden_protocol::block::BlockNumber;
+use miden_protocol::block::{BlockHeader, BlockNumber};
 use miden_standards::account::fees::{BasicConstantFeePolicy, FeePolicyManager};
 
 use crate::miden_client::MidenClientLib;
@@ -34,13 +34,26 @@ pub fn zero_fee_policy_manager_for(
         .build()
 }
 
-/// The chain's fee faucet id, from block-header fee parameters (constant for
-/// the chain's lifetime — the genesis header is authoritative; the current
-/// sync-height header is the fallback when genesis is not stored locally).
+/// The fee faucet a block header commits to. Since protocol 0.17 the fee asset
+/// lives in the `ProtocolConfig` (header carries only its commitment); the
+/// client stores the config by commitment when it syncs past it.
+pub async fn fee_faucet_id_for_header(
+    client: &MidenClientLib,
+    header: &BlockHeader,
+) -> anyhow::Result<AccountId> {
+    let config = client
+        .get_protocol_config(header.protocol_config_commitment())
+        .await?;
+    Ok(config.fee_asset_id().faucet_id())
+}
+
+/// The chain's fee faucet id (constant for the chain's lifetime — the genesis
+/// header is authoritative; the current sync-height header is the fallback
+/// when genesis is not stored locally).
 pub async fn fee_faucet_id_from_chain(client: &MidenClientLib) -> anyhow::Result<AccountId> {
     for block in [BlockNumber::GENESIS, client.get_sync_height().await?] {
         if let Some((header, _)) = client.get_block_header_by_num(block).await? {
-            return Ok(header.fee_parameters().fee_faucet_id());
+            return fee_faucet_id_for_header(client, &header).await;
         }
     }
     anyhow::bail!(

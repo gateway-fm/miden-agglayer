@@ -292,7 +292,7 @@ impl NoteProvenanceFacts {
             .collect();
         // Standard/AggLayer MINT notes intentionally have no outer NoteAssets.
         // The asset which `mint_and_send` binds to the consuming faucet lives in
-        // the canonical 22-felt MINT storage instead. Treat that faucet as
+        // the canonical MINT storage instead. Treat that faucet as
         // positive provenance too, otherwise a metadata-stripped MINT carrying
         // one of OUR faucets but a foreign attachment could be misclassified as
         // foreign and skipped by #2/#4.
@@ -645,13 +645,18 @@ fn monitor_registry_key(faucets: &[crate::store::FaucetEntry]) -> [u8; 32] {
 /// Decode the real AggLayer MINT representation.
 ///
 /// MINT notes have an empty outer `NoteAssets`; the standard MINT script reads
-/// the asset and the P2ID output recipient from its 22-felt public storage:
+/// the asset and the P2ID output recipient from its public storage:
 ///
 /// - `[0..4]` P2ID script root
 /// - `[4..8]` P2ID serial (the claim proof-data key)
 /// - `[8..12]` asset key, `[12..16]` asset value
 /// - `[16]` P2ID destination tag, `[17..20]` zero padding
-/// - `[20..22]` P2ID destination account (suffix, prefix)
+/// - `[20..]` the P2ID note storage: destination account (suffix, prefix) and,
+///   since 0.17, a 2-felt salt — 24 items in all (22 on 0.16)
+///
+/// The expected length is derived from upstream's constants, never hard-coded,
+/// so a future layout change makes every MINT undecodable (loud: `Undetermined`
+/// alerts) rather than silently decoded wrong.
 ///
 /// Any non-canonical/undecodable shape returns `None` and is handled as
 /// `Undetermined` by #4; it is never accepted as legitimate.
@@ -667,7 +672,10 @@ fn observed_mint_identity(note: &InputNoteRecord) -> Option<ObservedMintIdentity
         return None;
     }
     let items = note.details().storage().items();
-    if items.len() != 22 || items[..4] != *P2idNote::script_root().as_elements() {
+    let p2id_offset = MintNote::MIN_NUM_STORAGE_ITEMS_PUBLIC;
+    if items.len() != p2id_offset + P2idNote::NUM_STORAGE_ITEMS
+        || items[..4] != *P2idNote::script_root().as_elements()
+    {
         return None;
     }
 
@@ -679,7 +687,9 @@ fn observed_mint_identity(note: &InputNoteRecord) -> Option<ObservedMintIdentity
     let key = Word::from(<[Felt; 4]>::try_from(&items[8..12]).ok()?);
     let value = Word::from(<[Felt; 4]>::try_from(&items[12..16]).ok()?);
     let asset = FungibleAsset::from_id_and_value_words(key, value).ok()?;
-    let destination = P2idNoteStorage::try_from(&items[20..22]).ok()?.target();
+    let destination = P2idNoteStorage::try_from(&items[p2id_offset..])
+        .ok()?
+        .target();
     if items[16] != Felt::from(NoteTag::with_account_target(destination))
         || items[17..20].iter().any(|felt| *felt != Felt::ZERO)
     {
@@ -1883,7 +1893,7 @@ impl BridgeOutScanner {
             let observed: Option<AccountId> = match crate::network_accounts::owner_account_id(&acct)
             {
                 Ok(id) => Some(id),
-                Err(miden_base_agglayer::AgglayerFaucetError::OwnershipRenounced) => None,
+                Err(crate::network_accounts::FaucetReadError::OwnershipRenounced) => None,
                 Err(e) => {
                     // Classification already proved this IS an AggLayer
                     // faucet, so a decode failure here means the monitor
@@ -2882,7 +2892,7 @@ mod tests {
     }
 
     /// A canonical AggLayer MINT: empty outer assets and the fungible asset +
-    /// public P2ID output recipient encoded in the real 22-felt storage.
+    /// public P2ID output recipient encoded in the real MINT storage.
     fn mint_note_with_asset(
         serial: miden_protocol::Word,
         faucet: AccountId,
@@ -2946,7 +2956,7 @@ mod tests {
         let asset = FungibleAsset::new(faucet, amount).unwrap();
         let p2id_recipient = P2idNoteStorage::new(destination).into_recipient(serial);
         let storage = NoteStorage::from(
-            MintNoteStorage::new_fungible_public(
+            MintNoteStorage::new_public(
                 p2id_recipient,
                 asset,
                 NoteTag::with_account_target(destination),
@@ -3526,7 +3536,9 @@ mod tests {
             note.details().assets().is_empty(),
             "standard MINT notes have no outer assets"
         );
-        assert_eq!(note.details().storage().num_items(), 22);
+        // 0.17: 20 MINT items + the 4-item P2ID storage (target + 2-felt salt);
+        // it was 22 on 0.16. Pinned literally so a layout change trips here.
+        assert_eq!(note.details().storage().num_items(), 24);
         assert_eq!(
             observed_mint_identity(&note),
             Some(ObservedMintIdentity {

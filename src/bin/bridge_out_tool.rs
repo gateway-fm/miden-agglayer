@@ -210,6 +210,14 @@ struct Args {
     #[arg(long)]
     funding_manifest: Option<PathBuf>,
 
+    /// Node v0.17: write the genesis INPUT accounts (`native_faucet.mac` +
+    /// `faucet_operator.mac`) that `miden-validator genesis --native-faucet
+    /// --funding-account` imports, into this directory, and exit. Never contacts
+    /// the node; the global `--store-dir`/`--node-url` are still required by the
+    /// parser but unused.
+    #[arg(long, value_name = "DIR")]
+    write_genesis_accounts: Option<PathBuf>,
+
     /// Extra targets, repeatable: `<account-id-hex>=<amount>`.
     #[arg(long = "fund", num_args = 1..)]
     fund: Vec<String>,
@@ -618,9 +626,9 @@ async fn fund_fee_asset(
     use miden_agglayer_service::miden_client::{
         submit_new_transaction, wait_for_transaction_commit,
     };
+    use miden_client::account::AccountFile;
     use miden_client::keystore::Keystore as _;
     use miden_client::transaction::{PaymentNoteDescription, TransactionRequestBuilder};
-    use miden_protocol::account::AccountFile;
     use miden_protocol::asset::{Asset, FungibleAsset};
     use miden_protocol::note::NoteType;
 
@@ -629,8 +637,8 @@ async fn fund_fee_asset(
     })?;
     let file = AccountFile::read(mac)
         .with_context(|| format!("reading faucet operator account file {}", mac.display()))?;
-    let operator_id = file.account.id();
-    if file.auth_secret_keys.is_empty() {
+    let operator_id = file.account().id();
+    if file.auth_secret_keys().is_empty() {
         return Err(anyhow!(
             "{} carries no signing key — is this native_faucet.mac instead of \
              faucet_operator.mac? The operator (the faucet's owner) is the funding source",
@@ -639,7 +647,7 @@ async fn fund_fee_asset(
     }
     // The operator must SIGN its sends: load its secret(s) into this tool's
     // local keystore.
-    for key in &file.auth_secret_keys {
+    for key in file.auth_secret_keys() {
         keystore
             .add_key(key, operator_id)
             .await
@@ -649,7 +657,7 @@ async fn fund_fee_asset(
     // the genesis file over it fails with AccountNonceTooLow.
     if client.get_account(operator_id).await?.is_none() {
         client
-            .add_account(&file.account, false)
+            .add_account(file.account(), false)
             .await
             .map_err(|e| anyhow!("importing faucet operator {}: {e:?}", operator_id.to_hex()))?;
     }
@@ -703,12 +711,13 @@ async fn fund_fee_asset(
     // Self-check before spending: the operator's genesis vault must cover the
     // total, in the SAME fee asset the manifest names (wrong chain otherwise).
     let have: u64 = file
-        .account
+        .account()
         .vault()
         .assets()
-        .filter_map(|a| match a {
-            Asset::Fungible(f) if f.faucet_id() == fee_faucet_id => Some(f.amount().as_u64()),
-            _ => None,
+        .filter_map(|a| {
+            a.as_fungible()
+                .filter(|f| f.faucet_id() == fee_faucet_id)
+                .map(|f| f.amount().as_u64())
         })
         .sum();
     let need: u64 = targets.iter().map(|(_, a)| *a).sum();
@@ -722,7 +731,7 @@ async fn fund_fee_asset(
     }
 
     for (target, amount) in targets {
-        let asset = Asset::Fungible(
+        let asset = Asset::from(
             FungibleAsset::new(fee_faucet_id, amount)
                 .map_err(|e| anyhow!("fee asset amount {amount}: {e:?}"))?,
         );
@@ -797,6 +806,13 @@ async fn fund_fee_asset(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    if let Some(dir) = &args.write_genesis_accounts {
+        let (faucet, operator) = miden_agglayer_service::genesis_accounts::write(dir)?;
+        println!("native_faucet={}", faucet.id().to_hex());
+        println!("faucet_operator={}", operator.id().to_hex());
+        return Ok(());
+    }
 
     if args.print_script_roots {
         // Keep key=0x<hex> stable — verify-event-completeness.sh parses it.
@@ -943,7 +959,7 @@ async fn main() -> anyhow::Result<()> {
             };
             let mut any = false;
             for asset in record.vault().assets() {
-                if let miden_protocol::asset::Asset::Fungible(f) = asset {
+                if let Some(f) = asset.as_fungible() {
                     any = true;
                     println!(
                         "vault-balance: account={} faucet={} amount={}",
@@ -1018,7 +1034,7 @@ async fn main() -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow!("list-wallet-faucets: get_account_vault failed: {e:?}"))?;
         for asset in vault.assets() {
-            if let miden_client::asset::Asset::Fungible(fa) = asset {
+            if let Some(fa) = asset.as_fungible() {
                 println!(
                     "wallet-faucet: faucet_id={} amount={}",
                     fa.faucet_id().to_hex(),
@@ -1136,10 +1152,14 @@ async fn main() -> anyhow::Result<()> {
         // against the chain's real fee faucet.
         let fee_faucet_id =
             miden_agglayer_service::fee_policy::fee_faucet_id_from_chain(&client).await?;
+        // 0.17: FEE_MNGR + PAUSER held by the foreign service (its 0.16 ADMIN
+        // authority), as in init.rs.
         let roles = BridgeRoles::new(
             std::collections::BTreeSet::from([service.id()]),
             std::collections::BTreeSet::from([ger_manager.id()]),
             std::collections::BTreeSet::from([ger_manager.id()]),
+            std::collections::BTreeSet::from([service.id()]),
+            std::collections::BTreeSet::from([service.id()]),
         )
         .map_err(|e| anyhow!("foreign bridge role construction failed: {e}"))?;
         let bridge = miden_agglayer_service::network_accounts::bridge_account_builder(

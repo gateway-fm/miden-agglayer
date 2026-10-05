@@ -22,8 +22,17 @@
 # is also the exact shape of the incident this queue exists to prevent (#119: one
 # out-of-order claimAsset permanently wedged an account's claim stream). The
 # calldata does not need to describe a claimable deposit: this test asserts
-# ADMISSION-level behaviour (park / idempotency / conflict / promotion + order),
-# which is decided before any claim semantics are evaluated.
+# ADMISSION-level behaviour (park / idempotency / conflict / promotion + order).
+#
+# It DOES need a valid inclusion proof. Since 8a890f4 ("validate claim inclusion
+# before admission", 2026-09-24) the proxy runs `claim_proof::validate` BEFORE
+# the nonce/park decision, so the old arbitrary roots were refused with
+# "InvalidSmtProof: claim leaf is not included in the supplied exit root" and the
+# queue was never reached (test-e2e failed on main in this tier). Each tx below
+# therefore carries a mainnet globalIndex (leaf 0) and the mainnetExitRoot its own
+# leaf + proof fold to — computed here exactly as src/claim_proof.rs does. The
+# root is never injected as a GER, so the claim still cannot settle; only
+# admission is under test, as before.
 #
 # Promotion is observed via the `pending` transaction count advancing across the
 # gap — admission-level (queue drain + nonce CAS), independent of whether the
@@ -78,14 +87,32 @@ SIGNER="$(cast wallet address --private-key "$KEY")"
 SIGNER_LC="$(echo "$SIGNER" | tr 'A-F' 'a-f')"
 log "signer=$SIGNER  rpc=$L2_RPC  bridge=$BRIDGE_ADDR  chain_id=$CHAIN_ID"
 
-# mk_raw <nonce> <marker-hex-byte> → raw EIP-2718 signed claimAsset tx.
+# Mainnet globalIndex, leaf 0: mainnet flag (bit 64) set, rollup index 0.
+MAINNET_GI=18446744073709551616   # 2^64
+# claim_root <marker-hex-byte> → the mainnetExitRoot that this test's leaf
+# (origin net 0 / token 0x0 / dest net 1 / dest $SIGNER / amount 1 / metadata
+# 0x) folds to through proof32 <marker> at leaf index 0. Mirrors
+# src/claim_proof.rs: leaf = keccak(0x00 ‖ u32 origNet ‖ origToken ‖ u32 destNet
+# ‖ destAddr ‖ u256 amount ‖ keccak(metadata)); index 0 ⇒ node = keccak(node ‖ sib).
+claim_root() {
+    local dest; dest="$(echo "${SIGNER#0x}" | tr 'A-F' 'a-f')"
+    local node sib i
+    node="$(cast keccak "0x00$(printf '%08x' 0)$(printf '%040x' 0)$(printf '%08x' 1)${dest}$(printf '%064x' 1)$(cast keccak 0x | cut -c3-)")"
+    for i in $(seq 0 31); do
+        sib="$(printf '%062x%02x' "$i" "$((16#$1))")"
+        node="$(cast keccak "0x${node#0x}${sib}")"
+    done
+    echo "$node"
+}
+# mk_raw <nonce> <marker-hex-byte> → raw EIP-2718 signed claimAsset tx whose
+# inclusion proof verifies (see the header).
 mk_raw() {
-    local pr; pr="$(proof32 "$2")"
+    local pr root; pr="$(proof32 "$2")"; root="$(claim_root "$2")"
     cast mktx --private-key "$KEY" --nonce "$1" --chain-id "$CHAIN_ID" \
         --gas-limit "$GAS_LIMIT" --gas-price "$GAS_PRICE" --value 0 \
         "$BRIDGE_ADDR" "$CLAIM_SIG" \
-        "$pr" "$pr" 1 \
-        0x0000000000000000000000000000000000000000000000000000000000000001 \
+        "$pr" "$pr" "$MAINNET_GI" \
+        "$root" \
         0x0000000000000000000000000000000000000000000000000000000000000002 \
         0 0x0000000000000000000000000000000000000000 1 "$SIGNER" 1 0x 2>/dev/null
 }
