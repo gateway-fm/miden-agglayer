@@ -1,0 +1,1066 @@
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use miden_protocol::Word;
+use miden_protocol::account::{
+    AccountId,
+    AccountUpdateDetails,
+    AccountVaultPatch,
+    StorageMapKey,
+    StorageMapPatchEntries,
+    StorageSlot,
+    StorageSlotContent,
+    StorageSlotName,
+    StorageSlotType,
+};
+use miden_protocol::address::NetworkId;
+use miden_protocol::batch::{ProposedBatch, ProvenBatch};
+use miden_protocol::block::{BlockHeader, BlockNumber, SignedBlock};
+use miden_protocol::crypto::merkle::MerklePath;
+use miden_protocol::crypto::merkle::mmr::{Forest, Mmr, MmrProof};
+use miden_protocol::crypto::merkle::smt::PartialSmt;
+use miden_protocol::note::{NoteAttachments, NoteHeader, NoteId, NoteScript, NoteTag};
+use miden_protocol::protocol_config::ProtocolConfig;
+use miden_protocol::transaction::{ExecutedTransaction, OutputNote, ProvenTransaction};
+use miden_protocol::vm::ExecutionProof;
+use miden_testing::{MockChain, MockChainNote};
+use miden_tx::utils::sync::RwLock;
+
+use crate::Client;
+use crate::rpc::domain::account::{
+    AccountDetails,
+    AccountProof,
+    AccountStorageDetails,
+    AccountStorageMapDetails,
+    AccountVaultDetails,
+    GetAccountRequest,
+    StorageMapEntries,
+    StorageMapEntry,
+    StorageMapFetch,
+    VaultFetch,
+};
+use crate::rpc::domain::account_vault::AccountVaultInfo;
+use crate::rpc::domain::note::{CommittedNote, FetchedNote, SyncNotesBlock};
+use crate::rpc::domain::nullifier::NullifierUpdate;
+use crate::rpc::domain::status::NetworkNoteStatusInfo;
+use crate::rpc::domain::storage_map::StorageMapInfo;
+use crate::rpc::domain::sync::{ChainMmrInfo, SyncTarget};
+use crate::rpc::domain::transaction::TransactionRecord;
+use crate::rpc::encryption::{AttestedTransactionEncryptionKey, SealedTransactionInputs};
+use crate::rpc::{AccountStateAt, NodeRpcClient, RpcEndpoint, RpcError, RpcStatusInfo};
+
+pub type MockClient<AUTH> = Client<AUTH>;
+
+#[derive(Clone, Copy)]
+struct BlockHeaderRequest {
+    block_num: Option<BlockNumber>,
+    include_mmr_proof: bool,
+}
+
+/// Mock RPC API
+///
+/// This struct implements the RPC API used by the client to communicate with the node. It simulates
+/// most of the functionality of the actual node, with some small differences:
+/// - It uses a [`MockChain`] to simulate the blockchain state.
+/// - Blocks are not automatically created after time passes, but rather new blocks are created when
+///   calling the `prove_block` method.
+/// - Network account and transactions aren't supported in the current version.
+/// - Account update block numbers aren't tracked, so any endpoint that returns when certain account
+///   updates were made will return the chain tip block number instead.
+#[derive(Clone)]
+pub struct MockRpcApi {
+    account_commitment_updates: Arc<RwLock<BTreeMap<BlockNumber, BTreeMap<AccountId, Word>>>>,
+    pub mock_chain: Arc<RwLock<MockChain>>,
+    /// Chain snapshots used to answer block-pinned account queries.
+    historical_chains: Arc<RwLock<BTreeMap<BlockNumber, Arc<MockChain>>>>,
+    oversize_threshold: usize,
+    /// Note headers to report as erased in sync transaction responses.
+    erased_notes: Arc<RwLock<Vec<NoteHeader>>>,
+    /// Attachment content `get_notes_by_id` serves for private notes, populated by
+    /// `submit_proven_transaction` and by `register_private_note_attachments`. A note absent here
+    /// is served with empty attachments, which is how a test simulates a withholding node.
+    private_note_attachments: Arc<RwLock<BTreeMap<NoteId, NoteAttachments>>>,
+    /// Test overrides for the MMR paths returned by `sync_notes`, keyed by block number.
+    sync_notes_mmr_path_overrides: Arc<RwLock<BTreeMap<BlockNumber, MerklePath>>>,
+    /// Number of `get_notes_by_id` requests served, so a test can assert that a flow avoided the
+    /// round trip.
+    get_notes_by_id_calls: Arc<AtomicUsize>,
+    /// Block header requests, recorded with the requested block and proof flag.
+    block_header_requests: Arc<RwLock<Vec<BlockHeaderRequest>>>,
+    /// Number of `get_account` requests served, so a test can assert that a flow avoided the round
+    /// trip.
+    get_account_calls: Arc<AtomicUsize>,
+    /// Failures to serve instead of answering, keyed by [`RpcEndpoint::proto_name`] and set by
+    /// [`MockRpcApi::fail_next_call`]. An entry is removed when served, so the call after it
+    /// answers normally and a test can exercise a retry.
+    next_call_failures: Arc<RwLock<BTreeMap<&'static str, RpcError>>>,
+    /// Invitation code each account was registered with, recorded by `register_account`.
+    registered_accounts: Arc<RwLock<BTreeMap<AccountId, String>>>,
+    /// Whether `is_account_allowed` consults `registered_accounts`. A node that does not enforce
+    /// the allowlist answers `true` for every account, which is the default here so that tests
+    /// which deploy accounts need no registration.
+    allowlist_enforced: Arc<AtomicBool>,
+    /// Number of `is_account_allowed` requests served, so a test can assert that a flow avoided the
+    /// round trip.
+    is_account_allowed_calls: Arc<AtomicUsize>,
+    /// Sealed inputs handed to `submit_proven_batch`, one entry per call and recorded before any
+    /// staged failure is served, so a test can assert that a resubmission sealed again instead of
+    /// reusing a cached ciphertext.
+    submitted_batch_sealed_inputs: Arc<RwLock<Vec<Vec<SealedTransactionInputs>>>>,
+}
+
+impl Default for MockRpcApi {
+    fn default() -> Self {
+        Self::new(MockChain::new())
+    }
+}
+
+impl MockRpcApi {
+    // Constant to use in mocked pagination.
+    const PAGINATION_BLOCK_LIMIT: u32 = 5;
+
+    /// Creates a new [`MockRpcApi`] instance with the state of the provided [`MockChain`].
+    pub fn new(mock_chain: MockChain) -> Self {
+        Self {
+            account_commitment_updates: Arc::new(RwLock::new(build_account_updates(&mock_chain))),
+            mock_chain: Arc::new(RwLock::new(mock_chain)),
+            historical_chains: Arc::new(RwLock::new(BTreeMap::new())),
+            oversize_threshold: 1000,
+            erased_notes: Arc::new(RwLock::new(Vec::new())),
+            private_note_attachments: Arc::new(RwLock::new(BTreeMap::new())),
+            sync_notes_mmr_path_overrides: Arc::new(RwLock::new(BTreeMap::new())),
+            get_notes_by_id_calls: Arc::new(AtomicUsize::new(0)),
+            block_header_requests: Arc::new(RwLock::new(Vec::new())),
+            get_account_calls: Arc::new(AtomicUsize::new(0)),
+            next_call_failures: Arc::new(RwLock::new(BTreeMap::new())),
+            registered_accounts: Arc::new(RwLock::new(BTreeMap::new())),
+            allowlist_enforced: Arc::new(AtomicBool::new(false)),
+            is_account_allowed_calls: Arc::new(AtomicUsize::new(0)),
+            submitted_batch_sealed_inputs: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
+    /// Makes `is_account_allowed` answer from the recorded registrations, modelling a node that
+    /// enforces the account allowlist. Without this the mock answers `true` for every account.
+    pub fn enforce_account_allowlist(&self) {
+        self.allowlist_enforced.store(true, Ordering::SeqCst);
+    }
+
+    /// Id of the first account updated in the mock chain's proven blocks, in block then
+    /// within-block order. Tests use it to get hold of an account the chain already knows.
+    ///
+    /// Panics if the chain has no account updates.
+    pub fn first_account_id(&self) -> AccountId {
+        self.mock_chain
+            .read()
+            .proven_blocks()
+            .iter()
+            .flat_map(|block| block.body().updated_accounts())
+            .next()
+            .expect("the mock chain must have at least one account update")
+            .account_id()
+    }
+
+    /// Sealed inputs recorded by `submit_proven_batch`, one entry per call, including calls that
+    /// went on to be served a staged failure. Within an entry the order matches the batch's
+    /// transaction order.
+    pub fn submitted_batch_sealed_inputs(&self) -> Vec<Vec<SealedTransactionInputs>> {
+        self.submitted_batch_sealed_inputs.read().clone()
+    }
+
+    /// Makes the next call to `endpoint` fail with `error` instead of answering. The failure is
+    /// consumed, so the call after it answers normally and a test can exercise a retry.
+    ///
+    /// Staging a failure for an endpoint whose mock implementation does not look for one is a
+    /// silent no-op.
+    pub fn fail_next_call(&self, endpoint: RpcEndpoint, error: RpcError) {
+        self.next_call_failures.write().insert(endpoint.proto_name(), error);
+    }
+
+    /// Returns the failure staged for `endpoint`, removing it so it is served once.
+    fn take_failure(&self, endpoint: RpcEndpoint) -> Option<RpcError> {
+        self.next_call_failures.write().remove(endpoint.proto_name())
+    }
+
+    /// Returns the invitation code `account_id` was registered with, or `None` if this API served
+    /// no registration for it.
+    pub fn registered_invitation_code(&self, account_id: AccountId) -> Option<String> {
+        self.registered_accounts.read().get(&account_id).cloned()
+    }
+
+    /// Registers the attachment content for a private note so that subsequent `get_notes_by_id`
+    /// responses include it, mirroring a node that stores private-note attachments on-chain.
+    pub fn register_private_note_attachments(&self, note_id: NoteId, attachments: NoteAttachments) {
+        self.private_note_attachments.write().insert(note_id, attachments);
+    }
+
+    /// Returns how many `get_notes_by_id` requests this API has served.
+    pub fn get_notes_by_id_call_count(&self) -> usize {
+        self.get_notes_by_id_calls.load(Ordering::Relaxed)
+    }
+
+    /// Returns the proof flags of requests for `block_num`.
+    pub fn block_header_requests(&self, block_num: BlockNumber) -> Vec<bool> {
+        self.block_header_requests
+            .read()
+            .iter()
+            .filter_map(|request| {
+                (request.block_num == Some(block_num)).then_some(request.include_mmr_proof)
+            })
+            .collect()
+    }
+
+    /// Returns how many `get_account` requests this API has served.
+    pub fn get_account_call_count(&self) -> usize {
+        self.get_account_calls.load(Ordering::Relaxed)
+    }
+
+    /// Returns how many `is_account_allowed` requests this API has served.
+    pub fn is_account_allowed_call_count(&self) -> usize {
+        self.is_account_allowed_calls.load(Ordering::Relaxed)
+    }
+
+    /// Overrides the MMR path returned by `sync_notes` for the specified block.
+    pub fn set_sync_notes_mmr_path(&self, block_num: BlockNumber, path: MerklePath) {
+        self.sync_notes_mmr_path_overrides.write().insert(block_num, path);
+    }
+
+    /// Sets the oversize threshold for `get_account`. A storage map whose entries were requested in
+    /// full comes back as `StorageMapEntries::LimitExceeded` past this threshold, and a vault with
+    /// more assets than it comes back with the `too_many_assets` flag set.
+    #[must_use]
+    pub fn with_oversize_threshold(mut self, threshold: usize) -> Self {
+        self.oversize_threshold = threshold;
+        self
+    }
+
+    /// Registers a note header to be reported as erased in subsequent sync transaction responses.
+    pub fn mark_note_as_erased(&self, header: NoteHeader) {
+        self.erased_notes.write().push(header);
+    }
+
+    /// Returns the current MMR of the blockchain.
+    pub fn get_mmr(&self) -> Mmr {
+        self.mock_chain.read().blockchain().as_mmr().clone()
+    }
+
+    /// Returns the protocol configuration the mock chain commits to.
+    pub fn protocol_config(&self) -> ProtocolConfig {
+        self.mock_chain.read().protocol_config().clone()
+    }
+
+    /// Returns the chain tip block number.
+    pub fn get_chain_tip_block_num(&self) -> BlockNumber {
+        self.mock_chain.read().latest_block_header().block_num()
+    }
+
+    /// Adds an executed transaction to the pending transactions of the mock chain with a dummy
+    /// proof. The next [`Self::prove_block`] call commits it.
+    ///
+    /// Tests use this method to put a transaction on chain without the cost of a real proof.
+    pub fn add_pending_executed_transaction(&self, executed_transaction: &ExecutedTransaction) {
+        self.mock_chain
+            .write()
+            .add_pending_executed_transaction(executed_transaction)
+            .expect("mock chain should accept the executed transaction");
+    }
+
+    /// Advances the mock chain by proving the next block, committing all pending objects to the
+    /// chain in the process.
+    pub fn prove_block(&self) {
+        let proven_block = {
+            let mut mock_chain = self.mock_chain.write();
+            let historical_block_num = mock_chain.latest_block_header().block_num();
+            let snapshot = Arc::new(mock_chain.clone());
+            let proven_block = mock_chain.prove_next_block().unwrap();
+            self.historical_chains.write().insert(historical_block_num, snapshot);
+            proven_block
+        };
+        let block_num = proven_block.header().block_num();
+        let mut account_commitment_updates = self.account_commitment_updates.write();
+        let updates: BTreeMap<AccountId, Word> = proven_block
+            .body()
+            .updated_accounts()
+            .iter()
+            .map(|update| (update.account_id(), update.final_state_commitment()))
+            .collect();
+
+        if !updates.is_empty() {
+            account_commitment_updates.insert(block_num, updates);
+        }
+    }
+
+    /// Removes the account-state snapshot for the specified block.
+    ///
+    /// Tests use this method to model a node that pruned historical account state.
+    pub fn prune_account_state_at(&self, block_num: BlockNumber) {
+        self.historical_chains.write().remove(&block_num);
+    }
+
+    /// Retrieves a block by its block number.
+    fn get_block_by_num(&self, block_num: BlockNumber) -> BlockHeader {
+        self.mock_chain.read().block_header(block_num.as_usize())
+    }
+
+    /// Retrieves account vault updates in a given block range. This method tries to simulate
+    /// pagination by limiting the number of blocks processed per request.
+    fn get_sync_account_vault_request(
+        &self,
+        block_from: BlockNumber,
+        block_to: BlockNumber,
+        account_id: AccountId,
+    ) -> (BlockNumber, BlockNumber, AccountVaultPatch) {
+        let chain_tip = self.get_chain_tip_block_num();
+        let target_block = block_to.min(chain_tip);
+
+        let page_end_block: BlockNumber = (block_from.as_u32() + Self::PAGINATION_BLOCK_LIMIT)
+            .min(target_block.as_u32())
+            .into();
+
+        // Blocks are iterated in ascending order, so later blocks win per asset ID.
+        let mut vault_patch = AccountVaultPatch::default();
+        for block in self.mock_chain.read().proven_blocks() {
+            let block_number = block.header().block_num();
+            // Only include blocks in range [block_from, page_end_block]
+            if block_number < block_from || block_number > page_end_block {
+                continue;
+            }
+
+            for update in block
+                .body()
+                .updated_accounts()
+                .iter()
+                .filter(|block_acc_update| block_acc_update.account_id() == account_id)
+            {
+                let AccountUpdateDetails::Public(patch) = update.details().clone() else {
+                    continue;
+                };
+
+                vault_patch.merge(patch.vault().clone());
+            }
+        }
+
+        (chain_tip, page_end_block, vault_patch)
+    }
+
+    /// Retrieves transactions in a given block range that match the provided account IDs
+    fn get_sync_transactions_request(
+        &self,
+        block_from: BlockNumber,
+        block_to: BlockNumber,
+        account_ids: &[AccountId],
+    ) -> Vec<TransactionRecord> {
+        let mut transactions = Vec::new();
+        for block in self.mock_chain.read().proven_blocks() {
+            let block_number = block.header().block_num();
+            if block_number < block_from || block_number > block_to {
+                continue;
+            }
+
+            for transaction_header in block.body().transactions().as_slice() {
+                if !account_ids.contains(&transaction_header.account_id()) {
+                    continue;
+                }
+
+                let erased_output_notes = self.erased_notes.read().clone();
+
+                transactions.push(TransactionRecord {
+                    block_num: block_number,
+                    transaction_header: transaction_header.clone(),
+                    output_notes: vec![],
+                    erased_output_notes,
+                    consumed_note_refs: vec![],
+                });
+            }
+        }
+
+        transactions
+    }
+
+    /// Retrieves storage map updates in a given block range.
+    ///
+    /// This method tries to simulate pagination of the real node.
+    fn get_sync_storage_maps_request(
+        &self,
+        block_from: BlockNumber,
+        block_to: BlockNumber,
+        account_id: AccountId,
+    ) -> (BlockNumber, BlockNumber, BTreeMap<StorageSlotName, StorageMapPatchEntries>) {
+        let chain_tip = self.get_chain_tip_block_num();
+        let target_block = block_to.min(chain_tip);
+
+        let page_end_block: BlockNumber = (block_from.as_u32() + Self::PAGINATION_BLOCK_LIMIT)
+            .min(target_block.as_u32())
+            .into();
+
+        // Blocks are iterated in ascending order, so later blocks win per `(slot, key)`.
+        let mut map_entries: BTreeMap<StorageSlotName, StorageMapPatchEntries> = BTreeMap::new();
+        for block in self.mock_chain.read().proven_blocks() {
+            let block_number = block.header().block_num();
+            // Only include blocks in range [block_from, page_end_block]
+            if block_number < block_from || block_number > page_end_block {
+                continue;
+            }
+
+            for update in block
+                .body()
+                .updated_accounts()
+                .iter()
+                .filter(|block_acc_update| block_acc_update.account_id() == account_id)
+            {
+                let AccountUpdateDetails::Public(patch) = update.details().clone() else {
+                    continue;
+                };
+
+                for (slot_name, map_patch) in patch.storage().maps() {
+                    if let Some(entries) = map_patch.entries() {
+                        map_entries
+                            .entry(slot_name.clone())
+                            .or_default()
+                            .as_map_mut()
+                            .extend(entries.as_map().clone());
+                    }
+                }
+            }
+        }
+
+        (chain_tip, page_end_block, map_entries)
+    }
+
+    pub fn get_available_notes(&self) -> Vec<MockChainNote> {
+        self.mock_chain.read().committed_notes().values().cloned().collect()
+    }
+
+    pub fn get_public_available_notes(&self) -> Vec<MockChainNote> {
+        self.mock_chain
+            .read()
+            .committed_notes()
+            .values()
+            .filter(|n| matches!(n, MockChainNote::Public(_, _)))
+            .cloned()
+            .collect()
+    }
+
+    pub fn advance_blocks(&self, num_blocks: u32) {
+        let mut mock_chain = self.mock_chain.write();
+        let block_num = mock_chain.latest_block_header().block_num();
+        let snapshot = Arc::new(mock_chain.clone());
+        mock_chain.prove_until_block(block_num + num_blocks).unwrap();
+        self.historical_chains.write().insert(block_num, snapshot);
+    }
+}
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+impl NodeRpcClient for MockRpcApi {
+    /// Always reports the commitment as unset, unlike a real client.
+    ///
+    /// A real client's RPC connection is its own, so whoever set the commitment also stored the
+    /// header. Tests share one mock across clients with separate stores, where a commitment set by
+    /// the first would stop every later client from storing genesis at all.
+    fn has_genesis_commitment(&self) -> Option<Word> {
+        None
+    }
+
+    async fn set_genesis_commitment(&self, _commitment: Word) -> Result<(), RpcError> {
+        // The mock sends no request headers, so there is nothing to pin the commitment to.
+        Ok(())
+    }
+
+    /// Returns note updates in the inclusive block range `[block_from, block_to]`. Only notes that
+    /// match the provided tags will be returned, grouped by block.
+    async fn sync_notes(
+        &self,
+        block_from: BlockNumber,
+        block_to: BlockNumber,
+        note_tags: &BTreeSet<NoteTag>,
+    ) -> Result<Vec<SyncNotesBlock>, RpcError> {
+        let mut blocks_with_notes: BTreeMap<BlockNumber, BTreeMap<NoteId, CommittedNote>> =
+            BTreeMap::new();
+        for note in self.mock_chain.read().committed_notes().values() {
+            let note_block = note.inclusion_proof().location().block_num();
+            if note_tags.contains(&note.metadata().tag())
+                && note_block >= block_from
+                && note_block <= block_to
+            {
+                let mut committed =
+                    CommittedNote::new(note.id(), *note.metadata(), note.inclusion_proof().clone());
+                // Mirror the node: a single-word attachment is sent verbatim and the record is
+                // complete. A larger one is sent as a commitment only.
+                let attachments = note.attachments();
+                if attachments.iter().all(|attachment| attachment.num_words() == 1) {
+                    committed = committed
+                        .with_attachments(attachments.clone())
+                        .expect("the note's own attachments match its commitment");
+                }
+                blocks_with_notes.entry(note_block).or_default().insert(note.id(), committed);
+            }
+        }
+
+        Ok(blocks_with_notes
+            .into_iter()
+            .map(|(bn, notes)| {
+                let block_header = self.get_block_by_num(bn);
+                let mmr_path =
+                    self.sync_notes_mmr_path_overrides.read().get(&bn).cloned().unwrap_or_else(
+                        || self.get_mmr().open(bn.as_usize()).unwrap().merkle_path().clone(),
+                    );
+                SyncNotesBlock { block_header, mmr_path, notes }
+            })
+            .collect())
+    }
+
+    async fn sync_chain_mmr(
+        &self,
+        current_block_height: BlockNumber,
+        upper_bound: SyncTarget,
+    ) -> Result<ChainMmrInfo, RpcError> {
+        let chain_tip = self.get_chain_tip_block_num();
+        // The mock chain doesn't distinguish committed vs proven tips.
+        let target_block = match upper_bound {
+            SyncTarget::CommittedChainTip | SyncTarget::ProvenChainTip => chain_tip,
+        };
+
+        let from_forest = if current_block_height == target_block {
+            target_block.as_usize()
+        } else {
+            current_block_height.as_u32() as usize + 1
+        };
+
+        let mmr_delta = self
+            .get_mmr()
+            .get_delta(
+                Forest::new(from_forest).unwrap(),
+                Forest::new(target_block.as_usize()).unwrap(),
+            )
+            .unwrap();
+
+        let block_header = self.get_block_by_num(target_block);
+        let block_signatures = self
+            .mock_chain
+            .read()
+            .proven_blocks()
+            .iter()
+            .find(|block| block.header().block_num() == target_block)
+            .expect("the mock chain contains the target block")
+            .signatures()
+            .clone();
+
+        // Mirrors the node: send the configuration when the caller starts at genesis, or when the
+        // commitment changed over the range. A caller already at the target gets nothing.
+        let protocol_config = if current_block_height == BlockNumber::GENESIS {
+            Some(self.protocol_config())
+        } else if current_block_height == target_block {
+            None
+        } else {
+            let commitment_at_start =
+                self.get_block_by_num(current_block_height).protocol_config_commitment();
+            (commitment_at_start != block_header.protocol_config_commitment())
+                .then(|| self.protocol_config())
+        };
+
+        Ok(ChainMmrInfo {
+            block_from: current_block_height,
+            block_to: target_block,
+            mmr_delta,
+            block_header,
+            protocol_config,
+            block_signatures,
+        })
+    }
+
+    /// Retrieves the block header for the specified block number. If the block number is not
+    /// provided, the chain tip block header will be returned.
+    async fn get_block_header_by_number(
+        &self,
+        block_num: Option<BlockNumber>,
+        include_mmr_proof: bool,
+    ) -> Result<(BlockHeader, Option<MmrProof>), RpcError> {
+        self.block_header_requests
+            .write()
+            .push(BlockHeaderRequest { block_num, include_mmr_proof });
+
+        let block = if let Some(block_num) = block_num {
+            self.mock_chain.read().block_header(block_num.as_usize())
+        } else {
+            self.mock_chain.read().latest_block_header()
+        };
+
+        let mmr_proof = if include_mmr_proof {
+            Some(self.get_mmr().open(block_num.unwrap().as_usize()).unwrap())
+        } else {
+            None
+        };
+
+        Ok((block, mmr_proof))
+    }
+
+    /// Returns the node's tracked notes that match the provided note IDs.
+    async fn get_notes_by_id(&self, note_ids: &[NoteId]) -> Result<Vec<FetchedNote>, RpcError> {
+        self.get_notes_by_id_calls.fetch_add(1, Ordering::Relaxed);
+
+        let notes = self.mock_chain.read().committed_notes().clone();
+
+        let hit_notes = note_ids.iter().filter_map(|id| notes.get(id));
+        let mut return_notes = vec![];
+        for note in hit_notes {
+            let fetched_note = match note {
+                MockChainNote::Private(note_id, note_metadata, _, note_inclusion_proof) => {
+                    let attachments = self
+                        .private_note_attachments
+                        .read()
+                        .get(note_id)
+                        .cloned()
+                        .unwrap_or_else(NoteAttachments::empty);
+                    FetchedNote::Private(
+                        *note_id,
+                        *note_metadata,
+                        attachments,
+                        note_inclusion_proof.clone(),
+                    )
+                },
+                MockChainNote::Public(note, note_inclusion_proof) => {
+                    FetchedNote::Public(note.clone(), note_inclusion_proof.clone())
+                },
+            };
+            return_notes.push(fetched_note);
+        }
+        Ok(return_notes)
+    }
+
+    /// The mock does not serve the encryption key. Verifying an attestation needs a validator
+    /// signature the mock chain cannot produce, so tests that submit transactions seed the key
+    /// directly through `Client::seed_transaction_encryption_key` instead.
+    async fn get_transaction_encryption_key(
+        &self,
+    ) -> Result<AttestedTransactionEncryptionKey, RpcError> {
+        Err(RpcError::TransactionEncryptionKeyRejected(
+            "the mock RPC client does not serve a transaction encryption key".into(),
+        ))
+    }
+
+    /// Simulates the submission of a proven transaction to the node. This will create a new block
+    /// just for the new transaction and return the block number of the newly created block.
+    async fn submit_proven_transaction(
+        &self,
+        proven_transaction: &ProvenTransaction,
+        _sealed_transaction_inputs: SealedTransactionInputs, /* Unnecessary for testing client
+                                                              * itself. */
+    ) -> Result<BlockNumber, RpcError> {
+        if let Some(error) = self.take_failure(RpcEndpoint::SubmitProvenTx) {
+            return Err(error);
+        }
+
+        // Record private-note attachment content the way a real node does: attachments are stored
+        // on-chain even for private notes, so `get_notes_by_id` must be able to serve them. The
+        // mock chain itself only keeps private note headers.
+        for note in proven_transaction.output_notes().iter() {
+            if let OutputNote::Private(private_note) = note
+                && !private_note.attachments().is_empty()
+            {
+                self.private_note_attachments
+                    .write()
+                    .insert(private_note.id(), private_note.attachments().clone());
+            }
+        }
+
+        {
+            let mut mock_chain = self.mock_chain.write();
+            mock_chain.add_pending_proven_transaction(proven_transaction.clone());
+        };
+
+        let block_num = self.get_chain_tip_block_num();
+
+        Ok(block_num)
+    }
+
+    /// Simulates the submission of a proven batch to the node by adding it to the mock chain's
+    /// pending batches. The `proposed_batch` argument is accepted to match the trait signature but
+    /// is unused: the mock relies on the `ProvenBatch` alone. The sealed inputs are recorded rather
+    /// than decrypted, so a test can inspect what each attempt sent.
+    async fn submit_proven_batch(
+        &self,
+        proven_batch: &ProvenBatch,
+        _proposed_batch: &ProposedBatch,
+        sealed_transaction_inputs: Vec<SealedTransactionInputs>,
+    ) -> Result<BlockNumber, RpcError> {
+        // Recorded before the staged failure is served: a submission whose response is lost still
+        // reached the node, so a test can compare what that attempt sent against the retry.
+        self.submitted_batch_sealed_inputs.write().push(sealed_transaction_inputs);
+
+        if let Some(error) = self.take_failure(RpcEndpoint::SubmitProvenBatch) {
+            return Err(error);
+        }
+
+        let mut mock_chain = self.mock_chain.write();
+        mock_chain.add_pending_batch(proven_batch.clone());
+        drop(mock_chain);
+
+        let block_num = self.get_chain_tip_block_num();
+
+        Ok(block_num)
+    }
+
+    /// Returns the account proof for the specified account. The `known_code` and `vault` fields are
+    /// ignored: full account data is returned, with truncation flags set when it exceeds
+    /// `oversize_threshold`.
+    async fn get_account(
+        &self,
+        account_id: AccountId,
+        request: GetAccountRequest,
+    ) -> Result<(BlockNumber, AccountProof), RpcError> {
+        self.get_account_calls.fetch_add(1, Ordering::Relaxed);
+
+        if let Some(error) = self.take_failure(RpcEndpoint::GetAccount) {
+            return Err(error);
+        }
+
+        let current_chain = self.mock_chain.read();
+        let current_block_number = current_chain.latest_block_header().block_num();
+        let block_number = match request.at {
+            AccountStateAt::Block(number) => number,
+            AccountStateAt::ChainTip => current_block_number,
+        };
+        let historical_chain = match request.at {
+            AccountStateAt::Block(_) if block_number != current_block_number => Some(
+                self.historical_chains.read().get(&block_number).cloned().ok_or_else(|| {
+                    RpcError::InvalidResponse(alloc::format!(
+                        "no mock chain snapshot at block {block_number}"
+                    ))
+                })?,
+            ),
+            AccountStateAt::ChainTip | AccountStateAt::Block(_) => None,
+        };
+        let mock_chain = historical_chain.as_deref().unwrap_or(&*current_chain);
+
+        let headers = if account_id.is_public() {
+            let account = mock_chain.committed_account(account_id).unwrap();
+
+            // `All` enumerates the account's map slots directly — the mock can introspect the
+            // account, so it simulates the (not-yet-on-the-wire) "all storage maps" request. A slot
+            // maps to the keys requested for it, empty meaning "every entry".
+            let requested_slots: Vec<(StorageSlotName, Vec<StorageMapKey>)> = match &request.storage
+            {
+                StorageMapFetch::Skip => Vec::new(),
+                StorageMapFetch::Slots(reqs) => {
+                    reqs.inner().iter().map(|(name, keys)| (name.clone(), keys.clone())).collect()
+                },
+                StorageMapFetch::All => account
+                    .storage()
+                    .to_header()
+                    .slots()
+                    .filter(|slot| slot.slot_type() == StorageSlotType::Map)
+                    .map(|slot| (slot.name().clone(), Vec::new()))
+                    .collect(),
+            };
+
+            let mut map_details = vec![];
+            for (slot_name, requested_keys) in &requested_slots {
+                if let Some(StorageSlotContent::Map(storage_map)) =
+                    account.storage().get(slot_name).map(StorageSlot::content)
+                {
+                    // Mirror the node: named keys come back as one partial SMT covering them, and
+                    // an empty key list comes back as the whole map, or as `LimitExceeded` once it
+                    // grows past the threshold.
+                    let entries = if requested_keys.is_empty() {
+                        let entries: Vec<StorageMapEntry> = storage_map
+                            .entries()
+                            .map(|(key, value)| StorageMapEntry { key: *key, value: *value })
+                            .collect();
+
+                        if entries.len() > self.oversize_threshold {
+                            StorageMapEntries::LimitExceeded
+                        } else {
+                            StorageMapEntries::AllEntries(entries)
+                        }
+                    } else {
+                        let partial_smt = PartialSmt::from_proofs(
+                            requested_keys.iter().map(|key| storage_map.open(key).into()),
+                        )
+                        .expect("proofs from one map share a root");
+
+                        StorageMapEntries::PartialMap {
+                            map_keys: requested_keys.clone(),
+                            partial_smt,
+                        }
+                    };
+
+                    map_details
+                        .push(AccountStorageMapDetails { slot_name: slot_name.clone(), entries });
+                } else {
+                    panic!("Storage slot {slot_name} is not a map");
+                }
+            }
+
+            let storage_details = AccountStorageDetails {
+                header: account.storage().to_header(),
+                map_details,
+            };
+
+            // Mirror the node: `Skip` sends no assets, and `IfChangedFrom` omits them when the
+            // account's vault root already equals the sent commitment.
+            let include_assets = match request.vault {
+                VaultFetch::Skip => false,
+                VaultFetch::Always => true,
+                VaultFetch::IfChangedFrom(root) => root != account.vault().root(),
+            };
+            let mut assets = vec![];
+            if include_assets {
+                for asset in account.vault().assets() {
+                    assets.push(asset);
+                }
+            }
+            let vault_details = AccountVaultDetails {
+                too_many_assets: assets.len() > self.oversize_threshold,
+                assets,
+            };
+
+            Some(AccountDetails {
+                header: account.into(),
+                storage_details,
+                code: account.code().clone(),
+                vault_details,
+            })
+        } else {
+            None
+        };
+
+        let witness = mock_chain.account_tree().open(account_id);
+
+        let proof = AccountProof::new(witness, headers).unwrap();
+
+        Ok((block_number, proof))
+    }
+
+    async fn register_account(
+        &self,
+        invitation_code: &str,
+        account_id: AccountId,
+    ) -> Result<(), RpcError> {
+        if let Some(error) = self.take_failure(RpcEndpoint::RegisterAccount) {
+            return Err(error);
+        }
+
+        // The mock holds no invitations, so it accepts any code and records the pair. Stage a
+        // failure with `fail_next_call` to exercise a rejection.
+        self.registered_accounts
+            .write()
+            .insert(account_id, String::from(invitation_code));
+
+        Ok(())
+    }
+
+    async fn is_account_allowed(&self, account_id: AccountId) -> Result<bool, RpcError> {
+        self.is_account_allowed_calls.fetch_add(1, Ordering::Relaxed);
+
+        if let Some(error) = self.take_failure(RpcEndpoint::IsAccountAllowed) {
+            return Err(error);
+        }
+
+        // A node that does not enforce the allowlist allows every account. Call
+        // `enforce_account_allowlist` to answer from the recorded registrations instead.
+        if !self.allowlist_enforced.load(Ordering::SeqCst) {
+            return Ok(true);
+        }
+
+        Ok(self.registered_accounts.read().contains_key(&account_id))
+    }
+
+    /// Returns the nullifiers created after the specified block number that match the provided
+    /// prefixes.
+    async fn sync_nullifiers(
+        &self,
+        prefixes: &[u16],
+        block_from: BlockNumber,
+        block_to: BlockNumber,
+    ) -> Result<Vec<NullifierUpdate>, RpcError> {
+        let nullifiers = self
+            .mock_chain
+            .read()
+            .nullifier_tree()
+            .entries()
+            .filter_map(|(nullifier, block_num)| {
+                let within_range = block_num >= block_from && block_num <= block_to;
+
+                if prefixes.contains(&nullifier.prefix()) && within_range {
+                    Some(NullifierUpdate { nullifier, block_num })
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        Ok(nullifiers)
+    }
+
+    async fn get_block_by_number(
+        &self,
+        block_num: BlockNumber,
+        include_proof: bool,
+    ) -> Result<(SignedBlock, Option<ExecutionProof>), RpcError> {
+        let block = self
+            .mock_chain
+            .read()
+            .proven_blocks()
+            .iter()
+            .find(|b| b.header().block_num() == block_num)
+            .unwrap()
+            .clone();
+        let (header, body, signatures, proof) = block.into_parts();
+
+        Ok((
+            SignedBlock::new_unchecked(header, body, signatures),
+            include_proof.then_some(proof),
+        ))
+    }
+
+    async fn get_note_script_by_root(&self, root: Word) -> Result<Option<NoteScript>, RpcError> {
+        let script = self
+            .get_available_notes()
+            .iter()
+            .filter_map(|note| note.note())
+            .find(|n| Word::from(n.script().root()) == root)
+            .map(|n| n.script().clone());
+
+        Ok(script)
+    }
+
+    async fn sync_storage_maps(
+        &self,
+        block_from: BlockNumber,
+        block_to: BlockNumber,
+        account_id: AccountId,
+    ) -> Result<StorageMapInfo, RpcError> {
+        let mut map_entries: BTreeMap<StorageSlotName, StorageMapPatchEntries> = BTreeMap::new();
+        let mut current_block_from = block_from;
+        let chain_tip = self.get_chain_tip_block_num();
+        let target_block = block_to.min(chain_tip);
+
+        loop {
+            let (page_chain_tip, page_block_number, page_entries) =
+                self.get_sync_storage_maps_request(current_block_from, block_to, account_id);
+            for (slot_name, entries) in page_entries {
+                map_entries
+                    .entry(slot_name)
+                    .or_default()
+                    .as_map_mut()
+                    .extend(entries.into_map());
+            }
+
+            if page_block_number >= target_block {
+                return Ok(StorageMapInfo {
+                    chain_tip: page_chain_tip,
+                    block_number: page_block_number,
+                    map_entries,
+                });
+            }
+
+            current_block_from = (page_block_number.as_u32() + 1).into();
+        }
+    }
+
+    async fn sync_account_vault(
+        &self,
+        block_from: BlockNumber,
+        block_to: BlockNumber,
+        account_id: AccountId,
+    ) -> Result<AccountVaultInfo, RpcError> {
+        let mut vault_patch = AccountVaultPatch::default();
+        let mut current_block_from = block_from;
+        let chain_tip = self.get_chain_tip_block_num();
+        let target_block = block_to.min(chain_tip);
+
+        loop {
+            let (page_chain_tip, page_block_number, page_patch) =
+                self.get_sync_account_vault_request(current_block_from, block_to, account_id);
+            vault_patch.merge(page_patch);
+
+            if page_block_number >= target_block {
+                return Ok(AccountVaultInfo {
+                    chain_tip: page_chain_tip,
+                    block_number: page_block_number,
+                    vault_patch,
+                });
+            }
+
+            current_block_from = (page_block_number.as_u32() + 1).into();
+        }
+    }
+
+    async fn sync_transactions(
+        &self,
+        block_from: BlockNumber,
+        block_to: BlockNumber,
+        account_ids: Vec<AccountId>,
+    ) -> Result<Vec<TransactionRecord>, RpcError> {
+        Ok(self.get_sync_transactions_request(block_from, block_to, &account_ids))
+    }
+
+    async fn get_network_id(&self) -> Result<NetworkId, RpcError> {
+        Ok(NetworkId::Testnet)
+    }
+
+    async fn get_rpc_limits(&self) -> Result<crate::rpc::RpcLimits, RpcError> {
+        Ok(crate::rpc::RpcLimits::default())
+    }
+
+    fn has_rpc_limits(&self) -> Option<crate::rpc::RpcLimits> {
+        None
+    }
+
+    async fn set_rpc_limits(&self, _limits: crate::rpc::RpcLimits) {
+        // No-op for mock client
+    }
+
+    async fn get_status_unversioned(&self) -> Result<RpcStatusInfo, RpcError> {
+        Ok(RpcStatusInfo {
+            version: env!("CARGO_PKG_VERSION").into(),
+            genesis_commitment: None,
+            chain_tip: 0,
+            block_producer: None,
+        })
+    }
+
+    async fn get_network_note_status(
+        &self,
+        _note_id: NoteId,
+    ) -> Result<NetworkNoteStatusInfo, RpcError> {
+        todo!("We need to check if we want to implement this for the mockchain");
+    }
+}
+
+// CONVERSIONS
+// ================================================================================================
+
+impl From<MockChain> for MockRpcApi {
+    fn from(mock_chain: MockChain) -> Self {
+        MockRpcApi::new(mock_chain)
+    }
+}
+
+// HELPERS
+// ================================================================================================
+
+fn build_account_updates(
+    mock_chain: &MockChain,
+) -> BTreeMap<BlockNumber, BTreeMap<AccountId, Word>> {
+    let mut account_commitment_updates = BTreeMap::new();
+    for block in mock_chain.proven_blocks() {
+        let block_num = block.header().block_num();
+        let mut updates = BTreeMap::new();
+
+        for update in block.body().updated_accounts() {
+            updates.insert(update.account_id(), update.final_state_commitment());
+        }
+
+        if updates.is_empty() {
+            continue;
+        }
+
+        account_commitment_updates.insert(block_num, updates);
+    }
+    account_commitment_updates
+}

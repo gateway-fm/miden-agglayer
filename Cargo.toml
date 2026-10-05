@@ -230,5 +230,14 @@ postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:futures-util"]
 # processed it" into an application-level rejection, and our bridge-out tool
 # once bridged the same assets twice on that false premise.
 #
-# There is NO [patch.crates-io] section. The `upstream-api-gate` CI job fails
-# on any that appears, so re-vendoring anything is a reviewed decision again.
+# EXPERIMENTAL BRANCH ONLY (chore/miden-0.17-tagcap-1280) — NOT FOR MERGE.
+# miden-client 0.17.0 refuses `add_account` past 128 account note tags
+# (`Client::MAX_ACCOUNT_TAGS`, a hard-coded const — no builder option, feature
+# or env var). The proxy tracks every faucet it creates, so new-token
+# onboarding died at ~128 accounts on the growing-chain soak. vendor/miden-client
+# is the crates.io 0.17.0 source with that one constant raised to 1280; asked
+# upstream to scope the cap to note-transport (the only node-side 128 limit).
+# The `upstream-api-gate` CI job fails on this section BY DESIGN: it marks the
+# branch as a test vehicle until upstream ships a fix.
+[patch.crates-io]
+miden-client = { path = "vendor/miden-client" }

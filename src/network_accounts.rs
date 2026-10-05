@@ -57,6 +57,17 @@ use miden_standards::note::P2idNote;
 
 use crate::fee_policy::zero_fee_policy_manager_for;
 
+// The proxy tracks every faucet it creates as a client account. Stock
+// miden-client 0.17.0 caps that at 128 account note tags
+// (rust-sdk#2627), which stopped new-token onboarding at ~128 accounts on the
+// growing-chain soak. This branch vendors the client with the cap raised; a
+// COMPILE-TIME guard so a dependency update cannot silently restore the stock
+// limit.
+const _: () = assert!(
+    miden_client::Client::<()>::MAX_ACCOUNT_TAGS >= 1280,
+    "miden-client account-tag cap reverted to stock — the vendored 0.17 patch is gone"
+);
+
 /// The upstream allowlist plus the P2ID script, so the account can be funded
 /// (and later topped up) with a plain P2ID of the fee asset.
 pub fn p2id_fundable(allowed: BTreeSet<NoteScriptRoot>) -> BTreeSet<NoteScriptRoot> {
