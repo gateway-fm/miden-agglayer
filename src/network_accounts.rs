@@ -236,6 +236,57 @@ pub fn try_faucet_from_account(
 mod tests {
     use super::*;
 
+    /// miden-client 0.17.0 refused `add_account` once 128 DISTINCT account note
+    /// tags were tracked (`AccountTagLimitExceeded`, rust-sdk#2627). The proxy
+    /// adds every faucet it creates, so on the growing-chain soak new-token
+    /// onboarding died at 130 accounts / 128 distinct tags. 0.17.1 removed that
+    /// cap. This drives the exact failing call — the production faucet builder,
+    /// a real client store — well past 128 distinct tags.
+    #[tokio::test]
+    async fn client_tracks_more_than_128_faucet_tags() {
+        use miden_client::sync::NoteTagSource;
+
+        const FAUCETS: u32 = 200;
+        let mut client = crate::test_helpers::offline_miden_client_lib().await;
+        let admin = AccountId::from_hex("0xac0000000000dd110000ee000000ad").unwrap();
+        let bridge = AccountId::from_hex("0xac0000000000dd110000ee000000fc").unwrap();
+        let fee_faucet = AccountId::from_hex("0x9a0000000000dd110000ee000000fc").unwrap();
+        for i in 0..FAUCETS {
+            let mut seed = [0u8; 32];
+            seed[..4].copy_from_slice(&i.to_le_bytes());
+            let faucet = faucet_account_builder(
+                seed,
+                "TT",
+                8,
+                Felt::new(1_000_000).unwrap(),
+                Felt::new(0).unwrap(),
+                admin,
+                bridge,
+                fee_faucet,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            client
+                .add_account(&faucet, false)
+                .await
+                .unwrap_or_else(|e| panic!("add_account refused faucet #{i}: {e}"));
+        }
+        let distinct_account_tags: BTreeSet<_> = client
+            .get_note_tags()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|record| matches!(record.source, NoteTagSource::Account(_)))
+            .map(|record| record.tag)
+            .collect();
+        assert!(
+            distinct_account_tags.len() > 128,
+            "only {} distinct account tags — the test did not cross the old 128 cap",
+            distinct_account_tags.len()
+        );
+    }
+
     #[test]
     fn p2id_is_added_to_the_allowlists() {
         let bridge = p2id_fundable(AggLayerBridge::allowed_notes());

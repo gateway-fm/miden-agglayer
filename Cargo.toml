@@ -33,7 +33,7 @@ path = "src/bin/bridge_autoclaim.rs"
 # testing exposes the generated proto types — the ONLY public construction
 # path for rpc TransactionRecord fixtures (consumed_note_refs is pub(crate)
 # upstream since 0.16.0).
-miden-client = { version = "=0.17.0", features = ["testing", "tonic"] }
+miden-client = { version = "=0.17.1", features = ["testing", "tonic"] }
 tempfile = "3.10"
 # test-util enables tokio's paused virtual clock (start_paused) — used by the
 # ger::poll_until_ready timing regression test to pin the exact sleep count
@@ -147,8 +147,11 @@ futures-util = { version = "0.3", optional = true }
 #     releases). 0.17.0 is exactly what miden-node v0.17.0's Cargo.lock
 #     resolves (verified against the tag), so the BURN/MINT/CLAIM/B2AGG MAST
 #     roots agree across the node/client boundary by construction.
-#   - miden-client / miden-client-sqlite-store = 0.17.0 (stable), STOCK
+#   - miden-client / miden-client-sqlite-store = 0.17.1 (stable), STOCK
 #     crates.io release, no [patch.crates-io], no vendor/ (#177 stays closed).
+#     0.17.1 removes 0.17.0's 128 account-tag cap (rust-sdk#2627), which stopped
+#     the proxy onboarding new L1 tokens past ~128 tracked faucets; the 128 now
+#     only bounds one note-transport request, which the proxy does not use.
 #     Requires a new client database (sqlite schema changed) — every e2e run
 #     starts from a fresh store anyway. The caller-side backstop
 #     (`submit_is_indeterminate` in src/bin/bridge_out_tool.rs) stays.
@@ -200,12 +203,12 @@ miden-processor = { default-features = false, features = [
   "std",
 ], version = "0.35" }
 
-# miden-client 0.17.0 — stock crates.io release (see the release matrix above
+# miden-client 0.17.1 — stock crates.io release (see the release matrix above
 # for why no patch is needed). sqlite-store pinned in lockstep.
 miden-client = { default-features = false, features = [
   "tonic",
-], version = "=0.17.0" }
-miden-client-sqlite-store = { version = "=0.17.0" }
+], version = "=0.17.1" }
+miden-client-sqlite-store = { version = "=0.17.1" }
 
 [features]
 default = []
