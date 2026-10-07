@@ -220,6 +220,9 @@ provision() {
     ( cd "$BRIDGE_SVC_SRC" && DOCKER_BUILDKIT=1 docker build -t "$BRIDGE_SVC_IMAGE" -f ./Dockerfile . ) | tail -2 || \
       die "building $BRIDGE_SVC_IMAGE FAILED"
   else ok "$BRIDGE_SVC_IMAGE (cached)"; fi
+  # The L1 PP route (compose service l1-pp-route) must match the pinned agglayer,
+  # or every L1 settlement reverts RouteNotFound and no certificate ever settles.
+  ./scripts/check-agglayer-pp-route.sh || die "agglayer PP route pin is stale — see the message above"
 
   section "0d · L1 fixtures (kurtosis CDK snapshot -> anvil replay)"
   if [ -s "$PROJECT_DIR/fixtures/.env" ] && [ -s "$PROJECT_DIR/fixtures/l1-raw-txs.txt" ]; then
