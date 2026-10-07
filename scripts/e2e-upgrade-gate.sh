@@ -27,7 +27,8 @@
 # classifies itself "mixed" (fidelity above, idempotence below) on its own.
 #
 # Env: GATE_TAG (results dir prefix, default "gate"), GATE_TS (resume into an
-# existing dir), SKIP_PHASE_A=1, HALT_AFTER_REPEATS, MAX_CYCLES.
+# existing dir), SKIP_PHASE_A=1, HALT_AFTER_REPEATS, MAX_CYCLES, PREFLIGHT_GRACE
+# (seconds a non-healthy stack may take to recover before a cycle, default 1800).
 # Results: e2e-results/<GATE_TAG>-<TS>/{results.tsv,growth.tsv,gate.log,logs/}
 # ══════════════════════════════════════════════════════════════════════════════
 set -uo pipefail
@@ -122,11 +123,30 @@ step_cmd() {
     esac
 }
 
+# A chaos-soak step deliberately crashes services; the preflight that follows can
+# catch the proxy mid-recovery. Wait up to PREFLIGHT_GRACE seconds for the stack to
+# report healthy before halting — and LOG how long recovery took, so a slow recovery
+# is evidence in gate.log, never silently absorbed (0.17.1 gate c1: a 10 s node
+# partition kept the proxy's Miden client down ~15 min — no gRPC/TCP keepalive).
+PREFLIGHT_GRACE="${PREFLIGHT_GRACE:-1800}"
+preflight() { # sets h / hrc
+    local t0=$SECONDS first=""
+    while true; do
+        h="$(stack_health)"; hrc=$?
+        (( hrc == 0 )) && break
+        [[ -z "$first" ]] && { first="$h"; log "preflight: stack is $h — waiting up to ${PREFLIGHT_GRACE}s for recovery"; }
+        (( SECONDS - t0 >= PREFLIGHT_GRACE )) && return 0
+        sleep 30
+    done
+    [[ -n "$first" ]] && log "preflight: recovered from $first after $(( SECONDS - t0 ))s"
+    return 0
+}
+
 c=1
 while (( MAX_CYCLES == 0 || c <= MAX_CYCLES )); do
-    h="$(stack_health)"; hrc=$?
+    preflight
     if (( hrc != 0 )); then
-        log "stack is $h before cycle $c — HALT (every later step would measure the wedge)"
+        log "stack is $h before cycle $c after a ${PREFLIGHT_GRACE}s grace — HALT (every later step would measure the wedge)"
         post_mortem "B-c$c-preflight"
         printf '%s\t%s\t%s\t%s\t%s\n' "B" "c$c-preflight" "HALT:$h" 0 "$R/gate.log" >> "$TSV"
         exit 1
