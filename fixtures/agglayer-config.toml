@@ -13,7 +13,7 @@ mock-verifier = true
 
 [prover.mock-prover]
 proving-timeout = "5m"
-proving_request_timeout = "300s"
+proving-request-timeout = "300s"
 
 [rpc]
 grpc-port = 4443

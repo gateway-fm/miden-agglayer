@@ -1,0 +1,142 @@
+From 3f714b115db8fb2ffd1bc6400370d940857c7ebf Mon Sep 17 00:00:00 2001
+From: Max Revitt <max@revitt.co>
+Date: Wed, 10 Jun 2026 12:55:55 +0000
+Subject: [PATCH 2/2] feat(autoclaim): add SourceNetworkID to sponsor only one
+ source network
+
+On a shared AggLayer rollup manager every rollup settles its L2->L1 exits on
+the same L1, so the standalone auto-claimer would sponsor (pay gas for) every
+co-tenant rollup's exits, not just ours.
+
+Add an optional [AutoClaim].SourceNetworkID. When set, only bridges whose
+origin network_id matches it are claimed (filtered after fetching from
+/pending-bridges, covering both asset and authorized-message bridges); the
+number skipped is logged. When unset the previous all-source-networks
+behaviour is preserved, so single-tenant deployments are unaffected.
+
+Adds TestFilterBySourceNetwork.
+---
+ autoclaimservice/autoclaim/autoclaim.go      | 25 +++++++++++-
+ autoclaimservice/autoclaim/autoclaim_test.go | 40 ++++++++++++++++++++
+ autoclaimservice/autoclaim/config.go         |  8 ++++
+ autoclaimservice/config/default.go           |  4 ++
+ 4 files changed, 76 insertions(+), 1 deletion(-)
+ create mode 100644 autoclaimservice/autoclaim/autoclaim_test.go
+
+diff --git a/autoclaimservice/autoclaim/autoclaim.go b/autoclaimservice/autoclaim/autoclaim.go
+index 6c55134..98774ea 100644
+--- a/autoclaimservice/autoclaim/autoclaim.go
++++ b/autoclaimservice/autoclaim/autoclaim.go
+@@ -316,7 +316,30 @@ func (ac *autoclaim) getBridgesToClaim() ([]*pb.Deposit, error) {
+ 		}
+ 		bridges = append(bridges, authorizedBridges...)
+ 	}
+-	return bridges, nil
++	return ac.filterBySourceNetwork(bridges), nil
++}
++
++// filterBySourceNetwork drops bridges that do not originate from cfg.SourceNetworkID, so the
++// claimer only sponsors (pays gas for) bridges from our own network. When SourceNetworkID is
++// unset it is a no-op and every source network is claimed.
++func (ac *autoclaim) filterBySourceNetwork(bridges []*pb.Deposit) []*pb.Deposit {
++	if ac.cfg.SourceNetworkID == nil {
++		return bridges
++	}
++	src := *ac.cfg.SourceNetworkID
++	filtered := make([]*pb.Deposit, 0, len(bridges))
++	var skipped int
++	for _, b := range bridges {
++		if b.NetworkId == src {
++			filtered = append(filtered, b)
++		} else {
++			skipped++
++		}
++	}
++	if skipped > 0 {
++		log.Infof("Skipped %d bridge(s) not originating from source network %d (only sponsoring source network %d)", skipped, src, src)
++	}
++	return filtered
+ }
+ 
+ func (ac *autoclaim) getPendingBridges(leafType uint32, destAddress common.Address) ([]*pb.Deposit, uint64, error) {
+diff --git a/autoclaimservice/autoclaim/autoclaim_test.go b/autoclaimservice/autoclaim/autoclaim_test.go
+new file mode 100644
+index 0000000..ec82ddf
+--- /dev/null
++++ b/autoclaimservice/autoclaim/autoclaim_test.go
+@@ -0,0 +1,40 @@
++package autoclaim
++
++import (
++	"testing"
++
++	"github.com/0xPolygon/zkevm-bridge-service/bridgectrl/pb"
++	"github.com/stretchr/testify/assert"
++)
++
++func TestFilterBySourceNetwork(t *testing.T) {
++	bridges := []*pb.Deposit{
++		{DepositCnt: 13, NetworkId: 76}, // ours
++		{DepositCnt: 23, NetworkId: 44}, // another rollup
++		{DepositCnt: 23, NetworkId: 76}, // ours
++		{DepositCnt: 7, NetworkId: 0},   // L1 origin
++	}
++
++	t.Run("unset claims every source network", func(t *testing.T) {
++		ac := autoclaim{cfg: &Config{}}
++		got := ac.filterBySourceNetwork(bridges)
++		assert.Equal(t, 4, len(got))
++	})
++
++	t.Run("set restricts to the configured source network", func(t *testing.T) {
++		src := uint32(76)
++		ac := autoclaim{cfg: &Config{SourceNetworkID: &src}}
++		got := ac.filterBySourceNetwork(bridges)
++		assert.Equal(t, 2, len(got))
++		for _, b := range got {
++			assert.Equal(t, uint32(76), b.NetworkId)
++		}
++	})
++
++	t.Run("set to a network with no bridges yields none", func(t *testing.T) {
++		src := uint32(99)
++		ac := autoclaim{cfg: &Config{SourceNetworkID: &src}}
++		got := ac.filterBySourceNetwork(bridges)
++		assert.Equal(t, 0, len(got))
++	})
++}
+diff --git a/autoclaimservice/autoclaim/config.go b/autoclaimservice/autoclaim/config.go
+index c5b5148..1d95104 100644
+--- a/autoclaimservice/autoclaim/config.go
++++ b/autoclaimservice/autoclaim/config.go
+@@ -15,4 +15,12 @@ type Config struct {
+ 	MaxNumberOfClaimsPerGroup int `mapstructure:"MaxNumberOfClaimsPerGroup"`
+ 	// BridgeURL is the URL of the bridge service
+ 	BridgeURL string `mapstructure:"BridgeURL"`
++	// SourceNetworkID, when set, restricts auto-claiming to bridges that originate from this
++	// network only (matched against each deposit's origin network_id). When unset, bridges
++	// from every source network are claimed (the previous behaviour).
++	//
++	// On a shared AggLayer rollup manager many rollups settle their L2->L1 exits on the same
++	// L1, so the claimer would otherwise sponsor (pay gas for) every co-tenant's exits. Set
++	// this to our own rollup's network id (e.g. Miden) so we only sponsor our own bridges.
++	SourceNetworkID *uint32 `mapstructure:"SourceNetworkID"`
+ }
+diff --git a/autoclaimservice/config/default.go b/autoclaimservice/config/default.go
+index 0f093be..0f3ad75 100644
+--- a/autoclaimservice/config/default.go
++++ b/autoclaimservice/config/default.go
+@@ -18,6 +18,10 @@ AuthorizedClaimMessageAddresses = []
+ AutoClaimInterval = "10m"
+ MaxNumberOfClaimsPerGroup = 10
+ BridgeURL = "http://localhost:8080"
++# SourceNetworkID, when set, only auto-claims bridges originating from this source network
++# (the deposit's origin network_id). Unset = claim from all source networks. Set it to our
++# own rollup's network id on a shared rollup manager so we only sponsor our own L2->L1 bridges.
++# SourceNetworkID = 76
+ 
+ [BlockchainManager]
+ PrivateKey = {Path = "./test/test.keystore", Password = "testonly"}
+-- 
+2.43.0
+

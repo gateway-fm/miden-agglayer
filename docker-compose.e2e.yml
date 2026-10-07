@@ -604,8 +604,8 @@ services:
   bridge-service:
     # Patched image: /pending-bridges disambiguates the already-claimed check by
     # source rollup (see revitteth/zkevm-bridge-service#1). Built locally via
-    # `docker buildx build -t zkevm-bridge-service:v0.6.4-RC2-pendingbridges`.
-    image: zkevm-bridge-service:v0.6.4-RC2-pendingbridges
+    # `docker buildx build -t zkevm-bridge-service:v0.6.4-RC4-pendingbridges`.
+    image: zkevm-bridge-service:v0.6.4-RC4-pendingbridges
     entrypoint: ["/app/zkevm-bridge"]
     command: ["run", "--cfg", "/etc/zkevm/bridge-config.toml"]
     ports:
@@ -660,7 +660,7 @@ services:
 
   # ── AggLayer (certificate aggregation) ─────────────────────────────────────
   agglayer:
-    image: europe-west2-docker.pkg.dev/prj-polygonlabs-devtools-dev/public/agglayer:0.4.4-remove-agglayer-prover
+    image: ghcr.io/agglayer/agglayer:0.6.1
     restart: on-failure
     command: ["/usr/local/bin/agglayer", "run", "--cfg=/etc/agglayer/config.toml"]
     ports:
@@ -679,7 +679,7 @@ services:
 
   # ── AggKit (aggoracle + aggsender) ─────────────────────────────────────────
   aggkit:
-    image: ghcr.io/agglayer/aggkit:0.8.3-rc1
+    image: ghcr.io/agglayer/aggkit:0.10.0
     restart: on-failure
     command: ["run", "--cfg=/etc/aggkit/config.toml", "--components=aggoracle,aggsender"]
     ports:

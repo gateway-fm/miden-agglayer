@@ -157,7 +157,24 @@ provision() {
     die "pinned node $MIDEN_NODE_GIT_REF has no --tx-prover.timeout flag (needs >= v0.16.0-rc.4) — refusing to build a node with a hardcoded 10s prover timeout"
   [ -z "$(git -C "$WORK/miden-node-build" status --porcelain)" ] || \
     die "node build worktree $WORK/miden-node-build is not clean — the e2e stack builds the UNMODIFIED upstream checkout"
-  [ -d "$WORK/zkevm-bridge-service" ] || git clone --depth 1 --branch fix/pending-bridges-rollup-disambiguation https://github.com/revitteth/zkevm-bridge-service.git "$WORK/zkevm-bridge-service"
+  # zkevm-bridge-service: upstream tag + OUR patches (fixtures/patches/zkevm-bridge-service),
+  # applied onto a verified clean checkout — no personal fork branch in the build path.
+  # The two patches (already-claimed check disambiguated by source rollup; autoclaim
+  # SourceNetworkID) are not upstream as of v0.6.4-RC4. Bump BRIDGE_SVC_REF + _COMMIT
+  # together; the image tag carries the ref so a stale image is never reused.
+  BRIDGE_SVC_REF="v0.6.4-RC4"
+  BRIDGE_SVC_COMMIT="b83691bfca6aa30a1d89a85c920f73fd8a69f803"
+  BRIDGE_SVC_IMAGE="zkevm-bridge-service:${BRIDGE_SVC_REF}-pendingbridges"
+  BRIDGE_SVC_SRC="$WORK/zkevm-bridge-service-$BRIDGE_SVC_REF"
+  if [ ! -d "$BRIDGE_SVC_SRC" ]; then
+    git clone --quiet --branch "$BRIDGE_SVC_REF" https://github.com/0xPolygon/zkevm-bridge-service.git "$BRIDGE_SVC_SRC" || \
+      die "cannot clone zkevm-bridge-service $BRIDGE_SVC_REF"
+    [ "$(git -C "$BRIDGE_SVC_SRC" rev-parse HEAD)" = "$BRIDGE_SVC_COMMIT" ] || \
+      die "zkevm-bridge-service $BRIDGE_SVC_REF is not the pinned commit $BRIDGE_SVC_COMMIT — refusing to build"
+    git -C "$BRIDGE_SVC_SRC" -c user.name=e2e -c user.email=e2e@localhost am --quiet \
+      "$PROJECT_DIR"/fixtures/patches/zkevm-bridge-service/*.patch || \
+      die "our zkevm-bridge-service patches do not apply to $BRIDGE_SVC_REF — rebase them"
+  fi
   ok "repos present under $WORK"
 
   section "0c · docker images (built only if missing)"
@@ -198,9 +215,11 @@ provision() {
   build_node_img miden-node          57291 miden-node
   build_node_img miden-ntx-builder   50301 miden-ntx-builder
   build_node_img miden-remote-prover 50051 miden-remote-prover
-  if ! docker image inspect zkevm-bridge-service:v0.6.4-RC2-pendingbridges >/dev/null 2>&1; then
-    say "building patched zkevm-bridge-service ..."; ( cd "$WORK/zkevm-bridge-service" && DOCKER_BUILDKIT=1 docker build -t zkevm-bridge-service:v0.6.4-RC2-pendingbridges -f ./Dockerfile . ) | tail -2
-  else ok "zkevm-bridge-service:v0.6.4-RC2-pendingbridges (cached)"; fi
+  if ! docker image inspect "$BRIDGE_SVC_IMAGE" >/dev/null 2>&1; then
+    say "building patched zkevm-bridge-service ($BRIDGE_SVC_REF + fixtures/patches) ..."
+    ( cd "$BRIDGE_SVC_SRC" && DOCKER_BUILDKIT=1 docker build -t "$BRIDGE_SVC_IMAGE" -f ./Dockerfile . ) | tail -2 || \
+      die "building $BRIDGE_SVC_IMAGE FAILED"
+  else ok "$BRIDGE_SVC_IMAGE (cached)"; fi
 
   section "0d · L1 fixtures (kurtosis CDK snapshot -> anvil replay)"
   if [ -s "$PROJECT_DIR/fixtures/.env" ] && [ -s "$PROJECT_DIR/fixtures/l1-raw-txs.txt" ]; then

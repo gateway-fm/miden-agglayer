@@ -39,7 +39,8 @@ GlobalExitRootL2 = "0xa40d5f56745a118d0906a34e69aec8c0db1cb8fa"
 WaitPeriodMonitorTx = "5s"
 
 [AggOracle.EVMSender.EthTxManager]
-# Aggkit v0.8.3-rc1 defaults to evicting a transaction after one failed
+# Aggkit (v0.8.3-rc1 and v0.10.0 — both on zkevm-ethtx-manager v0.2.18, where
+# this is interpreted) defaults to evicting a transaction after one failed
 # estimate/send. The oracle then deduplicates the GER and never requeues it.
 # Keep retrying transient proxy/node outages; harness deadlines and the
 # admission-aware watchdog still fail closed on a persistent wedge.

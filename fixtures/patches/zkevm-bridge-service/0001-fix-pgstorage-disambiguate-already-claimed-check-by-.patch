@@ -1,0 +1,160 @@
+From f23254ddd67d7c2393ba85c2395464ec433491e3 Mon Sep 17 00:00:00 2001
+From: Max Revitt <max@revitt.co>
+Date: Wed, 10 Jun 2026 10:28:03 +0000
+Subject: [PATCH 1/2] fix(pgstorage): disambiguate already-claimed check by
+ source rollup
+
+GetPendingDepositsToClaim (count + rows) and GetDepositsFromOtherL2ToClaim
+excluded a deposit whenever any sync.claim row shared (network_id, index),
+ignoring the claim's origin (rollup_index / mainnet_flag).
+
+On a shared AggLayer rollup manager every rollup claims its L2->L1 exits on
+L1 under network_id=0, and their deposit_cnt index spaces overlap. So once
+any rollup claimed its exit #N, every other rollup's exit #N was permanently
+hidden from /pending-bridges and the standalone auto-claimer never submitted
+it (logging "No bridges to claim were found"). /bridges reported them
+claimable the whole time because GetClaim already uses the strict
+rollup_index + 1 = network_id key.
+
+Mirror GetClaim's origin key in all three pending-deposit checks:
+
+  (d.network_id = 0  AND c.mainnet_flag)
+  OR (d.network_id <> 0 AND NOT c.mainnet_flag AND c.rollup_index + 1 = d.network_id)
+
+No schema/migration change; single-rollup deployments are unaffected.
+
+Adds TestGetPendingDepositsToClaimCrossRollup, which reproduces the
+collision (rollup 76 exits 13/14/23 while rollups 44/49/52/57 have claimed
+their own #23): fails on the unqualified query (0 deposits) and passes with
+the fix (3 deposits, then 2 once rollup 76 claims its own #23).
+---
+ db/pgstorage/pgstorage.go      |  6 +--
+ db/pgstorage/pgstorage_test.go | 83 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 86 insertions(+), 3 deletions(-)
+
+diff --git a/db/pgstorage/pgstorage.go b/db/pgstorage/pgstorage.go
+index 0c47282..dba1483 100644
+--- a/db/pgstorage/pgstorage.go
++++ b/db/pgstorage/pgstorage.go
+@@ -684,7 +684,7 @@ func (p *PostgresStorage) UpdateL2DepositsStatus(ctx context.Context, exitRoot [
+ 
+ // GetDepositsFromOtherL2ToClaim returns L2 deposits whose destination is an specific L2
+ func (p *PostgresStorage) GetDepositsFromOtherL2ToClaim(ctx context.Context, destinationNetwork uint32, dbTx interface{}) ([]*etherman.Deposit, error) {
+-	const getL2DepositsToClaimStatusSQL = `select sync.deposit.id, sync.deposit.leaf_type, sync.deposit.orig_net, sync.deposit.orig_addr, sync.deposit.amount, sync.deposit.dest_net, sync.deposit.dest_addr, sync.deposit.deposit_cnt, sync.deposit.block_id, sync.deposit.network_id, sync.deposit.tx_hash, sync.deposit.metadata, sync.deposit.ready_for_claim FROM sync.deposit where sync.deposit.deposit_cnt not in (select index FROM sync.claim where sync.claim.network_id = $1) and sync.deposit.network_id !=0 and sync.deposit.ignore = false and sync.deposit.dest_net = $1 and ready_for_claim =true order by sync.deposit.id desc;`
++	const getL2DepositsToClaimStatusSQL = `select sync.deposit.id, sync.deposit.leaf_type, sync.deposit.orig_net, sync.deposit.orig_addr, sync.deposit.amount, sync.deposit.dest_net, sync.deposit.dest_addr, sync.deposit.deposit_cnt, sync.deposit.block_id, sync.deposit.network_id, sync.deposit.tx_hash, sync.deposit.metadata, sync.deposit.ready_for_claim FROM sync.deposit where not exists (select 1 FROM sync.claim c where c.network_id = $1 and c.index = sync.deposit.deposit_cnt and not c.mainnet_flag and c.rollup_index + 1 = sync.deposit.network_id) and sync.deposit.network_id !=0 and sync.deposit.ignore = false and sync.deposit.dest_net = $1 and ready_for_claim =true order by sync.deposit.id desc;`
+ 	rows, err := p.getExecQuerier(dbTx).Query(ctx, getL2DepositsToClaimStatusSQL, destinationNetwork)
+ 	if err != nil {
+ 		return nil, err
+@@ -787,13 +787,13 @@ func (p *PostgresStorage) GetPendingDepositsToClaim(ctx context.Context, address
+ 	} else if fromNetwork == 1 { // only L2
+ 		fromNetworkSQL = "AND d.network_id != 0"
+ 	}
+-	getNumberPendingDepositsToClaimSQL := "SELECT count(*) FROM sync.deposit AS d WHERE dest_net = $1 AND ready_for_claim = true " + fromNetworkSQL + " AND leaf_type = $2 " + addrSQL + " AND NOT EXISTS (SELECT 1 FROM sync.claim c WHERE c.network_id = $1 AND c.index = d.deposit_cnt) AND NOT EXISTS (SELECT 1 FROM sync.monitored_txs mt WHERE mt.deposit_id = d.id) AND ignore = false"
++	getNumberPendingDepositsToClaimSQL := "SELECT count(*) FROM sync.deposit AS d WHERE dest_net = $1 AND ready_for_claim = true " + fromNetworkSQL + " AND leaf_type = $2 " + addrSQL + " AND NOT EXISTS (SELECT 1 FROM sync.claim c WHERE c.network_id = $1 AND c.index = d.deposit_cnt AND ((d.network_id = 0 AND c.mainnet_flag) OR (d.network_id <> 0 AND NOT c.mainnet_flag AND c.rollup_index + 1 = d.network_id))) AND NOT EXISTS (SELECT 1 FROM sync.monitored_txs mt WHERE mt.deposit_id = d.id) AND ignore = false"
+ 	var totalCount uint64
+ 	err := p.getExecQuerier(dbTx).QueryRow(ctx, getNumberPendingDepositsToClaimSQL, destNetwork, leafType).Scan(&totalCount)
+ 	if err != nil {
+ 		return nil, 0, err
+ 	}
+-	getPendingDepositsToClaimSQL := "SELECT d.id, leaf_type, orig_net, orig_addr, amount, dest_net, dest_addr, deposit_cnt, block_id, b.block_num, d.network_id, tx_hash, metadata, ready_for_claim FROM sync.deposit AS d INNER JOIN sync.block AS b ON d.block_id = b.id WHERE dest_net = $1 AND ready_for_claim = true " + fromNetworkSQL + " AND leaf_type = $2 " + addrSQL + " AND ignore = false AND NOT EXISTS (SELECT 1 FROM sync.claim c WHERE c.network_id = $1 AND c.index = d.deposit_cnt) AND NOT EXISTS (SELECT 1 FROM sync.monitored_txs mt WHERE mt.deposit_id = d.id) ORDER BY d.deposit_cnt ASC "
++	getPendingDepositsToClaimSQL := "SELECT d.id, leaf_type, orig_net, orig_addr, amount, dest_net, dest_addr, deposit_cnt, block_id, b.block_num, d.network_id, tx_hash, metadata, ready_for_claim FROM sync.deposit AS d INNER JOIN sync.block AS b ON d.block_id = b.id WHERE dest_net = $1 AND ready_for_claim = true " + fromNetworkSQL + " AND leaf_type = $2 " + addrSQL + " AND ignore = false AND NOT EXISTS (SELECT 1 FROM sync.claim c WHERE c.network_id = $1 AND c.index = d.deposit_cnt AND ((d.network_id = 0 AND c.mainnet_flag) OR (d.network_id <> 0 AND NOT c.mainnet_flag AND c.rollup_index + 1 = d.network_id))) AND NOT EXISTS (SELECT 1 FROM sync.monitored_txs mt WHERE mt.deposit_id = d.id) ORDER BY d.deposit_cnt ASC "
+ 	var rows pgx.Rows
+ 	if limit > 0 {
+ 		getPendingDepositsToClaimSQL += "LIMIT $3 OFFSET $4"
+diff --git a/db/pgstorage/pgstorage_test.go b/db/pgstorage/pgstorage_test.go
+index cae5f46..f1dbe05 100644
+--- a/db/pgstorage/pgstorage_test.go
++++ b/db/pgstorage/pgstorage_test.go
+@@ -264,6 +264,89 @@ func TestGetPendingDepositsToClaim(t *testing.T) {
+ 	assert.Equal(t, true, deposits[0].ReadyForClaim)
+ }
+ 
++// TestGetPendingDepositsToClaimCrossRollup reproduces the shared-rollup-manager bug
++// where a deposit's exit index collides with another rollup's already-claimed exit at
++// the same index. On a shared AggLayer L1, every rollup claims its L2->L1 exits under
++// network_id = 0, and their deposit_cnt index spaces overlap. The pending-deposits query
++// must disambiguate the claim by its origin (mainnet_flag / rollup_index + 1 = network_id)
++// exactly like GetClaim does, otherwise rollup A's exit #N permanently hides rollup B's
++// exit #N from /pending-bridges (the standalone auto-claimer never sees it).
++//
++// Field case (Bali): our rollup 76 exit #23 was ready & unclaimed, but rollups 44/49/52/57
++// had already claimed their own #23 on L1, so the unqualified query returned 0 rows.
++func TestGetPendingDepositsToClaimCrossRollup(t *testing.T) {
++	// Three of our deposits (origin rollup 76, network_id 76) bridging out to L1 (dest_net 0),
++	// at exit indices 13, 14 and 23, all ready and unclaimed by us.
++	// Plus claims recorded on L1 (network_id 0, mainnet_flag false) for the SAME indices but
++	// belonging to OTHER rollups: #13 by rollup 44 (rollup_index 43), #14 by rollup 49
++	// (rollup_index 48), and #23 by rollups 52 and 57 (rollup_index 51 and 56).
++	data := `INSERT INTO sync.block
++	(id, block_num, block_hash, network_id)
++	VALUES(1, 1, decode('5C7831','hex'), 0);
++
++	INSERT INTO sync.deposit
++	(leaf_type, network_id, orig_net, orig_addr, amount, dest_net, dest_addr, block_id, deposit_cnt, tx_hash, metadata, id, ready_for_claim)
++	VALUES(0, 76, 76, decode('0000000000000000000000000000000000000000','hex'), '90000000000000000', 0, decode('F39FD6E51AAD88F6F4CE6AB8827279CFFFB92266','hex'), 1, 13, decode('CBE7A77275EE22780BB94EA900D42CEF88F5A2F0E1A7C76696556D7FF17767E6','hex'), decode('','hex'), 1, true);
++	INSERT INTO sync.deposit
++	(leaf_type, network_id, orig_net, orig_addr, amount, dest_net, dest_addr, block_id, deposit_cnt, tx_hash, metadata, id, ready_for_claim)
++	VALUES(0, 76, 76, decode('0000000000000000000000000000000000000000','hex'), '90000000000000000', 0, decode('F39FD6E51AAD88F6F4CE6AB8827279CFFFB92266','hex'), 1, 14, decode('6282FACE883070640F802CE8A2C42593AA18D3A691C61BA006EC477D6E5FEE1F','hex'), decode('','hex'), 2, true);
++	INSERT INTO sync.deposit
++	(leaf_type, network_id, orig_net, orig_addr, amount, dest_net, dest_addr, block_id, deposit_cnt, tx_hash, metadata, id, ready_for_claim)
++	VALUES(0, 76, 76, decode('0000000000000000000000000000000000000000','hex'), '90000000000000000', 0, decode('F38FD6E51AAD88F6F4CE6AB8827279CFFFB92266','hex'), 1, 23, decode('A382FACE883070640F802CE8A2C42593AA18D3A691C61BA006EC477D6E5FEE1F','hex'), decode('','hex'), 3, true);
++
++	INSERT INTO sync.claim
++	(network_id, "index", orig_net, orig_addr, amount, dest_addr, block_id, tx_hash, rollup_index, mainnet_flag)
++	VALUES(0, 13, 0, decode('0000000000000000000000000000000000000000','hex'), '90000000000000000', decode('F39FD6E51AAD88F6F4CE6AB8827279CFFFB92266','hex'), 1, decode('BF2C816AB6F8A8F5F9DDA6EE97D433CC841E69B5669A5CDF499826FA4B99C179','hex'), 43, false);
++	INSERT INTO sync.claim
++	(network_id, "index", orig_net, orig_addr, amount, dest_addr, block_id, tx_hash, rollup_index, mainnet_flag)
++	VALUES(0, 14, 0, decode('0000000000000000000000000000000000000000','hex'), '90000000000000000', decode('F39FD6E51AAD88F6F4CE6AB8827279CFFFB92266','hex'), 1, decode('BF2C816AB6F8A8F5F9DDA6EE97D433CC841E69B5669A5CDF499826FA4B99C179','hex'), 48, false);
++	INSERT INTO sync.claim
++	(network_id, "index", orig_net, orig_addr, amount, dest_addr, block_id, tx_hash, rollup_index, mainnet_flag)
++	VALUES(0, 23, 0, decode('0000000000000000000000000000000000000000','hex'), '90000000000000000', decode('F39FD6E51AAD88F6F4CE6AB8827279CFFFB92266','hex'), 1, decode('BF2C816AB6F8A8F5F9DDA6EE97D433CC841E69B5669A5CDF499826FA4B99C179','hex'), 51, false);
++	INSERT INTO sync.claim
++	(network_id, "index", orig_net, orig_addr, amount, dest_addr, block_id, tx_hash, rollup_index, mainnet_flag)
++	VALUES(0, 23, 0, decode('0000000000000000000000000000000000000000','hex'), '90000000000000000', decode('F39FD6E51AAD88F6F4CE6AB8827279CFFFB92266','hex'), 1, decode('BF2C816AB6F8A8F5F9DDA6EE97D433CC841E69B5669A5CDF499826FA4B99C179','hex'), 56, false);
++	`
++	dbCfg := NewConfigFromEnv()
++	ctx := context.Background()
++	err := InitOrReset(ctx, dbCfg)
++	require.NoError(t, err)
++
++	store, err := NewPostgresStorage(ctx, dbCfg)
++	require.NoError(t, err)
++
++	_, err = store.Exec(ctx, data)
++	require.NoError(t, err)
++
++	// dest_net = 0 (L1). Despite other rollups having claimed their #13/#14/#23, all three of
++	// our rollup-76 exits must still be pending (none was claimed BY rollup 76).
++	deposits, totalCount, err := store.GetPendingDepositsToClaim(ctx, common.Address{}, 0, 0, 0, 0, -1, nil)
++	require.NoError(t, err)
++	assert.Equal(t, uint64(3), totalCount)
++	require.Equal(t, 3, len(deposits))
++	assert.Equal(t, uint32(13), deposits[0].DepositCount)
++	assert.Equal(t, uint32(14), deposits[1].DepositCount)
++	assert.Equal(t, uint32(23), deposits[2].DepositCount)
++	for _, d := range deposits {
++		assert.Equal(t, uint32(76), d.NetworkID)
++		assert.Equal(t, uint32(0), d.DestinationNetwork)
++	}
++
++	// Now rollup 76 itself claims its exit #23 on L1 (rollup_index 75, i.e. network_id 76).
++	// That claim — and only that claim — must remove deposit #23 from the pending set.
++	_, err = store.Exec(ctx, `INSERT INTO sync.claim
++	(network_id, "index", orig_net, orig_addr, amount, dest_addr, block_id, tx_hash, rollup_index, mainnet_flag)
++	VALUES(0, 23, 0, decode('0000000000000000000000000000000000000000','hex'), '90000000000000000', decode('F39FD6E51AAD88F6F4CE6AB8827279CFFFB92266','hex'), 1, decode('A12C816AB6F8A8F5F9DDA6EE97D433CC841E69B5669A5CDF499826FA4B99C179','hex'), 75, false);`)
++	require.NoError(t, err)
++
++	deposits, totalCount, err = store.GetPendingDepositsToClaim(ctx, common.Address{}, 0, 0, 0, 0, -1, nil)
++	require.NoError(t, err)
++	assert.Equal(t, uint64(2), totalCount)
++	require.Equal(t, 2, len(deposits))
++	assert.Equal(t, uint32(13), deposits[0].DepositCount)
++	assert.Equal(t, uint32(14), deposits[1].DepositCount)
++}
++
+ func TestResetDeposits(t *testing.T) {
+ 	data := `INSERT INTO sync.block
+ 	(id, block_num, block_hash, network_id)
+-- 
+2.43.0
+

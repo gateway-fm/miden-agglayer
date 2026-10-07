@@ -1,4 +1,27 @@
-# Local patches for the e2e node images
+# Local patches for the e2e images
+
+## zkevm-bridge-service (`zkevm-bridge-service/`)
+
+`run-all.sh` clones upstream `0xPolygon/zkevm-bridge-service` at
+`BRIDGE_SVC_REF` (currently `v0.6.4-RC4`, commit-pinned via
+`BRIDGE_SVC_COMMIT`), applies these with `git am`, and builds
+`zkevm-bridge-service:<ref>-pendingbridges`. Neither change is upstream as of
+`v0.6.4-RC4`:
+
+1. **`0001` — already-claimed check disambiguated by source rollup.** Without
+   it, `/pending-bridges` treats a deposit as claimed when a claim with the
+   same deposit count exists from a DIFFERENT source rollup, which breaks
+   L2<->L2 (two origins share deposit counts).
+2. **`0002` — autoclaim `SourceNetworkID`.** Lets a sponsor serve exactly one
+   source network, so the L1 and L2B sponsors do not race each other.
+
+Both previously lived on the `revitteth/zkevm-bridge-service`
+`fix/pending-bridges-rollup-disambiguation` branch (on top of `v0.6.4-RC2`);
+they apply cleanly to `v0.6.4-RC4`, and `0002`'s unit test passes there. To
+rebase onto a newer tag: cherry-pick them, `git format-patch`, bump
+`BRIDGE_SVC_REF`/`BRIDGE_SVC_COMMIT`.
+
+## Miden node images
 
 **None.** The `miden-node` / `miden-validator` / `miden-ntx-builder` /
 `miden-remote-prover` e2e images are built from a verified, UNMODIFIED clone of
