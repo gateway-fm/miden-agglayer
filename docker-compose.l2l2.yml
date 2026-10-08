@@ -40,7 +40,7 @@ services:
   # scripts/setup-l2b.sh has registered rollup #2 + deployed the L2B bridge/GER;
   # until then it retries harmlessly (same startup pattern as aggkit #1).
   aggkit-l2b:
-    image: ghcr.io/agglayer/aggkit:0.10.0
+    image: ghcr.io/agglayer/aggkit:0.10.1
     restart: unless-stopped
     command: ["run", "--cfg=/etc/aggkit/config.toml", "--components=aggoracle,aggsender"]
     volumes:

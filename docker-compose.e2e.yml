@@ -722,7 +722,7 @@ services:
 
   # ── AggKit (aggoracle + aggsender) ─────────────────────────────────────────
   aggkit:
-    image: ghcr.io/agglayer/aggkit:0.10.0
+    image: ghcr.io/agglayer/aggkit:0.10.1
     restart: on-failure
     command: ["run", "--cfg=/etc/aggkit/config.toml", "--components=aggoracle,aggsender"]
     ports:
