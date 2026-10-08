@@ -15,6 +15,14 @@
 //!
 //! Genesis "deploys" accounts without a transaction, so both carry nonce 1 —
 //! genesis rejects a nonce-0 import as undeployed.
+//!
+//! The fee faucet carries allow-all send/receive policies behind the V2
+//! ASSET CALLBACKS (`TokenPolicyManagerV2`, miden-standards 0.17.1), like the
+//! live testnet fee faucet: every fee asset an account receives then runs the
+//! faucet's `invoke_receive_policy_v2`. Without callbacks the e2e never
+//! executes that path — and a proxy built on miden-standards 0.17.0 (no V2
+//! procedures) fails it with "procedure with root digest 0xefc0d6dc…ace2 could
+//! not be found" (testnet bring-up, proxy v0.17.1 on node v0.17.1).
 
 use std::path::Path;
 
@@ -26,7 +34,9 @@ use miden_protocol::account::{Account, AccountBuilder, AccountType};
 use miden_protocol::asset::{Asset, AssetAmount, AssetVault, FungibleAsset, TokenSymbol};
 use miden_standards::account::auth::{Approver, AuthSingleSig};
 use miden_standards::account::faucets::{FungibleFaucet, TokenName};
-use miden_standards::account::policies::{BurnPolicy, MintPolicy, TokenPolicyManager};
+use miden_standards::account::policies::{
+    BurnPolicy, MintPolicy, TokenPolicyManager, TokenPolicyManagerV2, TransferPolicy,
+};
 use miden_standards::account::wallets::create_basic_wallet;
 
 pub const NATIVE_FAUCET_FILE: &str = "native_faucet.mac";
@@ -74,12 +84,14 @@ pub fn build() -> anyhow::Result<GenesisAccounts> {
         .account_type(AccountType::Public)
         .with_component(AuthSingleSig::new(faucet_approver))
         .with_component(faucet)
-        .with_components(
+        .with_components(TokenPolicyManagerV2::new(
             TokenPolicyManager::builder()
                 .active_mint_policy(MintPolicy::allow_all())
                 .active_burn_policy(BurnPolicy::allow_all())
+                .active_send_policy(TransferPolicy::allow_all())
+                .active_receive_policy(TransferPolicy::allow_all())
                 .build(),
-        )
+        ))
         .build()
         .context("native faucet account")?;
     faucet_account.set_nonce(ONE)?;
@@ -159,6 +171,34 @@ mod tests {
         // Both carry a signing key (the operator's is what the fee-funder spends with).
         assert_eq!(accounts.native_faucet.auth_secret_keys().len(), 1);
         assert_eq!(accounts.faucet_operator.auth_secret_keys().len(), 1);
+    }
+
+    /// The fee faucet must wire the V2 transfer callbacks, as the testnet fee
+    /// faucet does — the receive root is pinned to the exact digest the
+    /// testnet bring-up failed on, so the e2e keeps exercising that path.
+    #[test]
+    fn native_faucet_wires_the_v2_asset_callbacks_like_testnet() {
+        use miden_protocol::asset::AssetCallbacks;
+        let accounts = build().unwrap();
+        let storage = accounts.native_faucet.account().storage();
+        let on_receive = storage
+            .get_item(AssetCallbacks::on_before_asset_added_to_account_slot())
+            .unwrap();
+        let on_send = storage
+            .get_item(AssetCallbacks::on_before_asset_added_to_note_slot())
+            .unwrap();
+        assert_eq!(
+            on_receive,
+            TokenPolicyManagerV2::invoke_receive_policy_root().as_word()
+        );
+        assert_eq!(
+            on_receive.to_hex(),
+            "0xefc0d6dc729c05e93107be949d6cca2e20daf02e20b923934c1c0420a466ace2"
+        );
+        assert_eq!(
+            on_send,
+            TokenPolicyManagerV2::invoke_send_policy_root().as_word()
+        );
     }
 
     #[test]
