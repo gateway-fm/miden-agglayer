@@ -140,11 +140,11 @@ deadpool-postgres = { version = "0.14", optional = true }
 # pages, so it returns ALL matches with bounded memory. Only used on the pg path.
 futures-util = { version = "0.3", optional = true }
 
-# Release matrix (refreshed 2026-10-03: stable 0.17 line — node v0.17.0,
-# protocol 0.17.0, client 0.17.0):
+# Release matrix (refreshed 2026-10-08: stable 0.17 line — node v0.17.1,
+# protocol 0.17.1, client 0.17.1):
 #   - protocol crates (miden-protocol / miden-standards / miden-agglayer /
-#     miden-tx) = 0.17.0 (stable), exact pins kept aligned (never mix protocol
-#     releases). 0.17.0 is exactly what miden-node v0.17.0's Cargo.lock
+#     miden-tx) = 0.17.1 (stable), exact pins kept aligned (never mix protocol
+#     releases). 0.17.1 is exactly what miden-node v0.17.1's Cargo.lock
 #     resolves (verified against the tag), so the BURN/MINT/CLAIM/B2AGG MAST
 #     roots agree across the node/client boundary by construction.
 #   - miden-client / miden-client-sqlite-store = 0.17.1 (stable), STOCK
@@ -156,11 +156,11 @@ futures-util = { version = "0.3", optional = true }
 #     starts from a fresh store anyway. The caller-side backstop
 #     (`submit_is_indeterminate` in src/bin/bridge_out_tool.rs) stays.
 #   - VM train (miden-assembly / miden-core / miden-processor) = 0.35 (lock
-#     cohort 0.35.0) — what protocol 0.17.0 and the node v0.17.0 lock require.
-#   - services interact with a miden-node v0.17.0 e2e stack; the Makefile
+#     cohort 0.35.0) — what protocol 0.17.1 and the node v0.17.1 lock require.
+#   - services interact with a miden-node v0.17.1 e2e stack; the Makefile
 #     (MIDEN_NODE_GIT_REF) is the single source of truth for the node ref.
-#   - Rust toolchain 1.98.1 (rust-version above; protocol 0.17.0 / client
-#     0.17.0 MSRV, unchanged from 0.16).
+#   - Rust toolchain 1.98.1 (rust-version above; protocol 0.17.1 / client
+#     0.17.1 MSRV, unchanged from 0.16).
 # 0.17 port, in brief: the fee asset moved from the block header's
 # FeeParameters into the ProtocolConfig (header carries its commitment);
 # `Asset` became a struct (`as_fungible`, `Asset::from`); the AggLayer faucet is
@@ -180,16 +180,16 @@ futures-util = { version = "0.3", optional = true }
 # MAST-root consistency note (carried over from the 0.14/0.15 pins): the
 # proxy-side `BurnNote::script_root()` MUST match the miden-node binary's, or
 # every L2→L1 bridge-out fails in the node's NTX `before_created` handler with
-# "note script with root <X> not found". The 0.17.0 base crates resolve
+# "note script with root <X> not found". The 0.17.1 base crates resolve
 # miden-assembly/core 0.35.x; keep these in lockstep with the deployed
-# miden-node v0.17.0 release and tighten to an exact patch if a root
+# miden-node v0.17.1 release and tighten to an exact patch if a root
 # mismatch resurfaces during the e2e regression.
-miden-base-agglayer = { package = "miden-agglayer", version = "=0.17.0" }
+miden-base-agglayer = { package = "miden-agglayer", version = "=0.17.1" }
 miden-protocol = { default-features = false, features = [
   "std",
-], version = "=0.17.0" }
-miden-standards = { default-features = false, version = "=0.17.0" }
-miden-tx = { default-features = false, version = "=0.17.0" }
+], version = "=0.17.1" }
+miden-standards = { default-features = false, version = "=0.17.1" }
+miden-tx = { default-features = false, version = "=0.17.1" }
 
 miden-assembly = { default-features = false, version = "0.35" }
 miden-core = { default-features = false, version = "0.35" }
