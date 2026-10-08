@@ -110,11 +110,15 @@ iso_fund_fee_asset() {
     [[ -n "$fee_faucet" && -n "$max_fee" ]] || { echo "isolated-wallet: $manifest lacks fee_faucet_id/max_fee_per_txn" >&2; return 1; }
     amount=${want:-$(( max_fee * 8192 ))}
     echo "isolated-wallet: fee-charging chain — funding $wallet with $amount units of the fee asset $fee_faucet (from the genesis faucet operator)" >&2
-    # The operator account is shared with other funders (the fee-funder sidecar); a send
-    # can lose a mempool race ("conflicts with current mempool state") — retry. A fresh
+    # The operator account is shared with other funders (the fee-funder sidecar, and every
+    # chaos-soak worker provisioning its own wallet at the same moment); a send can lose a
+    # mempool race ("transaction conflicts with current mempool state: initial account
+    # commitment … does not match"). Retry with a RANDOMISED backoff: a fixed 10s cadence
+    # kept concurrent funders colliding in lockstep and all four attempts lost (0.17.1
+    # gate, chaos-soak c1, 2026-10-06 — 9 conflicts on the operator in 2 minutes). A fresh
     # store per call: a reused one carries the operator from another chain / nonce.
-    local out attempt
-    for attempt in 1 2 3 4; do
+    local out attempt last_err="" backoff
+    for attempt in 1 2 3 4 5 6 7 8; do
         if out=$(docker run --rm --network "$ISO_NETWORK" \
             -v "$B2AGG_STORE_DIR:/store" \
             -v "${ISO_NODE_DATA_VOLUME:-miden-agglayer_node_data}:/data:ro" \
@@ -124,10 +128,14 @@ iso_fund_fee_asset() {
             --miden-prover-url "$ISO_PROVER_URL" \
             --fund-fee-asset --faucet-operator-mac /data/accounts/faucet_operator.mac \
             --fee-faucet-id "$fee_faucet" --fund "$wallet=$amount" 2>&1); then break; fi
-        echo "isolated-wallet: fee-asset send attempt $attempt failed — retrying in 10s" >&2; sleep 10; out=""
+        last_err="$out"; out=""
+        backoff=$(( 5 + RANDOM % 26 ))
+        echo "isolated-wallet: fee-asset send attempt $attempt failed — retrying in ${backoff}s: $(echo "$last_err" | grep -iE 'error|conflict|failed' | tail -1 | cut -c1-200)" >&2
+        sleep "$backoff"
     done
     if [[ -z "$out" ]]; then
-        echo "isolated-wallet: fee-asset funding of $wallet FAILED — on this chain its consumes cannot pay their fee" >&2
+        echo "isolated-wallet: fee-asset funding of $wallet FAILED after $attempt attempts — on this chain its consumes cannot pay their fee. Last error:" >&2
+        echo "$last_err" | tail -15 >&2
         return 1
     fi
     echo "$out" | grep -E "\[fund\]|sent|committed" | tail -3 >&2 || true
