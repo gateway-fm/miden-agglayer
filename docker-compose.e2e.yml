@@ -604,8 +604,8 @@ services:
   bridge-service:
     # Patched image: /pending-bridges disambiguates the already-claimed check by
     # source rollup (see revitteth/zkevm-bridge-service#1). Built locally via
-    # `docker buildx build -t zkevm-bridge-service:v0.6.4-RC2-pendingbridges`.
-    image: zkevm-bridge-service:v0.6.4-RC2-pendingbridges
+    # `docker buildx build -t zkevm-bridge-service:v0.6.4-RC4-pendingbridges`.
+    image: zkevm-bridge-service:v0.6.4-RC4-pendingbridges
     entrypoint: ["/app/zkevm-bridge"]
     command: ["run", "--cfg", "/etc/zkevm/bridge-config.toml"]
     ports:
@@ -658,9 +658,50 @@ services:
       miden-agglayer:
         condition: service_healthy
 
+  # ── L1 pessimistic-proof route for the pinned agglayer ─────────────────────
+  # The L1 AggLayerGateway routes every settlement proof to a verifier by its
+  # 4-byte pessimistic vkey SELECTOR. The replayed L1 fixture was deployed for
+  # agglayer 0.4.4 (selector 0x00000009); agglayer 0.6.1 proves with a newer
+  # pessimistic program (selector 0x0000000e), so without this every settlement
+  # reverted `RouteNotFound(0x0000000e)` and no certificate ever settled (aggkit
+  # 0.10 gate, suites 1-2). Kurtosis registers the route at deploy time from
+  # `agglayer vkey-selector` / `agglayer vkey`; we add it on top of the fixture.
+  # Same mock verifier as the fixture's existing route. Acts as the fixture admin
+  # via anvil impersonation (no key). Idempotent: no-op when the route already
+  # holds this vkey; FAILS on a different vkey. One gateway serves both rollups.
+  # The pinned values are re-derived from the image by scripts/check-agglayer-pp-route.sh.
+  l1-pp-route:
+    image: ghcr.io/foundry-rs/foundry:latest
+    depends_on:
+      anvil:
+        condition: service_healthy
+    environment:
+      L1_RPC: http://anvil:8545
+      GATEWAY: "0xf22E2B040B639180557745F47aB97dFA95B1e22a"
+      ADMIN: "0xE34aaF64b29273B7D567FCFc40544c014EEe9970"
+      VERIFIER: "0x322e0cfC33f916379702396E6e41A6d2D97d0D96"
+      PP_SELECTOR: "0x0000000e"
+      PP_VKEY: "0x00d14f977a6ec393014f300ad78d0761dc29435d3fa1e2626fa466bd3343578e"
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        cur=$$(cast call --rpc-url "$$L1_RPC" "$$GATEWAY" 'pessimisticVKeyRoutes(bytes4)(address,bytes32,bool)' "$$PP_SELECTOR" | sed -n 2p)
+        if [ "$$cur" = "$$PP_VKEY" ]; then echo "PP route $$PP_SELECTOR already registered"; exit 0; fi
+        if [ "$$cur" != "0x0000000000000000000000000000000000000000000000000000000000000000" ]; then
+          echo "PP route $$PP_SELECTOR holds a DIFFERENT vkey ($$cur) — refusing"; exit 1
+        fi
+        cast rpc --rpc-url "$$L1_RPC" anvil_impersonateAccount "$$ADMIN" >/dev/null
+        cast send --rpc-url "$$L1_RPC" --unlocked --from "$$ADMIN" "$$GATEWAY" \
+          'addPessimisticVKeyRoute(bytes4,address,bytes32)' "$$PP_SELECTOR" "$$VERIFIER" "$$PP_VKEY" >/dev/null
+        cast rpc --rpc-url "$$L1_RPC" anvil_stopImpersonatingAccount "$$ADMIN" >/dev/null
+        got=$$(cast call --rpc-url "$$L1_RPC" "$$GATEWAY" 'pessimisticVKeyRoutes(bytes4)(address,bytes32,bool)' "$$PP_SELECTOR" | sed -n 2p)
+        [ "$$got" = "$$PP_VKEY" ] || { echo "PP route registration did not take ($$got)"; exit 1; }
+        echo "registered PP route $$PP_SELECTOR -> $$VERIFIER ($$PP_VKEY)"
+
   # ── AggLayer (certificate aggregation) ─────────────────────────────────────
   agglayer:
-    image: europe-west2-docker.pkg.dev/prj-polygonlabs-devtools-dev/public/agglayer:0.4.4-remove-agglayer-prover
+    image: ghcr.io/agglayer/agglayer:0.6.1
     restart: on-failure
     command: ["/usr/local/bin/agglayer", "run", "--cfg=/etc/agglayer/config.toml"]
     ports:
@@ -676,10 +717,12 @@ services:
     depends_on:
       anvil:
         condition: service_healthy
+      l1-pp-route:
+        condition: service_completed_successfully
 
   # ── AggKit (aggoracle + aggsender) ─────────────────────────────────────────
   aggkit:
-    image: ghcr.io/agglayer/aggkit:0.8.3-rc1
+    image: ghcr.io/agglayer/aggkit:0.10.1
     restart: on-failure
     command: ["run", "--cfg=/etc/aggkit/config.toml", "--components=aggoracle,aggsender"]
     ports:

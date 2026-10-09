@@ -39,7 +39,8 @@ GlobalExitRootL2 = "0xa40d5f56745a118d0906a34e69aec8c0db1cb8fa"
 WaitPeriodMonitorTx = "5s"
 
 [AggOracle.EVMSender.EthTxManager]
-# Aggkit v0.8.3-rc1 defaults to evicting a transaction after one failed
+# Aggkit (v0.8.3-rc1, v0.10.0 and v0.10.1 — all on zkevm-ethtx-manager v0.2.18, where
+# this is interpreted) defaults to evicting a transaction after one failed
 # estimate/send. The oracle then deduplicates the GER and never requeues it.
 # Keep retrying transient proxy/node outages; harness deadlines and the
 # admission-aware watchdog still fail closed on a persistent wedge.
@@ -57,6 +58,22 @@ Password = "pSnv6Dh5s9ahuzGzH9RoCDrKAMddaX3m"
 [AggOracle.EVMSender.EthTxManager.Etherman]
 URL = "http://miden-agglayer:8546"
 L1ChainID = 2
+
+[L2NetworkConfig]
+# aggkit 0.10 resolves the rollup's initial Local Exit Root on EVERY startup by
+# reading RollupManager.rollupIDToRollupData at AggSender.RollupCreationBlockL1
+# (block 90) — new in 0.10 (cmd/run.go GetInitialLER; absent in 0.8.3-rc1). Our
+# L1 anvil keeps --max-persisted-states=12000, so once the growing chain's L1
+# passed ~12,090 blocks every aggkit restart died:
+#   FATAL failed to get initial local exit root: ... BlockOutOfRangeError:
+#   block height is 17738 but requested was 90
+# (soak c3, aggkit 0.10.1). Pinning the value skips that historical query
+# (aggkit default.go: "If not set, the value is queried from the RollupManager
+# contract on L1"). It is the empty local-exit-tree root — what aggkit itself
+# resolved on a good start, and the prevLER of each rollup's height-0
+# certificate. PRODUCTION: without this pin aggkit 0.10 needs an L1 RPC that
+# still serves state at RollupCreationBlockL1, i.e. an ARCHIVE node.
+InitialLER = "0x27ae5ba08d7291c96c8cbddcc148bf48a6d68c7974b94356f53754ef6171d757"
 
 [AggSender]
 # Sign certs with the sequencer key: it is the address registered in the

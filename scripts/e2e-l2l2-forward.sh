@@ -130,7 +130,19 @@ evidence_record "leg2" forward Miden ger_inject "${FWD_GER_INJECT_TX:-}" "" "mid
     "rpc-verified" "ger=$MIDENGER source=aggoracle(miden) verifiedVia=zkevm_getLatestGlobalExitRoot"
 # CERTIFICATE SETTLEMENT (forward): the network-2 (L2B) cert whose settlement on
 # L1 carried the forward deposit's exit root into the L1 GER.
-evidence_settlement "leg2" forward "${COMPOSE_PROJECT_NAME}-aggkit-l2b-1" "$TEST_START_TIME" 2 || true
+#
+# Collected now if a settlement already exists, and AGAIN after the forward claim
+# lands if not. aggkit <= 0.8.3 certified every epoch even with nothing to report,
+# so a settlement from earlier in the run was always in the log by this point;
+# aggkit 0.10's default ASAP trigger builds NO certificate while there is nothing
+# to certify ("PPFlow - no bridges or claims found ... so no certificate will be
+# built"), so the first network-2 settlement only exists ~1 min AFTER this deposit
+# — once the nudge cycles below drive it. Not a relaxation: evidence_summary still
+# REQUIRES a cert_settlement whose tx hit the RollupManager, and the forward claim
+# cannot be accepted on Miden without that settlement having happened.
+FWD_SETTLEMENT_RECORDED=0
+evidence_settlement "leg2" forward "${COMPOSE_PROJECT_NAME}-aggkit-l2b-1" "$TEST_START_TIME" 2 \
+    && FWD_SETTLEMENT_RECORDED=1
 
 # ── Leg 2b: claim on Miden — canonical client-submitted claimAsset ───────────
 # With per-rollup bridge-service isolation (canonical kurtosis: one service per
@@ -162,6 +174,16 @@ log "  forward deposit: cnt=$FWD_CNT globalIndex=$FWD_GI origNet=$FWD_ORIG_NET d
 nudge_until "forward claimAsset accepted on Miden (ClaimEvent for globalIndex $FWD_GI)" \
     _pred_submit_forward_claim "$FWD_CNT" "$FWD_GI" "$FWD_ORIG_NET" "$OPT0" "$FWD_DEST_NET" "$FWD_DEST_ADDR" "$FWD_AMOUNT_WEI" "$FWD_METADATA" \
     || fail "forward claimAsset never accepted on the Miden proxy (globalIndex $FWD_GI) despite repeated nudges"
+# The claim needed the network-2 settlement, so it now exists — record it if the
+# pre-claim attempt above was too early (see the CERTIFICATE SETTLEMENT note).
+if [[ "$FWD_SETTLEMENT_RECORDED" != 1 ]]; then
+    log "  evidence: recording the network-2 settlement after the forward claim (ASAP trigger certified on demand)"
+    # The claim proves the settlement hit L1; aggkit-l2b logs its SettlementTxnHash on
+    # its next agglayer status poll — wait for that line, fail loudly if it never comes.
+    wait_for "network-2 SettlementTxnHash in aggkit-l2b log (after forward claim)" 120 5 \
+        _pred_log_grep "${COMPOSE_PROJECT_NAME}-aggkit-l2b-1" "$TEST_START_TIME" "SettlementTxnHash: 0x[0-9a-f]{64}"
+    evidence_settlement "leg2" forward "${COMPOSE_PROJECT_NAME}-aggkit-l2b-1" "$TEST_START_TIME" 2 || true
+fi
 
 # (a) Faucet keyed (OPT0, net 2) — RPC view + PG truth must agree.
 FAUCETS_JSON=$(curl -sf "$L2_RPC" -H "Content-Type: application/json" -H "$ADMIN_BEARER" \

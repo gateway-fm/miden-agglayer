@@ -31,11 +31,11 @@ image:
 
 | Image | Source used by repository scripts |
 |---|---|
-| `miden-validator` | `https://github.com/0xMiden/node.git` at `v0.16.0` |
+| `miden-validator` | `https://github.com/0xMiden/node.git` at `v0.17.0` |
 | `miden-node` | same checkout and ref |
 | `miden-ntx-builder` | same checkout and ref |
 | `miden-remote-prover` | same checkout and ref |
-| `zkevm-bridge-service:v0.6.4-RC2-pendingbridges` | `revitteth/zkevm-bridge-service`, branch `fix/pending-bridges-rollup-disambiguation` |
+| `zkevm-bridge-service:v0.6.4-RC4-pendingbridges` | `0xPolygon/zkevm-bridge-service` at `v0.6.4-RC4` + `fixtures/patches/zkevm-bridge-service/*.patch` |
 
 `run-all.sh` is the repository's supported bootstrap for a bare Ubuntu host. It
 installs/checks tools, clones companion repositories next to this checkout,
@@ -69,9 +69,12 @@ do
   docker build --build-arg BIN="$1" --build-arg PORT="$2" -t "$1" .
 done
 
-cd ../zkevm-bridge-service
+# REPO = this repository's checkout (the patches live in it)
+git clone --branch v0.6.4-RC4 https://github.com/0xPolygon/zkevm-bridge-service.git ../zkevm-bridge-service-v0.6.4-RC4
+cd ../zkevm-bridge-service-v0.6.4-RC4
+git am "$REPO"/fixtures/patches/zkevm-bridge-service/*.patch
 docker build \
-  -t zkevm-bridge-service:v0.6.4-RC2-pendingbridges \
+  -t zkevm-bridge-service:v0.6.4-RC4-pendingbridges \
   -f Dockerfile .
 ```
 
