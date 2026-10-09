@@ -102,8 +102,8 @@ provision() {
   # Single source of truth is MIDEN_NODE_GIT_REF in the Makefile; this script
   # pins the same value and fails loudly if the two drift.
   MIDEN_NODE_GIT_URL="https://github.com/0xMiden/node.git"
-  MIDEN_NODE_GIT_REF="v0.17.0"
-  MIDEN_NODE_GIT_COMMIT="77e9c717fb16217fad2ba8b6b9fa28dd73211f2c"
+  MIDEN_NODE_GIT_REF="v0.17.1"
+  MIDEN_NODE_GIT_COMMIT="3d70821085e9050720fb179a54a52fe8566dfa72"
   export MIDEN_NODE_GIT_URL MIDEN_NODE_GIT_REF MIDEN_NODE_GIT_COMMIT
   makefile_pin="$(git rev-parse --show-toplevel)/Makefile"
   grep -Fx "MIDEN_NODE_GIT_URL := $MIDEN_NODE_GIT_URL" "$makefile_pin" || \
