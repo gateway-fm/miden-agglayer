@@ -239,6 +239,12 @@ fixture generation.
 `--restore` have different blast radii. Read the runbook before using them.
 Never delete the keystore or `bridge_accounts.toml` during recovery.
 
+Bridge role membership (`ADMIN`, `FAUCET_MNGR`, `GER_INJECTOR`, `GER_REMOVER`,
+`FEE_MNGR`, `PAUSER`) is changed with the `--grant-bridge-role` /
+`--revoke-bridge-role` one-shots, run with the serving proxy stopped and the
+production store + custody flags. See
+[bridge-admin-rbac.md](docs/operations/bridge-admin-rbac.md).
+
 ## License
 
 This project is available under either the

@@ -845,6 +845,25 @@ retry loops stop. There is no current admin rescue endpoint. Preserve the row,
 global index, destination, amount, and EVM hash and escalate to the bridge/token
 owner; do not delete `claimed_indices` to replay it.
 
+### Bridge role changes (grant / revoke)
+
+The bridge's RBAC roles are changed on-chain only, by an `RbacConfigNote` the
+bridge consumes, sent by a current holder of the role's admin role (`service`
+at creation). The proxy's one-shots do this under production custody:
+
+```bash
+# serving proxy stopped first (single-owner store); same store volume + custody env
+miden-agglayer-service --miden-store-dir "$STORE_DIR" --miden-node "$MIDEN_NODE" \
+  --grant-bridge-role ADMIN=0x<account>      # or --revoke-bridge-role
+```
+
+The one-shot verifies the signer bindings, checks the bridge allowlists the
+note and that `service` holds the admin role, submits, waits for commit, then
+polls the bridge's membership map (`--bridge-role-wait-secs`, default 300) and
+logs `member_count_after`. It refuses to revoke `service` from any role and
+refuses to revoke a role's last member. Full procedure, preflight metrics and
+rollback: [bridge-admin-rbac.md](bridge-admin-rbac.md).
+
 ## 5. Planned shutdown and restart
 
 1. Record tip/log fingerprint, image digest, metrics, pending transactions, and
