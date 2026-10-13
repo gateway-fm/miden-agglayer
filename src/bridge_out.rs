@@ -1252,14 +1252,10 @@ impl BridgeOutScanner {
                 // UPDATE_GER, and the new REMOVE_GER / DEREGISTER_AGG_FAUCET.
                 // #201: on a fee-charging chain the bridge is P2ID-fundable and
                 // consumes its fee-asset funding note (creation + top-ups) —
-                // canonical, not a wrapper; it advances no LET.
-                let admin_roots: [[u8; 32]; 5] = [
-                    miden_base_agglayer::ConfigAggBridgeNote::script_root().as_bytes(),
-                    miden_base_agglayer::UpdateGerNote::script_root().as_bytes(),
-                    miden_base_agglayer::RemoveGerNote::script_root().as_bytes(),
-                    miden_base_agglayer::DeregisterAggFaucetNote::script_root().as_bytes(),
-                    miden_standards::note::P2idNote::script_root().as_bytes(),
-                ];
+                // canonical, not a wrapper; it advances no LET. 0.17: the
+                // standard RBAC / pause / fee-policy config notes
+                // (`--grant-bridge-role` sends the first) — same category.
+                let admin_roots = crate::unknown_wrapper_detector::canonical_admin_note_roots();
                 let observed_bytes = note.details().script().root().as_bytes();
                 use crate::unknown_wrapper_detector::{
                     BridgeConsumerScript, classify_bridge_consumer_script_with_admin,
