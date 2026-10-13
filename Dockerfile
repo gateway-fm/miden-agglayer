@@ -1,4 +1,9 @@
-FROM rustlang/rust:nightly-trixie-slim AS builder
+# Pinned to the workspace toolchain (rust-toolchain.toml / Cargo.toml
+# rust-version = 1.98.1), not a floating nightly: on 2026-10-13 the day's
+# nightly (1.101.0-nightly e9bbadf68) ICE'd in `check_well_formed` compiling
+# p3-goldilocks 0.8.0, which broke every image build (release.yml included)
+# with no change on our side. Bump this together with rust-toolchain.toml.
+FROM rust:1.98.1-slim-trixie AS builder
 
 WORKDIR /usr/src/app
 

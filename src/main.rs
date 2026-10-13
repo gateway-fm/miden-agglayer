@@ -55,6 +55,31 @@ struct Command {
     #[arg(long)]
     print_funding: bool,
 
+    /// Bridge RBAC one-shot: grant `<ROLE>=<ACCOUNT>` on the bridge (e.g.
+    /// `ADMIN=0x…`, account as 0x-hex or bech32) and exit. Runs with the
+    /// production store + custody flags: the note is signed by `service`, the
+    /// bridge's initial ADMIN, through the configured signer. Roles: ADMIN,
+    /// FAUCET_MNGR, GER_INJECTOR, GER_REMOVER, FEE_MNGR, PAUSER. Stop the
+    /// serving proxy first (single-owner store). See
+    /// docs/operations/bridge-admin-rbac.md.
+    #[arg(
+        long,
+        value_name = "ROLE=ACCOUNT",
+        conflicts_with = "revoke_bridge_role"
+    )]
+    grant_bridge_role: Option<String>,
+
+    /// Bridge RBAC one-shot: revoke `<ROLE>=<ACCOUNT>` on the bridge and exit.
+    /// Refuses to touch the service account or the last member of a role.
+    #[arg(long, value_name = "ROLE=ACCOUNT")]
+    revoke_bridge_role: Option<String>,
+
+    /// How long a bridge-role one-shot polls the bridge for the change after
+    /// its note-creating transaction commits (the bridge consumes the note via
+    /// the ntx-builder). 0 = do not wait; exit code is unaffected either way.
+    #[arg(long, env = "BRIDGE_ROLE_WAIT_SECS", default_value_t = 300)]
+    bridge_role_wait_secs: u64,
+
     /// #201: on a fee-charging chain, how long a deploy waits for the account's
     /// fee-asset funding note before failing with the exact funding instruction.
     #[arg(long, env = "FUNDING_WAIT_SECS", default_value_t = 900)]
@@ -870,6 +895,84 @@ async fn main() -> anyhow::Result<()> {
              keystore and bridge_accounts.toml preserved",
             effective_store_dir.display()
         );
+    }
+
+    // Bridge RBAC one-shot (`--grant-bridge-role` / `--revoke-bridge-role`):
+    // needs an existing config (the bridge + service ids) and the production
+    // custody; submits one RbacConfigNote from `service` and exits. Nothing
+    // else (store, listeners, RPC) is started.
+    let bridge_role_change = match (&command.grant_bridge_role, &command.revoke_bridge_role) {
+        (Some(spec), None) => Some(
+            miden_agglayer_service::bridge_roles::BridgeRoleChange::parse(
+                miden_agglayer_service::bridge_roles::RoleAction::Grant,
+                spec,
+            )?,
+        ),
+        (None, Some(spec)) => Some(
+            miden_agglayer_service::bridge_roles::BridgeRoleChange::parse(
+                miden_agglayer_service::bridge_roles::RoleAction::Revoke,
+                spec,
+            )?,
+        ),
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            anyhow::bail!("--grant-bridge-role and --revoke-bridge-role are mutually exclusive")
+        }
+    };
+    if let Some(change) = bridge_role_change {
+        if command.init || command.print_funding {
+            anyhow::bail!("a bridge-role one-shot cannot be combined with --init/--print-funding");
+        }
+        if !config_path_exists(miden_store_dir.clone())? {
+            anyhow::bail!(
+                "no bridge_accounts.toml in the store dir: a bridge-role change needs the \
+                 deployed bridge + service ids (run against the proxy's --miden-store-dir)"
+            );
+        }
+        let accounts =
+            miden_agglayer_service::accounts_config::load_config(miden_store_dir.clone())?;
+        let client = MidenClient::new(
+            miden_store_dir.clone(),
+            command.miden_node.clone(),
+            command.miden_api_key.clone(),
+            command.miden_prover_url.clone(),
+            command.miden_prover_timeout_secs,
+            command.miden_prover_fallback_to_local,
+            vec![],
+            command.miden_debug,
+            custody.clone(),
+        )?;
+        let outcome = miden_agglayer_service::bridge_roles::run_one_shot(
+            &client,
+            accounts,
+            change,
+            std::time::Duration::from_secs(command.bridge_role_wait_secs),
+        )
+        .await;
+        client.shutdown()?;
+        match outcome? {
+            miden_agglayer_service::bridge_roles::RoleChangeOutcome::AlreadyApplied => {
+                tracing::info!("bridge role change: already applied on-chain; nothing submitted");
+            }
+            miden_agglayer_service::bridge_roles::RoleChangeOutcome::Submitted {
+                tx_id,
+                note_id,
+                confirmed,
+            } => {
+                tracing::info!(
+                    %tx_id,
+                    %note_id,
+                    confirmed,
+                    "bridge role change: note submitted{}",
+                    if confirmed {
+                        " and confirmed on the bridge"
+                    } else {
+                        "; NOT yet consumed by the bridge (pending)"
+                    }
+                );
+            }
+        }
+        return Ok(());
     }
 
     let needs_init =
@@ -1878,6 +1981,9 @@ mod hardening_tests {
             network_id: 1,
             init: false,
             print_funding: false,
+            grant_bridge_role: None,
+            revoke_bridge_role: None,
+            bridge_role_wait_secs: 300,
             funding_wait_secs: 900,
             database_url: None,
             restore: false,
