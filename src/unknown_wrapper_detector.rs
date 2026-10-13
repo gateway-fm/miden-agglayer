@@ -101,9 +101,79 @@ pub fn classify_bridge_consumer_script_with_admin(
     }
 }
 
+/// The canonical ADMIN / housekeeping note scripts the bridge consumes by
+/// design, i.e. everything in `AggLayerBridge::allowed_notes()` minus the two
+/// traffic notes (CLAIM, B2AGG) that the caller pins separately:
+/// - CONFIG_AGG_BRIDGE (register faucet), DEREGISTER_AGG_FAUCET,
+/// - UPDATE_GER, REMOVE_GER,
+/// - the 0.17 standard config notes: RBAC_CONFIG (role grants/revokes,
+///   `bridge_roles`), PAUSE_CONFIG, CONSTANT_FEE_POLICY_CONFIG,
+/// - the network-account defaults every such account allowlists:
+///   NETWORK_ACCOUNT_CONFIG (allowlist edits), FEE_SPONSORSHIP, and P2ID
+///   (#201: fee-asset funding and top-ups on a fee-charging chain).
+///
+/// A root outside this set AND outside {CLAIM, B2AGG} is the MA#4 signature.
+pub fn canonical_admin_note_roots() -> Vec<[u8; 32]> {
+    use miden_standards::account::auth::AuthNetworkAccount;
+    use miden_standards::note::config::{
+        ConstantFeePolicyConfigNote, PauseConfigNote, RbacConfigNote,
+    };
+    let mut roots = vec![
+        miden_base_agglayer::ConfigAggBridgeNote::script_root().as_bytes(),
+        miden_base_agglayer::UpdateGerNote::script_root().as_bytes(),
+        miden_base_agglayer::RemoveGerNote::script_root().as_bytes(),
+        miden_base_agglayer::DeregisterAggFaucetNote::script_root().as_bytes(),
+        RbacConfigNote::script_root().as_bytes(),
+        PauseConfigNote::script_root().as_bytes(),
+        ConstantFeePolicyConfigNote::script_root().as_bytes(),
+    ];
+    roots.extend(
+        AuthNetworkAccount::default_allowed_note_scripts()
+            .iter()
+            .map(|root| root.as_bytes()),
+    );
+    roots
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bridge consumes every note in its own allowlist by design (plus
+    /// P2ID funding). Each of those roots except the two traffic notes must
+    /// classify as `KnownAdmin`, or a routine admin operation (a faucet
+    /// registration, a `--grant-bridge-role`, a pause) fires the MA#4 alert.
+    #[test]
+    fn every_bridge_allowlisted_admin_note_is_canonical() {
+        use miden_base_agglayer::{AggLayerBridge, B2AggNote, ClaimNote};
+        use miden_standards::note::config::RbacConfigNote;
+
+        let admin_roots = canonical_admin_note_roots();
+        let b2agg = B2AggNote::script_root().as_bytes();
+        let claim = ClaimNote::script_root().as_bytes();
+        for root in AggLayerBridge::allowed_notes() {
+            let bytes = root.as_bytes();
+            let class =
+                classify_bridge_consumer_script_with_admin(bytes, b2agg, claim, &admin_roots);
+            assert_ne!(
+                class,
+                BridgeConsumerScript::Unknown,
+                "allowlisted root {root} is Unknown"
+            );
+        }
+        // P2ID funding (#201) stays canonical via the network-account defaults.
+        assert!(admin_roots.contains(&miden_standards::note::P2idNote::script_root().as_bytes()));
+        // The grant note specifically (docs/operations/bridge-admin-rbac.md).
+        assert_eq!(
+            classify_bridge_consumer_script_with_admin(
+                RbacConfigNote::script_root().as_bytes(),
+                b2agg,
+                claim,
+                &admin_roots
+            ),
+            BridgeConsumerScript::KnownAdmin
+        );
+    }
 
     /// Cantina MA#4 — repro+regression. The detection predicate must pin
     /// three states cleanly:
