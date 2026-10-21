@@ -1,4 +1,15 @@
-FROM rustlang/rust:nightly-trixie-slim AS builder
+# Pinned to the workspace toolchain (rust-toolchain.toml / Cargo.toml
+# rust-version = 1.98.1), not a floating nightly: on 2026-10-13 the day's
+# nightly (1.101.0-nightly e9bbadf68) ICE'd in `check_well_formed` compiling
+# p3-goldilocks 0.8.0, which broke every image build (release.yml included)
+# with no change on our side. Bump this together with rust-toolchain.toml.
+FROM rust:1.98.1-slim-trixie AS builder
+
+# Refresh Cargo's native trust store before fetching dependencies. Debian's
+# DSA-6572-1 removes the roots that trust the compromised eMudhra CAs.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20250419+deb13u1 \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/app
 
@@ -15,7 +26,7 @@ RUN \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/src/app/target \
-    cargo build --profile=release --features=postgres --bin=miden-agglayer-service --bin=bridge-out-tool --bin=bridge-autoclaim \
+    cargo build --locked --profile=release --features=postgres --bin=miden-agglayer-service --bin=bridge-out-tool --bin=bridge-autoclaim \
     && cp target/release/miden-agglayer-service bin/miden-agglayer-service \
     && cp target/release/bridge-out-tool bin/bridge-out-tool \
     && cp target/release/bridge-autoclaim bin/bridge-autoclaim
@@ -31,6 +42,7 @@ FROM debian:trixie-slim AS runtime
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20250419+deb13u1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/src/app/bin/miden-agglayer-service /usr/local/bin/
