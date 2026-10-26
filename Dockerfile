@@ -7,8 +7,11 @@ FROM rust:1.98.1-slim-trixie AS builder
 
 # Refresh Cargo's native trust store before fetching dependencies. Debian's
 # DSA-6572-1 removes the roots that trust the compromised eMudhra CAs.
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+# DSA-6582-1 fixes Brotli's decoder overflow (CVE-2026-111497); refresh the
+# native library before Cargo fetches dependencies, and enforce the fixed floor.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libbrotli1 \
     && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20250419+deb13u1 \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' libbrotli1)" ge 1.1.0-2+deb13u1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/app
@@ -42,7 +45,9 @@ FROM debian:trixie-slim AS runtime
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    libbrotli1 \
     && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20250419+deb13u1 \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' libbrotli1)" ge 1.1.0-2+deb13u1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/src/app/bin/miden-agglayer-service /usr/local/bin/
