@@ -33,7 +33,7 @@ path = "src/bin/bridge_autoclaim.rs"
 # testing exposes the generated proto types — the ONLY public construction
 # path for rpc TransactionRecord fixtures (consumed_note_refs is pub(crate)
 # upstream since 0.16.0).
-miden-client = { version = "=0.17.1", features = ["testing", "tonic"] }
+miden-client = { version = "=0.17.5", features = ["testing", "tonic"] }
 tempfile = "3.10"
 # test-util enables tokio's paused virtual clock (start_paused) — used by the
 # ger::poll_until_ready timing regression test to pin the exact sleep count
@@ -203,12 +203,12 @@ miden-processor = { default-features = false, features = [
   "std",
 ], version = "0.35" }
 
-# miden-client 0.17.1 — stock crates.io release (see the release matrix above
+# miden-client 0.17.5 — stock crates.io release (see the release matrix above
 # for why no patch is needed). sqlite-store pinned in lockstep.
 miden-client = { default-features = false, features = [
   "tonic",
-], version = "=0.17.1" }
-miden-client-sqlite-store = { version = "=0.17.1" }
+], version = "=0.17.5" }
+miden-client-sqlite-store = { version = "=0.17.5" }
 
 [features]
 default = []

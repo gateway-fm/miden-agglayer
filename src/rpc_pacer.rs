@@ -309,6 +309,14 @@ impl NodeRpcClient for PacedRpcClient {
         .await
     }
 
+    async fn is_invitation_code_valid(&self, invitation_code: &str) -> Result<bool, RpcError> {
+        self.call(
+            "is_invitation_code_valid",
+            self.inner.is_invitation_code_valid(invitation_code),
+        )
+        .await
+    }
+
     async fn get_notes_by_id(&self, note_ids: &[NoteId]) -> Result<Vec<FetchedNote>, RpcError> {
         self.call("get_notes_by_id", self.inner.get_notes_by_id(note_ids))
             .await
