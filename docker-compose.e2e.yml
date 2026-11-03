@@ -25,7 +25,11 @@ services:
       # must account for the quotes, else it false-positives on an empty chain
       # (bit us when a stale l1-raw-txs.txt mount skipped the replay: the stack
       # came up "healthy" with NO contracts and agglayer/aggkit crash-looped).
-      test: ["CMD-SHELL", "cast rpc eth_getCode 0xC8cbEBf950B9Df44d987c8619f092beA980fF038 latest --rpc-url http://localhost:8545 2>/dev/null | grep -vE '^\"?0x\"?$$'"]
+      # The bridge having code is NOT enough: replay-txs.sh deploys the L1
+      # gateway later, and under load l1-pp-route ran mid-replay, saw no code
+      # and refused ("holds a DIFFERENT vkey ()"). Gate on the replay's own
+      # completion marker as well.
+      test: ["CMD-SHELL", "test -f /tmp/l1-replay-done && cast rpc eth_getCode 0xC8cbEBf950B9Df44d987c8619f092beA980fF038 latest --rpc-url http://localhost:8545 2>/dev/null | grep -vE '^\"?0x\"?$$'"]
       interval: 5s
       timeout: 15s
       retries: 30

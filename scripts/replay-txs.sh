@@ -40,3 +40,7 @@ cast rpc anvil_mine 50 --rpc-url "$RPC" > /dev/null 2>&1
 
 BLOCK=$(cast block-number --rpc-url "$RPC" 2>/dev/null || echo "?")
 echo "==> Replay complete. Block: $BLOCK"
+# The anvil healthcheck waits for this marker: contracts deployed late in the
+# replay (the L1 gateway that l1-pp-route registers on) must exist before any
+# dependent one-shot runs.
+touch /tmp/l1-replay-done
