@@ -12,7 +12,9 @@ mod claim_proof;
 #[cfg(test)]
 mod claim_proof_tests;
 pub mod claim_watcher;
+pub mod client_access;
 pub(crate) mod coalesced_read;
+pub(crate) mod consumed_note_feed;
 pub mod exit;
 pub mod expected_mint_tracker;
 pub mod faucet_bootstrap;

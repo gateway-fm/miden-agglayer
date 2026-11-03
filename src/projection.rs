@@ -12,8 +12,8 @@ use crate::claim_watcher::{
     DecodedFullClaim, derive_manual_claim_tx_hash, parse_claim_event_from_storage,
     parse_full_claim_from_storage,
 };
+use crate::client_access::ClientAccess;
 use crate::metadata_recovery::{EmitMetadata, METADATA_UNRECOVERABLE_METRIC};
-use crate::miden_client::MidenClientLib;
 use crate::store::Store;
 use miden_base_agglayer::UpdateGerNote;
 use miden_client::store::InputNoteRecord;
@@ -193,7 +193,7 @@ impl BlockProjection<'_> {
         timestamp: u64,
         block_notes: &[(Option<NoteId>, &InputNoteRecord)],
         output_metadata: &std::collections::HashMap<[u8; 32], NoteMetadata>,
-        mut client: Option<&mut MidenClientLib>,
+        mut client: Option<&mut ClientAccess<'_>>,
         within_tx_pos: &std::collections::HashMap<NoteId, u32>,
     ) -> anyhow::Result<BlockProjectionCounts> {
         let mut notes: Vec<(Option<NoteId>, &InputNoteRecord)> = block_notes.to_vec();
@@ -333,7 +333,7 @@ pub async fn project_b2agg_note(
     restore_block: u64,
     block_hash: [u8; 32],
     bridge_address: &str,
-    client: Option<&mut MidenClientLib>,
+    client: Option<&mut ClientAccess<'_>>,
     network_rpcs: &crate::metadata_recovery::NetworkRpcMap,
 ) -> anyhow::Result<B2AggRestoreOutcome> {
     let details = note.details();
