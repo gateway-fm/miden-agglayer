@@ -90,7 +90,7 @@ services:
   # NTX-BUILDER PROVER TIMEOUT: the ntx-builder's per-request remote-prover
   # timeout defaults to 10s. Bridge CLAIM-consumption proofs exceed that on
   # shared e2e hardware, so the ntx-builder service below passes
-  # `--tx-prover.timeout=180s` (a flag since node v0.16.0-rc.4,
+  # `--tx-prover.timeout=600s` (a flag since node v0.16.0-rc.4,
   # 0xMiden/node#2537 — before that the images had to be built from a
   # sed-patched checkout, #180). Without it every deposit mint retries
   # forever on "Timeout expired". Keep it in step with tx-prover's own
@@ -248,9 +248,9 @@ services:
       # rc.1 defaults the SERVER-side proof timeout to 1m, which the bridge
       # CLAIM-consumption proof exceeds on shared e2e hardware — the prover
       # cancels mid-proof ("Timeout expired") and the ntx-builder retries
-      # forever, so deposits never mint. Match the ntx-builder's own 180s
-      # prover budget.
-      - --timeout=180sec
+      # forever, so deposits never mint. Match the ntx-builder's own 600s
+      # prover budget (raised from 180s for CPU-starved shared boxes).
+      - --timeout=600sec
 
   # The sequencer is the RPC the proxy + aggkit talk to. Named `miden-node` so
   # the existing `--miden-node=http://miden-node:57291` wiring is unchanged.
@@ -345,7 +345,14 @@ services:
       - --rpc.auth-header-value=${MIDEN_NTX_AUTH:-e2e-ntx-secret}
       - --tx-prover.url=http://tx-prover:50051
       # See "NTX-BUILDER PROVER TIMEOUT" above (#180).
-      - --tx-prover.timeout=180s
+      - --tx-prover.timeout=600s
+      # A network tx expires this many blocks (3s each) after the ntx-builder
+      # builds it, and the same delta is its local retry timeout. The default of
+      # 30 (~90s) is shorter than a bridge-consumption proof on a CPU-starved
+      # box (~72s observed under lez-swap-stack load), so every retry expired
+      # before it landed and the B2AGG was never consumed. 300 (~15 min) covers
+      # the full 600s prover budget.
+      - --tx-expiration-delta=300
       - --data-directory=/data/ntx-builder
 
     # ── L2 EVM Proxy (service under test) ──────────────────────────────────────
