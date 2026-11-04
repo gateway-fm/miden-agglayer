@@ -121,9 +121,7 @@ struct Args {
     /// on-chain (polling sync), up to this many seconds. 0 disables the wait
     /// (legacy behaviour: 5 blind sync cycles). Load tests MUST wait: pacing on
     /// tx acceptance alone floods the bridge with in-flight consumptions.
-    /// The default outlasts a full ntx-builder retry (600s prover budget) on a
-    /// CPU-starved box.
-    #[arg(long, env = "B2AGG_WAIT_CONSUMED_SECS", default_value_t = 900)]
+    #[arg(long, env = "B2AGG_WAIT_CONSUMED_SECS", default_value_t = 360)]
     wait_consumed_secs: u64,
 
     /// Foreign-deployment provision mode (claim-provenance e2e): stand up a
