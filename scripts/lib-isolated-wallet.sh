@@ -67,17 +67,25 @@ _iso_own_store() {
     if mkdir -p "$B2AGG_STORE_DIR/tmp" 2>/dev/null && [[ -w "$B2AGG_STORE_DIR" ]]; then
         return 0
     fi
-    docker run --rm -v "$B2AGG_STORE_DIR:/store" busybox \
+    _iso_docker_run --rm -v "$B2AGG_STORE_DIR:/store" busybox \
         chown -R "$(id -u):$(id -g)" /store >/dev/null 2>&1 || true
     mkdir -p "$B2AGG_STORE_DIR/tmp" 2>/dev/null || true
     [[ -w "$B2AGG_STORE_DIR" ]]
+}
+
+# Chaos may label its throwaway tooling for exact cancellation cleanup. With
+# no owner configured, invocation is byte-for-byte the usual docker run args.
+_iso_docker_run() {
+    local owner_args=()
+    [[ -z "${ISO_CHAOS_OWNER:-}" ]] || owner_args+=(--label "miden.chaos-owner=$ISO_CHAOS_OWNER")
+    docker run "${owner_args[@]}" "$@"
 }
 
 # iso_tool <args...> : run bridge-out-tool in a throwaway container against the
 # ISOLATED store. TMPDIR is kept on the same bind-mounted device as the store
 # to avoid rusqlite's "Invalid cross-device link" on atomic rename.
 iso_tool() {
-    docker run --rm --network "$ISO_NETWORK" \
+    _iso_docker_run --rm --network "$ISO_NETWORK" \
         -v "$B2AGG_STORE_DIR:/store" \
         -e "MIDEN_PROVER_URL=$ISO_PROVER_URL" \
         -e "TMPDIR=/store/tmp" \
@@ -93,8 +101,8 @@ iso_tool() {
 # claimant's consume of its minted P2ID — so a fresh recipient with an empty
 # vault aborts in the kernel ("failed to remove the fungible asset from the
 # vault …") and the deposit's balance never shows although the mint is on-chain.
-# The proxy writes `funding.toml` only when the chain charges fees, so its
-# presence is the guard; the source of funds is the genesis faucet operator
+# The manifest is also present on zero-fee chains; max_fee_per_txn is the
+# guard. The source of funds is the genesis faucet operator
 # (`/data/accounts/faucet_operator.mac` on the node_data volume), exactly as the
 # e2e `fee-funder` sidecar uses for the proxy's own accounts. The wallet's next
 # consume takes the fee P2ID together with whatever else is pending and pays for
@@ -103,11 +111,12 @@ iso_tool() {
 # own budget + 12 cascades of 256 = 698,880 at base fee 7; 2048× no longer covered it).
 iso_fund_fee_asset() {
     local wallet="$1" want="${2:-}" manifest="$PROJECT_DIR/.miden-agglayer-data/funding.toml"
-    [[ -f "$manifest" ]] || return 0   # zero-fee chain: nothing to do
+    [[ -f "$manifest" ]] || return 0   # legacy zero-fee initialization
     local fee_faucet max_fee amount
     fee_faucet=$(sed -n 's/^fee_faucet_id *= *"\(.*\)"/\1/p' "$manifest")
     max_fee=$(sed -n 's/^max_fee_per_txn *= *\([0-9]*\).*/\1/p' "$manifest")
     [[ -n "$fee_faucet" && -n "$max_fee" ]] || { echo "isolated-wallet: $manifest lacks fee_faucet_id/max_fee_per_txn" >&2; return 1; }
+    [[ "$max_fee" != 0 ]] || return 0
     amount=${want:-$(( max_fee * 8192 ))}
     echo "isolated-wallet: fee-charging chain — funding $wallet with $amount units of the fee asset $fee_faucet (from the genesis faucet operator)" >&2
     # The operator account is shared with other funders (the fee-funder sidecar, and every
@@ -119,7 +128,7 @@ iso_fund_fee_asset() {
     # store per call: a reused one carries the operator from another chain / nonce.
     local out attempt last_err="" backoff
     for attempt in 1 2 3 4 5 6 7 8; do
-        if out=$(docker run --rm --network "$ISO_NETWORK" \
+        if out=$(_iso_docker_run --rm --network "$ISO_NETWORK" \
             -v "$B2AGG_STORE_DIR:/store" \
             -v "${ISO_NODE_DATA_VOLUME:-miden-agglayer_node_data}:/data:ro" \
             -e "MIDEN_PROVER_URL=$ISO_PROVER_URL" -e "TMPDIR=/store/tmp" \
@@ -149,7 +158,7 @@ _iso_wipe_store() {
         local parent base
         parent="$(dirname "$B2AGG_STORE_DIR")"
         base="$(basename "$B2AGG_STORE_DIR")"
-        docker run --rm -v "$parent:/work" busybox rm -rf "/work/$base"
+        _iso_docker_run --rm -v "$parent:/work" busybox rm -rf "/work/$base"
     fi
 }
 
@@ -181,13 +190,13 @@ iso_inspect_faucet() {
     mkdir -p "$fresh/tmp" 2>/dev/null || true
     # Capture the container's exit code WITHOUT tripping the caller's set -e: a bare
     # `out=$(docker ...); rc=$?` aborts under errexit before rc is read on nonzero.
-    if out=$(docker run --rm --network "$ISO_NETWORK" \
+    if out=$(_iso_docker_run --rm --network "$ISO_NETWORK" \
         -v "$fresh:/store" -e "TMPDIR=/store/tmp" \
         --entrypoint bridge-out-tool "$ISO_IMAGE" \
         --store-dir /store --node-url "$ISO_NODE_URL" \
         --inspect-faucet "$fid" 2>&1); then rc=0; else rc=$?; fi
     # container-created files are root-owned; wipe via busybox if plain rm fails.
-    rm -rf "$fresh" 2>/dev/null || docker run --rm -v "$B2AGG_STORE_DIR:/w" busybox rm -rf "/w/$(basename "$fresh")" >/dev/null 2>&1 || true
+    rm -rf "$fresh" 2>/dev/null || _iso_docker_run --rm -v "$B2AGG_STORE_DIR:/w" busybox rm -rf "/w/$(basename "$fresh")" >/dev/null 2>&1 || true
     echo "$out"
     return "$rc"
 }
