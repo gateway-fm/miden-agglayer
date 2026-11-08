@@ -26,6 +26,16 @@ state must be retained.
 The normal host needs Docker with Compose, Foundry (`cast`), Bash, `jq`, Python
 3, Node.js, and Rust 1.98.1 or newer. Fixture generation also needs Kurtosis.
 
+On macOS, the recovery scripts and log assertions require GNU utilities and
+`flock`. Use the C locale for shell parsing and UTC so Docker log queries match
+the scripts' timestamps. Set these up in the shell used to run the tests:
+
+```bash
+brew install bash coreutils findutils gnu-sed flock
+export PATH="$(brew --prefix)/bin:$(brew --prefix coreutils)/libexec/gnubin:$(brew --prefix findutils)/libexec/gnubin:$(brew --prefix gnu-sed)/libexec/gnubin:$PATH"
+export TZ=UTC LC_ALL=C
+```
+
 Compose expects four locally built Miden images and one patched bridge-service
 image:
 
@@ -180,6 +190,22 @@ To run one script without resetting the chain:
 
 Scripts make assumptions about prior funding and test order; read the header of
 the selected script first.
+
+### Fee top-ups
+
+Run the funding regressions with `cargo test --locked --lib fee_funding`.
+After starting a fresh local stack, check the running wallet monitor with:
+
+```bash
+cargo test --locked --lib fee_funding::note_tests::live_wallet_top_ups \
+  -- --ignored --exact --nocapture
+```
+
+This uses an isolated client store and the local genesis funding account to
+send P2IDs and custom fee notes to both infrastructure wallets. It succeeds
+when both P2IDs are consumed and all custom notes remain committed. Run it
+before other E2E scripts that spend from the genesis funding account, then
+run `make e2e-test` for the full bridge flow on the same chain.
 
 ## Manual wallet work
 
