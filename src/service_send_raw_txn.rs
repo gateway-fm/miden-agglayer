@@ -402,39 +402,23 @@ async fn recovery_bootstrap_active(service: &ServiceState) -> anyhow::Result<boo
 
 /// May THIS signer still adopt a post-rebuild baseline?
 ///
-/// #90 (round-5) — this used to GRANDFATHER any signer with parked rows and
-/// `nonce_get() == 0`, so that the global window closing could not orphan work
-/// acknowledged while it was open. That was WRONG and is reverted: an ABSENT
-/// ledger row also reads 0, and the predicate proved neither that a rebuild had
-/// happened nor that the row was parked while the window was open. On a fresh
-/// deployment a genuinely new wallet could submit nonce 42, be parked, and then
-/// be seeded to 42 — skipping 0..41 entirely. That is a direct nonce-ordering
-/// violation, and a permanent amnesty rather than a bounded one.
-///
-/// Eligibility is therefore the durable global window only. The residual it
-/// leaves is real and is recorded in the branch notes rather than papered over:
-/// a transaction parked in the last few blocks before the window closes cannot
-/// be seeded on that sweep (the settle margin has not elapsed) and will not be
-/// seeded afterwards. Closing that hole needs proof that a row was parked while
-/// the window was open — a durable per-row "parked during recovery" marker — not
-/// a predicate that cannot tell a continuing wallet from a new one.
+/// Eligibility comes from the active rebuild window or the lowest queue row's
+/// durable recovery-era admission stamp. The stamp proves when the row was
+/// admitted, not that this signer existed before the loss. A new signer first
+/// seen during recovery receives the same policy; finite observation cannot
+/// distinguish it from a continuing wallet indefinitely.
 async fn signer_may_bootstrap(service: &ServiceState, signer: &str, global: bool) -> bool {
     if global {
         return true;
     }
     // The global window has closed. A row PARKED WHILE IT WAS OPEN stays
-    // eligible, because that marker is proof — not inference — that this is a
-    // continuing wallet from the rebuild era. Without it, a tx parked inside the
-    // final settle margin (the sweep waits BOOTSTRAP_SETTLE_BLOCKS before
+    // eligible because its admission occurred during recovery. Without it, a tx
+    // parked inside the final settle margin (the sweep waits before
     // seeding, so it cannot be adopted on that sweep) is stranded forever behind
     // nonces that will never arrive, having already been ACKNOWLEDGED.
     //
-    // This is NOT the reverted round-4 grandfathering. That inferred eligibility
-    // from `nonce_get() == 0` plus the presence of parked rows, which an ABSENT
-    // ledger row also satisfies — so a brand-new wallet submitting nonce 42
-    // would have been seeded to 42, skipping 0..41. The marker is written at
-    // park time and only when recovery mode was genuinely active, so a new
-    // wallet's out-of-order tx can never carry it.
+    // An ordinary live gap outside recovery never earns this stamp. Merely
+    // having parked rows and nonce_get() == 0 cannot authorize baseline adoption.
     // Read the LOWEST parked nonce's row: that is the one a baseline adoption
     // would seed from, so its provenance is the one that governs eligibility.
     let Ok(Some(min)) = service.store.peek_queued_min_nonce(signer).await else {
@@ -1784,8 +1768,8 @@ async fn service_send_raw_txn_inner(
             // Stamp the row iff the #90 post-rebuild recovery window is open
             // RIGHT NOW. Captured at park time and stored durably, so a tx
             // parked inside the final settle margin stays eligible for baseline
-            // adoption after the global window closes — without granting a new
-            // wallet the same amnesty, since it can never earn the stamp.
+            // adoption after the global window closes. This records admission
+            // during recovery, not evidence that the signer predates the loss.
             //
             // Review finding 2: this read must FAIL CLOSED, not default. The
             // previous `unwrap_or(false)` turned a transient store error into
@@ -2017,9 +2001,37 @@ async fn service_send_raw_txn_inner(
 /// same sweep that expires pending receipts. ~1h at ~1 block/s.
 const QUEUE_TTL_BLOCKS: u64 = 3_600;
 
-/// Blocks the lowest parked nonce must have been queued for before it may seed a
-/// post-rebuild baseline, so a LOWER nonce still in validation can arrive first.
+/// Both projected-block progress and real observation time must elapse before
+/// adopting a post-rebuild baseline. Catch-up can publish many historical blocks
+/// immediately; those blocks do not give a lower nonce time to arrive.
 const BOOTSTRAP_SETTLE_BLOCKS: u64 = 3;
+const BOOTSTRAP_SETTLE_TIME: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootstrapObservation {
+    Ineligible,
+    AwaitingBlocks,
+    AwaitingTime,
+    Ready,
+}
+
+fn bootstrap_observation(
+    queued: &crate::store::QueuedTxn,
+    recovery_active: bool,
+    current_block: u64,
+) -> BootstrapObservation {
+    if queued.nonce == 0 || !(recovery_active || queued.parked_during_recovery) {
+        return BootstrapObservation::Ineligible;
+    }
+    let parked_block = queued.expires_at.saturating_sub(QUEUE_TTL_BLOCKS);
+    if current_block < parked_block.saturating_add(BOOTSTRAP_SETTLE_BLOCKS) {
+        BootstrapObservation::AwaitingBlocks
+    } else if queued.parked_for < BOOTSTRAP_SETTLE_TIME {
+        BootstrapObservation::AwaitingTime
+    } else {
+        BootstrapObservation::Ready
+    }
+}
 
 /// How long a nonce gap must persist before a STUCK ledger row adopts the
 /// lowest parked nonce (see `bootstrap_one_signer`).
@@ -2027,20 +2039,20 @@ const BOOTSTRAP_SETTLE_BLOCKS: u64 = 3;
 /// Sized between the two existing constants, deliberately:
 ///
 /// * MUCH larger than `BOOTSTRAP_SETTLE_BLOCKS` (3). That margin only has to
-///   outlast a same-tick race between a peek and a park. Here the hazard is a
-///   LOWER nonce still inside a stateful admission — strict-H6 waits are
-///   minutes long — so the window must outlast a whole in-flight admission.
+///   allow lower nonces to arrive alongside the real-time margin. Here the
+///   hazard also includes a LOWER nonce still inside stateful admission;
+///   strict-H6 waits can take minutes, so the policy allows more chain progress.
 /// * MUCH smaller than `QUEUE_TTL_BLOCKS` (3600). Keying on the queue TTL was
 ///   the first attempt and it is unusable: at the ~20 blocks/min this chain
 ///   sustains it is roughly THREE HOURS, so the bridge stays wedged — no claim
 ///   lands at all — for the entire time it takes to conclude something the
-///   recovery stamp plus a few minutes of silence already prove. Measured live:
+///   recovery policy permits resuming after a bounded observation. Measured live:
 ///   ledger stuck at 6 with a stamped row parked at 7, unchanged for six
 ///   minutes, while every L1→L2 claim failed.
 ///
-/// Blocks rather than wall-clock on purpose: a busier chain gives a slow lower
-/// nonce more chances to land, so the evidence scales with the traffic that
-/// would produce it.
+/// The block bound scales with chain progress, while BOOTSTRAP_SETTLE_TIME
+/// separately provides a real ordering margin. Neither bound proves that a
+/// lower nonce will never arrive; recovery deliberately accepts that residual.
 const GAP_ADOPT_STALL_BLOCKS: u64 = 120;
 
 /// Wall-clock budget for one signer's slice of the periodic drain sweep.
@@ -2246,23 +2258,16 @@ async fn bootstrap_one_signer(service: &ServiceState, signer: &str, bootstrap: b
                 .flatten(),
             _ => None,
         };
-        let eligible_now = candidate
-            .as_ref()
-            .is_some_and(|q| bootstrap || q.parked_during_recovery);
         // ONE read of the tip serves both the settle check and the dead-gap TTL
         // check below, so they cannot disagree about "now".
         let now_block_for_gap = service.store.get_latest_block_number().await.unwrap_or(0);
-        let settled = match candidate.as_ref() {
-            Some(q) => {
-                let parked_at = q.expires_at.saturating_sub(QUEUE_TTL_BLOCKS);
-                now_block_for_gap >= parked_at.saturating_add(BOOTSTRAP_SETTLE_BLOCKS)
-            }
-            None => false,
-        };
-        if eligible_now
-            && settled
+        let observation = candidate
+            .as_ref()
+            .map_or(BootstrapObservation::Ineligible, |q| {
+                bootstrap_observation(q, bootstrap, now_block_for_gap)
+            });
+        if observation == BootstrapObservation::Ready
             && let Some(q) = candidate
-            && q.nonce > 0
         {
             let min_parked = q.nonce;
             // (a) The wallet has NO ledger row at all — the original #90 case.
@@ -2288,7 +2293,7 @@ async fn bootstrap_one_signer(service: &ServiceState, signer: &str, bootstrap: b
                     .saturating_add(GAP_ADOPT_STALL_BLOCKS)
             {
                 // (b) The wallet HAS a row, stuck BELOW the lowest parked nonce,
-                // and the gap has now persisted a FULL queue TTL.
+                // and the gap has now passed the block stall threshold.
                 //
                 // Insert-if-absent cannot reach this: a wallet that transacted
                 // successfully before the recovery has a row, advanced by those
@@ -2303,11 +2308,12 @@ async fn bootstrap_one_signer(service: &ServiceState, signer: &str, bootstrap: b
                 // The STALL WINDOW is the evidence, and it is why this is not
                 // the reverted round-4 amnesty: the gap has gone unfilled for
                 // GAP_ADOPT_STALL_BLOCKS since this row parked, ON TOP OF the
-                // recovery stamp that already proves a continuing wallet from the
-                // rebuild era. A merely slow lower nonce cannot satisfy both.
+                // recovery-era admission stamp and the real observation margin.
+                // This is a bounded recovery policy, not proof that a lower
+                // nonce will never arrive or that the signer predates the loss.
                 // The advance is monotonic (`nonce < baseline` in SQL), so it can
-                // never move a ledger backwards or skip a nonce that later shows
-                // up — that one is refused "nonce too low", which is the string
+                // never move a ledger backwards. A lower nonce that later shows
+                // up is refused "nonce too low", which is the string
                 // claimtxman's isNonceError matches, so it re-derives and
                 // resubmits rather than wedging.
                 if matches!(
@@ -2326,7 +2332,7 @@ async fn bootstrap_one_signer(service: &ServiceState, signer: &str, bootstrap: b
                         stall_blocks = GAP_ADOPT_STALL_BLOCKS,
                         now_block = now_block_for_gap,
                         "#90: nonce ledger was STUCK below the lowest parked nonce and the gap \
-                         outlived a full queue TTL — adopting the lowest parked nonce so a \
+                         passed the recovery stall threshold — adopting the lowest parked nonce so a \
                          continuing wallet resumes instead of wedging forever"
                     );
                 }
@@ -3721,10 +3727,10 @@ mod tests {
     /// were each 8 PASS/20 FAIL, with Bridge and Claim event counts frozen.
     ///
     /// The fix adopts the lowest parked nonce, but ONLY once the gap has
-    /// outlived a full queue TTL — that is the evidence distinguishing "this
-    /// nonce is never coming" from "a lower nonce is still in validation", and
-    /// it is what keeps this from being the reverted round-4 amnesty.
-    #[tokio::test]
+    /// passed the recovery stall threshold and real observation margin. This
+    /// bounded policy permits recovery without claiming that the missing nonce
+    /// can never arrive.
+    #[tokio::test(start_paused = true)]
     async fn finding90_stuck_ledger_below_dead_gap_is_adopted_after_stall() {
         let (service, _sd) = mempool_service();
         let store = service.store.clone();
@@ -3752,8 +3758,9 @@ mod tests {
             Some(6)
         );
 
-        // Past the settle margin, but the gap has NOT yet outlived its TTL: the
+        // Past the settle margin, but the gap has NOT outlived its stall window: the
         // ledger must NOT move, because a lower nonce could still be arriving.
+        tokio::time::advance(BOOTSTRAP_SETTLE_TIME).await;
         let now = store.get_latest_block_number().await.unwrap();
         store
             .set_latest_block_number(now + BOOTSTRAP_SETTLE_BLOCKS + 1)
@@ -3770,7 +3777,7 @@ mod tests {
         // Now let the gap outlive the STALL WINDOW. Keying on the queue TTL
         // instead was the first attempt and is unusable in practice: 3600 blocks
         // is ~3 hours at this chain's rate, so the bridge would stay wedged for
-        // hours to conclude what the stamp plus a few minutes already prove.
+        // hours before the bounded recovery policy permits it to resume.
         let parked = store.get_queued_txn(&signer_str, 6).await.unwrap().unwrap();
         let parked_at = parked.expires_at.saturating_sub(QUEUE_TTL_BLOCKS);
         store
@@ -3799,7 +3806,7 @@ mod tests {
     /// sweep), and the parked tx is promoted. Seeding is deliberately NOT done at
     /// admission: whichever request arrives first could be N+1, which would seed
     /// N+1 and strand a still-in-flight N.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn finding90_rebuilt_ledger_bootstraps_continuing_signer() {
         let (service, _sd) = mempool_service();
         let store = service.store.clone();
@@ -3835,6 +3842,7 @@ mod tests {
         );
 
         // Advance past the margin; the drain adopts the LOWEST PARKED nonce.
+        tokio::time::advance(BOOTSTRAP_SETTLE_TIME).await;
         let now = store.get_latest_block_number().await.unwrap();
         store
             .set_latest_block_number(now + BOOTSTRAP_SETTLE_BLOCKS + 1)
@@ -3851,6 +3859,94 @@ mod tests {
             store.peek_queued_min_nonce(&signer_str).await.unwrap(),
             None,
             "the parked tx must be promoted out of the queue, never stranded"
+        );
+    }
+
+    /// A restore can leave the global recovery window open while a genuinely
+    /// new signer submits out of order. Rapid projector catch-up must not
+    /// consume the real ordering margin before nonce zero reaches admission.
+    #[tokio::test(start_paused = true)]
+    async fn recovery_bootstrap_waits_for_real_age_before_skipping_a_nonce_gap() {
+        let (service, _sd) = mempool_service();
+        let store = service.store.clone();
+        store.set_nonce_ledger_rebuilt(true).await.unwrap();
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer = format!("{:#x}", key.address());
+        let (raw1, hash1) = ger_tx_at(&key, 1, 0xA1);
+        service_send_raw_txn(service.clone(), raw1.clone())
+            .await
+            .unwrap();
+        let parked = store.get_queued_txn(&signer, 1).await.unwrap().unwrap();
+        assert!(parked.parked_during_recovery);
+
+        // Historical blocks become visible immediately, far past both block
+        // guards. They are not evidence of elapsed admission time.
+        store
+            .set_latest_block_number(GAP_ADOPT_STALL_BLOCKS + 50)
+            .await
+            .unwrap();
+        assert_eq!(
+            bootstrap_observation(&parked, true, GAP_ADOPT_STALL_BLOCKS + 50),
+            BootstrapObservation::AwaitingTime
+        );
+        resume_queued_drain(&service).await.unwrap();
+        assert_eq!(store.nonce_get(&signer).await.unwrap(), 0);
+
+        tokio::time::advance(BOOTSTRAP_SETTLE_TIME - std::time::Duration::from_millis(1)).await;
+        service_send_raw_txn(service.clone(), raw1).await.unwrap();
+        let reparking = store.get_queued_txn(&signer, 1).await.unwrap().unwrap();
+        assert_eq!(
+            reparking.parked_for,
+            BOOTSTRAP_SETTLE_TIME - std::time::Duration::from_millis(1)
+        );
+        resume_queued_drain(&service).await.unwrap();
+        assert_eq!(store.nonce_get(&signer).await.unwrap(), 0);
+        assert!(store.txn_get(hash1).await.unwrap().is_none());
+
+        let (raw0, hash0) = ger_tx_at(&key, 0, 0xA0);
+        assert_eq!(
+            service_send_raw_txn(service.clone(), raw0).await.unwrap(),
+            hash0
+        );
+        assert_eq!(store.nonce_get(&signer).await.unwrap(), 2);
+        assert!(store.txn_get(hash1).await.unwrap().is_some());
+        assert!(store.get_queued_txn(&signer, 1).await.unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_bootstrap_observation_requires_eligibility_blocks_and_age() {
+        let (service, _sd) = mempool_service();
+        let store = service.store.clone();
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let signer = format!("{:#x}", key.address());
+        let (raw, _) = ger_tx_at(&key, 21, 0xA2);
+        service_send_raw_txn(service.clone(), raw).await.unwrap();
+        let row = store.get_queued_txn(&signer, 21).await.unwrap().unwrap();
+        assert_eq!(
+            bootstrap_observation(&row, false, 100),
+            BootstrapObservation::Ineligible
+        );
+        assert_eq!(
+            bootstrap_observation(&row, true, 0),
+            BootstrapObservation::AwaitingBlocks
+        );
+        assert_eq!(
+            bootstrap_observation(&row, true, 100),
+            BootstrapObservation::AwaitingTime
+        );
+        tokio::time::advance(BOOTSTRAP_SETTLE_TIME).await;
+        let row = store.get_queued_txn(&signer, 21).await.unwrap().unwrap();
+        assert_eq!(
+            bootstrap_observation(&row, true, 0),
+            BootstrapObservation::AwaitingBlocks
+        );
+        assert_eq!(
+            bootstrap_observation(&row, true, 100),
+            BootstrapObservation::Ready
+        );
+        assert_eq!(
+            bootstrap_observation(&row, false, 100),
+            BootstrapObservation::Ineligible
         );
     }
 
@@ -3891,7 +3987,7 @@ mod tests {
     /// baseline must still be `21`. This drives the real durable path (park ->
     /// drain -> seed -> promote) rather than an in-memory shadow of it, so the
     /// ordering guarantee also survives a restart.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn finding90_seeds_lowest_parked_nonce_not_first_arrival() {
         let (service, _sd) = mempool_service();
         let store = service.store.clone();
@@ -3917,6 +4013,7 @@ mod tests {
         );
 
         // Let the settle margin elapse so the baseline may be adopted.
+        tokio::time::advance(BOOTSTRAP_SETTLE_TIME).await;
         let now = store.get_latest_block_number().await.unwrap();
         store
             .set_latest_block_number(now + BOOTSTRAP_SETTLE_BLOCKS + 1)
@@ -3974,7 +4071,7 @@ mod tests {
     /// UNSTAMPED row must never be adopted once the window is shut — including
     /// when it becomes the queue minimum only because eviction removed rows
     /// ahead of it (the B2 check-then-seed divergence).
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn stamped_row_is_adopted_after_window_close_and_unstamped_never() {
         let (service, _sd) = mempool_service();
         let store = service.store.clone();
@@ -4005,6 +4102,7 @@ mod tests {
         service_send_raw_txn(service.clone(), raw_b).await.unwrap();
 
         // Let the settle margin elapse, then sweep.
+        tokio::time::advance(BOOTSTRAP_SETTLE_TIME).await;
         let now = store.get_latest_block_number().await.unwrap();
         store
             .set_latest_block_number(now + BOOTSTRAP_SETTLE_BLOCKS + 1)
@@ -4111,7 +4209,7 @@ mod tests {
         );
     }
 
-    /// #90 (round-5) — a genuinely NEW wallet must never be bootstrapped.
+    /// Outside recovery, an unstamped new wallet must never be bootstrapped.
     ///
     /// An earlier revision grandfathered any signer with parked rows and
     /// `nonce_get() == 0` so a late-parked tx could not be orphaned by the window
@@ -4119,7 +4217,7 @@ mod tests {
     /// tell a continuing wallet from a new one: on a fresh deployment a new wallet
     /// submitting nonce 42 was parked and then SEEDED to 42, skipping 0..41. This
     /// pins that it cannot happen once the window is shut.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn finding90_new_wallet_is_never_bootstrapped_after_the_window() {
         let (service, _sd) = mempool_service();
         let store = service.store.clone();
@@ -4137,6 +4235,7 @@ mod tests {
         );
 
         // Let the settle margin elapse and sweep repeatedly.
+        tokio::time::advance(BOOTSTRAP_SETTLE_TIME).await;
         let now = store.get_latest_block_number().await.unwrap();
         store
             .set_latest_block_number(now + BOOTSTRAP_SETTLE_BLOCKS + 1)
@@ -4167,7 +4266,7 @@ mod tests {
     /// reconnects afterwards. "Retire once any signer has a nonce row" cleared
     /// the amnesty when A resumed, so B parked behind nonce 0 with bootstrap
     /// already disabled: stranded forever. B must still be bootstrapped.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn finding90_window_is_durable_and_covers_a_later_second_wallet() {
         let (service, _sd) = mempool_service();
         let store = service.store.clone();
@@ -4178,6 +4277,7 @@ mod tests {
         let a = format!("{:#x}", key_a.address());
         let (raw_a, _) = ger_tx_at(&key_a, 21, 0xF1);
         service_send_raw_txn(service.clone(), raw_a).await.unwrap();
+        tokio::time::advance(BOOTSTRAP_SETTLE_TIME).await;
         let now = store.get_latest_block_number().await.unwrap();
         store
             .set_latest_block_number(now + BOOTSTRAP_SETTLE_BLOCKS + 1)
@@ -4199,6 +4299,7 @@ mod tests {
         service_send_raw_txn(service.clone(), raw_b)
             .await
             .expect("a later continuing wallet must be accepted (parked), never rejected");
+        tokio::time::advance(BOOTSTRAP_SETTLE_TIME).await;
         let now = store.get_latest_block_number().await.unwrap();
         store
             .set_latest_block_number(now + BOOTSTRAP_SETTLE_BLOCKS + 1)

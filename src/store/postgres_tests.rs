@@ -42,6 +42,145 @@ async fn pg_store() -> Option<PgStore> {
 }
 
 #[tokio::test]
+async fn pgstore_queued_observation_age_survives_repark_and_excludes_lock_wait() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let url = std::env::var("DATABASE_URL").unwrap();
+    let (mut client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    let signer = "0x7373737373737373737373737373737373737373";
+    let hash = TxHash::from([0x74; 32]);
+    let entry = dummy_txn_entry();
+    let bounds = super::QueueBounds {
+        per_signer: 256,
+        global: 4096,
+    };
+
+    // A transaction may wait for the global queue lock. Its begin timestamp
+    // must not count toward observing a queue row that does not exist yet.
+    let blocker = client.transaction().await.unwrap();
+    blocker
+        .batch_execute("SELECT pg_advisory_xact_lock(hashtext('queued_txns_bounds'))")
+        .await
+        .unwrap();
+    let queuer = PgStore::new(&url).await.unwrap();
+    let envelope = entry.envelope.clone();
+    let queued = tokio::spawn(async move {
+        queuer
+            .queue_txn(signer, 1, hash, &envelope, 3600, true, bounds)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = blocker
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_locks waiting JOIN pg_locks held \
+                 ON held.locktype = waiting.locktype AND held.database = waiting.database \
+                 AND held.classid = waiting.classid AND held.objid = waiting.objid \
+                 AND held.objsubid = waiting.objsubid \
+                 WHERE waiting.locktype = 'advisory' AND NOT waiting.granted \
+                 AND held.granted AND held.pid = pg_backend_pid())",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("queue insertion never waited on the held advisory lock");
+    let released_at: f64 = blocker
+        .query_one(
+            "SELECT EXTRACT(EPOCH FROM clock_timestamp())::double precision",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    blocker.commit().await.unwrap();
+    assert_eq!(queued.await.unwrap().unwrap(), super::QueueOutcome::Parked);
+    let created_at: f64 = client.query_one(
+        "SELECT EXTRACT(EPOCH FROM created_at)::double precision FROM queued_txns WHERE signer = $1 AND nonce = 1", &[&signer])
+        .await.unwrap().get(0);
+    assert!(
+        created_at >= released_at,
+        "pre-insertion lock wait was counted as queue observation"
+    );
+
+    // Age the durable row directly instead of spending real time in the test.
+    let original: f64 = client.query_one(
+        "UPDATE queued_txns SET created_at = clock_timestamp() - interval '45 seconds' WHERE signer = $1 AND nonce = 1 \
+         RETURNING EXTRACT(EPOCH FROM created_at)::double precision", &[&signer]).await.unwrap().get(0);
+    assert!(
+        store
+            .get_queued_txn(signer, 1)
+            .await
+            .unwrap()
+            .unwrap()
+            .parked_for
+            >= std::time::Duration::from_secs(45)
+    );
+    assert_eq!(
+        store
+            .queue_txn(signer, 1, hash, &entry.envelope, 9999, false, bounds)
+            .await
+            .unwrap(),
+        super::QueueOutcome::AlreadyParked
+    );
+    let after_repark: f64 = client.query_one(
+        "SELECT EXTRACT(EPOCH FROM created_at)::double precision FROM queued_txns WHERE signer = $1 AND nonce = 1", &[&signer])
+        .await.unwrap().get(0);
+    assert_eq!(
+        original, after_repark,
+        "rebroadcast reset the first observation time"
+    );
+    let reopened = PgStore::new(&url).await.unwrap();
+    for snapshot in [
+        reopened.get_queued_txn(signer, 1).await.unwrap().unwrap(),
+        reopened.queued_txn_by_hash(hash).await.unwrap().unwrap(),
+    ] {
+        assert!(snapshot.parked_for >= std::time::Duration::from_secs(45));
+        assert!(snapshot.parked_during_recovery);
+        assert_eq!(snapshot.expires_at, 3600);
+    }
+    client.execute(
+        "UPDATE queued_txns SET created_at = clock_timestamp() + interval '1 minute' WHERE signer = $1 AND nonce = 1",
+        &[&signer],
+    ).await.unwrap();
+    for snapshot in [
+        reopened.get_queued_txn(signer, 1).await.unwrap().unwrap(),
+        reopened.queued_txn_by_hash(hash).await.unwrap().unwrap(),
+    ] {
+        assert_eq!(
+            snapshot.parked_for,
+            std::time::Duration::ZERO,
+            "a future timestamp must delay bootstrap without hiding the queued transaction"
+        );
+    }
+    for invalid in ["'infinity'::timestamptz", "'-infinity'::timestamptz"] {
+        client
+            .execute(
+                &format!(
+                    "UPDATE queued_txns SET created_at = {invalid} WHERE signer = $1 AND nonce = 1"
+                ),
+                &[&signer],
+            )
+            .await
+            .unwrap();
+        assert!(reopened.get_queued_txn(signer, 1).await.is_err());
+        assert!(reopened.queued_txn_by_hash(hash).await.is_err());
+    }
+    store.delete_queued_txn(signer, 1, hash).await.unwrap();
+}
+
+#[tokio::test]
 async fn pgstore_invalid_claim_fences_receipts_and_owners() {
     let Some(store) = pg_store().await else {
         return;

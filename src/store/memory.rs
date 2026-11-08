@@ -37,6 +37,19 @@ struct TxnReceipt {
     next_recovery_at: Option<u64>,
 }
 
+struct QueuedTxnRecord {
+    txn: QueuedTxn,
+    created_at: tokio::time::Instant,
+}
+
+impl QueuedTxnRecord {
+    fn snapshot(&self) -> QueuedTxn {
+        let mut txn = self.txn.clone();
+        txn.parked_for = self.created_at.elapsed();
+        txn
+    }
+}
+
 /// #55 BLOCKER 1 — in-memory fenced admission-lease reservation row.
 #[derive(Clone)]
 struct Reservation {
@@ -242,7 +255,7 @@ pub struct InMemoryStore {
     // #146 future-nonce queue ("mempool"): signer -> (nonce -> parked tx). A
     // BTreeMap keeps nonces ordered so `peek_queued_min_nonce` is the first key.
     // Field-backed mirror of the PgStore `queued_txns` table (migration 020).
-    queued_txns: RwLock<HashMap<String, std::collections::BTreeMap<u64, QueuedTxn>>>,
+    queued_txns: RwLock<HashMap<String, std::collections::BTreeMap<u64, QueuedTxnRecord>>>,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
@@ -1678,7 +1691,7 @@ impl Store for InMemoryStore {
         // Idempotency / conflict at (signer, nonce) BEFORE the bound checks — an
         // already-parked same-hash re-broadcast must accept even at the bound.
         if let Some(existing) = map.get(&key).and_then(|m| m.get(&nonce)) {
-            return Ok(if existing.tx_hash == tx_hash {
+            return Ok(if existing.txn.tx_hash == tx_hash {
                 QueueOutcome::AlreadyParked
             } else {
                 QueueOutcome::ConflictDifferentHash
@@ -1692,13 +1705,17 @@ impl Store for InMemoryStore {
         }
         map.entry(key.clone()).or_default().insert(
             nonce,
-            QueuedTxn {
-                signer: key,
-                nonce,
-                tx_hash,
-                envelope: envelope.clone(),
-                expires_at,
-                parked_during_recovery,
+            QueuedTxnRecord {
+                txn: QueuedTxn {
+                    signer: key,
+                    nonce,
+                    tx_hash,
+                    envelope: envelope.clone(),
+                    expires_at,
+                    parked_for: std::time::Duration::ZERO,
+                    parked_during_recovery,
+                },
+                created_at: tokio::time::Instant::now(),
             },
         );
         Ok(QueueOutcome::Parked)
@@ -1710,7 +1727,7 @@ impl Store for InMemoryStore {
             .read()
             .get(&signer.to_lowercase())
             .and_then(|m| m.get(&nonce))
-            .cloned())
+            .map(QueuedTxnRecord::snapshot))
     }
 
     async fn delete_queued_txn(
@@ -1724,7 +1741,7 @@ impl Store for InMemoryStore {
         let Some(inner) = map.get_mut(&key) else {
             return Ok(false);
         };
-        if inner.get(&nonce).map(|q| q.tx_hash) != Some(tx_hash) {
+        if inner.get(&nonce).map(|q| q.txn.tx_hash) != Some(tx_hash) {
             return Ok(false);
         }
         inner.remove(&nonce);
@@ -1752,8 +1769,8 @@ impl Store for InMemoryStore {
             .read()
             .values()
             .flat_map(|m| m.values())
-            .find(|q| q.tx_hash == tx_hash)
-            .cloned())
+            .find(|q| q.txn.tx_hash == tx_hash)
+            .map(QueuedTxnRecord::snapshot))
     }
 
     async fn evict_expired_queued_txns(
@@ -1767,8 +1784,8 @@ impl Store for InMemoryStore {
         for (signer, txs) in map.iter_mut() {
             txs.retain(|nonce, q| {
                 // Stamped rows are exempt — see the postgres impl / trait doc.
-                if q.expires_at <= now && !q.parked_during_recovery {
-                    evicted.push((signer.clone(), *nonce, q.tx_hash));
+                if q.txn.expires_at <= now && !q.txn.parked_during_recovery {
+                    evicted.push((signer.clone(), *nonce, q.txn.tx_hash));
                     false
                 } else {
                     true

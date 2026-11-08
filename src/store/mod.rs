@@ -387,6 +387,11 @@ pub struct QueuedTxn {
     pub envelope: TxEnvelope,
     /// Block number after which the expiry sweep drops this parked tx.
     pub expires_at: u64,
+    /// Elapsed time since the first durable park, measured by the store at this
+    /// read. Re-broadcasts preserve that origin; projected block catch-up does
+    /// not advance this clock. Future timestamps clamp to zero; nonfinite or
+    /// unrepresentable persisted ages fail the read.
+    pub parked_for: std::time::Duration,
     /// True iff this row was parked while the #90 post-rebuild recovery window
     /// was open. Carried durably so a tx parked inside the final settle margin
     /// stays eligible for baseline adoption after the global window closes.
@@ -971,8 +976,8 @@ pub trait Store: Send + Sync + 'static {
     /// queue with no operator remedy short of hand-editing the table.
     ///
     /// EXEMPTION (review round 3): rows with `parked_during_recovery` are NOT
-    /// evicted. That stamp is the only proof of a continuing wallet's
-    /// post-restore eligibility; evicting it re-creates the wedge the marker
+    /// evicted. That stamp preserves the row's recovery-era admission
+    /// eligibility; evicting it re-creates the wedge the marker
     /// closes (re-broadcast parks unstamped forever against an empty ledger).
     /// The exempt population is bounded — stamps are only mintable while the
     /// recovery window is open — and leaves via adoption + promotion.

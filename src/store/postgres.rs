@@ -15,6 +15,7 @@ use crate::log_synthesis::{
 use alloy::consensus::TxEnvelope;
 use alloy::eips::Encodable2718;
 use alloy::primitives::{Address, LogData, TxHash, U256};
+use anyhow::Context;
 use deadpool_postgres::{Manager, Pool};
 use miden_protocol::Word;
 use miden_protocol::account::AccountId;
@@ -2170,10 +2171,12 @@ impl Store for PgStore {
         }
         let mut envelope_bytes = Vec::new();
         envelope.encode_2718(&mut envelope_bytes);
+        // now() is fixed at transaction start, before the queue lock wait.
+        // Observation starts when the row is inserted, not while waiting.
         tx.execute(
             "INSERT INTO queued_txns \
-             (signer, nonce, tx_hash, envelope, expires_at, parked_during_recovery)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+             (signer, nonce, tx_hash, envelope, expires_at, parked_during_recovery, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, clock_timestamp())",
             &[
                 &key,
                 &nonce_db,
@@ -2193,7 +2196,8 @@ impl Store for PgStore {
         let key = signer.to_lowercase();
         let Some(row) = client
             .query_opt(
-                "SELECT tx_hash, envelope, expires_at, parked_during_recovery \
+                "SELECT tx_hash, envelope, expires_at, parked_during_recovery, \
+                 EXTRACT(EPOCH FROM clock_timestamp() - created_at)::double precision \
                  FROM queued_txns WHERE signer = $1 AND nonce = $2",
                 &[&key, &(nonce as i64)],
             )
@@ -2250,7 +2254,8 @@ impl Store for PgStore {
         let Some(row) = client
             .query_opt(
                 "SELECT signer, nonce, tx_hash, envelope, expires_at, \
-                 parked_during_recovery
+                 parked_during_recovery, \
+                 EXTRACT(EPOCH FROM clock_timestamp() - created_at)::double precision
                  FROM queued_txns WHERE tx_hash = $1 LIMIT 1",
                 &[&format!("{tx_hash:#x}")],
             )
@@ -2267,6 +2272,7 @@ impl Store for PgStore {
             envelope: decode_queued_envelope(row.get(3))?,
             expires_at: row.get::<_, i64>(4) as u64,
             parked_during_recovery: row.get(5),
+            parked_for: decode_queued_age(row.get(6))?,
         }))
     }
 
@@ -2278,8 +2284,8 @@ impl Store for PgStore {
         // design decision and the re-broadcast contract that makes it safe).
         let client = self.pool.get().await?;
         // (review round 3, codex B1) Stamped rows are EXEMPT. A
-        // `parked_during_recovery` row is the ONLY proof of a continuing
-        // wallet's post-restore eligibility; evicting it re-creates the exact
+        // `parked_during_recovery` row preserves post-restore admission
+        // eligibility; evicting it re-creates the exact
         // wedge the marker closes — the re-broadcast arrives with the window
         // shut, parks UNSTAMPED, expires, evicts, re-broadcasts, forever, and
         // never reaches "nonce too low" because the empty ledger keeps reading
@@ -4017,7 +4023,17 @@ fn parse_queued_hash(hash_str: &str) -> anyhow::Result<TxHash> {
         .map_err(|e| anyhow::anyhow!("stored queued tx_hash {hash_str} is invalid ({e})"))
 }
 
-/// Build a `QueuedTxn` from a `SELECT tx_hash, envelope, expires_at` row (#146).
+fn decode_queued_age(seconds: f64) -> anyhow::Result<std::time::Duration> {
+    // A backwards clock adjustment must delay bootstrap without hiding the
+    // parked transaction from ordinary reads or contiguous promotion.
+    if seconds.is_finite() && seconds < 0.0 {
+        return Ok(std::time::Duration::ZERO);
+    }
+    std::time::Duration::try_from_secs_f64(seconds)
+        .context("invalid queued transaction age; refusing nonce bootstrap")
+}
+
+/// Build a queued transaction snapshot, including its store-measured age.
 fn row_to_queued_txn(
     signer: String,
     nonce: u64,
@@ -4030,5 +4046,6 @@ fn row_to_queued_txn(
         envelope: decode_queued_envelope(row.get(1))?,
         expires_at: row.get::<_, i64>(2) as u64,
         parked_during_recovery: row.get(3),
+        parked_for: decode_queued_age(row.get(4))?,
     })
 }
