@@ -33,6 +33,7 @@
 //!   ends, even while a finished cache entry remains for hash deduplication.
 
 use crate::service_state::ServiceState;
+use crate::transaction_lifecycle::{ReceiptState, SubmissionBoundary, TransactionLifecycle};
 use alloy::consensus::TxEnvelope;
 use alloy::primitives::{Address, TxHash};
 use dashmap::DashMap;
@@ -1181,19 +1182,25 @@ async fn write_failure_receipt(
 /// finality. A concurrent projector can finish the receipt immediately after
 /// this snapshot; RPC responses always read the durable store directly.
 async fn completed_dispatch_state(store: &Arc<dyn crate::store::Store>, hash: TxHash) -> JobState {
-    match store.txn_get(hash).await {
-        Ok(Some(tx)) if tx.result.is_none() => {
-            match store.get_note_handoff_for_tx(&format!("{hash:#x}")).await {
-                Ok(Some(handoff)) => match handoff.state {
-                    crate::store::NoteHandoffState::Prepared => JobState::AwaitingReconciliation,
-                    crate::store::NoteHandoffState::Submitted => JobState::AwaitingProjection,
-                },
-                Ok(None) => JobState::DispatchComplete,
-                Err(_) => JobState::AwaitingReconciliation,
-            }
+    let tx = match store.txn_get(hash).await {
+        Ok(tx) => tx,
+        Err(_) => return JobState::AwaitingReconciliation,
+    };
+    if TransactionLifecycle::from_snapshot(tx.as_ref(), None).receipt != ReceiptState::Pending {
+        return JobState::DispatchComplete;
+    }
+    let handoff = match store.get_note_handoff_for_tx(&format!("{hash:#x}")).await {
+        Ok(handoff) => handoff,
+        Err(_) => return JobState::AwaitingReconciliation,
+    };
+    match TransactionLifecycle::from_snapshot(tx.as_ref(), handoff.as_ref()).submission {
+        SubmissionBoundary::Prepared | SubmissionBoundary::PreparedWithTransactionId => {
+            JobState::AwaitingReconciliation
         }
-        Ok(_) => JobState::DispatchComplete,
-        Err(_) => JobState::AwaitingReconciliation,
+        SubmissionBoundary::Submitted => JobState::AwaitingProjection,
+        SubmissionBoundary::Unlinked | SubmissionBoundary::TransactionRecorded => {
+            JobState::DispatchComplete
+        }
     }
 }
 

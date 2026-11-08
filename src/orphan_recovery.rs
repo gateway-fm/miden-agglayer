@@ -44,7 +44,10 @@
 
 use crate::service_send_raw_txn::decode_write_call;
 use crate::service_state::ServiceState;
-use crate::store::{NoteHandoffState, RecoverablePendingTxn};
+use crate::store::RecoverablePendingTxn;
+use crate::transaction_lifecycle::{
+    ExactNoteOutcome, ReceiptState, RecoveryDecision, TransactionLifecycle,
+};
 use crate::writer_worker::DecodedWriteCall;
 use alloy::consensus::TxEnvelope;
 use alloy::primitives::{Address, Bytes};
@@ -279,13 +282,12 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
         }
     };
     // Terminalised concurrently (writer/projector finished it) — done, keep walking.
-    if fresh.result.is_some() {
+    let lifecycle = TransactionLifecycle::from_snapshot(Some(&fresh), handoff.as_ref());
+    if lifecycle.receipt != ReceiptState::Pending {
         tracing::debug!(target: "recovery", tx_hash = %tx.tx_hash, nonce = tx.nonce, "recovery: tx terminalised concurrently; skipping");
         return Step::Continue;
     }
-    let fresh_handoff_state = handoff.as_ref().map(|h| h.state);
-    let fresh_has_handoff = handoff.is_some();
-    let fresh_miden_id = fresh.id.is_some();
+    let fresh_has_handoff = lifecycle.submission.has_note_handoff();
     let handoff_note_id = handoff.as_ref().and_then(|h| h.note_id.clone());
 
     // 2. Reconcile against a FRESH, authoritative Miden view (reviewer #5 — the
@@ -312,7 +314,8 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
             .await
         }
     };
-    match outcome {
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
         Err(e) => {
             // Node unavailable OR no fresh view — NEVER decide "absent" from a
             // stale/absent read. Poll at the sweep cadence (do NOT grow the backoff:
@@ -324,7 +327,49 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
             );
             return Step::StopSigner;
         }
-        Ok(crate::applied_state::ExactNoteOutcome::AppliedByExactNote) => {
+    };
+
+    // Proof rejection takes precedence over ordinary submission waiting only
+    // when fresh evidence proves the effect absent. Missing/unsynced exact
+    // notes cannot authorize this deterministic rejection.
+    if outcome == ExactNoteOutcome::NotApplied
+        && let DecodedWriteCall::Claim { params } = &decoded
+        && !params.amount.is_zero()
+        && let Err(error) = crate::claim_proof::validate(params)
+    {
+        let reason = format!("claim rejected during recovery: {error}");
+        let block = match service.store.get_latest_block_number().await {
+            Ok(block) => block,
+            Err(_) => return Step::StopSigner,
+        };
+        match service
+            .store
+            .txn_fail_invalid_claim(
+                tx.tx_hash,
+                params.globalIndex,
+                handoff.as_ref().map(|h| h.note_commitment.as_str()),
+                &reason,
+                block,
+            )
+            .await
+        {
+            Ok(true) => {
+                let _ = service.store.clear_recovery_backoff(tx.tx_hash).await;
+                tracing::warn!(target: "recovery", tx_hash = %tx.tx_hash, global_index = %params.globalIndex,
+                    %error, "rejected invalid claim proof; deposit remains claimable with a valid proof");
+                return Step::Continue;
+            }
+            Ok(false) => return Step::StopSigner,
+            Err(error) => {
+                tracing::warn!(target: "recovery", tx_hash = %tx.tx_hash, %error, "invalid claim finalization failed");
+                return Step::StopSigner;
+            }
+        }
+    }
+
+    match lifecycle.recovery_decision(outcome) {
+        RecoveryDecision::NoPendingReceipt => return Step::Continue,
+        RecoveryDecision::AwaitProjection => {
             // The EXACT note landed. Reviewer #4 — finalisation of an exact landed note
             // is PROJECTOR-OWNED for BOTH GER and CLAIM: the SyntheticProjector
             // finalises the receipt atomically with its event (ClaimEvent /
@@ -342,7 +387,7 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
             );
             return Step::StopSigner;
         }
-        Ok(crate::applied_state::ExactNoteOutcome::AppliedElsewhere) => {
+        RecoveryDecision::ConfirmDuplicate => {
             // The effect was applied by ANOTHER transaction/note; the projector will
             // never emit an event for THIS tx's (unconsumed/absent) note, so recovery
             // finalises it as a confirmed duplicate. GER injection is idempotent →
@@ -365,100 +410,47 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
                 }
             };
         }
-        // A fresh absent effect plus a known unconsumed note (or no handoff)
-        // permits deterministic proof rejection. A valid proof still follows
-        // the usual handoff state machine; missing/unsynced notes stay uncertain.
-        Ok(crate::applied_state::ExactNoteOutcome::NotApplied) => {
-            if let DecodedWriteCall::Claim { params } = &decoded
-                && !params.amount.is_zero()
-                && let Err(error) = crate::claim_proof::validate(params)
+        RecoveryDecision::AwaitConfirmation => {
+            poll_next_sweep(tx, "submitted handoff; awaiting Miden confirmation");
+            return Step::StopSigner;
+        }
+        RecoveryDecision::CheckPreparedExpiry => {
+            // Only the store's authoritative reconciliation cursor can prove the
+            // exact prepared note dead. The classifier does not authorize clearing.
+            let Some(commitment) = handoff.as_ref().map(|h| h.note_commitment.clone()) else {
+                poll_next_sweep(
+                    tx,
+                    "prepared handoff no longer present; re-checking next sweep",
+                );
+                return Step::StopSigner;
+            };
+            match service
+                .store
+                .clear_expired_prepared_note_handoff(&tx_key, &commitment)
+                .await
             {
-                let reason = format!("claim rejected during recovery: {error}");
-                let block = match service.store.get_latest_block_number().await {
-                    Ok(block) => block,
-                    Err(_) => return Step::StopSigner,
-                };
-                match service
-                    .store
-                    .txn_fail_invalid_claim(
-                        tx.tx_hash,
-                        params.globalIndex,
-                        handoff.as_ref().map(|h| h.note_commitment.as_str()),
-                        &reason,
-                        block,
-                    )
-                    .await
-                {
-                    Ok(true) => {
-                        let _ = service.store.clear_recovery_backoff(tx.tx_hash).await;
-                        tracing::warn!(target: "recovery", tx_hash = %tx.tx_hash, global_index = %params.globalIndex,
-                            %error, "rejected invalid claim proof; deposit remains claimable with a valid proof");
-                        return Step::Continue;
-                    }
-                    Ok(false) => return Step::StopSigner,
-                    Err(error) => {
-                        tracing::warn!(target: "recovery", tx_hash = %tx.tx_hash, %error, "invalid claim finalization failed");
-                        return Step::StopSigner;
-                    }
+                Ok(true) => {
+                    // Expired past the authoritative cursor — the stale note is provably
+                    // dead. Fall through to re-drive a fresh note.
+                    tracing::warn!(target: "recovery", tx_hash = %tx.tx_hash, nonce = tx.nonce, "recovery: cleared expired prepared note handoff; re-driving a fresh note");
+                }
+                Ok(false) => {
+                    poll_next_sweep(
+                        tx,
+                        "prepared note not yet expired; awaiting consumption or expiration",
+                    );
+                    return Step::StopSigner;
+                }
+                Err(e) => {
+                    poll_next_sweep(
+                        tx,
+                        &format!("prepared-handoff expiration check failed: {e}"),
+                    );
+                    return Step::StopSigner;
                 }
             }
         }
-        Ok(crate::applied_state::ExactNoteOutcome::Uncertain) => {}
-    }
-
-    // 3. A CONFIRMED submission — a `Submitted` handoff or a recorded Miden tx id —
-    //    crossed the boundary and Miden already has it. Poll for the effect at the
-    //    sweep cadence; never re-submit, and hold later nonces until it resolves.
-    if matches!(fresh_handoff_state, Some(NoteHandoffState::Submitted)) || fresh_miden_id {
-        poll_next_sweep(tx, "submitted handoff; awaiting Miden confirmation");
-        return Step::StopSigner;
-    }
-
-    // 4a. A PREPARED-but-unconfirmed handoff needs care: the writer durably recorded
-    //     an EXACT note identity but was interrupted (e.g. killed mid-proving) before
-    //     Miden confirmed it. We must NOT blindly re-drive — each GER/claim note is
-    //     built with a fresh random serial, so a re-drive produces a DIFFERENT note
-    //     that conflicts with the durable prepared link (`prepare_note_handoff` is
-    //     first-writer-wins) and the outcome stays forever "ambiguous", looping. Mirror
-    //     the public admission path: clear the prepared link ONLY once the authoritative
-    //     Miden reconcile cursor has passed its expiration block (proving the creating
-    //     tx can never be included, so the note is dead), then re-drive a fresh note.
-    //     Until then, poll at the sweep cadence — the note may yet be consumed (→ effect
-    //     applied, finalised in step 2) or will expire. (Relies on submission notes
-    //     carrying a finite expiration delta; see `submission_note_expiration_delta`.)
-    if matches!(fresh_handoff_state, Some(NoteHandoffState::Prepared)) {
-        let Some(commitment) = handoff.as_ref().map(|h| h.note_commitment.clone()) else {
-            poll_next_sweep(
-                tx,
-                "prepared handoff no longer present; re-checking next sweep",
-            );
-            return Step::StopSigner;
-        };
-        match service
-            .store
-            .clear_expired_prepared_note_handoff(&tx_key, &commitment)
-            .await
-        {
-            Ok(true) => {
-                // Expired past the authoritative cursor — the stale note is provably
-                // dead. Fall through to re-drive a fresh note.
-                tracing::warn!(target: "recovery", tx_hash = %tx.tx_hash, nonce = tx.nonce, "recovery: cleared expired prepared note handoff; re-driving a fresh note");
-            }
-            Ok(false) => {
-                poll_next_sweep(
-                    tx,
-                    "prepared note not yet expired; awaiting consumption or expiration",
-                );
-                return Step::StopSigner;
-            }
-            Err(e) => {
-                poll_next_sweep(
-                    tx,
-                    &format!("prepared-handoff expiration check failed: {e}"),
-                );
-                return Step::StopSigner;
-            }
-        }
+        RecoveryDecision::Redrive => {}
     }
 
     // 4b. Orphaned durable intent (or a just-cleared, provably-dead prepared handoff).

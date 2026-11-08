@@ -1844,6 +1844,146 @@ async fn test_pgstore_s9_corrupt_envelope_row_surfaces_error() {
     );
 }
 
+/// Unknown persisted states must not be interpreted differently by RPC reads,
+/// recovery enumeration, and mutation paths. A refusal leaves evidence intact.
+#[tokio::test]
+async fn test_pgstore_unknown_lifecycle_states_fail_closed() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let url = std::env::var("DATABASE_URL").unwrap();
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    let tx_hash = TxHash::from([0x72; 32]);
+    let hash = format!("{tx_hash:#x}");
+    store.txn_begin(tx_hash, dummy_txn_entry()).await.unwrap();
+    client
+        .execute(
+            "UPDATE transactions SET status = 'unknown' WHERE tx_hash = $1",
+            &[&hash],
+        )
+        .await
+        .unwrap();
+    assert!(store.txn_receipt(tx_hash).await.is_err());
+    assert!(store.txn_get(tx_hash).await.is_err());
+    assert!(store.txn_commit(tx_hash, Ok(()), 5, [0; 32]).await.is_err());
+    let status: String = client
+        .query_one(
+            "SELECT status FROM transactions WHERE tx_hash = $1",
+            &[&hash],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        status, "unknown",
+        "corruption must not be overwritten as success"
+    );
+
+    client
+        .execute(
+            "UPDATE transactions SET status = 'pending' WHERE tx_hash = $1",
+            &[&hash],
+        )
+        .await
+        .unwrap();
+    client
+        .execute(
+            "UPDATE transactions SET miden_tx_id = 'malformed' WHERE tx_hash = $1",
+            &[&hash],
+        )
+        .await
+        .unwrap();
+    assert!(
+        store.txn_get(tx_hash).await.is_err(),
+        "a recorded submission cannot become an unlinked intent"
+    );
+    client
+        .execute(
+            "UPDATE transactions SET miden_tx_id = NULL WHERE tx_hash = $1",
+            &[&hash],
+        )
+        .await
+        .unwrap();
+    let miden_id =
+        miden_protocol::transaction::TransactionId::from_raw(miden_protocol::Word::default());
+    client
+        .execute(
+            "UPDATE transactions SET tx_hash = 'malformed', miden_tx_id = $2 WHERE tx_hash = $1",
+            &[&hash, &miden_id.to_hex()],
+        )
+        .await
+        .unwrap();
+    assert!(store.txn_pending_by_miden_id(miden_id).await.is_err());
+    client
+        .execute(
+            "UPDATE transactions SET tx_hash = $1, miden_tx_id = NULL WHERE tx_hash = 'malformed'",
+            &[&hash],
+        )
+        .await
+        .unwrap();
+    store
+        .prepare_note_handoff(&hash, "lifecycle-commitment", "lifecycle-note", 10)
+        .await
+        .unwrap();
+    client
+        .execute(
+            "UPDATE tx_note_links SET handoff_state = 'unknown' WHERE tx_hash = $1",
+            &[&hash],
+        )
+        .await
+        .unwrap();
+    assert!(store.get_note_handoff_for_tx(&hash).await.is_err());
+    assert!(store.recoverable_pending_txns(10_000).await.is_err());
+    assert!(
+        store
+            .pending_nonce_frontier(&format!("{:#x}", Address::ZERO))
+            .await
+            .is_err()
+    );
+
+    let signer = "0x7272727272727272727272727272727272727272";
+    let lease = std::time::Duration::from_secs(90);
+    store
+        .reserve_nonce(signer, 0, tx_hash, lease)
+        .await
+        .unwrap();
+    client.execute("UPDATE nonce_reservations SET state = 'unknown', lease_expires_at = now() - interval '1 second' WHERE signer = $1 AND nonce = 0", &[&signer]).await.unwrap();
+    assert!(
+        store
+            .reserve_nonce(signer, 0, tx_hash, lease)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .reserve_nonce(signer, 0, TxHash::from([0x73; 32]), lease)
+            .await
+            .is_err()
+    );
+    assert!(
+        !store
+            .renew_reservation(signer, 0, tx_hash, lease)
+            .await
+            .unwrap(),
+        "invalid state cannot renew execution ownership"
+    );
+    let state: String = client
+        .query_one(
+            "SELECT state FROM nonce_reservations WHERE signer = $1 AND nonce = 0",
+            &[&signer],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        state, "unknown",
+        "expiry must not grant ownership of an invalid row"
+    );
+}
+
 /// Cantina finding #12 (redesign) — PgStore `get_logs` returns ALL matches with
 /// NO normal-operation row cap. The ORIGINAL fix fetched `CAP+1` and errored once
 /// a range held more than 1000 raw rows (even when few matched the queried

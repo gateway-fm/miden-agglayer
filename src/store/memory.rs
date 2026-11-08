@@ -1,13 +1,14 @@
 //! In-memory Store implementation — wraps HashMap/RwLock data structures.
 
 use super::{
-    ClaimFence, FaucetEntry, NoteHandoff, NoteHandoffState, PendingNonceFrontier, QueueBounds,
-    QueueOutcome, QueuedTxn, RecoverablePendingTxn, Store, TxnData, TxnEntry,
-    UnbridgeableBridgeOut, UnclaimableClaim,
+    ClaimFence, ClaimState, FaucetEntry, NoteHandoff, NoteHandoffState, PendingNonceFrontier,
+    QueueBounds, QueueOutcome, QueuedTxn, RecoverablePendingTxn, ReservationState, Store, TxnData,
+    TxnEntry, UnbridgeableBridgeOut, UnclaimableClaim,
 };
 use crate::log_synthesis::{
     GerEntry, L2_GLOBAL_EXIT_ROOT_ADDRESS, LogFilter, SyntheticLog, UPDATE_HASH_CHAIN_VALUE_TOPIC,
 };
+use crate::transaction_lifecycle::ReceiptState;
 use alloy::consensus::TxEnvelope;
 use alloy::primitives::{Address, LogData, TxHash, U256};
 use lru::LruCache;
@@ -57,21 +58,6 @@ struct Reservation {
     state: ReservationState,
     lease_expires_at: std::time::Instant,
     fence: u64,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ReservationState {
-    Executing,
-    ReleasedSuccess,
-    ReleasedFailure,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ClaimState {
-    Executing,
-    Prepared,
-    Submitted,
-    Landed,
 }
 
 #[derive(Clone)]
@@ -1432,9 +1418,7 @@ impl Store for InMemoryStore {
         // observation, or expiration reconciliation. Never expose status 0.
         let logs_to_add = {
             let links = self.tx_note_links.read();
-            if result.is_err() && links.contains_key(&format!("{tx_hash:#x}")) {
-                return Ok(());
-            }
+            let has_handoff = links.contains_key(&format!("{tx_hash:#x}"));
             let mut txns = self.transactions.lock();
             let Some(receipt) = txns.get_mut(&tx_hash) else {
                 anyhow::bail!("Store: transaction {tx_hash} not found");
@@ -1442,22 +1426,12 @@ impl Store for InMemoryStore {
             // A real Miden landing must always beat a failure observation, and a
             // landed success must never be clobbered. Pending failures are
             // terminal; a later real landing may still heal one to success.
-            enum St {
-                Pending,
-                Failed,
-                Success,
-            }
-            let st = match &receipt.result {
-                None => St::Pending,
-                Some(Ok(_)) => St::Success,
-                Some(Err(_)) => St::Failed,
+            let state = match &receipt.result {
+                None => ReceiptState::Pending,
+                Some(Ok(_)) => ReceiptState::Succeeded,
+                Some(Err(_)) => ReceiptState::Failed,
             };
-            let apply = match (&st, result.is_ok()) {
-                (St::Success, _) => false,
-                (_, true) => true,
-                (St::Pending, false) => true,
-                (St::Failed, false) => false,
-            };
+            let apply = state.accepts_result(result.is_ok(), has_handoff);
             if !apply {
                 tracing::debug!(
                     "Store: txn {tx_hash} terminal transition ignored (success-always-wins CAS)"
@@ -1864,11 +1838,8 @@ impl Store for InMemoryStore {
                 // attempt may have crossed an external side-effect boundary, so a
                 // different replacement may only take over an ABANDONED slot (see
                 // the wedge-#5 rule below), never a released or admitted one.
-                let takeover = r.tx_hash == tx_hash
-                    && (matches!(
-                        r.state,
-                        ReservationState::ReleasedFailure | ReservationState::ReleasedSuccess
-                    ) || r.lease_expires_at <= now);
+                let takeover =
+                    r.tx_hash == tx_hash && r.state.can_reacquire_same(r.lease_expires_at <= now);
                 // Wedge #5 — ABANDONED-slot reclamation for a DIFFERENT tx: the
                 // reservation precedes durable admission, so a crash in that
                 // window leaves `executing` + expired lease, and a NORMAL
@@ -1880,20 +1851,16 @@ impl Store for InMemoryStore {
                 // Mirrors the PgStore rule; LRU eviction could theoretically make
                 // an admitted hash look absent here, but this in-memory store is
                 // test/dev-only — PostgreSQL is authoritative in deployments.
-                let abandoned_state = (r.state == ReservationState::Executing
-                    && r.lease_expires_at <= now)
-                    || r.state == ReservationState::ReleasedFailure;
-                let abandoned = r.tx_hash != tx_hash
-                    && abandoned_state
-                    && !self.transactions.lock().contains(&r.tx_hash);
+                let abandoned_cause = r
+                    .state
+                    .abandonment_candidate(r.lease_expires_at <= now)
+                    .filter(|_| {
+                        r.tx_hash != tx_hash && !self.transactions.lock().contains(&r.tx_hash)
+                    });
+                let abandoned = abandoned_cause.is_some();
                 if takeover || abandoned {
                     let fence = r.fence + 1;
-                    if abandoned {
-                        let cause = if r.state == ReservationState::ReleasedFailure {
-                            "released_failure"
-                        } else {
-                            "expired_executing"
-                        };
+                    if let Some(cause) = abandoned_cause {
                         ::metrics::counter!(
                             "nonce_reservation_abandoned_reclaimed_total",
                             "cause" => cause

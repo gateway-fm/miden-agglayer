@@ -39,6 +39,7 @@ pub mod mint_target_monitor;
 pub mod network_accounts;
 pub mod orphan_recovery;
 pub mod projection;
+pub mod projection_lifecycle;
 pub mod projection_order;
 pub mod proxy_keystore;
 pub mod recovery;
@@ -62,6 +63,7 @@ pub mod synthetic_projector;
 #[cfg(test)]
 pub mod test_helpers;
 mod transaction_headers;
+pub(crate) mod transaction_lifecycle;
 pub mod twin_note_detector;
 pub mod unknown_wrapper_detector;
 pub mod writer_worker;

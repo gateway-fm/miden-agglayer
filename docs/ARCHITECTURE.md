@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the implementation on `main`. The Rust source is the
+This document describes the repository implementation. The Rust source is the
 authority when this overview and the code disagree.
 
 `miden-agglayer` presents an EVM-compatible JSON-RPC surface for an AggLayer
@@ -81,6 +81,41 @@ The process has four important ownership rules:
 4. The projector is single-process. Running multiple proxy replicas against one
    store is unsupported even though nonce admission itself is fenced in the
    database.
+
+## Lifecycle ownership
+
+Lifecycle state has one owner per consistency boundary. Receipt status and
+submission evidence remain independent: a failed legacy receipt can still have
+an exact prepared note, and a submitted transaction still awaits projection.
+Combining these into one linear status would discard evidence needed after a
+crash. `transaction_lifecycle` classifies that product once for admission,
+writer completion, and orphan recovery; store fences and compare-and-set writes
+remain the authority for transitions.
+
+| Boundary | Explicit state and transition owner | Recovery invariant |
+| --- | --- | --- |
+| Receipt and exact-note handoff | `ReceiptState`, `SubmissionBoundary`, `RecoveryDecision` in `transaction_lifecycle` | Recorded Miden submission forbids another dispatch; only exact effect evidence justifies success. |
+| Signer/nonce and claim ownership | Shared `ReservationState`, `ClaimState` and fenced `Store` operations | A different hash can reclaim only an abandoned, never-admitted reservation; stale owners cannot release a newer fence. |
+| Writer task | `JobState` and `owns_work()` in `writer_worker` | Dispatch completion differs from chain inclusion; ownership lasts through the awaited receipt write. |
+| Projected history | `ProjectionSession::Live/Restore` and private `PublishedBlock` | Restore pins its target and deposit frontier; the cursor can advance only after publication passes the event/reservation gate. |
+| Projection availability | `Availability`, `PassState`, `ProjectionPhase` in `projection_lifecycle` | Failures and interrupted passes block readiness until a full successful pass covers its captured target. |
+| Client and listener ownership | RAII client ownership, counted listener pauses and generation-tagged passes in `miden_client` | A pass overlapping a pause cannot certify health; constructor failure or thread exit releases ownership. |
+| Faucet deployment and bootstrap | `StepAction` and a prepared-transaction journal | Chain evidence completes a step; otherwise replay the exact prepared transaction until strict expiry permits a new preparation. |
+| CLAIM consumption watchdog | Durable generation plus pending delivery in `expected_mint_tracker` | Creation commit is not consumption; an unacknowledged alert survives restart, and stale delivery cannot acknowledge a new generation. |
+
+PostgreSQL readers reject unknown receipt, handoff, claim, and reservation
+states instead of guessing a recovery action. In-memory and PostgreSQL receipt
+transitions and nonce-reclamation eligibility use the same classifiers. The
+remaining SQL predicates intentionally enforce those transitions atomically
+under row locks; an in-memory snapshot never authorizes a durable mutation.
+
+Initialization keeps `initialization.toml` beside `bridge_accounts.toml`. An
+exclusive file lock covers each initialization attempt. The checkpoint binds
+the chain genesis, network and fee policy, saves the service, GER manager,
+bridge and ETH faucet identities before external effects, and journals the
+exact prepared transactions. Files are replaced atomically after fsync. A
+restart reuses those identities and handoffs; corrupted or mismatched
+checkpoints stop initialization instead of creating replacement accounts.
 
 ## Signed transaction admission
 

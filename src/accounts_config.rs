@@ -1,3 +1,6 @@
+#[path = "init_checkpoint.rs"]
+pub(crate) mod initialization;
+
 use anyhow::Context;
 use miden_protocol::account::AccountId;
 use miden_protocol::address::NetworkId;
@@ -310,11 +313,7 @@ pub fn save_funding_manifest(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    // Write-then-rename so a crash never leaves a truncated manifest that a
-    // resuming --init would misread as "no manifest" and rebuild (orphaning).
-    let tmp = path.with_extension("toml.tmp");
-    fs::write(&tmp, toml::to_string(manifest)?)?;
-    fs::rename(&tmp, &path)?;
+    write_config_atomic(&path, &toml::to_string(manifest)?)?;
     Ok(path)
 }
 
@@ -399,6 +398,10 @@ fn write_config_atomic(config_path: &std::path::Path, config_toml: &str) -> anyh
         )
     })?;
 
+    #[cfg(unix)]
+    if let Some(parent) = config_path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 

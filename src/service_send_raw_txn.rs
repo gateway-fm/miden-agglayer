@@ -3,6 +3,7 @@ use crate::ger::{insertGlobalExitRootCall, updateExitRootCall};
 use crate::hex::hex_decode_prefixed;
 use crate::service_state::ServiceState;
 use crate::store::TxnEntry;
+use crate::transaction_lifecycle::{ReceiptState, TransactionLifecycle};
 use crate::*;
 use alloy::consensus::TxEnvelope;
 use alloy::consensus::transaction::SignerRecoverable;
@@ -1451,9 +1452,11 @@ async fn service_send_raw_txn_inner(
     let tx_key = format!("{txn_hash:#x}");
     let mut known_store_entry = service.store.txn_get(txn_hash).await?;
     let mut handoff = service.store.get_note_handoff_for_tx(&tx_key).await?;
+    let initial_lifecycle =
+        TransactionLifecycle::from_snapshot(known_store_entry.as_ref(), handoff.as_ref());
     if let Some(prepared) = handoff
         .as_ref()
-        .filter(|handoff| handoff.state == crate::store::NoteHandoffState::Prepared)
+        .filter(|_| initial_lifecycle.submission.has_prepared_note())
     {
         if service
             .store
@@ -1476,16 +1479,16 @@ async fn service_send_raw_txn_inner(
             return Ok(txn_hash);
         }
     }
-    let known_store_tx = known_store_entry.is_some();
+    let lifecycle =
+        TransactionLifecycle::from_snapshot(known_store_entry.as_ref(), handoff.as_ref());
+    let known_store_tx = lifecycle.receipt != ReceiptState::Missing;
     let known_store_linked = handoff
         .as_ref()
         .is_some_and(|handoff| handoff.state == crate::store::NoteHandoffState::Submitted);
     // A pending row with neither a note handoff nor a recorded Miden transaction
     // id is a durable queue intent. A legacy id-only row crossed the submission
     // boundary and must be reconciled, never rebuilt on rebroadcast.
-    let mut known_durable_intent = known_store_entry
-        .as_ref()
-        .is_some_and(|entry| entry.result.is_none() && entry.id.is_none() && !known_store_linked);
+    let mut known_durable_intent = lifecycle.is_durable_intent();
     tracing::info!(
         target: "rpc::nonce_snoop",
         "{}",
@@ -1626,15 +1629,15 @@ async fn service_send_raw_txn_inner(
         // to build another note from that now-submitted transaction.
         let refreshed_entry = service.store.txn_get(txn_hash).await?;
         let refreshed_handoff = service.store.get_note_handoff_for_tx(&tx_key).await?;
-        if refreshed_entry
-            .as_ref()
-            .is_some_and(|entry| entry.result.is_some() || entry.id.is_some())
-            || refreshed_handoff.is_some()
-        {
+        let lifecycle = TransactionLifecycle::from_snapshot(
+            refreshed_entry.as_ref(),
+            refreshed_handoff.as_ref(),
+        );
+        if lifecycle.admission_is_known() {
             repair_commit_gap_nonce(&service, &signer_str, tx_nonce).await?;
             return Ok(txn_hash);
         }
-        known_durable_intent = refreshed_entry.is_some();
+        known_durable_intent = lifecycle.is_durable_intent();
 
         // R4 — nonce validation. Pre-fix the proxy advanced its tracked nonce
         // only on success and never compared the incoming `tx.nonce` against

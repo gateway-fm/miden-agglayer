@@ -54,6 +54,8 @@ use crate::bridge_out::{
 use crate::miden_client::{
     MidenClientLib, SyncListener, ensure_complete_note_response, ordered_account_transactions,
 };
+pub use crate::projection_lifecycle::{ProjectionHealth, ProjectionHealthSnapshot};
+use crate::projection_lifecycle::{ProjectionPhase, ProjectionSession};
 use crate::store::Store;
 use crate::writer_worker::DecodedWriteCall;
 use alloy::primitives::TxHash;
@@ -71,7 +73,7 @@ use miden_protocol::note::{
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Blocks per `sync_notes` window walked by the note-visibility reconciler.
@@ -324,76 +326,14 @@ pub enum CatchUpMode {
     Restore,
 }
 
-/// A completed projection pass, rather than node connectivity alone, establishes
-/// readiness. Keep a failure latched while retrying: starting the next pass must
-/// not briefly report healthy before the same blocking gate is checked again.
-#[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct ProjectionHealthSnapshot {
-    pub ready: bool,
-    pub running: bool,
-    pub projector_cursor: u64,
-    pub reconcile_cursor: u64,
-    pub target_tip: Option<u64>,
-    pub last_error: Option<String>,
-}
-
-#[derive(Default)]
-struct ProjectionHealthState {
-    snapshot: ProjectionHealthSnapshot,
-    failed_this_pass: bool,
-}
-
-#[derive(Default)]
-pub struct ProjectionHealth {
-    state: std::sync::Mutex<ProjectionHealthState>,
-}
-
-impl ProjectionHealth {
-    pub fn snapshot(&self) -> ProjectionHealthSnapshot {
-        self.state
-            .lock()
-            .expect("projection health")
-            .snapshot
-            .clone()
-    }
-
-    fn begin_pass(&self, target_tip: u64, projector_cursor: u64, reconcile_cursor: u64) {
-        let mut state = self.state.lock().expect("projection health");
-        state.failed_this_pass = false;
-        state.snapshot.running = true;
-        state.snapshot.target_tip = Some(target_tip);
-        state.snapshot.projector_cursor = projector_cursor;
-        state.snapshot.reconcile_cursor = reconcile_cursor;
-    }
-
-    fn record_failure(&self, error: &anyhow::Error) {
-        let mut state = self.state.lock().expect("projection health");
-        state.failed_this_pass = true;
-        state.snapshot.ready = false;
-        state.snapshot.last_error = Some(format!("{error:#}"));
-    }
-
-    fn record_progress(&self, projector_cursor: u64, reconcile_cursor: u64) {
-        let mut state = self.state.lock().expect("projection health");
-        state.snapshot.projector_cursor = projector_cursor;
-        state.snapshot.reconcile_cursor = reconcile_cursor;
-    }
-
-    fn finish_pass(&self, projector_cursor: u64, reconcile_cursor: u64) {
-        let mut state = self.state.lock().expect("projection health");
-        state.snapshot.running = false;
-        state.snapshot.projector_cursor = projector_cursor;
-        state.snapshot.reconcile_cursor = reconcile_cursor;
-        if !state.failed_this_pass
-            && state
-                .snapshot
-                .target_tip
-                .is_some_and(|target| projector_cursor >= target && reconcile_cursor >= target)
-        {
-            state.snapshot.ready = true;
-            state.snapshot.last_error = None;
-        }
-    }
+/// Proof that all events and reservation guards for this block succeeded and
+/// its synthetic tip was durably published. Only cursor commit consumes it.
+#[derive(Debug)]
+struct PublishedBlock {
+    number: u64,
+    logs: usize,
+    session_before: ProjectionSession,
+    session_after: ProjectionSession,
 }
 
 pub struct SyntheticProjector {
@@ -473,13 +413,8 @@ pub struct SyntheticProjector {
     audit_resolved: std::sync::Mutex<HashSet<([u8; 32], u64, u32)>>,
     /// Tick counter driving the every-[`AUDIT_EVERY_N_TICKS`] audit cadence.
     audit_tick_counter: AtomicU64,
-    /// Set by `CatchUpMode::Restore`. Restore fails closed where a live tick
-    /// tolerates and retries, because it has no later tick to heal in.
-    restore_posture: AtomicBool,
-    /// Canonical LET frontier of blocks replayed in this restore session. Unlike
-    /// the durable reservation total, this excludes leaves in future windows.
-    restore_next_deposit_index: AtomicU64,
-    restore_session_tip: AtomicU64,
+    /// The pinned restore target and replay frontier form one session state.
+    session: std::sync::Mutex<ProjectionSession>,
     /// For the restore report only.
     faucet_identities_rebuilt: AtomicUsize,
     /// For the restore report only; counted here so the report comes from the
@@ -576,9 +511,7 @@ impl SyntheticProjector {
             reconcile_concurrency,
             reconcile_budget,
             pending_duplicate_cursor: std::sync::Mutex::new(None),
-            restore_posture: AtomicBool::new(false),
-            restore_next_deposit_index: AtomicU64::new(0),
-            restore_session_tip: AtomicU64::new(0),
+            session: std::sync::Mutex::new(ProjectionSession::Live),
             faucet_identities_rebuilt: AtomicUsize::new(0),
             projection_totals: std::sync::Mutex::new(Default::default()),
             audit_resolved: std::sync::Mutex::new(HashSet::new()),
@@ -589,6 +522,10 @@ impl SyntheticProjector {
 
     pub fn health(&self) -> Arc<ProjectionHealth> {
         self.health.clone()
+    }
+
+    fn session(&self) -> ProjectionSession {
+        *self.session.lock().expect("projection session")
     }
 
     async fn load_pending_duplicate(
@@ -1633,6 +1570,7 @@ impl SyntheticProjector {
             None,
         )
         .await
+        .map(|published| published.logs)
     }
 
     /// Project the already-filtered notes consumed at `miden_block` into the
@@ -1647,12 +1585,16 @@ impl SyntheticProjector {
         client: Option<&mut MidenClientLib>,
         within_tx_pos: &HashMap<NoteId, u32>,
         restore_frontier: Option<u64>,
-    ) -> anyhow::Result<usize> {
+    ) -> anyhow::Result<PublishedBlock> {
+        let session_before = self.session();
+        let session_after = session_before.after_publication(miden_block, restore_frontier)?;
         // The order + dispatch live in the SHARED per-block unit
         // (`projection::BlockProjection`) — the same code `--restore` replays
         // through, so live emission and restored emission cannot diverge.
         // This wrapper keeps only the live-tick concerns: block metadata
         // lookup, the emitted-frontier gate, and the seal.
+        self.health
+            .enter_phase(ProjectionPhase::ProjectingBlock { block: miden_block });
         let block_hash = self.block_state.get_block_hash(miden_block);
         let timestamp = self.block_state.get_block_timestamp(miden_block);
         let counts = crate::projection::BlockProjection {
@@ -1693,6 +1635,8 @@ impl SyntheticProjector {
         // Retained PG may contain crash reservations in blocks still ahead of
         // this replay. They become mandatory at their canonical block, not at
         // genesis. Live projection keeps the unconditional global gate.
+        self.health
+            .enter_phase(ProjectionPhase::CheckingEmission { block: miden_block });
         if let Some((idx, note)) = self.store.first_unemitted_reservation().await?
             && restore_frontier.is_none_or(|frontier| u64::from(idx) < frontier)
         {
@@ -1709,9 +1653,45 @@ impl SyntheticProjector {
         // DB, so it is safe to advance the synthetic tip to == the Miden block.
         // Runs for EMPTY Miden blocks too (advance the tip even with 0 logs), so the
         // synthetic chain mirrors Miden block-for-block (eth_blockNumber == Miden tip).
+        self.health
+            .enter_phase(ProjectionPhase::PublishingBlock { block: miden_block });
         self.store.set_latest_block_number(miden_block).await?;
 
-        Ok(logs)
+        Ok(PublishedBlock {
+            number: miden_block,
+            logs,
+            session_before,
+            session_after,
+        })
+    }
+
+    /// Publication is a prerequisite, represented by the consumed token. Keep
+    /// the durable cursor behind all block writes, and the memory/session
+    /// mirrors behind the durable cursor, so interruption always permits replay.
+    async fn commit_published_cursor(&self, published: PublishedBlock) -> anyhow::Result<u64> {
+        let next = published.number;
+        anyhow::ensure!(
+            self.cursor.load(Ordering::Acquire).checked_add(1) == Some(next),
+            "published block {next} is not the next projection cursor"
+        );
+        anyhow::ensure!(
+            self.session() == published.session_before,
+            "projection session changed after block publication"
+        );
+        tracing::debug!(target: "writer_diagnostics", block = next, logs = published.logs, "committing published block cursor");
+        self.health
+            .enter_phase(ProjectionPhase::PersistingCursor { block: next });
+        crate::metrics::meter_writer_stage(
+            "projector",
+            "persist_cursor",
+            self.store.set_projector_cursor(next),
+        )
+        .await?;
+        *self.session.lock().expect("projection session") = published.session_after;
+        self.cursor.store(next, Ordering::Release);
+        self.health
+            .record_progress(next, self.reconcile_cursor.load(Ordering::Acquire));
+        Ok(next)
     }
 
     /// Reconcile note visibility, then project every block through the Miden tip. No block
@@ -1740,18 +1720,18 @@ impl SyntheticProjector {
         reconcile_patience: ReconcilePatience,
         enforce_let_cardinality: bool,
     ) -> anyhow::Result<u64> {
-        self.health.begin_pass(
+        let pass = self.health.begin_pass(
             tip,
             self.cursor.load(Ordering::Acquire),
             self.reconcile_cursor.load(Ordering::Acquire),
-        );
+        )?;
         let result = self
             .tick_pass_inner(client, tip, reconcile_patience, enforce_let_cardinality)
             .await;
         if let Err(error) = &result {
             self.health.record_failure(error);
         }
-        self.health.finish_pass(
+        pass.finish(
             self.cursor.load(Ordering::Acquire),
             self.reconcile_cursor.load(Ordering::Acquire),
         );
@@ -1765,6 +1745,12 @@ impl SyntheticProjector {
         reconcile_patience: ReconcilePatience,
         enforce_let_cardinality: bool,
     ) -> anyhow::Result<u64> {
+        let live = matches!(reconcile_patience, ReconcilePatience::LiveTick);
+        let session = self.session();
+        if live {
+            session.require_live()?;
+        }
+        let restore_posture = matches!(session, ProjectionSession::Restore { .. });
         let mut cursor = self.cursor.load(Ordering::Acquire);
         // Reconcile even when projection is already at the tip so note imports do not stall
         // while block production is paused.
@@ -1797,6 +1783,8 @@ impl SyntheticProjector {
         }
         // Receipt polling is store-only. Resolve confirmed duplicates here, on
         // the existing single-flight projector task, with a bounded batch.
+        self.health
+            .enter_phase(ProjectionPhase::ReconcilingDuplicates);
         if let Err(error) = crate::metrics::meter_writer_stage(
             "projector",
             "reconcile_duplicates",
@@ -1816,6 +1804,8 @@ impl SyntheticProjector {
         let held = tip.saturating_sub(reconcile_cursor);
         ::metrics::gauge!("projector_visibility_barrier_held_blocks").set(held as f64);
         if held > 0 {
+            self.health
+                .enter_phase(ProjectionPhase::WaitingForDiscovery);
             tracing::debug!(
                 tip,
                 reconcile_cursor,
@@ -1831,12 +1821,11 @@ impl SyntheticProjector {
                 "reconcile cursor is ahead of the Miden tip"
             );
         }
-        let live = matches!(reconcile_patience, ReconcilePatience::LiveTick);
-        let restore_posture = self.restore_posture.load(Ordering::Acquire);
         // Claim-calldata repair runs every live tick, before the at-tip return,
         // so a historical ClaimEvent missing its calldata heals without waiting
         // for new traffic. It is a whole-store read; restore skips it because it
         // projects calldata inline and must stay bounded by the window.
+        self.health.enter_phase(ProjectionPhase::RepairingCalldata);
         let consumed: Vec<InputNoteRecord> = if live {
             client
                 .get_input_notes(NoteFilter::Consumed)
@@ -1864,6 +1853,7 @@ impl SyntheticProjector {
         // Design: docs/design/UNIFIED-PROJECTOR.md. Cantina #7: the within-tx
         // input position is the on-chain LET append order, the only correct
         // tiebreak for same-transaction B2AGG siblings.
+        self.health.enter_phase(ProjectionPhase::ResolvingInputs);
         let mut within_tx_pos: HashMap<NoteId, u32> = HashMap::new();
         let mut txs = self
             .node_rpc
@@ -1954,17 +1944,17 @@ impl SyntheticProjector {
         // restore pass leaves beyond `pass_tip` are legitimately not yet
         // reserved; the equality gate therefore runs on the final pass only.
         // The prefix checks are window-local and always run.
+        self.health.enter_phase(ProjectionPhase::ValidatingLet);
         let bridge_account = self.bridge_account_for_let_gate(client).await?;
         let on_chain = miden_base_agglayer::AggLayerBridge::read_let_num_leaves(&bridge_account);
         let accounted = self.store.get_accounted_deposit_count().await?;
         let note_keys: Vec<String> = auth_b2agg.iter().map(|(id, _)| id.to_hex()).collect();
         let existing = self.store.get_deposit_indices(&note_keys).await?;
-        let restore_start =
-            restore_posture.then(|| self.restore_next_deposit_index.load(Ordering::Acquire));
+        let restore_start = session.next_deposit_index();
         let baseline = self.store.get_let_gate_baseline().await?;
         tracing::debug!(target: "writer_diagnostics",
             restore_posture, cursor, pass_tip = tip,
-            session_tip = self.restore_session_tip.load(Ordering::Acquire),
+            session_tip = session.target_tip().unwrap_or(0),
             accounted, baseline, restore_start, window_leaves = note_keys.len(),
             reserved_in_window = existing.len(), "checking LET reservation window");
         let window_end =
@@ -1974,7 +1964,7 @@ impl SyntheticProjector {
                         "{error:#}; restore={restore_posture}, cursor={cursor}, pass_tip={tip}, \
                  session_tip={}, accounted={accounted}, baseline={baseline}, \
                  canonical_start={restore_start:?}, window_leaves={}",
-                        self.restore_session_tip.load(Ordering::Acquire),
+                        session.target_tip().unwrap_or(0),
                         note_keys.len()
                     )
                 },
@@ -2039,8 +2029,9 @@ impl SyntheticProjector {
             let bucket = by_block.get(&next).unwrap_or(&no_notes);
             let restore_frontier = if restore_posture {
                 Some(
-                    self.restore_next_deposit_index
-                        .load(Ordering::Acquire)
+                    self.session()
+                        .next_deposit_index()
+                        .expect("restore session")
                         .checked_add(*restore_leaves_by_block.get(&next).unwrap_or(&0))
                         .ok_or_else(|| anyhow::anyhow!("restore LET frontier overflow"))?,
                 )
@@ -2048,7 +2039,7 @@ impl SyntheticProjector {
                 None
             };
             tracing::debug!(target: "writer_diagnostics", block = next, tip, notes = bucket.len(), "projector block started");
-            crate::metrics::meter_writer_stage(
+            let published = crate::metrics::meter_writer_stage(
                 "projector",
                 "project_block",
                 self.project_block_notes(
@@ -2061,24 +2052,7 @@ impl SyntheticProjector {
                 ),
             )
             .await?;
-            // Advance the cursor only after the block is fully projected, so a
-            // crash mid-block re-projects (idempotently) rather than skipping.
-            // Persist BEFORE updating the in-memory cursor so the durable cursor
-            // never runs ahead of fully-projected state.
-            crate::metrics::meter_writer_stage(
-                "projector",
-                "persist_cursor",
-                self.store.set_projector_cursor(next),
-            )
-            .await?;
-            if let Some(frontier) = restore_frontier {
-                self.restore_next_deposit_index
-                    .store(frontier, Ordering::Release);
-            }
-            self.cursor.store(next, Ordering::Release);
-            self.health
-                .record_progress(next, self.reconcile_cursor.load(Ordering::Acquire));
-            cursor = next;
+            cursor = self.commit_published_cursor(published).await?;
         }
         // (Claim-calldata backfill already ran once this tick, before the at-tip early return.)
         // COMPLETENESS AUDITOR (detection only, every AUDIT_EVERY_N_TICKS ticks): diff the
@@ -2087,6 +2061,7 @@ impl SyntheticProjector {
         // Non-fatal by construction: an audit failure warns and retries next cycle, it never
         // blocks projection.
         // Live only: a whole-store read, and meaningless mid-rebuild.
+        self.health.enter_phase(ProjectionPhase::Auditing);
         if live
             && self
                 .audit_tick_counter
@@ -2126,13 +2101,11 @@ impl SyntheticProjector {
     /// `--restore` resets the store before constructing its projector instead,
     /// so this has no production caller today.
     pub async fn reset_cursors_to_genesis(&self) -> anyhow::Result<()> {
+        self.health.reset()?;
         self.store.reset_cursors_to_genesis().await?;
         self.reconcile_cursor.store(0, Ordering::Release);
         self.cursor.store(0, Ordering::Release);
-        self.restore_posture.store(false, Ordering::Release);
-        self.restore_next_deposit_index.store(0, Ordering::Release);
-        self.restore_session_tip.store(0, Ordering::Release);
-        *self.health.state.lock().expect("projection health") = ProjectionHealthState::default();
+        *self.session.lock().expect("projection session") = ProjectionSession::Live;
         tracing::warn!(
             "projector cursors reset to genesis (discovery + projection, persisted + in-memory)"
         );
@@ -2154,22 +2127,12 @@ impl SyntheticProjector {
                 Ok(self.cursor.load(Ordering::Acquire))
             }
             CatchUpMode::Restore => {
-                if !self.restore_posture.load(Ordering::Acquire) {
-                    anyhow::ensure!(
-                        self.cursor.load(Ordering::Acquire) == 0,
-                        "restore must start from genesis to establish the canonical LET frontier"
-                    );
-                    self.restore_next_deposit_index
-                        .store(self.store.get_let_gate_baseline().await?, Ordering::Release);
-                    self.restore_session_tip
-                        .store(target_tip, Ordering::Release);
-                } else {
-                    anyhow::ensure!(
-                        self.restore_session_tip.load(Ordering::Acquire) == target_tip,
-                        "restore session target changed during replay"
-                    );
-                }
-                self.restore_posture.store(true, Ordering::Release);
+                let session = self.session().start_restore(
+                    self.cursor.load(Ordering::Acquire),
+                    target_tip,
+                    self.store.get_let_gate_baseline().await?,
+                )?;
+                *self.session.lock().expect("projection session") = session;
                 self.drive_catch_up_to_tip(client, target_tip).await
             }
         }
@@ -2629,68 +2592,6 @@ impl SyncListener for SyntheticProjector {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn projection_readiness_requires_a_completed_pass_and_latches_failures() {
-        let health = super::ProjectionHealth::default();
-        assert!(
-            !health.snapshot().ready,
-            "startup has no verified projection pass"
-        );
-
-        health.begin_pass(100, 0, 0);
-        health.finish_pass(0, 50);
-        assert!(
-            !health.snapshot().ready,
-            "discovery alone cannot establish readiness"
-        );
-        health.begin_pass(100, 0, 50);
-        health.finish_pass(100, 100);
-        assert!(health.snapshot().ready);
-
-        // A normal new block / bounded catch-up pass must not oscillate readiness.
-        health.begin_pass(110, 100, 100);
-        assert!(health.snapshot().ready);
-        health.finish_pass(100, 105);
-        assert!(health.snapshot().ready);
-
-        // A publication gate fails despite a successful node sync. Retrying and
-        // advancing discovery must not clear it before publication reaches tip.
-        health.begin_pass(110, 100, 105);
-        health.record_failure(&anyhow::anyhow!("reserved LET leaf has no BridgeEvent"));
-        health.finish_pass(101, 110);
-        assert!(!health.snapshot().ready);
-        health.begin_pass(112, 101, 110);
-        assert!(
-            !health.snapshot().ready,
-            "retry start must retain the blocker"
-        );
-        health.finish_pass(102, 112);
-        assert!(
-            !health.snapshot().ready,
-            "partial recovery must retain the blocker"
-        );
-        health.begin_pass(112, 102, 112);
-        health.finish_pass(112, 112);
-        assert!(health.snapshot().ready);
-        assert!(health.snapshot().last_error.is_none());
-    }
-
-    #[test]
-    fn swallowed_discovery_failure_cannot_be_cleared_by_the_same_pass() {
-        let health = super::ProjectionHealth::default();
-        health.begin_pass(10, 10, 10);
-        health.finish_pass(10, 10);
-        health.begin_pass(10, 10, 10);
-        health.record_failure(&anyhow::anyhow!("note discovery unavailable"));
-        health.finish_pass(10, 10);
-        assert!(!health.snapshot().ready);
-        assert!(!health.snapshot().running);
-        assert!(health.snapshot().last_error.is_some());
-        health.begin_pass(10, 10, 10);
-        health.finish_pass(10, 10);
-        assert!(health.snapshot().ready);
-    }
-
     // ── FINDING #112: typed node-backpressure classification + backoff ──────
     // The classifier must fire ONLY on the client's typed
     // ResourceExhausted/Unavailable request errors (mirroring miden-client's
@@ -5471,7 +5372,7 @@ mod tests {
             .project_block_notes(&pairs, &HashMap::new(), 7, None, &within_tx_pos, None)
             .await
             .unwrap();
-        assert_eq!(written, 3);
+        assert_eq!(written.logs, 3);
 
         let logs = logs_in_range(&store, 0, 7).await;
         assert_eq!(logs.len(), 3);
@@ -5553,7 +5454,7 @@ mod tests {
             .project_block_notes(&pairs, &HashMap::new(), 9, None, &within_tx_pos, None)
             .await
             .unwrap();
-        assert_eq!(written, 4);
+        assert_eq!(written.logs, 4);
         let got: Vec<String> = logs_in_range(&store, 0, 9)
             .await
             .iter()
@@ -5772,7 +5673,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            written, 2,
+            written.logs, 2,
             "BOTH leaves must emit — dedup is by unique NoteId"
         );
         assert_eq!(store.get_deposit_count().await.unwrap(), 2);
@@ -5818,6 +5719,9 @@ mod tests {
             // Two complete replays must reuse the exact same indices and logs.
             for _ in 0..2 {
                 projector.reset_cursors_to_genesis().await.unwrap();
+                *projector.session.lock().unwrap() = ProjectionSession::Live
+                    .start_restore(0, 7489, baseline)
+                    .unwrap();
                 let mut frontier = store.get_let_gate_baseline().await.unwrap();
                 for range in [0..10, 10..14] {
                     let window = &keys[range.clone()];
@@ -5898,10 +5802,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publication_token_requires_emitted_reservations_before_cursor_commit() {
+        let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+        register_faucet(&store).await;
+        let block_state = StdArc::new(BlockState::new());
+        let projector = test_projector(&store, &block_state).await;
+
+        let first = projector
+            .project_block_notes(&[], &HashMap::new(), 1, None, &HashMap::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(store.get_latest_block_number().await.unwrap(), 1);
+        assert_eq!(store.get_projector_cursor().await.unwrap(), 0);
+        projector.commit_published_cursor(first).await.unwrap();
+        assert_eq!(store.get_projector_cursor().await.unwrap(), 1);
+
+        let note = b2agg_note_with_amount(2, Some(0), 72);
+        let id = test_note_id(901);
+        store.reserve_deposit_index(&id.to_hex()).await.unwrap();
+        let blocked = projector
+            .project_block_notes(&[], &HashMap::new(), 2, None, &HashMap::new(), None)
+            .await;
+        assert!(
+            blocked.is_err(),
+            "an unemitted reservation produces no publication token"
+        );
+        assert_eq!(store.get_latest_block_number().await.unwrap(), 1);
+        assert_eq!(store.get_projector_cursor().await.unwrap(), 1);
+
+        let repaired = projector
+            .project_block_notes(
+                &[(Some(id), &note)],
+                &HashMap::new(),
+                2,
+                None,
+                &HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(repaired.logs, 1);
+        assert!(store.first_unemitted_reservation().await.unwrap().is_none());
+        assert_eq!(logs_in_range(&store, 2, 2).await.len(), 1);
+        assert_eq!(store.get_latest_block_number().await.unwrap(), 2);
+        assert_eq!(store.get_projector_cursor().await.unwrap(), 1);
+        projector.commit_published_cursor(repaired).await.unwrap();
+        assert_eq!(store.get_projector_cursor().await.unwrap(), 2);
+        assert_eq!(projector.cursor.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
     async fn restore_emitted_frontier_blocks_current_poison_but_waits_for_future_leaf() {
         let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
         let block_state = StdArc::new(BlockState::new());
         let projector = test_projector(&store, &block_state).await;
+        *projector.session.lock().unwrap() =
+            ProjectionSession::Live.start_restore(0, 2, 0).unwrap();
         store
             .reserve_deposit_index("crash-reservation")
             .await
@@ -5918,6 +5874,7 @@ mod tests {
         assert!(error.to_string().contains("never emitted"));
         assert_eq!(store.get_latest_block_number().await.unwrap(), 1);
         // Live mode retains the unconditional gate.
+        *projector.session.lock().unwrap() = ProjectionSession::Live;
         assert!(
             projector
                 .project_block_notes(&[], &HashMap::new(), 2, None, &HashMap::new(), None)

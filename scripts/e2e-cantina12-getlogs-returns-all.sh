@@ -65,7 +65,7 @@ rpc_call() {
 # The redesign's only limit is the OOM backstop. Read the NEW constant so the
 # script tracks the source; the seed just needs to be comfortably over the OLD
 # 1000-row cap (to prove "no truncation") while staying far under the ceiling.
-CEILING="$(grep -oP 'GETLOGS_SAFETY_CEILING: usize = \K[0-9_]+' "$PROJECT_DIR/src/store/mod.rs" | tr -d '_' || echo 500000)"
+CEILING="$(sed -nE 's/^pub const GETLOGS_SAFETY_CEILING: usize = ([0-9_]+);/\1/p' "$PROJECT_DIR/src/store/mod.rs" | tr -d '_')"
 [[ "$CEILING" =~ ^[0-9]+$ ]] || CEILING=500000
 
 # Moderately dense: > OLD cap (1000), << ceiling. This is the count the old code

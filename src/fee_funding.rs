@@ -342,10 +342,37 @@ pub enum DeployKind {
     NetworkAccount { funder: AccountId },
 }
 
+/// Deployment policy after authoritative chain reconciliation. This decision
+/// is shared by direct tooling and the durable initialization driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeploymentPlan {
+    AlreadyDeployed,
+    EmptyTransaction,
+    AwaitOperatorFunding,
+    CascadeThenConsume { funder: AccountId },
+}
+
+pub(crate) fn deployment_plan(
+    deployed: bool,
+    kind: DeployKind,
+    fee: &FeeSnapshot,
+) -> DeploymentPlan {
+    if deployed {
+        DeploymentPlan::AlreadyDeployed
+    } else if !fee.charges_fees() {
+        DeploymentPlan::EmptyTransaction
+    } else {
+        match kind {
+            DeployKind::Wallet => DeploymentPlan::AwaitOperatorFunding,
+            DeployKind::NetworkAccount { funder } => DeploymentPlan::CascadeThenConsume { funder },
+        }
+    }
+}
+
 /// Reconcile publication before deciding whether deployment is complete.
 /// SDK account state includes locally applied, uncommitted transactions, so a
 /// positive local nonce is never sufficient evidence that an account exists.
-async fn deployment_exists_on_chain(
+pub(crate) async fn deployment_exists_on_chain(
     client: &mut MidenClientLib,
     account_id: AccountId,
     name: &str,
@@ -428,14 +455,17 @@ pub async fn deploy_account(
     fee: &FeeSnapshot,
     wait: Duration,
 ) -> anyhow::Result<()> {
-    if deployment_exists_on_chain(client, account_id, name).await? {
+    let plan = deployment_plan(
+        deployment_exists_on_chain(client, account_id, name).await?,
+        kind,
+        fee,
+    );
+    if plan == DeploymentPlan::AlreadyDeployed {
         tracing::info!(account = name, account_id = %AccountIdBech32(account_id),
             "account exists on chain — skipping deployment");
         return Ok(());
     }
-    if fee.charges_fees()
-        && let DeployKind::NetworkAccount { funder } = kind
-    {
+    if let DeploymentPlan::CascadeThenConsume { funder } = plan {
         fund_from_service(client, funder, account_id, name, cascade_amount(fee), fee).await?;
     }
     tracing::info!(
@@ -443,7 +473,7 @@ pub async fn deploy_account(
         name,
         AccountIdBech32(account_id)
     );
-    let request = if !fee.charges_fees() {
+    let request = if plan == DeploymentPlan::EmptyTransaction {
         TransactionRequestBuilder::new().build()?
     } else {
         let notes = wait_for_funding_notes(client, account_id, name, fee, wait).await?;

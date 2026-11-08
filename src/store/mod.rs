@@ -171,6 +171,63 @@ pub enum NonceReservation {
     HeldByOther(TxHash),
 }
 
+/// Durable ownership of a signer/nonce slot. Lease expiry alone never proves
+/// that a different transaction may replace a durably admitted owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReservationState {
+    Executing,
+    ReleasedSuccess,
+    ReleasedFailure,
+}
+
+impl ReservationState {
+    #[cfg(feature = "postgres")]
+    fn from_persisted(state: &str) -> anyhow::Result<Self> {
+        match state {
+            "executing" => Ok(Self::Executing),
+            "released_success" => Ok(Self::ReleasedSuccess),
+            "released_failure" => Ok(Self::ReleasedFailure),
+            other => anyhow::bail!("unknown nonce reservation state {other:?}"),
+        }
+    }
+
+    fn can_reacquire_same(self, expired: bool) -> bool {
+        self != Self::Executing || expired
+    }
+
+    /// A candidate still requires proof that its previous owner was never
+    /// durably admitted, under the backend's reservation lock/transaction.
+    fn abandonment_candidate(self, expired: bool) -> Option<&'static str> {
+        match self {
+            Self::ReleasedFailure => Some("released_failure"),
+            Self::Executing if expired => Some("expired_executing"),
+            Self::Executing | Self::ReleasedSuccess => None,
+        }
+    }
+}
+
+/// Ownership of a bridge claim advances independently of its RPC receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimState {
+    Executing,
+    Prepared,
+    Submitted,
+    Landed,
+}
+
+impl ClaimState {
+    #[cfg(feature = "postgres")]
+    fn from_persisted(state: &str) -> anyhow::Result<Self> {
+        match state {
+            "executing" => Ok(Self::Executing),
+            "prepared" => Ok(Self::Prepared),
+            "submitted" => Ok(Self::Submitted),
+            "landed" => Ok(Self::Landed),
+            other => anyhow::bail!("unknown claim ownership state {other:?}"),
+        }
+    }
+}
+
 /// Fenced ownership token for an in-progress claim submission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaimFence {
@@ -184,6 +241,19 @@ pub enum NoteHandoffState {
     Prepared,
     /// The transaction committed or the exact note was later observed.
     Submitted,
+}
+
+impl NoteHandoffState {
+    /// Every store reader must interpret durable handoff states identically.
+    /// Unknown state is corruption, not permission to retry or inferred success.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn from_persisted(state: &str) -> anyhow::Result<Self> {
+        match state {
+            "prepared" => Ok(Self::Prepared),
+            "submitted" => Ok(Self::Submitted),
+            other => anyhow::bail!("unknown note handoff state {other:?}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

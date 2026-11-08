@@ -18,13 +18,7 @@ use miden_protocol::{Felt, Word};
 #[cfg(not(test))]
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExactNoteOutcome {
-    NotApplied,
-    AppliedByExactNote,
-    AppliedElsewhere,
-    Uncertain,
-}
+pub(crate) use crate::transaction_lifecycle::ExactNoteOutcome;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NoteObservation {

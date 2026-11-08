@@ -46,7 +46,7 @@ if [[ -n "${PROXY_CONTAINER:-}" ]]; then
     grep -qxF "$PROXY_CONTAINER" <<<"$CANDIDATES" \
         || { echo "FATAL: PROXY_CONTAINER='$PROXY_CONTAINER' is not a running *-miden-agglayer-1 container"; exit 1; }
 else
-    n_cand="$(grep -c . <<<"$CANDIDATES" 2>/dev/null || echo 0)"
+    n_cand="$(awk 'NF { n++ } END { print n+0 }' <<<"$CANDIDATES")"
     if [[ "$n_cand" -eq 0 ]]; then
         echo "FATAL: no running *-miden-agglayer-1 container"; exit 1
     elif [[ "$n_cand" -gt 1 ]]; then
@@ -651,7 +651,7 @@ gl_key() { awk -F'\t' '{print $1"|"$3"|"$4"|"$5}' "$1" | sort; }
 MISSING="/tmp/fdl-getlogs-missing-${RUN_SUFFIX}.txt"
 comm -23 <(gl_key "$GL_BEFORE") <(gl_key "$GL_AFTER") > "$MISSING" 2>/dev/null || : > "$MISSING"
 GAINED=$(comm -13 <(gl_key "$GL_BEFORE") <(gl_key "$GL_AFTER") 2>/dev/null | grep -c . || true)
-NMISS=$(grep -c . "$MISSING" 2>/dev/null || echo 0)
+NMISS=$(awk 'NF { n++ } END { print n+0 }' "$MISSING")
 
 if (( NMISS > 0 )); then
     say "eth_getLogs: $NMISS log(s) present BEFORE and absent AFTER — classifying each"

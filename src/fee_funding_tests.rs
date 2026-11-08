@@ -743,3 +743,28 @@ async fn live_wallet_top_ups() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 }
+
+#[test]
+fn deployment_plan_requires_chain_evidence_and_selects_funding_owner() {
+    let funder = AccountId::builder().build_with_seed([82; 32]);
+    for kind in [DeployKind::Wallet, DeployKind::NetworkAccount { funder }] {
+        for base in [0, 7] {
+            let fee = FeeSnapshot {
+                verification_base_fee: base,
+                ..snapshot()
+            };
+            assert_eq!(
+                deployment_plan(true, kind, &fee),
+                DeploymentPlan::AlreadyDeployed
+            );
+            let expected = match (base, kind) {
+                (0, _) => DeploymentPlan::EmptyTransaction,
+                (_, DeployKind::Wallet) => DeploymentPlan::AwaitOperatorFunding,
+                (_, DeployKind::NetworkAccount { funder }) => {
+                    DeploymentPlan::CascadeThenConsume { funder }
+                }
+            };
+            assert_eq!(deployment_plan(false, kind, &fee), expected);
+        }
+    }
+}

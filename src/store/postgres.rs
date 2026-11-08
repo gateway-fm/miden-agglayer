@@ -4,14 +4,16 @@
 //! with the schema from `migrations/001_initial.sql` applied.
 
 use super::{
-    ClaimFence, FaucetEntry, NoteHandoff, NoteHandoffState, PendingNonceFrontier, QueueBounds,
-    QueueOutcome, QueuedTxn, RecoverablePendingTxn, Store, TxnData, TxnEntry,
-    UnbridgeableBridgeOut, UnbridgeableBridgeOutReason, UnclaimableClaim, UnclaimableReason,
+    ClaimFence, ClaimState, FaucetEntry, NoteHandoff, NoteHandoffState, PendingNonceFrontier,
+    QueueBounds, QueueOutcome, QueuedTxn, RecoverablePendingTxn, ReservationState, Store, TxnData,
+    TxnEntry, UnbridgeableBridgeOut, UnbridgeableBridgeOutReason, UnclaimableClaim,
+    UnclaimableReason,
 };
 use crate::bridge_address::get_bridge_address;
 use crate::log_synthesis::{
     GerEntry, L2_GLOBAL_EXIT_ROOT_ADDRESS, LogFilter, SyntheticLog, UPDATE_HASH_CHAIN_VALUE_TOPIC,
 };
+use crate::transaction_lifecycle::ReceiptState;
 use alloy::consensus::TxEnvelope;
 use alloy::eips::Encodable2718;
 use alloy::primitives::{Address, LogData, TxHash, U256};
@@ -532,11 +534,8 @@ impl Store for PgStore {
             .await?;
         row.map(|row| {
             let state: String = row.get(2);
-            let state = match state.as_str() {
-                "prepared" => NoteHandoffState::Prepared,
-                "submitted" => NoteHandoffState::Submitted,
-                other => anyhow::bail!("unknown note handoff state {other:?} for {tx_hash}"),
-            };
+            let state = NoteHandoffState::from_persisted(&state)
+                .with_context(|| format!("decoding handoff for {tx_hash}"))?;
             Ok(NoteHandoff {
                 note_commitment: row.get(0),
                 note_id: row.get(1),
@@ -624,11 +623,11 @@ impl Store for PgStore {
             // note_id would classify it as an orphan and re-prove it every sweep.
             // A missing link row yields a NULL handoff_state via the LEFT JOIN.
             let handoff_state: Option<String> = row.get(5);
-            let handoff = handoff_state.as_deref().map(|state| match state {
-                "prepared" => NoteHandoffState::Prepared,
-                // Legacy rows default handoff_state to 'submitted' (mig 012).
-                _ => NoteHandoffState::Submitted,
-            });
+            let handoff = handoff_state
+                .as_deref()
+                .map(NoteHandoffState::from_persisted)
+                .transpose()
+                .with_context(|| format!("decoding recovery handoff for {hash_str}"))?;
             out.push(RecoverablePendingTxn {
                 tx_hash,
                 signer: row.get::<_, String>(1).to_lowercase(),
@@ -895,8 +894,8 @@ impl Store for PgStore {
             .await?;
         if let Some(row) = row {
             let state: String = row.get(0);
-            match state.as_str() {
-                "prepared" => {
+            match ClaimState::from_persisted(&state)? {
+                ClaimState::Prepared => {
                     txn.execute(
                         "DELETE FROM claimed_indices
                          WHERE owner_tx_hash = $1 AND claim_state = 'prepared'",
@@ -906,11 +905,7 @@ impl Store for PgStore {
                 }
                 // A landed claim is an authoritative fence. Rolling the link
                 // back would reopen attribution and permit a duplicate claim.
-                "landed" => {
-                    txn.rollback().await?;
-                    return Ok(false);
-                }
-                _ => {
+                ClaimState::Landed | ClaimState::Executing | ClaimState::Submitted => {
                     txn.rollback().await?;
                     return Ok(false);
                 }
@@ -1660,12 +1655,8 @@ impl Store for PgStore {
 
         // A real landing may heal a pending/failed observation to success;
         // success itself is monotonic and the first failure remains stable.
-        let apply = match (current_status.as_str(), result.is_ok()) {
-            ("success", _) => false,
-            (_, true) => true,
-            ("pending", false) => !has_handoff,
-            (_, false) => false,
-        };
+        let apply = ReceiptState::from_persisted(&current_status)?
+            .accepts_result(result.is_ok(), has_handoff);
         if !apply {
             tx.rollback().await?;
             tracing::debug!(
@@ -1842,8 +1833,8 @@ impl Store for PgStore {
         ).await?;
         if let Some(claim) = claim {
             let owner: Option<String> = claim.get(0);
-            let state: String = claim.get(1);
-            if owner.as_deref() == Some(hash.as_str()) && state == "landed" {
+            let state = ClaimState::from_persisted(claim.get(1))?;
+            if owner.as_deref() == Some(hash.as_str()) && state == ClaimState::Landed {
                 return Ok(false);
             }
         }
@@ -1886,13 +1877,14 @@ impl Store for PgStore {
         let error_msg: Option<&str> = row.get(1);
         let block_num: i64 = row.get(2);
 
-        match status {
-            "success" => Ok(Some((Ok(()), block_num as u64))),
-            "failed" => Ok(Some((
+        match ReceiptState::from_persisted(status)? {
+            ReceiptState::Succeeded => Ok(Some((Ok(()), block_num as u64))),
+            ReceiptState::Failed => Ok(Some((
                 Err(error_msg.unwrap_or("unknown error").to_string()),
                 block_num as u64,
             ))),
-            _ => Ok(None), // pending
+            ReceiptState::Pending => Ok(None),
+            ReceiptState::Missing => unreachable!("persisted receipt cannot be missing"),
         }
     }
 
@@ -1945,10 +1937,11 @@ impl Store for PgStore {
             anyhow::anyhow!("stored signer for {hash_str} is not a valid Address ({e})")
         })?;
 
-        let result = match status {
-            "success" => Some(Ok(())),
-            "failed" => Some(Err(error_msg.unwrap_or("").to_string())),
-            _ => None,
+        let result = match ReceiptState::from_persisted(status)? {
+            ReceiptState::Succeeded => Some(Ok(())),
+            ReceiptState::Failed => Some(Err(error_msg.unwrap_or("").to_string())),
+            ReceiptState::Pending => None,
+            ReceiptState::Missing => unreachable!("persisted receipt cannot be missing"),
         };
 
         // Fetch logs
@@ -1980,14 +1973,18 @@ impl Store for PgStore {
 
         // Task 3: Deserialize TransactionId from stored hex string
         let miden_id_str: Option<&str> = row.get(0);
-        let id = miden_id_str.and_then(|s| {
-            let hex_str = if s.starts_with("0x") {
-                s.to_string()
-            } else {
-                format!("0x{s}")
-            };
-            parse_transaction_id(&hex_str)
-        });
+        let id = miden_id_str
+            .map(|s| {
+                let hex_str = if s.starts_with("0x") {
+                    s.to_string()
+                } else {
+                    format!("0x{s}")
+                };
+                parse_transaction_id(&hex_str).with_context(|| {
+                    format!("stored Miden transaction ID for {hash_str} cannot be decoded")
+                })
+            })
+            .transpose()?;
 
         Ok(Some(TxnData {
             id,
@@ -2006,8 +2003,7 @@ impl Store for PgStore {
         let client = self.pool.get().await?;
         let rows = client
             .query(
-                "SELECT t.envelope_bytes,
-                        (l.tx_hash IS NULL OR l.handoff_state <> 'submitted') AS unlinked
+                "SELECT t.envelope_bytes, l.handoff_state
                  FROM transactions t
                  LEFT JOIN tx_note_links l ON l.tx_hash = t.tx_hash
                  WHERE lower(t.signer) = lower($1) AND t.status = 'pending'",
@@ -2028,7 +2024,11 @@ impl Store for PgStore {
                     .lowest_pending
                     .map_or(nonce, |current| current.min(nonce)),
             );
-            if row.get::<_, bool>(1) {
+            let handoff = row
+                .get::<_, Option<&str>>(1)
+                .map(NoteHandoffState::from_persisted)
+                .transpose()?;
+            if handoff != Some(NoteHandoffState::Submitted) {
                 frontier.lowest_unlinked = Some(
                     frontier
                         .lowest_unlinked
@@ -2050,10 +2050,10 @@ impl Store for PgStore {
             )
             .await?;
 
-        Ok(rows.first().and_then(|r| {
-            let hash_str: &str = r.get(0);
-            hash_str.parse().ok()
-        }))
+        rows.first().map(|row| {
+            let hash_str: &str = row.get(0);
+            hash_str.parse().with_context(|| format!("stored Ethereum transaction hash for Miden transaction {id_str} cannot be decoded"))
+        }).transpose()
     }
 
     async fn txn_commit_pending(
@@ -2407,7 +2407,7 @@ impl Store for PgStore {
             }
             Some(row) => {
                 let row_hash: String = row.get(0);
-                let state: String = row.get(1);
+                let state = ReservationState::from_persisted(row.get(1))?;
                 let expired: bool = row.get(2);
                 let fence: i64 = row.get(3);
                 // A nonce slot is bound to its first transaction hash. Expiry
@@ -2416,8 +2416,7 @@ impl Store for PgStore {
                 // ambiguous — it may only take over an ABANDONED slot (executing,
                 // lease expired, never durably admitted; wedge-#5 rule below).
                 let same_tx = row_hash.eq_ignore_ascii_case(&hash_str);
-                let takeover = same_tx
-                    && (state == "released_failure" || state == "released_success" || expired);
+                let takeover = same_tx && state.can_reacquire_same(expired);
                 if takeover {
                     let new_fence = fence + 1;
                     tx.execute(
@@ -2465,13 +2464,7 @@ impl Store for PgStore {
                     // `released_success` slots and any slot WITH a durable row
                     // stay permanently hash-bound (receipt identity / pending-tx
                     // machinery).
-                    let reclaim_cause = if state == "released_failure" {
-                        Some("released_failure")
-                    } else if state == "executing" && expired {
-                        Some("expired_executing")
-                    } else {
-                        None
-                    };
+                    let reclaim_cause = state.abandonment_candidate(expired);
                     let abandoned_cause = match reclaim_cause {
                         Some(cause) => {
                             let admitted: bool = tx
@@ -2553,7 +2546,7 @@ impl Store for PgStore {
                 "UPDATE nonce_reservations
              SET lease_expires_at = now() + ($4 || ' seconds')::interval
              WHERE signer = $1 AND nonce = $2 AND tx_hash = $3
-               AND state <> 'released_failure'",
+               AND state IN ('executing', 'released_success')",
                 &[&key, &(nonce as i64), &hash_str, &lease_secs.to_string()],
             )
             .await?;

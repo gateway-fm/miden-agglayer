@@ -52,7 +52,7 @@ impl FaucetStep {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FaucetPreparedTx {
     pub generation: u32,
     pub expiration_block: u64,
@@ -62,33 +62,49 @@ pub struct FaucetPreparedTx {
     pub proven: Vec<u8>,
 }
 
-/// Shared store contract. Fresh absence is checked by the caller; the store
-/// also prevents skipping generations or replacing a still-valid handoff.
+/// The only legal actions after a fresh chain observation. Expiry equality
+/// still permits admission of the old transaction, so replacement is strict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StepAction {
+    Complete,
+    Replay,
+    Prepare { generation: u32 },
+}
+
+pub(crate) fn step_action(
+    current: Option<&FaucetPreparedTx>,
+    effect_observed: bool,
+    observed_height: u64,
+) -> anyhow::Result<StepAction> {
+    if effect_observed {
+        return Ok(StepAction::Complete);
+    }
+    match current {
+        None => Ok(StepAction::Prepare { generation: 0 }),
+        Some(saved) if observed_height <= saved.expiration_block => Ok(StepAction::Replay),
+        Some(saved) => Ok(StepAction::Prepare {
+            generation: saved
+                .generation
+                .checked_add(1)
+                .context("faucet generation overflow")?,
+        }),
+    }
+}
+
+/// Shared persistence guard, using the same expiry/generation decision as the
+/// driver. Callers must first establish fresh absence on chain.
 pub(crate) fn check_next_generation(
     current: Option<&FaucetPreparedTx>,
     next: &FaucetPreparedTx,
     observed_height: u64,
 ) -> anyhow::Result<()> {
-    match current {
-        None => ensure!(
-            next.generation == 0,
-            "first faucet handoff must be generation zero"
-        ),
-        Some(current) => {
-            ensure!(
-                next.generation
-                    == current
-                        .generation
-                        .checked_add(1)
-                        .context("faucet generation overflow")?,
-                "faucet handoff generation changed; reconcile before preparing again"
-            );
-            ensure!(
-                observed_height > current.expiration_block,
-                "prior faucet handoff has not expired"
-            );
-        }
-    }
+    ensure!(
+        step_action(current, false, observed_height)?
+            == StepAction::Prepare {
+                generation: next.generation
+            },
+        "faucet handoff generation changed or prior handoff has not expired"
+    );
     ensure!(
         next.expiration_block > observed_height,
         "new faucet handoff already expired"
@@ -100,8 +116,43 @@ pub(crate) fn check_next_generation(
     Ok(())
 }
 
-/// Runtime claim/admin path. Bootstrap and standalone tools keep their own
-/// lifecycle; this journal belongs to the proxy's Store, not to the SDK cache.
+/// Runtime uses the proxy Store; initialization uses a locked, atomically
+/// replaced checkpoint beside its account config. Both persist before send.
+pub(crate) trait StepJournal {
+    /// Bootstrap retains its historical init/faucet proof attribution. Runtime
+    /// journals remain unmetered here; replay and commit polling never prove.
+    fn proof_kind(&self, _key: &str, _step: FaucetStep) -> Option<crate::metrics::ProofKind> {
+        None
+    }
+
+    async fn load(&self, key: &str, step: FaucetStep) -> anyhow::Result<Option<FaucetPreparedTx>>;
+    async fn prepare(
+        &self,
+        key: &str,
+        step: FaucetStep,
+        proposal: FaucetPreparedTx,
+        observed_height: u64,
+    ) -> anyhow::Result<FaucetPreparedTx>;
+}
+
+impl<T: Store + ?Sized> StepJournal for T {
+    async fn load(&self, key: &str, step: FaucetStep) -> anyhow::Result<Option<FaucetPreparedTx>> {
+        self.get_faucet_step(key, step).await
+    }
+    async fn prepare(
+        &self,
+        key: &str,
+        step: FaucetStep,
+        proposal: FaucetPreparedTx,
+        observed_height: u64,
+    ) -> anyhow::Result<FaucetPreparedTx> {
+        self.prepare_faucet_step(key, step, proposal, observed_height)
+            .await
+    }
+}
+
+/// Runtime claim/admin path. Its identity and journal belong to the proxy's
+/// Store; bootstrap shares the driver with a separate file-backed journal.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_and_register_faucet(
     client: &mut MidenClientLib,
@@ -382,9 +433,9 @@ fn decode_handoff(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn drive_step<F>(
+pub(crate) async fn drive_step<F>(
     client: &mut MidenClientLib,
-    store: &dyn Store,
+    store: &(impl StepJournal + ?Sized),
     key: &str,
     step: FaucetStep,
     faucet: AccountId,
@@ -404,6 +455,7 @@ where
             step,
             faucet,
             signer,
+            proof_kind: store.proof_kind(key, step),
             build_request: Some(build_request),
         },
     )
@@ -412,42 +464,43 @@ where
 
 // Keep the durable orchestration independent of the transport so restart and
 // lost-response regressions exercise the same state machine as live sends.
-trait StepRuntime {
+pub(crate) trait StepRuntime {
     async fn sync_height(&mut self) -> anyhow::Result<u64>;
     async fn effect(&mut self, saved: &FaucetPreparedTx) -> anyhow::Result<bool>;
     async fn prepare(&mut self, generation: u32) -> anyhow::Result<FaucetPreparedTx>;
     async fn submit(&mut self, saved: &FaucetPreparedTx) -> anyhow::Result<()>;
 }
 
-async fn resume_step(
-    store: &dyn Store,
+pub(crate) async fn resume_step(
+    journal: &(impl StepJournal + ?Sized),
     key: &str,
     step: FaucetStep,
     runtime: &mut impl StepRuntime,
 ) -> anyhow::Result<()> {
     let observed_height = runtime.sync_height().await?;
-    let previous = store.get_faucet_step(key, step).await?;
-    let mut generation = 0;
-    if let Some(saved) = previous {
-        if runtime.effect(&saved).await? {
-            return Ok(());
+    let previous = journal.load(key, step).await?;
+    // RPC/conversion failures propagate before the pure decision. They are
+    // never represented as absence and cannot authorize a replacement.
+    let observed = match previous.as_ref() {
+        Some(saved) => runtime.effect(saved).await?,
+        None => false,
+    };
+    match step_action(previous.as_ref(), observed, observed_height)? {
+        StepAction::Complete => Ok(()),
+        StepAction::Replay => {
+            runtime
+                .submit(previous.as_ref().expect("replay has a handoff"))
+                .await
         }
-        if observed_height <= saved.expiration_block {
-            return runtime.submit(&saved).await;
+        StepAction::Prepare { generation } => {
+            let proposal = runtime.prepare(generation).await?;
+            let saved = journal
+                .prepare(key, step, proposal, observed_height)
+                .await?;
+            // Another writer may have won. Only the durable winner is sent.
+            runtime.submit(&saved).await
         }
-        // Exact absence is checked AFTER syncing beyond the creating tx's
-        // expiry. An unavailable node fails above; it cannot authorize a send.
-        generation = saved
-            .generation
-            .checked_add(1)
-            .context("faucet generation overflow")?;
     }
-    let proposal = runtime.prepare(generation).await?;
-    let saved = store
-        .prepare_faucet_step(key, step, proposal, observed_height)
-        .await?;
-    // Another writer may have won. Only the durable winner may be submitted.
-    runtime.submit(&saved).await
 }
 
 struct MidenStep<'a, F> {
@@ -455,6 +508,7 @@ struct MidenStep<'a, F> {
     step: FaucetStep,
     faucet: AccountId,
     signer: AccountId,
+    proof_kind: Option<crate::metrics::ProofKind>,
     build_request: Option<F>,
 }
 
@@ -478,11 +532,18 @@ where
             .take()
             .context("faucet request builder already used")?;
         let request = build(self.client).await?;
-        let result = self
-            .client
-            .execute_transaction(self.signer, request)
-            .await?;
-        let proven = self.client.prove_transaction(&result).await?;
+        let prepare = async {
+            let result = self
+                .client
+                .execute_transaction(self.signer, request)
+                .await?;
+            let proven = self.client.prove_transaction(&result).await?;
+            Ok::<_, ClientError>((result, proven))
+        };
+        let (result, proven) = match self.proof_kind {
+            Some(kind) => crate::metrics::meter_proof(kind, prepare).await?,
+            None => prepare.await?,
+        };
         Ok(FaucetPreparedTx {
             generation,
             expiration_block: proven.expiration_block_num().as_u64(),
