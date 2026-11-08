@@ -3872,20 +3872,19 @@ impl Store for PgStore {
     async fn expected_mint_record(
         &self,
         global_index: &[u8; 32],
-        expected_mint: &[u8; 32],
+        claim_note: &[u8; 32],
     ) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
         client
             .execute(
                 "INSERT INTO monitor_expected_mints \
-                 (global_index, expected_mint, ticks_pending, alerted) \
-                 VALUES ($1, $2, 0, FALSE) \
-                 ON CONFLICT (global_index) DO UPDATE \
-                 SET expected_mint = EXCLUDED.expected_mint, \
-                     ticks_pending = 0, \
-                     alerted = FALSE, \
-                     updated_at = now()",
-                &[&global_index.as_slice(), &expected_mint.as_slice()],
+             (global_index, expected_mint, ticks_pending, alerted, alert_pending) \
+             VALUES ($1, $2, 0, FALSE, FALSE) \
+             ON CONFLICT (global_index) DO UPDATE \
+             SET expected_mint = EXCLUDED.expected_mint, \
+                 ticks_pending = 0, alerted = FALSE, alert_pending = FALSE, \
+                 generation = EXCLUDED.generation, updated_at = now()",
+                &[&global_index.as_slice(), &claim_note.as_slice()],
             )
             .await?;
         Ok(())
@@ -3895,37 +3894,54 @@ impl Store for PgStore {
         let client = self.pool.get().await?;
         client
             .execute(
-                "DELETE FROM monitor_expected_mints WHERE global_index = $1",
+                "DELETE FROM monitor_expected_mints WHERE global_index = $1 AND NOT alert_pending",
                 &[&global_index.as_slice()],
             )
             .await?;
         Ok(())
     }
 
-    async fn expected_mint_load_all(&self) -> anyhow::Result<Vec<([u8; 32], [u8; 32], u32, bool)>> {
+    async fn expected_mint_remove_generation(
+        &self,
+        global_index: &[u8; 32],
+        generation: i64,
+    ) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .execute(
+                "DELETE FROM monitor_expected_mints \
+             WHERE global_index = $1 AND generation = $2 AND NOT alert_pending",
+                &[&global_index.as_slice(), &generation],
+            )
+            .await?
+            > 0)
+    }
+
+    async fn expected_mint_load_all(&self) -> anyhow::Result<Vec<super::ClaimWatchEntry>> {
         let client = self.pool.get().await?;
         let rows = client
             .query(
-                "SELECT global_index, expected_mint, ticks_pending, alerted \
-                 FROM monitor_expected_mints",
+                "SELECT global_index, expected_mint, ticks_pending, alert_pending, generation \
+             FROM monitor_expected_mints",
                 &[],
             )
             .await?;
         let mut out = Vec::with_capacity(rows.len());
-        for r in &rows {
-            let gi: &[u8] = r.get(0);
-            let em: &[u8] = r.get(1);
-            if gi.len() != 32 || em.len() != 32 {
-                continue;
-            }
-            let ticks: i32 = r.get(2);
-            let alerted: bool = r.get(3);
-            out.push((
-                bytes_to_array_32(gi),
-                bytes_to_array_32(em),
-                ticks.max(0) as u32,
-                alerted,
-            ));
+        for row in &rows {
+            let gi: &[u8] = row.get(0);
+            let claim_note: &[u8] = row.get(1);
+            anyhow::ensure!(
+                gi.len() == 32 && claim_note.len() == 32,
+                "invalid CLAIM watchdog identity length"
+            );
+            let ticks: i32 = row.get(2);
+            out.push(super::ClaimWatchEntry {
+                global_index: bytes_to_array_32(gi),
+                claim_note: bytes_to_array_32(claim_note),
+                ticks_pending: ticks.max(0) as u32,
+                alert_pending: row.get(3),
+                generation: row.get(4),
+            });
         }
         Ok(out)
     }
@@ -3933,20 +3949,31 @@ impl Store for PgStore {
     async fn expected_mint_update_tick(
         &self,
         global_index: &[u8; 32],
+        generation: i64,
         ticks_pending: u32,
-        alerted: bool,
+        alert_pending: bool,
+    ) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let ticks_i32 = i32::try_from(ticks_pending).unwrap_or(i32::MAX);
+        Ok(client.execute(
+            "UPDATE monitor_expected_mints \
+             SET ticks_pending = GREATEST(ticks_pending, $1), alert_pending = $2, updated_at = now() \
+             WHERE global_index = $3 AND generation = $4 AND NOT alert_pending",
+            &[&ticks_i32, &alert_pending, &global_index.as_slice(), &generation],
+        ).await? > 0)
+    }
+
+    async fn expected_mint_acknowledge_alert(
+        &self,
+        global_index: &[u8; 32],
+        generation: i64,
     ) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
-        // Bound ticks_pending into i32 range so the column write never
-        // panics on saturating_add edges. INT in postgres is signed 32-bit;
-        // u32::MAX would overflow.
-        let ticks_i32 = i32::try_from(ticks_pending).unwrap_or(i32::MAX);
         client
             .execute(
-                "UPDATE monitor_expected_mints \
-                 SET ticks_pending = $1, alerted = $2, updated_at = now() \
-                 WHERE global_index = $3",
-                &[&ticks_i32, &alerted, &global_index.as_slice()],
+                "DELETE FROM monitor_expected_mints \
+             WHERE global_index = $1 AND generation = $2 AND alert_pending",
+                &[&global_index.as_slice(), &generation],
             )
             .await?;
         Ok(())

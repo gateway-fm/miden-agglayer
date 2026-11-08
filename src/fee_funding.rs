@@ -312,8 +312,18 @@ pub async fn fund_from_service(
     )
     .await
     .with_context(|| format!("service could not fund {name} (is service itself funded?)"))?;
-    crate::miden_client::wait_for_transaction_commit(client, txn_id, 30, Duration::from_secs(2))
-        .await?;
+    let committed = crate::miden_client::wait_for_transaction_commit(
+        client,
+        txn_id,
+        30,
+        Duration::from_secs(2),
+    )
+    .await?;
+    anyhow::ensure!(
+        committed,
+        "funding transaction {txn_id} for {name} was submitted but not observed committed; \
+         reconcile its exact transaction before sending another funding payment"
+    );
     client.sync_state().await?;
     Ok(())
 }
@@ -330,6 +340,73 @@ pub enum DeployKind {
     /// A network account (bridge, faucet): `funder` (service) cascade-sends
     /// the P2ID first, then the deploy consumes it.
     NetworkAccount { funder: AccountId },
+}
+
+/// Reconcile publication before deciding whether deployment is complete.
+/// SDK account state includes locally applied, uncommitted transactions, so a
+/// positive local nonce is never sufficient evidence that an account exists.
+async fn deployment_exists_on_chain(
+    client: &mut MidenClientLib,
+    account_id: AccountId,
+    name: &str,
+) -> anyhow::Result<bool> {
+    use miden_client::store::TransactionFilter;
+    use miden_client::transaction::TransactionStatus;
+
+    client.sync_state().await?;
+    // Do not overwrite an optimistic wallet snapshot while it has pending
+    // transactions. Reconcile those exact submissions before importing state or
+    // constructing any new deployment/cascade transaction.
+    for transaction in client
+        .get_transactions(TransactionFilter::Uncommitted)
+        .await?
+    {
+        if transaction.details.account_id != account_id
+            || !matches!(transaction.status, TransactionStatus::Pending)
+        {
+            continue;
+        }
+        let committed = crate::miden_client::wait_for_transaction_commit(
+            client,
+            transaction.id,
+            20,
+            Duration::from_secs(1),
+        )
+        .await?;
+        anyhow::ensure!(
+            committed,
+            "deployment reconciliation for {name}: transaction {} was submitted but not observed \
+             committed; retaining the exact pending transaction without another deployment",
+            transaction.id
+        );
+    }
+    match client.import_account_by_id(account_id).await {
+        Ok(()) => {
+            let account = client
+                .get_account(account_id)
+                .await?
+                .context("deployed account missing after authoritative import")?;
+            anyhow::ensure!(
+                !account.is_new(),
+                "node returned an undeployed account for {name}"
+            );
+            Ok(true)
+        }
+        Err(miden_client::ClientError::AccountNotFoundOnChain(missing))
+            if missing == account_id =>
+        {
+            let account = client.get_account(account_id).await?.with_context(|| {
+                format!("initial account for {name} is missing from the client store")
+            })?;
+            anyhow::ensure!(
+                account.is_new(),
+                "{name} is absent on chain but its local account has already advanced; \
+                 reconcile the account before retrying deployment"
+            );
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Deploy `account_id` on-chain.
@@ -351,25 +428,15 @@ pub async fn deploy_account(
     fee: &FeeSnapshot,
     wait: Duration,
 ) -> anyhow::Result<()> {
-    if fee.charges_fees() {
-        // Resume: --init reuses the accounts funding.toml records. One that was
-        // already deployed (nonce > 0) must not wait for a second funding note
-        // that will never come — its note was consumed by the first deploy.
-        client.sync_state().await?;
-        if let Some(account) = client.get_account(account_id).await?
-            && !account.is_new()
-        {
-            tracing::info!(
-                account = name,
-                account_id = %AccountIdBech32(account_id),
-                nonce = %account.nonce(),
-                "already deployed on-chain — skipping deploy (#201)"
-            );
-            return Ok(());
-        }
-        if let DeployKind::NetworkAccount { funder } = kind {
-            fund_from_service(client, funder, account_id, name, cascade_amount(fee), fee).await?;
-        }
+    if deployment_exists_on_chain(client, account_id, name).await? {
+        tracing::info!(account = name, account_id = %AccountIdBech32(account_id),
+            "account exists on chain — skipping deployment");
+        return Ok(());
+    }
+    if fee.charges_fees()
+        && let DeployKind::NetworkAccount { funder } = kind
+    {
+        fund_from_service(client, funder, account_id, name, cascade_amount(fee), fee).await?;
     }
     tracing::info!(
         "deploying {} account {} ...",
@@ -389,7 +456,7 @@ pub async fn deploy_account(
         crate::miden_client::submit_new_transaction(client, account_id, request),
     )
     .await?;
-    tracing::info!("deployed {name} account with txn_id {txn_id}");
+    tracing::info!("submitted deployment for {name} account with txn_id {txn_id}");
 
     let committed = crate::miden_client::wait_for_transaction_commit(
         client,
@@ -398,9 +465,12 @@ pub async fn deploy_account(
         Duration::from_secs(1),
     )
     .await?;
-    if committed {
-        tracing::info!("deploy tx {txn_id} committed");
-    }
+    anyhow::ensure!(
+        committed,
+        "deployment transaction {txn_id} for {name} was submitted but not observed committed; \
+         synchronize and reconcile the account before retrying deployment"
+    );
+    tracing::info!("deploy tx {txn_id} committed");
     Ok(())
 }
 

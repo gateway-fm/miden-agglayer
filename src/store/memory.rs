@@ -175,7 +175,8 @@ pub struct InMemoryStore {
     // SAME note is benign; a different note holding the serial is the attack.
     monitor_burn_serials: RwLock<HashMap<[u8; 32], [u8; 32]>>,
     monitor_twin_notes: RwLock<HashMap<[u8; 32], Vec<[u8; 32]>>>,
-    monitor_expected_mints: RwLock<HashMap<[u8; 32], MonitorExpectedMintRow>>,
+    monitor_expected_mints: RwLock<HashMap<[u8; 32], super::ClaimWatchEntry>>,
+    monitor_expected_mint_generation: std::sync::atomic::AtomicI64,
     // Cantina #4 — permanent claim→expected-MINT-IDENTITY reconciliation
     // history (mirror of monitor_claim_mint_serials): serial → full identity.
     monitor_claim_mint_serials: RwLock<HashMap<[u8; 32], crate::store::ExpectedMint>>,
@@ -188,6 +189,9 @@ pub struct InMemoryStore {
     monitor_test_calls: Mutex<HashMap<&'static str, usize>>,
     #[cfg(test)]
     monitor_test_failures: Mutex<HashSet<&'static str>>,
+
+    #[cfg(test)]
+    txn_commit_pause: Mutex<Option<TxnCommitPause>>,
 
     // Synthetic projector cursor (synthetic-indexer redesign, Phase 2a) —
     // last fully-projected Miden block height. Field-backed mirror of the
@@ -241,17 +245,31 @@ pub struct InMemoryStore {
     queued_txns: RwLock<HashMap<String, std::collections::BTreeMap<u64, QueuedTxn>>>,
 }
 
-#[derive(Clone, Copy)]
-struct MonitorExpectedMintRow {
-    expected_mint: [u8; 32],
-    ticks_pending: u32,
-    alerted: bool,
-}
-
 const fn assert_sync<T: Send + Sync>() {}
 const _: () = assert_sync::<InMemoryStore>();
 
+#[cfg(test)]
+type TxnCommitPause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
 impl InMemoryStore {
+    /// Pause one receipt write after its caller enters the store, to test
+    /// ownership while persistence is outstanding without scheduling sleeps.
+    #[cfg(test)]
+    pub(crate) fn pause_next_txn_commit(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.txn_commit_pause.lock() = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
     #[cfg(test)]
     pub(crate) fn monitor_calls(&self, operation: &'static str) -> usize {
         self.monitor_test_calls
@@ -328,6 +346,7 @@ impl InMemoryStore {
             monitor_burn_serials: RwLock::new(HashMap::new()),
             monitor_twin_notes: RwLock::new(HashMap::new()),
             monitor_expected_mints: RwLock::new(HashMap::new()),
+            monitor_expected_mint_generation: std::sync::atomic::AtomicI64::new(0),
             monitor_claim_mint_serials: RwLock::new(HashMap::new()),
             #[cfg(test)]
             fail_list_faucets: std::sync::atomic::AtomicBool::new(false),
@@ -335,6 +354,8 @@ impl InMemoryStore {
             monitor_test_calls: Mutex::new(HashMap::new()),
             #[cfg(test)]
             monitor_test_failures: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            txn_commit_pause: Mutex::new(None),
             projector_cursor: RwLock::new(0),
             reconcile_cursor: RwLock::new(0),
             nonce_ledger_rebuilt: RwLock::new(false),
@@ -1386,6 +1407,14 @@ impl Store for InMemoryStore {
         block_num: u64,
         block_hash: [u8; 32],
     ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        {
+            let pause = self.txn_commit_pause.lock().take();
+            if let Some((entered, release)) = pause {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+        }
         // Once an exact handoff exists, an error is ambiguous until commit,
         // observation, or expiration reconciliation. Never expose status 0.
         let logs_to_add = {
@@ -2789,43 +2818,98 @@ impl Store for InMemoryStore {
     async fn expected_mint_record(
         &self,
         global_index: &[u8; 32],
-        expected_mint: &[u8; 32],
+        claim_note: &[u8; 32],
     ) -> anyhow::Result<()> {
         let mut map = self.monitor_expected_mints.write();
+        let generation = self
+            .monitor_expected_mint_generation
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |generation| generation.checked_add(1),
+            )
+            .map_err(|_| anyhow::anyhow!("CLAIM watchdog generation overflow"))?
+            + 1;
         map.insert(
             *global_index,
-            MonitorExpectedMintRow {
-                expected_mint: *expected_mint,
+            super::ClaimWatchEntry {
+                global_index: *global_index,
+                claim_note: *claim_note,
                 ticks_pending: 0,
-                alerted: false,
+                alert_pending: false,
+                generation,
             },
         );
         Ok(())
     }
 
     async fn expected_mint_remove(&self, global_index: &[u8; 32]) -> anyhow::Result<()> {
-        self.monitor_expected_mints.write().remove(global_index);
+        let mut map = self.monitor_expected_mints.write();
+        if map.get(global_index).is_some_and(|row| !row.alert_pending) {
+            map.remove(global_index);
+        }
         Ok(())
     }
 
-    async fn expected_mint_load_all(&self) -> anyhow::Result<Vec<([u8; 32], [u8; 32], u32, bool)>> {
-        let map = self.monitor_expected_mints.read();
-        Ok(map
-            .iter()
-            .map(|(gi, row)| (*gi, row.expected_mint, row.ticks_pending, row.alerted))
+    async fn expected_mint_remove_generation(
+        &self,
+        global_index: &[u8; 32],
+        generation: i64,
+    ) -> anyhow::Result<bool> {
+        let mut map = self.monitor_expected_mints.write();
+        if map
+            .get(global_index)
+            .is_some_and(|row| row.generation == generation && !row.alert_pending)
+        {
+            map.remove(global_index);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn expected_mint_load_all(&self) -> anyhow::Result<Vec<super::ClaimWatchEntry>> {
+        Ok(self
+            .monitor_expected_mints
+            .read()
+            .values()
+            .copied()
             .collect())
     }
 
     async fn expected_mint_update_tick(
         &self,
         global_index: &[u8; 32],
+        generation: i64,
         ticks_pending: u32,
-        alerted: bool,
-    ) -> anyhow::Result<()> {
+        alert_pending: bool,
+    ) -> anyhow::Result<bool> {
+        #[cfg(test)]
+        self.monitor_test_call("expected_mint_update_tick")?;
         let mut map = self.monitor_expected_mints.write();
-        if let Some(row) = map.get_mut(global_index) {
-            row.ticks_pending = ticks_pending;
-            row.alerted = alerted;
+        if let Some(row) = map.get_mut(global_index)
+            && row.generation == generation
+            && !row.alert_pending
+        {
+            row.ticks_pending = row.ticks_pending.max(ticks_pending);
+            row.alert_pending = alert_pending;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn expected_mint_acknowledge_alert(
+        &self,
+        global_index: &[u8; 32],
+        generation: i64,
+    ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        self.monitor_test_call("expected_mint_acknowledge_alert")?;
+        let mut map = self.monitor_expected_mints.write();
+        if map
+            .get(global_index)
+            .is_some_and(|row| row.generation == generation && row.alert_pending)
+        {
+            map.remove(global_index);
         }
         Ok(())
     }

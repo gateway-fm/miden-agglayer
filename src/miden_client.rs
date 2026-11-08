@@ -40,6 +40,30 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// (`new_test*`) deliberately bypass this guard.
 static LIVE_CLIENT: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
+/// Releases singleton ownership on construction failure, thread exit, or panic.
+struct ClientOwnership<'a>(&'a std::sync::Mutex<bool>);
+
+impl<'a> ClientOwnership<'a> {
+    fn acquire(live: &'a std::sync::Mutex<bool>) -> anyhow::Result<Self> {
+        let mut owned = live.lock().unwrap_or_else(|error| error.into_inner());
+        if *owned {
+            anyhow::bail!(
+                "a MidenClient is already live — MidenClient must be a process-wide \
+                 singleton (the single owner of the sqlite store); refusing to open \
+                 store.sqlite3 from a second in-process client"
+            );
+        }
+        *owned = true;
+        Ok(Self(live))
+    }
+}
+
+impl Drop for ClientOwnership<'_> {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = false;
+    }
+}
+
 /// Process-wide read-only switch (`--read-only` / `AGGLAYER_READ_ONLY`).
 ///
 /// When set, EVERY chain mutation is refused at the single chokepoint all
@@ -434,21 +458,107 @@ pub struct MidenClient {
     /// (which would double-emit synthetic logs and race the deposit-count
     /// counter). Released in a `Drop` guard so an error mid-restore still
     /// re-enables listeners.
-    listeners_paused: Arc<AtomicBool>,
+    listener_control: Arc<ListenerControl>,
     #[cfg(test)]
     call_count: Arc<AtomicUsize>,
 }
 
-/// RAII guard returned by [`MidenClient::pause_listeners`]. While in scope,
-/// the background sync loop will skip `on_post_sync` dispatch on every
-/// listener. Drop (success or panic) restores the previous flag.
+/// Synchronizes pause ownership with completion of a listener pass. A pass
+/// overlapping any pause cannot certify readiness after that pause is released.
+#[derive(Default)]
+struct ListenerControl(std::sync::Mutex<ListenerState>);
+
+#[derive(Default)]
+struct ListenerState {
+    pauses: usize,
+    generation: u64,
+    healthy: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ListenerPass {
+    generation: u64,
+    dispatch: bool,
+}
+
+impl ListenerControl {
+    fn begin(&self) -> ListenerPass {
+        let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        ListenerPass {
+            generation: state.generation,
+            dispatch: state.pauses == 0,
+        }
+    }
+
+    fn finish(&self, pass: ListenerPass, succeeded: bool) {
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if state.generation == pass.generation {
+            state.healthy = succeeded && pass.dispatch && state.pauses == 0;
+        }
+    }
+
+    fn invalidate(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .healthy = false;
+    }
+
+    fn healthy(&self) -> bool {
+        let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        state.healthy && state.pauses == 0
+    }
+
+    fn paused(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pauses
+            != 0
+    }
+
+    fn pause(self: &Arc<Self>) -> ListenerPauseGuard {
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        state.pauses = state
+            .pauses
+            .checked_add(1)
+            .expect("listener pause counter overflow");
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .expect("listener generation overflow");
+        state.healthy = false;
+        ListenerPauseGuard {
+            control: self.clone(),
+        }
+    }
+}
+
+/// Dispatch resumes only after every outstanding pause guard is dropped.
 pub struct ListenerPauseGuard {
-    flag: Arc<AtomicBool>,
+    control: Arc<ListenerControl>,
 }
 
 impl Drop for ListenerPauseGuard {
     fn drop(&mut self) {
-        self.flag.store(false, Ordering::Release);
+        let mut state = self
+            .control
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.pauses -= 1;
+    }
+}
+
+struct ClientThreadHealth {
+    alive: Arc<AtomicBool>,
+    listeners: Arc<ListenerControl>,
+}
+
+impl Drop for ClientThreadHealth {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+        self.listeners.invalidate();
     }
 }
 
@@ -471,22 +581,7 @@ impl MidenClient {
         // `crate::remote_signer::CustodyMode`.
         custody: crate::remote_signer::CustodyMode,
     ) -> anyhow::Result<Self> {
-        // Critical section: enforce a single live production MidenClient. The
-        // flag is cleared by the background thread on clean shutdown (see the
-        // `Ok(())` arm of the run loop below).
-        {
-            let mut live = LIVE_CLIENT
-                .lock()
-                .expect("MidenClient singleton guard poisoned");
-            if *live {
-                return Err(anyhow!(
-                    "a MidenClient is already live — MidenClient must be a process-wide \
-                     singleton (the single owner of the sqlite store); refusing to open \
-                     store.sqlite3 from a second in-process client"
-                ));
-            }
-            *live = true;
-        }
+        let ownership = ClientOwnership::acquire(&LIVE_CLIENT)?;
         let store_dir = store_dir.unwrap_or(Self::default_store_dir());
         let node_endpoint = node_url
             .map(Self::parse_node_url)
@@ -513,11 +608,16 @@ impl MidenClient {
         let (done_sender, done_receiver) = oneshot::channel::<()>();
         let alive = Arc::new(AtomicBool::new(false));
         let alive_for_run = alive.clone();
-        let listeners_paused = Arc::new(AtomicBool::new(false));
-        let listeners_paused_for_run = listeners_paused.clone();
+        let listener_control = Arc::new(ListenerControl::default());
+        let listener_control_for_run = listener_control.clone();
 
         let runtime = tokio::runtime::Runtime::new()?;
         let task = thread::spawn(move || -> anyhow::Result<()> {
+            let _ownership = ownership;
+            let _thread_health = ClientThreadHealth {
+                alive: alive_for_run.clone(),
+                listeners: listener_control_for_run.clone(),
+            };
             let local_set = tokio::task::LocalSet::new();
             let mut receiver = receiver;
             let mut done_receiver = done_receiver;
@@ -535,22 +635,19 @@ impl MidenClient {
                     &sync_listeners,
                     debug_mode,
                     &alive_for_run,
-                    &listeners_paused_for_run,
+                    &listener_control_for_run,
                 )));
 
                 match result {
                     Ok(()) => {
-                        // Clean shutdown (done_receiver signalled). Release the
-                        // singleton guard so a subsequent MidenClient::new (e.g.
-                        // the init → runtime handoff in main) can build.
+                        // The ownership guard releases the singleton on exit.
                         alive_for_run.store(false, Ordering::Release);
-                        *LIVE_CLIENT
-                            .lock()
-                            .expect("MidenClient singleton guard poisoned") = false;
+                        listener_control_for_run.invalidate();
                         return Ok(());
                     }
                     Err(err) => {
                         alive_for_run.store(false, Ordering::Release);
+                        listener_control_for_run.invalidate();
                         metrics::counter!("miden_client_restarts_total").increment(1);
                         tracing::error!("MidenClient::run crashed: {err:#}, restarting in 5s...");
                         std::thread::sleep(Duration::from_secs(5));
@@ -568,7 +665,7 @@ impl MidenClient {
             done_sender,
             alive,
             local_prover_fallback,
-            listeners_paused,
+            listener_control,
             #[cfg(test)]
             call_count: Arc::new(AtomicUsize::new(0)),
         })
@@ -594,20 +691,19 @@ impl MidenClient {
     /// the live `BridgeOutScanner` / `ClaimWatcher` cannot interleave with
     /// the consumed-note replay loop and double-emit synthetic logs.
     ///
-    /// Calling this while already paused is safe: each guard restores the
-    /// flag to `false` on drop, but the wider `restore()` codepath holds the
-    /// outermost guard for its entire duration, so the inner reset is a
-    /// no-op in practice.
+    /// Nested and overlapping guards keep dispatch paused until all are dropped.
     pub fn pause_listeners(&self) -> ListenerPauseGuard {
-        self.listeners_paused.store(true, Ordering::Release);
-        ListenerPauseGuard {
-            flag: self.listeners_paused.clone(),
-        }
+        self.listener_control.pause()
     }
 
-    /// Cantina MA#23 — true while `on_post_sync` dispatch is suppressed.
+    /// True while post-sync dispatch is suppressed by any pause owner.
     pub fn listeners_paused(&self) -> bool {
-        self.listeners_paused.load(Ordering::Acquire)
+        self.listener_control.paused()
+    }
+
+    /// All post-sync listeners completed successfully since the last pause or failure.
+    pub fn listeners_healthy(&self) -> bool {
+        self.listener_control.healthy()
     }
 
     /// Returns true if the background thread is connected and syncing.
@@ -661,7 +757,10 @@ impl MidenClient {
             done_sender: std::sync::Mutex::new(Some(done_sender)),
             alive: Arc::new(AtomicBool::new(true)),
             local_prover_fallback: None,
-            listeners_paused: Arc::new(AtomicBool::new(false)),
+            listener_control: Arc::new(ListenerControl(std::sync::Mutex::new(ListenerState {
+                healthy: true,
+                ..Default::default()
+            }))),
             call_count,
         }
     }
@@ -699,7 +798,10 @@ impl MidenClient {
                 done_sender: std::sync::Mutex::new(Some(done_sender)),
                 alive: Arc::new(AtomicBool::new(true)),
                 local_prover_fallback: None,
-                listeners_paused: Arc::new(AtomicBool::new(false)),
+                listener_control: Arc::new(ListenerControl(std::sync::Mutex::new(ListenerState {
+                    healthy: true,
+                    ..Default::default()
+                }))),
                 call_count,
             },
             release_sender,
@@ -857,13 +959,12 @@ impl MidenClient {
         result: anyhow::Result<SyncSummary>,
         client: &mut MidenClientLib,
         listeners: &[Arc<dyn SyncListener>],
-        listeners_paused: &AtomicBool,
+        paused: bool,
     ) -> anyhow::Result<()> {
         let summary = result?;
         // Cantina MA#23 — sample once per sync tick so the pause/unpause
         // transitions don't interleave with this listener loop. Cheap and
         // race-resilient: a tick that begins while paused completes paused.
-        let paused = listeners_paused.load(Ordering::Acquire);
         for listener in listeners {
             // `on_sync` is the cheap summary hook — keep firing it so
             // listeners can keep low-frequency tick-counter state in step
@@ -886,6 +987,18 @@ impl MidenClient {
         Ok(())
     }
 
+    async fn on_sync_tracked(
+        result: anyhow::Result<SyncSummary>,
+        client: &mut MidenClientLib,
+        listeners: &[Arc<dyn SyncListener>],
+        control: &ListenerControl,
+    ) -> anyhow::Result<()> {
+        let pass = control.begin();
+        let outcome = Self::on_sync(result, client, listeners, !pass.dispatch).await;
+        control.finish(pass, outcome.is_ok());
+        outcome
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn run(
         store_dir: PathBuf,
@@ -899,7 +1012,7 @@ impl MidenClient {
         sync_listeners: &[Arc<dyn SyncListener>],
         debug_mode: bool,
         alive: &AtomicBool,
-        listeners_paused: &AtomicBool,
+        listener_control: &ListenerControl,
     ) -> anyhow::Result<()> {
         // node client — retry build with exponential backoff
         let node_timeout_ms: u64 = 10_000;
@@ -981,7 +1094,7 @@ impl MidenClient {
         tokio::select! {
             result = Self::sync(&mut client) => {
                 let synced = result.is_ok();
-                if let Err(err) = Self::on_sync(result, &mut client, sync_listeners, listeners_paused).await {
+                if let Err(err) = Self::on_sync_tracked(result, &mut client, sync_listeners, listener_control).await {
                     tracing::error!("MidenClient initial sync listener error: {err:#}");
                 }
                 alive.store(synced, Ordering::Release);
@@ -1007,7 +1120,7 @@ impl MidenClient {
                     tokio::select! {
                         result = Self::sync(&mut client) => {
                             alive.store(result.is_ok(), Ordering::Release);
-                            if let Err(err) = Self::on_sync(result, &mut client, sync_listeners, listeners_paused).await {
+                            if let Err(err) = Self::on_sync_tracked(result, &mut client, sync_listeners, listener_control).await {
                                 tracing::error!("MidenClient sync listener error: {err:#}");
                             }
                         },
@@ -1239,6 +1352,103 @@ async fn wait_for_transaction_commit_inner(
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_overlapping_pause_invalidates_the_entire_listener_pass() {
+        let control = Arc::new(ListenerControl::default());
+        control.finish(control.begin(), true);
+        assert!(control.healthy());
+        let running = control.begin();
+        let pause = control.pause();
+        drop(pause);
+        control.finish(running, true);
+        assert!(
+            !control.healthy(),
+            "a pre-pause pass cannot certify recovery"
+        );
+
+        let pause = control.pause();
+        let skipped = control.begin();
+        assert!(!skipped.dispatch);
+        drop(pause);
+        control.finish(skipped, true);
+        assert!(!control.healthy(), "a skipped pass cannot certify recovery");
+        control.finish(control.begin(), true);
+        assert!(control.healthy());
+    }
+
+    #[test]
+    fn client_thread_unwind_clears_liveness_and_listener_readiness() {
+        let alive = Arc::new(AtomicBool::new(true));
+        let control = Arc::new(ListenerControl::default());
+        control.finish(control.begin(), true);
+        let _ = std::panic::catch_unwind({
+            let alive = alive.clone();
+            let listeners = control.clone();
+            move || {
+                let _health = ClientThreadHealth { alive, listeners };
+                panic!("actor panic after successful sync");
+            }
+        });
+        assert!(!alive.load(Ordering::Acquire));
+        assert!(!control.healthy());
+    }
+
+    #[test]
+    fn singleton_ownership_is_released_after_failed_construction_and_unwind() {
+        let live = std::sync::Mutex::new(false);
+        let construct = || -> anyhow::Result<()> {
+            let _ownership = ClientOwnership::acquire(&live)?;
+            assert!(ClientOwnership::acquire(&live).is_err());
+            anyhow::bail!("configuration failed before spawning the client");
+        };
+        assert!(construct().is_err());
+        let ownership = ClientOwnership::acquire(&live).unwrap();
+        drop(ownership);
+        let _ = std::panic::catch_unwind(|| {
+            let _ownership = ClientOwnership::acquire(&live).unwrap();
+            panic!("background thread unwound");
+        });
+        assert!(ClientOwnership::acquire(&live).is_ok());
+    }
+
+    #[tokio::test]
+    async fn listener_failure_and_pause_require_a_complete_successful_pass() {
+        use miden_protocol::block::BlockNumber;
+
+        struct FailingListener(AtomicBool);
+        #[async_trait::async_trait]
+        impl SyncListener for FailingListener {
+            fn on_sync(&self, _: &SyncSummary) {}
+            async fn on_post_sync(&self, _: &mut MidenClientLib) -> anyhow::Result<()> {
+                anyhow::ensure!(!self.0.load(Ordering::Acquire), "listener failed");
+                Ok(())
+            }
+        }
+        let mut client = crate::test_helpers::offline_miden_client_lib().await;
+        let listener = Arc::new(FailingListener(AtomicBool::new(true)));
+        let listeners: Vec<Arc<dyn SyncListener>> = vec![listener.clone()];
+        let control = Arc::new(ListenerControl::default());
+        control.finish(control.begin(), true);
+        let summary = || Ok(SyncSummary::new_empty(BlockNumber::from(1u32)));
+        assert!(
+            MidenClient::on_sync_tracked(summary(), &mut client, &listeners, &control)
+                .await
+                .is_err()
+        );
+        assert!(!control.healthy());
+        listener.0.store(false, Ordering::Release);
+        let pause = control.pause();
+        MidenClient::on_sync_tracked(summary(), &mut client, &listeners, &control)
+            .await
+            .unwrap();
+        assert!(!control.healthy(), "skipped listeners are not recovered");
+        drop(pause);
+        MidenClient::on_sync_tracked(summary(), &mut client, &listeners, &control)
+            .await
+            .unwrap();
+        assert!(control.healthy());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn issue_210_sync_deadline_drops_work_before_releasing_the_client() {
         let dropped = Arc::new(AtomicBool::new(false));
@@ -1406,11 +1616,8 @@ mod tests {
         assert!(!client.listeners_paused(), "drop releases the pause");
     }
 
-    /// Cantina MA#23 — nesting two guards keeps the flag paused for the
-    /// entire outer scope. Inner-drop releases the flag prematurely, but
-    /// the outer guard runs `drop()` next and re-asserts the released
-    /// state — this test pins the documented "outer guard wins" behaviour
-    /// so future refactors don't silently turn pause into a counter.
+    /// Dropping either overlapping guard must not resume dispatch while another
+    /// caller still owns a pause.
     #[test]
     fn ma23_pause_listeners_guards_nest() {
         let client = MidenClient::new_test();
@@ -1420,12 +1627,26 @@ mod tests {
             let inner = client.pause_listeners();
             assert!(client.listeners_paused());
             drop(inner);
-            // Current contract: inner drop releases the flag. The outer
-            // guard's existence does NOT keep it paused on its own —
-            // restore() must hold a single guard for its entire window.
-            assert!(!client.listeners_paused());
+            assert!(
+                client.listeners_paused(),
+                "outer guard must keep dispatch paused"
+            );
         }
         drop(outer);
+        assert!(!client.listeners_paused());
+        assert!(
+            !client.listeners_healthy(),
+            "a fresh pass is required after a pause"
+        );
+
+        let first = client.pause_listeners();
+        let second = client.pause_listeners();
+        drop(first);
+        assert!(
+            client.listeners_paused(),
+            "drop order must not change ownership"
+        );
+        drop(second);
         assert!(!client.listeners_paused());
     }
 
@@ -1485,14 +1706,14 @@ mod tests {
         let mut client = crate::test_helpers::offline_miden_client_lib().await;
         let listener = Arc::new(CountingListener::default());
         let listeners: Vec<Arc<dyn SyncListener>> = vec![listener.clone()];
-        let paused = AtomicBool::new(true);
+        let paused = AtomicUsize::new(1);
 
         // Tick 1: paused — on_sync fires, on_post_sync is suppressed.
         MidenClient::on_sync(
             Ok(SyncSummary::new_empty(BlockNumber::from(1u32))),
             &mut client,
             &listeners,
-            &paused,
+            paused.load(Ordering::Acquire) != 0,
         )
         .await
         .unwrap();
@@ -1512,19 +1733,19 @@ mod tests {
             Ok(SyncSummary::new_empty(BlockNumber::from(2u32))),
             &mut client,
             &listeners,
-            &paused,
+            paused.load(Ordering::Acquire) != 0,
         )
         .await
         .unwrap();
         assert_eq!(listener.on_post_sync_calls.load(Ordering::SeqCst), 0);
 
         // Tick 3: unpaused (guard dropped in production) — dispatch resumes.
-        paused.store(false, Ordering::Release);
+        paused.store(0, Ordering::Release);
         MidenClient::on_sync(
             Ok(SyncSummary::new_empty(BlockNumber::from(3u32))),
             &mut client,
             &listeners,
-            &paused,
+            paused.load(Ordering::Acquire) != 0,
         )
         .await
         .unwrap();
@@ -1586,7 +1807,7 @@ mod tests {
             Ok(SyncSummary::new_empty(BlockNumber::from(1u32))),
             &mut lib,
             &listeners,
-            &client.listeners_paused,
+            client.listeners_paused(),
         )
         .await
         .unwrap();
@@ -1607,7 +1828,7 @@ mod tests {
             Ok(SyncSummary::new_empty(BlockNumber::from(2u32))),
             &mut lib,
             &listeners,
-            &client.listeners_paused,
+            client.listeners_paused(),
         )
         .await
         .unwrap();

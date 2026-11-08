@@ -324,9 +324,82 @@ pub enum CatchUpMode {
     Restore,
 }
 
+/// A completed projection pass, rather than node connectivity alone, establishes
+/// readiness. Keep a failure latched while retrying: starting the next pass must
+/// not briefly report healthy before the same blocking gate is checked again.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ProjectionHealthSnapshot {
+    pub ready: bool,
+    pub running: bool,
+    pub projector_cursor: u64,
+    pub reconcile_cursor: u64,
+    pub target_tip: Option<u64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Default)]
+struct ProjectionHealthState {
+    snapshot: ProjectionHealthSnapshot,
+    failed_this_pass: bool,
+}
+
+#[derive(Default)]
+pub struct ProjectionHealth {
+    state: std::sync::Mutex<ProjectionHealthState>,
+}
+
+impl ProjectionHealth {
+    pub fn snapshot(&self) -> ProjectionHealthSnapshot {
+        self.state
+            .lock()
+            .expect("projection health")
+            .snapshot
+            .clone()
+    }
+
+    fn begin_pass(&self, target_tip: u64, projector_cursor: u64, reconcile_cursor: u64) {
+        let mut state = self.state.lock().expect("projection health");
+        state.failed_this_pass = false;
+        state.snapshot.running = true;
+        state.snapshot.target_tip = Some(target_tip);
+        state.snapshot.projector_cursor = projector_cursor;
+        state.snapshot.reconcile_cursor = reconcile_cursor;
+    }
+
+    fn record_failure(&self, error: &anyhow::Error) {
+        let mut state = self.state.lock().expect("projection health");
+        state.failed_this_pass = true;
+        state.snapshot.ready = false;
+        state.snapshot.last_error = Some(format!("{error:#}"));
+    }
+
+    fn record_progress(&self, projector_cursor: u64, reconcile_cursor: u64) {
+        let mut state = self.state.lock().expect("projection health");
+        state.snapshot.projector_cursor = projector_cursor;
+        state.snapshot.reconcile_cursor = reconcile_cursor;
+    }
+
+    fn finish_pass(&self, projector_cursor: u64, reconcile_cursor: u64) {
+        let mut state = self.state.lock().expect("projection health");
+        state.snapshot.running = false;
+        state.snapshot.projector_cursor = projector_cursor;
+        state.snapshot.reconcile_cursor = reconcile_cursor;
+        if !state.failed_this_pass
+            && state
+                .snapshot
+                .target_tip
+                .is_some_and(|target| projector_cursor >= target && reconcile_cursor >= target)
+        {
+            state.snapshot.ready = true;
+            state.snapshot.last_error = None;
+        }
+    }
+}
+
 pub struct SyntheticProjector {
     store: Arc<dyn Store>,
     block_state: Arc<BlockState>,
+    health: Arc<ProjectionHealth>,
     /// Bridge account id — the sole legitimate consumer of a bridge-out B2AGG
     /// note (MA#3) and the expected GER target (MA#28).
     bridge_id: AccountId,
@@ -490,6 +563,7 @@ impl SyntheticProjector {
         Ok(Self {
             store,
             block_state,
+            health: Arc::new(ProjectionHealth::default()),
             bridge_id: accounts.bridge.0,
             local_network_id,
             expected_ger_sender,
@@ -511,6 +585,10 @@ impl SyntheticProjector {
             audit_tick_counter: AtomicU64::new(0),
             claim_calldata_resolved: std::sync::Mutex::new(HashSet::new()),
         })
+    }
+
+    pub fn health(&self) -> Arc<ProjectionHealth> {
+        self.health.clone()
     }
 
     async fn load_pending_duplicate(
@@ -844,6 +922,8 @@ impl SyntheticProjector {
                 // cursor un-advanced so the window is re-swept.
                 self.store.set_reconcile_cursor(to).await?;
                 self.reconcile_cursor.store(to, Ordering::Release);
+                self.health
+                    .record_progress(self.cursor.load(Ordering::Acquire), to);
                 metrics::gauge!("synthetic_reconciler_cursor").set(to as f64);
             }
             // Budget check AFTER the batch: at least one batch always runs
@@ -1306,8 +1386,10 @@ impl SyntheticProjector {
     /// projector logged "caught up to the Miden tip" at cursor 92, a bridge-out
     /// landed, and then
     ///
-    ///     ERROR MidenClient sync listener error:
-    ///           LET gate: bridge account 0xd09f96bd… is unavailable
+    /// ```text
+    /// ERROR MidenClient sync listener error:
+    ///   LET gate: bridge account 0xd09f96bd… is unavailable
+    /// ```
     ///
     /// repeated every 5s while `reconcile_cursor` ran on to 149 and
     /// `projector_cursor` stayed at 92. No BridgeEvent was ever emitted, so the
@@ -1636,11 +1718,14 @@ impl SyntheticProjector {
     /// seals until reconciliation reaches that same tip, because LET cardinality is a tip
     /// invariant.
     pub async fn tick(&self, client: &mut MidenClientLib) -> anyhow::Result<u64> {
-        let tip = client
-            .get_sync_height()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to get sync height: {e}"))?
-            .as_u64();
+        let tip = match client.get_sync_height().await {
+            Ok(height) => height.as_u64(),
+            Err(error) => {
+                let error = anyhow::anyhow!("failed to get sync height: {error}");
+                self.health.record_failure(&error);
+                return Err(error);
+            }
+        };
         self.tick_pass(client, tip, ReconcilePatience::LiveTick, true)
             .await
     }
@@ -1649,6 +1734,31 @@ impl SyntheticProjector {
     /// restore driver. The tip is a parameter and never re-queried so a
     /// producing node cannot drag a restore past its captured target.
     async fn tick_pass(
+        &self,
+        client: &mut MidenClientLib,
+        tip: u64,
+        reconcile_patience: ReconcilePatience,
+        enforce_let_cardinality: bool,
+    ) -> anyhow::Result<u64> {
+        self.health.begin_pass(
+            tip,
+            self.cursor.load(Ordering::Acquire),
+            self.reconcile_cursor.load(Ordering::Acquire),
+        );
+        let result = self
+            .tick_pass_inner(client, tip, reconcile_patience, enforce_let_cardinality)
+            .await;
+        if let Err(error) = &result {
+            self.health.record_failure(error);
+        }
+        self.health.finish_pass(
+            self.cursor.load(Ordering::Acquire),
+            self.reconcile_cursor.load(Ordering::Acquire),
+        );
+        result
+    }
+
+    async fn tick_pass_inner(
         &self,
         client: &mut MidenClientLib,
         tip: u64,
@@ -1666,6 +1776,10 @@ impl SyntheticProjector {
         )
         .await
         {
+            // Live discovery errors are retried below without aborting the
+            // callback, but must still withhold readiness until discovery and
+            // publication both complete a later pass successfully.
+            self.health.record_failure(&e);
             match reconcile_patience {
                 ReconcilePatience::LiveTick => tracing::warn!(
                     error = %format!("{e:#}"),
@@ -1962,6 +2076,8 @@ impl SyntheticProjector {
                     .store(frontier, Ordering::Release);
             }
             self.cursor.store(next, Ordering::Release);
+            self.health
+                .record_progress(next, self.reconcile_cursor.load(Ordering::Acquire));
             cursor = next;
         }
         // (Claim-calldata backfill already ran once this tick, before the at-tip early return.)
@@ -2016,6 +2132,7 @@ impl SyntheticProjector {
         self.restore_posture.store(false, Ordering::Release);
         self.restore_next_deposit_index.store(0, Ordering::Release);
         self.restore_session_tip.store(0, Ordering::Release);
+        *self.health.state.lock().expect("projection health") = ProjectionHealthState::default();
         tracing::warn!(
             "projector cursors reset to genesis (discovery + projection, persisted + in-memory)"
         );
@@ -2512,6 +2629,68 @@ impl SyncListener for SyntheticProjector {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn projection_readiness_requires_a_completed_pass_and_latches_failures() {
+        let health = super::ProjectionHealth::default();
+        assert!(
+            !health.snapshot().ready,
+            "startup has no verified projection pass"
+        );
+
+        health.begin_pass(100, 0, 0);
+        health.finish_pass(0, 50);
+        assert!(
+            !health.snapshot().ready,
+            "discovery alone cannot establish readiness"
+        );
+        health.begin_pass(100, 0, 50);
+        health.finish_pass(100, 100);
+        assert!(health.snapshot().ready);
+
+        // A normal new block / bounded catch-up pass must not oscillate readiness.
+        health.begin_pass(110, 100, 100);
+        assert!(health.snapshot().ready);
+        health.finish_pass(100, 105);
+        assert!(health.snapshot().ready);
+
+        // A publication gate fails despite a successful node sync. Retrying and
+        // advancing discovery must not clear it before publication reaches tip.
+        health.begin_pass(110, 100, 105);
+        health.record_failure(&anyhow::anyhow!("reserved LET leaf has no BridgeEvent"));
+        health.finish_pass(101, 110);
+        assert!(!health.snapshot().ready);
+        health.begin_pass(112, 101, 110);
+        assert!(
+            !health.snapshot().ready,
+            "retry start must retain the blocker"
+        );
+        health.finish_pass(102, 112);
+        assert!(
+            !health.snapshot().ready,
+            "partial recovery must retain the blocker"
+        );
+        health.begin_pass(112, 102, 112);
+        health.finish_pass(112, 112);
+        assert!(health.snapshot().ready);
+        assert!(health.snapshot().last_error.is_none());
+    }
+
+    #[test]
+    fn swallowed_discovery_failure_cannot_be_cleared_by_the_same_pass() {
+        let health = super::ProjectionHealth::default();
+        health.begin_pass(10, 10, 10);
+        health.finish_pass(10, 10);
+        health.begin_pass(10, 10, 10);
+        health.record_failure(&anyhow::anyhow!("note discovery unavailable"));
+        health.finish_pass(10, 10);
+        assert!(!health.snapshot().ready);
+        assert!(!health.snapshot().running);
+        assert!(health.snapshot().last_error.is_some());
+        health.begin_pass(10, 10, 10);
+        health.finish_pass(10, 10);
+        assert!(health.snapshot().ready);
+    }
+
     // ── FINDING #112: typed node-backpressure classification + backoff ──────
     // The classifier must fire ONLY on the client's typed
     // ResourceExhausted/Unavailable request errors (mirroring miden-client's

@@ -73,7 +73,7 @@ admission/reconciliation, or until an operator handles a surfaced stranded row.
 | `agglayer_writer_queue_depth` | Jobs currently waiting in the bounded channel |
 | `agglayer_writer_inflight_jobs` | Queued, submitting, and terminal entries not yet evicted |
 | `agglayer_writer_oldest_nonterminal_age_seconds` | Age of the oldest queued/submitting job, even with queue depth zero. Start with an alert above 300s for 1m; use [phase diagnostics](writer-stalls.md) to locate the wait |
-| `agglayer_writer_job_duration_seconds{kind,outcome}` | Dequeue-to-outcome latency; `kind=claim|ger_insert`; current outcomes include `committed`, `failed`, and `pending` for ambiguous durable handoffs |
+| `agglayer_writer_job_duration_seconds{kind,outcome}` | Dequeue-to-attempt-outcome latency; `kind=claim|ger_insert`; outcomes are `dispatch_complete`, `awaiting_projection`, `awaiting_reconciliation`, `dispatch_failed`, and `waiting_for_funds`. These describe worker ownership and observations, not durable receipt finality; query the receipt for that. |
 | `agglayer_writer_queue_full_rejections_total{kind}` | JSON-RPC `-32005` backpressure responses |
 | `agglayer_writer_job_failures_total{kind,reason}` | Terminal failures; reasons emitted by current paths include `ttl`, `miden`, and `panic` |
 | `agglayer_writer_drain_outcome_total{outcome}` | Graceful shutdowns labelled `clean` or `partial` |

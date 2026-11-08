@@ -68,12 +68,12 @@ pass "writer worker is active in $AGGLAYER_CONTAINER"
 # eth_sendRawTransaction, which on a freshly-up stack can land a minute or
 # two after the containers report healthy. An instant probe races it and
 # false-fails the suite — retry until the full surface (all three series AND
-# a committed job) is present, then run the assertions once on that snapshot.
+# a completed dispatch) is present, then run assertions once on that snapshot.
 METRICS_PROBE=""
 for _ in $(seq 1 60); do
     METRICS_PROBE=$(curl -fsS "$L2_RPC/metrics" 2>/dev/null || echo "")
     if grep -q "^# HELP agglayer_writer_queue_depth" <<<"$METRICS_PROBE" \
-        && grep -qE '^agglayer_writer_job_duration_seconds_count\{.*outcome="committed"' <<<"$METRICS_PROBE"; then
+        && grep -qE '^agglayer_writer_job_duration_seconds_count\{.*outcome="(dispatch_complete|awaiting_projection)"' <<<"$METRICS_PROBE"; then
         break
     fi
     sleep 3
@@ -90,11 +90,12 @@ pass "writer-active metrics surface present (queue_depth + inflight_jobs + job_d
 
 # Confirm the worker has actually processed at least one job — without this
 # we can't tell whether the worker is wired correctly or is silently sitting
-# idle. The histogram's _count series increments on every terminal job.
-if ! grep -qE '^agglayer_writer_job_duration_seconds_count\{.*outcome="committed"' <<<"$METRICS_PROBE"; then
-    fail "no committed jobs in agglayer_writer_job_duration_seconds within 180s — worker may be inert"
+# idle. Require a successful dispatch outcome; ambiguous handoffs and failed
+# attempts are insufficient evidence. Receipt finality belongs to the projector.
+if ! grep -qE '^agglayer_writer_job_duration_seconds_count\{.*outcome="(dispatch_complete|awaiting_projection)"' <<<"$METRICS_PROBE"; then
+    fail "no completed dispatches in agglayer_writer_job_duration_seconds within 180s — worker may be inert"
 fi
-pass "at least one job committed via the worker (RD-940 dispatch is live)"
+pass "at least one dispatch completed via the worker (RD-940 dispatch is live)"
 
 # dropped_on_restart MUST be 0 at the start of a fresh test run. The series
 # only renders once it has been touched; the boot path in src/main.rs reads

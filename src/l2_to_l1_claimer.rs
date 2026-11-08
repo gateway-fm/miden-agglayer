@@ -165,8 +165,9 @@ pub enum Readiness {
     NotReadyRetry,
     /// Already claimed on L1 — skip (belt-and-braces; we also pre-gate on isClaimed).
     AlreadyClaimed,
-    /// Anything else — surfaced loudly, not silently retried as if transient.
-    Permanent(String),
+    /// Simulation failed without authoritative completion evidence. Keep the
+    /// exit discoverable; even a bad proof can be repaired by a later fetch.
+    Retry(String),
 }
 
 fn selector_hex<E: SolError>() -> String {
@@ -185,7 +186,7 @@ pub fn classify_revert(err_text: &str) -> Readiness {
     } else if contains("alreadyclaimed") || contains(&selector_hex::<AlreadyClaimed>()) {
         Readiness::AlreadyClaimed
     } else {
-        Readiness::Permanent(err_text.to_string())
+        Readiness::Retry(err_text.to_string())
     }
 }
 
@@ -546,10 +547,9 @@ async fn submit<P: Provider>(
 
 /// Process one exit end-to-end: gate on isClaimed, fetch proof, simulate, submit.
 ///
-/// Returns `true` when the exit is RESOLVED (claimed now, already claimed, or a
-/// permanent failure we won't keep retrying) so the caller may advance the block
-/// cursor past it; `false` when it is merely NOT-READY-YET (proof not synced /
-/// GER not settled on L1) and must be re-discovered on a later poll. The caller
+/// Returns `true` only with completion evidence (already claimed or a successful
+/// on-chain receipt), allowing the caller to advance the block cursor past it.
+/// All other outcomes keep the exit discoverable on a later poll. The caller
 /// holds the cursor below any not-ready exit so re-discovery actually happens —
 /// advancing unconditionally would skip the block forever and the exit would
 /// never be claimed.
@@ -616,11 +616,14 @@ async fn process_exit<P1: Provider, P2: Provider>(
             );
             true
         }
-        Readiness::Permanent(err) => {
-            // Doomed: advance past it rather than re-scanning every poll forever.
-            tracing::error!(leaf = exit.leaf_index, error = %err, "claim simulation failed permanently; skipping");
-            metrics::counter!("bridge_autoclaim_permanent_failures_total").increment(1);
-            true
+        Readiness::Retry(err) => {
+            // RPC outages, unknown reverts, and stale/bad proofs are not proof
+            // that this exit is complete. Keep the cursor behind it and make
+            // the blockage visible while later polls fetch fresh evidence.
+            tracing::warn!(leaf = exit.leaf_index, block = exit.block_number, error = %err,
+                "claim simulation failed; retaining exit for retry");
+            metrics::counter!("bridge_autoclaim_simulation_retries_total").increment(1);
+            false
         }
     };
     Ok(resolved)
@@ -882,10 +885,144 @@ mod tests {
     }
 
     #[test]
-    fn classify_unknown_is_permanent() {
-        match classify_revert("execution reverted: InvalidSmtProof()") {
-            Readiness::Permanent(_) => {}
-            other => panic!("expected Permanent, got {other:?}"),
+    fn simulation_failures_keep_the_exit_retryable() {
+        for error in [
+            "execution reverted: InvalidSmtProof()",
+            "execution reverted: unrecognized custom error 0x12345678",
+            "HTTP 429 too many requests",
+            "connection reset by peer",
+            "RPC request timed out",
+            "upstream unavailable",
+        ] {
+            assert!(
+                matches!(classify_revert(error), Readiness::Retry(_)),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn simulation_rpc_and_transport_failures_retry_then_recover() {
+        use alloy_transport::mock::Asserter;
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let exit = PendingExit {
+            leaf_index: 1,
+            origin_network: 0,
+            origin_address: Address::ZERO,
+            destination_network: 0,
+            destination_address: Address::ZERO,
+            amount: U256::from(1),
+            metadata: Bytes::new(),
+            block_number: 10,
+        };
+        let proof = ProofBundle {
+            main_exit_root: FixedBytes::ZERO,
+            rollup_exit_root: FixedBytes::ZERO,
+            smt_local: [FixedBytes::ZERO; 32],
+            smt_rollup: [FixedBytes::ZERO; 32],
+        };
+        let call = build_claim_call(&exit, &proof, 1);
+        asserter.push_failure_msg("upstream temporarily unavailable");
+        assert!(matches!(
+            simulate(&provider, Address::ZERO, Address::ZERO, &call).await,
+            Readiness::Retry(_)
+        ));
+        // An empty mock queue is a transport error rather than a JSON-RPC error.
+        assert!(matches!(
+            simulate(&provider, Address::ZERO, Address::ZERO, &call).await,
+            Readiness::Retry(_)
+        ));
+        asserter.push_success(&Bytes::new());
+        assert_eq!(
+            simulate(&provider, Address::ZERO, Address::ZERO, &call).await,
+            Readiness::Ready
+        );
+    }
+
+    /// Drive the real discovery/poll loop. A later exit finishing must not let
+    /// an earlier RPC failure disappear behind the persistent cursor.
+    #[tokio::test]
+    async fn poll_retains_earliest_unresolved_exit_and_advances_after_recovery() {
+        use alloy_transport::mock::Asserter;
+        let l1_responses = Asserter::new();
+        let l2_responses = Asserter::new();
+        let l1 = ProviderBuilder::new().connect_mocked_client(l1_responses.clone());
+        let l2 = ProviderBuilder::new().connect_mocked_client(l2_responses.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claimer.sqlite");
+        let cfg = ClaimerConfig {
+            l2_rpc_url: "http://unused.invalid".into(),
+            l1_rpc_url: "http://unused.invalid".into(),
+            l1_bridge_address: Address::ZERO,
+            l2_bridge_address: Address::ZERO,
+            bridge_service_url: "http://unused.invalid".into(),
+            network_id: 1,
+            sponsor_key: String::new(),
+            poll_interval: Duration::from_secs(1),
+            max_range: 100,
+            start_block: None,
+            cursor_db_path: path.to_str().unwrap().into(),
+        };
+        let logs: Vec<_> = [10, 20]
+            .into_iter()
+            .map(|block| {
+                let event = BridgeEvent {
+                    leafType: 0,
+                    originNetwork: 0,
+                    originAddress: Address::ZERO,
+                    destinationNetwork: 0,
+                    destinationAddress: Address::ZERO,
+                    amount: U256::from(1),
+                    metadata: Bytes::new(),
+                    depositCount: block as u32,
+                };
+                alloy::rpc::types::Log {
+                    inner: alloy::primitives::Log {
+                        address: Address::ZERO,
+                        data: event.encode_log_data(),
+                    },
+                    block_number: Some(block),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let mut claimed = [0u8; 32];
+        claimed[31] = 1;
+        let claimed = Bytes::copy_from_slice(&claimed);
+        let cursor = CursorStore::open(&cfg.cursor_db_path).unwrap();
+        let mut last_processed = 0;
+        let http = reqwest::Client::new();
+        for poll in 0..2 {
+            l2_responses.push_success(&alloy::primitives::U64::from(20));
+            l2_responses.push_success(&logs);
+            l2_responses.push_success(&Option::<serde_json::Value>::None);
+            if poll == 0 {
+                l1_responses.push_failure_msg("temporary RPC outage");
+            } else {
+                l1_responses.push_success(&claimed);
+            }
+            l1_responses.push_success(&claimed);
+            poll_once(
+                &l1,
+                &l2,
+                &http,
+                &cfg,
+                Address::ZERO,
+                &cursor,
+                &mut last_processed,
+            )
+            .await
+            .unwrap();
+            let expected = if poll == 0 { 9 } else { 20 };
+            assert_eq!(last_processed, expected);
+            assert_eq!(
+                CursorStore::open(&cfg.cursor_db_path)
+                    .unwrap()
+                    .get()
+                    .unwrap(),
+                Some(expected)
+            );
         }
     }
 

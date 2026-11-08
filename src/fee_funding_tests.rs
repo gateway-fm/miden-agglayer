@@ -266,9 +266,20 @@ fn skipped_notes_do_not_use_the_per_tick_budget() {
 }
 
 async fn client_with_notes(account: &Account, notes: &[Note]) -> (MidenClientLib, Arc<MockRpcApi>) {
-    let mut builder = MockChainBuilder::with_accounts([account.clone()])
-        .unwrap()
-        .verification_base_fee(7);
+    client_with_notes_and_fee(account, notes, 7).await
+}
+
+async fn client_with_notes_and_fee(
+    account: &Account,
+    notes: &[Note],
+    base_fee: u32,
+) -> (MidenClientLib, Arc<MockRpcApi>) {
+    let mut builder = if account.is_new() {
+        MockChainBuilder::new()
+    } else {
+        MockChainBuilder::with_accounts([account.clone()]).unwrap()
+    }
+    .verification_base_fee(base_fee);
     for note in notes {
         builder.add_output_note(RawOutputNote::Full(note.clone()));
     }
@@ -301,6 +312,169 @@ async fn client_with_notes(account: &Account, notes: &[Note]) -> (MidenClientLib
         .await
         .unwrap();
     (client, rpc)
+}
+
+#[tokio::test(start_paused = true)]
+async fn deployment_timeout_then_retry_reconciles_exact_transaction_without_duplicates() {
+    use miden_client::rpc::node::GetAccountError;
+    use miden_client::rpc::{EndpointError, GrpcError};
+    use miden_client::store::TransactionFilter;
+    use miden_client::transaction::TransactionStatus;
+
+    for base_fee in [0, 7] {
+        let account = Account::builder([92; 32])
+            .account_type(miden_protocol::account::AccountType::Public)
+            .with_components(Auth::IncrNonce)
+            .with_component(miden_standards::account::wallets::BasicWallet)
+            .build()
+            .unwrap();
+        let notes = if base_fee == 0 {
+            vec![]
+        } else {
+            vec![p2id(account.id(), 73)]
+        };
+        let (mut client, rpc) = client_with_notes_and_fee(&account, &notes, base_fee).await;
+        let fee = FeeSnapshot {
+            verification_base_fee: base_fee,
+            ..snapshot()
+        };
+        // The stock mock unwraps an absent public account. Supply the real node's
+        // typed absence response for this preflight instead.
+        rpc.fail_next_call(
+            RpcEndpoint::GetAccount,
+            RpcError::RequestError {
+                endpoint: RpcEndpoint::GetAccount,
+                error_kind: GrpcError::NotFound,
+                endpoint_error: Some(EndpointError::GetAccount(GetAccountError::AccountNotFound)),
+                source: None,
+            },
+        );
+        for attempt in 0..2 {
+            let error = deploy_account(
+                &mut client,
+                account.id(),
+                "service",
+                DeployKind::Wallet,
+                crate::metrics::ProofKind::Init,
+                &fee,
+                Duration::ZERO,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("submitted but not observed committed"),
+                "{error:#}"
+            );
+            let transactions = client
+                .get_transactions(TransactionFilter::All)
+                .await
+                .unwrap();
+            assert_eq!(
+                transactions.len(),
+                1,
+                "retry {attempt} must reuse the accepted transaction"
+            );
+            assert!(matches!(transactions[0].status, TransactionStatus::Pending));
+            assert!(
+                !client
+                    .get_account(account.id())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_new(),
+                "the optimistic local nonce is already positive despite no on-chain commit"
+            );
+        }
+        rpc.advance_blocks(1);
+        deploy_account(
+            &mut client,
+            account.id(),
+            "service",
+            DeployKind::Wallet,
+            crate::metrics::ProofKind::Init,
+            &fee,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        let transactions = client
+            .get_transactions(TransactionFilter::All)
+            .await
+            .unwrap();
+        assert_eq!(
+            transactions.len(),
+            1,
+            "chain-confirmed retry must not deploy again"
+        );
+        assert!(matches!(
+            transactions[0].status,
+            TransactionStatus::Committed { .. }
+        ));
+    }
+}
+
+#[tokio::test]
+async fn deployment_reconciliation_node_error_never_authorizes_a_send() {
+    let account = wallet();
+    let (mut client, rpc) = client_with_notes(&account, &[]).await;
+    rpc.fail_next_call(
+        RpcEndpoint::GetAccount,
+        RpcError::InvalidResponse("node unavailable".into()),
+    );
+    assert!(
+        deploy_account(
+            &mut client,
+            account.id(),
+            "service",
+            DeployKind::Wallet,
+            crate::metrics::ProofKind::Init,
+            &snapshot(),
+            Duration::ZERO
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        client
+            .get_transactions(miden_client::store::TransactionFilter::All)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn funding_ack_without_commit_does_not_report_success() {
+    let mut account = wallet();
+    account.vault_mut().add_asset(fee_asset(1_000)).unwrap();
+    let (mut client, rpc) = client_with_notes(&account, &[]).await;
+    let error = fund_from_service(
+        &mut client,
+        account.id(),
+        snapshot().fee_faucet_id,
+        "bridge",
+        100,
+        &snapshot(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("submitted but not observed committed")
+    );
+    rpc.advance_blocks(1);
+    client.sync_state().await.unwrap();
+    assert_eq!(
+        client
+            .get_output_notes(NoteFilter::All)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]

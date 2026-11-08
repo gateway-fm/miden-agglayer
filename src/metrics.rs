@@ -668,8 +668,10 @@ pub fn init_metrics() {
     );
     describe_histogram!(
         "agglayer_writer_job_duration_seconds",
-        "RD-940: time from worker dequeue to terminal outcome (committed / \
-         failed). Labels: kind=claim|ger_insert, outcome=committed|failed. \
+        "RD-940: time from worker dequeue to attempt outcome, independently of \
+         receipt finality. Labels: kind=claim|ger_insert; outcomes include \
+         dispatch_complete, awaiting_projection, awaiting_reconciliation, \
+         dispatch_failed, waiting_for_funds. \
          Alert: p99 >60s for 10 min → page (aggkit's WaitTxToBeMined=2m)."
     );
     describe_counter!(
@@ -1348,7 +1350,7 @@ mod tests {
             metrics::histogram!(
                 "agglayer_writer_job_duration_seconds",
                 "kind" => "ger_insert",
-                "outcome" => "committed"
+                "outcome" => "dispatch_complete"
             )
             .record(12.0);
         });

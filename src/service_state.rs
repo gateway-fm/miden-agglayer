@@ -77,6 +77,9 @@ pub struct ServiceState {
     /// See `src/block_monitor.rs` module docstring. Cloned via `Arc`
     /// across every dispatcher; shared write surface for tip mirror updates.
     pub block_monitor: Arc<BlockMonitor>,
+    /// Shared with the live projector. Node sync alone does not prove that
+    /// synthetic history passed its discovery and publication gates.
+    pub projection_health: Arc<crate::synthetic_projector::ProjectionHealth>,
     /// L1 RPC URL for resolving exit roots from the L1 GER contract
     pub l1_rpc_url: Option<String>,
     /// L1 GER contract address
@@ -178,6 +181,7 @@ impl ServiceState {
             store,
             block_state,
             block_monitor,
+            projection_health: Arc::new(crate::synthetic_projector::ProjectionHealth::default()),
             l1_rpc_url: None,
             ger_l1_address: None,
             miden_store_dir: PathBuf::new(),

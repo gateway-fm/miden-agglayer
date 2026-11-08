@@ -2,6 +2,7 @@
 
 CARGO_PROFILE ?= dev
 CARGO_RELEASE_ARG := $(if $(filter release,$(CARGO_PROFILE)),--release,)
+CARGO_BIN_DIR := target/$(if $(filter dev,$(CARGO_PROFILE)),debug,$(CARGO_PROFILE))
 
 .PHONY: help
 help: ## Show description of all commands
@@ -74,13 +75,16 @@ test-unit: ## Run unit tests (no docker needed)
 
 .PHONY: test-scripts
 test-scripts: ## Syntax-check + run the shell guard test harnesses (no docker needed)
+	cargo build --locked --profile=$(CARGO_PROFILE) --bin bridge-out-tool
+	bash -n scripts/lib-tool-preflight.sh scripts/test-tool-preflight.sh
+	bash scripts/test-tool-preflight.sh
 	bash -n scripts/release-acceptance.sh
 	bash -n scripts/release-acceptance-guards.test.sh
 	bash scripts/release-acceptance-guards.test.sh
 	bash -n scripts/verify-event-completeness.sh
 	bash -n scripts/test-verify-completeness-substitution.sh
 	python3 -m py_compile scripts/lib-verify-completeness.py
-	TOOL_BIN=target/release/bridge-out-tool bash scripts/test-verify-completeness-substitution.sh
+	TOOL_BIN=$(CARGO_BIN_DIR)/bridge-out-tool bash scripts/test-verify-completeness-substitution.sh
 	# Verdict predicates that decide whether a gate passes. This one returned
 	# OK for an all-zero operational tuple — a run that did no work certifying
 	# itself — so it runs here rather than only inside a docker-bound e2e.

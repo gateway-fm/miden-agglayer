@@ -128,10 +128,12 @@ impl BurnSerialTracker {
             .store
             .burn_serial_observe_for_note(&serial, &note_id)
             .await?;
-        // Cache the OWNER either way: on the benign path so re-observations are
-        // cheap, and on the collision path so the alarm is not re-raised on
-        // every subsequent tick for the same pair.
-        self.cache.lock().put(serial, note_id);
+        // Only a store-confirmed owner may enter this cache. Caching the
+        // colliding observer would make the real owner look like an attacker
+        // on the next read and incorrectly accept the colliding note as benign.
+        if benign {
+            self.cache.lock().put(serial, note_id);
+        }
         Ok(if benign {
             Outcome::New
         } else {
@@ -259,8 +261,17 @@ mod tests {
             t2.record(serial, [0x0Bu8; 32]).await.unwrap(),
             Outcome::Duplicate
         );
-        // After the store roundtrip the cache is populated.
-        assert_eq!(t2.cache_size(), 1);
+        // A conflicting observer must never become the cached owner.
+        assert_eq!(t2.cache_size(), 0);
+        assert_eq!(t2.record(serial, [0x0Au8; 32]).await.unwrap(), Outcome::New);
+        assert_eq!(
+            t2.record(serial, [0x0Bu8; 32]).await.unwrap(),
+            Outcome::Duplicate
+        );
+        assert_eq!(
+            t2.record(serial, [0x0Cu8; 32]).await.unwrap(),
+            Outcome::Duplicate
+        );
         // The ORIGINAL note is still benign across the restart.
         let t3 = BurnSerialTracker::new(store.clone());
         assert_eq!(t3.record(serial, [0x0Au8; 32]).await.unwrap(), Outcome::New);
@@ -286,6 +297,16 @@ mod tests {
         // would return New here and Cantina #5 would slip through.
         assert_eq!(
             t.record(s1, [0xB1u8; 32]).await.unwrap(),
+            Outcome::Duplicate
+        );
+        // The cold collision must not displace the persisted owner.
+        assert_eq!(t.record(s1, [0xA1u8; 32]).await.unwrap(), Outcome::New);
+        assert_eq!(
+            t.record(s1, [0xB1u8; 32]).await.unwrap(),
+            Outcome::Duplicate
+        );
+        assert_eq!(
+            t.record(s1, [0xC1u8; 32]).await.unwrap(),
             Outcome::Duplicate
         );
     }

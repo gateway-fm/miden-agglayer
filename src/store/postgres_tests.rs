@@ -1256,9 +1256,82 @@ async fn test_pgstore_rd913_twin_notes() {
     assert!(commitments.contains(&c2));
 }
 
-/// PgStore round-trip for monitor_expected_mints. Record → load → tick
-/// updates → remove. Exercises the full state machine the
-/// `ExpectedMintTracker` drives.
+/// Run the actual upgrade against temporary legacy tables, including an old
+/// fee-note identity that only the fenced CLAIM handoff can repair.
+#[tokio::test]
+async fn test_pgstore_claim_watchdog_upgrade_repairs_proven_identity_and_retains_unknown_alerts() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let connection = tokio::spawn(connection);
+    client
+        .batch_execute(
+            "CREATE TEMP TABLE monitor_expected_mints (
+        global_index BYTEA PRIMARY KEY, expected_mint BYTEA NOT NULL,
+        ticks_pending INT NOT NULL DEFAULT 0, alerted BOOLEAN NOT NULL DEFAULT FALSE);
+        CREATE TEMP TABLE claimed_indices (global_index TEXT PRIMARY KEY, owner_tx_hash TEXT);
+        CREATE TEMP TABLE tx_note_links (tx_hash TEXT PRIMARY KEY, note_commitment TEXT NOT NULL);",
+        )
+        .await
+        .unwrap();
+    for index in 1..=3u8 {
+        let mut gi = [0u8; 32];
+        gi[31] = index;
+        client
+            .execute(
+                "INSERT INTO monitor_expected_mints VALUES ($1,$2,60,TRUE)",
+                &[&gi.as_slice(), &[0xEEu8; 32].as_slice()],
+            )
+            .await
+            .unwrap();
+    }
+    client
+        .batch_execute(
+            "INSERT INTO claimed_indices VALUES ('0x1','owner'),('0x3','invalid');
+        INSERT INTO tx_note_links VALUES ('owner',repeat('ab',32)),('invalid','malformed');",
+        )
+        .await
+        .unwrap();
+    client
+        .batch_execute(include_str!(
+            "../../migrations/030_claim_watchdog_delivery.sql"
+        ))
+        .await
+        .unwrap();
+    let rows = client
+        .query(
+            "SELECT global_index, expected_mint, ticks_pending, alert_pending,
+        generation FROM monitor_expected_mints ORDER BY global_index",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3, "upgrade must never discard legacy watchdogs");
+    for (i, row) in rows.iter().enumerate() {
+        let expected: Vec<u8> = row.get(1);
+        assert_eq!(
+            expected,
+            if i == 0 {
+                vec![0xAB; 32]
+            } else {
+                vec![0xEE; 32]
+            }
+        );
+        assert_eq!(row.get::<_, i32>(2), 60);
+        assert!(
+            row.get::<_, bool>(3),
+            "due delivery must survive identity repair"
+        );
+        assert!(row.get::<_, i64>(4) > 0);
+    }
+    drop(client);
+    connection.await.unwrap().unwrap();
+}
+
+/// Real PostgreSQL acknowledgement generations protect resumed watchdogs.
 #[tokio::test]
 async fn test_pgstore_rd913_expected_mints() {
     let Some(store) = pg_store().await else {
@@ -1266,26 +1339,95 @@ async fn test_pgstore_rd913_expected_mints() {
     };
     let mut gi = [0u8; 32];
     gi[..8].copy_from_slice(&rand_u64().to_be_bytes());
-    let mint = [0xCCu8; 32];
-
-    store.expected_mint_record(&gi, &mint).await.unwrap();
-    let rows = store.expected_mint_load_all().await.unwrap();
-    let found = rows.iter().find(|(g, _, _, _)| *g == gi).unwrap();
-    assert_eq!(found.1, mint);
-    assert_eq!(found.2, 0);
-    assert!(!found.3);
-
-    // Bump tick + alerted flag.
-    store.expected_mint_update_tick(&gi, 5, true).await.unwrap();
-    let rows = store.expected_mint_load_all().await.unwrap();
-    let found = rows.iter().find(|(g, _, _, _)| *g == gi).unwrap();
-    assert_eq!(found.2, 5);
-    assert!(found.3);
-
-    // Remove. The row should be gone.
+    let claim = [0xCCu8; 32];
+    store.expected_mint_record(&gi, &claim).await.unwrap();
+    let row = store
+        .expected_mint_load_all()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.global_index == gi)
+        .unwrap();
+    assert_eq!(row.claim_note, claim);
+    assert_eq!(row.ticks_pending, 0);
+    assert!(!row.alert_pending);
+    assert!(
+        store
+            .expected_mint_update_tick(&gi, row.generation, 5, true)
+            .await
+            .unwrap()
+    );
     store.expected_mint_remove(&gi).await.unwrap();
-    let rows = store.expected_mint_load_all().await.unwrap();
-    assert!(rows.iter().all(|(g, _, _, _)| *g != gi));
+    let due = store
+        .expected_mint_load_all()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.global_index == gi)
+        .unwrap();
+    assert!(due.alert_pending);
+    assert_eq!(due.ticks_pending, 5);
+
+    store.expected_mint_record(&gi, &claim).await.unwrap();
+    store
+        .expected_mint_acknowledge_alert(&gi, row.generation)
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .expected_mint_update_tick(&gi, row.generation, 99, true)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .expected_mint_remove_generation(&gi, row.generation)
+            .await
+            .unwrap()
+    );
+    let resumed = store
+        .expected_mint_load_all()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.global_index == gi)
+        .unwrap();
+    assert_ne!(resumed.generation, row.generation);
+    assert_eq!(resumed.ticks_pending, 0);
+    assert!(
+        store
+            .expected_mint_update_tick(&gi, resumed.generation, 5, true)
+            .await
+            .unwrap()
+    );
+    store
+        .expected_mint_acknowledge_alert(&gi, resumed.generation)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .expected_mint_load_all()
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.global_index != gi)
+    );
+
+    store.expected_mint_record(&gi, &claim).await.unwrap();
+    let recreated = store
+        .expected_mint_load_all()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.global_index == gi)
+        .unwrap();
+    assert_ne!(recreated.generation, resumed.generation);
+    assert!(
+        store
+            .expected_mint_remove_generation(&gi, recreated.generation)
+            .await
+            .unwrap()
+    );
 }
 
 // ── Cantina MA#18 — unbridgeable bridge-outs ─────────────────

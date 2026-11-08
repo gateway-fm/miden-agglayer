@@ -24,6 +24,17 @@ use miden_protocol::note::{NoteId, Nullifier};
 use miden_protocol::transaction::TransactionId;
 use std::sync::Arc;
 
+/// Durable CLAIM-consumption watchdog state. `alert_pending` distinguishes a
+/// due alert awaiting delivery from a claim still inside its observation window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClaimWatchEntry {
+    pub global_index: [u8; 32],
+    pub claim_note: [u8; 32],
+    pub ticks_pending: u32,
+    pub alert_pending: bool,
+    pub generation: i64,
+}
+
 // ── eth_getLogs safety ceiling (Cantina #12) ─────────────────────────
 
 /// OOM backstop on the number of **matching** logs a single `eth_getLogs`
@@ -1238,34 +1249,45 @@ pub trait Store: Send + Sync + 'static {
         Ok(true)
     }
 
-    /// Persist an expected-MINT entry for a submitted claim. (Cantina #7)
-    /// Upserts on global_index — re-submission of the same claim resets
-    /// the staleness window, which matches the in-memory contract.
+    /// Persist a submitted CLAIM watchdog, giving every resubmission a new
+    /// generation. Legacy method/table names are retained for compatibility.
     async fn expected_mint_record(
         &self,
         _global_index: &[u8; 32],
-        _expected_mint: &[u8; 32],
+        _claim_note: &[u8; 32],
     ) -> anyhow::Result<()> {
         Ok(())
     }
-    /// Delete the entry for `global_index` (called on Landed / mark_landed).
+    /// Remove an awaiting CLAIM; a due alert requires explicit acknowledgement.
     async fn expected_mint_remove(&self, _global_index: &[u8; 32]) -> anyhow::Result<()> {
         Ok(())
     }
-    /// Load all live entries for the staleness tick. Each row carries
-    /// `(global_index, expected_mint, ticks_pending, alerted)`.
-    async fn expected_mint_load_all(&self) -> anyhow::Result<Vec<([u8; 32], [u8; 32], u32, bool)>> {
+    async fn expected_mint_remove_generation(
+        &self,
+        _global_index: &[u8; 32],
+        _generation: i64,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    /// Load awaiting claims and due alerts. Pending alerts remain durable until
+    /// emission is acknowledged, including across restarts.
+    async fn expected_mint_load_all(&self) -> anyhow::Result<Vec<ClaimWatchEntry>> {
         Ok(Vec::new())
     }
-    /// Persist updated tick / alerted flags after a tick. Default impl
-    /// no-ops so InMemoryStore-only callers (tests) don't have to wire
-    /// it through — those callers reconstruct the tracker from the
-    /// in-memory cache directly.
+    /// Update only the matching generation while it is still awaiting a claim.
     async fn expected_mint_update_tick(
         &self,
         _global_index: &[u8; 32],
+        _generation: i64,
         _ticks_pending: u32,
-        _alerted: bool,
+        _alert_pending: bool,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    async fn expected_mint_acknowledge_alert(
+        &self,
+        _global_index: &[u8; 32],
+        _generation: i64,
     ) -> anyhow::Result<()> {
         Ok(())
     }

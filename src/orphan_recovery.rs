@@ -208,7 +208,7 @@ async fn recover_one(service: &ServiceState, signer: Address, tx: &RecoverablePe
     let live = service
         .writer_handle
         .as_ref()
-        .is_some_and(|h| h.is_inflight(&tx.tx_hash) || h.has_non_terminal_nonce(&signer, tx.nonce));
+        .is_some_and(|h| h.owns_work(&tx.tx_hash) || h.has_non_terminal_nonce(&signer, tx.nonce));
     if live {
         tracing::debug!(target: "recovery", tx_hash = %tx.tx_hash, nonce = tx.nonce, "recovery: live writer job present; skipping");
         return Step::Continue;

@@ -1496,11 +1496,12 @@ async fn service_send_raw_txn_inner(
     let known_store_linked = handoff
         .as_ref()
         .is_some_and(|handoff| handoff.state == crate::store::NoteHandoffState::Submitted);
-    // A pending row without a note handoff is the durable queue intent. It must
-    // be resumed after a crashed process loses its in-memory mpsc contents.
+    // A pending row with neither a note handoff nor a recorded Miden transaction
+    // id is a durable queue intent. A legacy id-only row crossed the submission
+    // boundary and must be reconciled, never rebuilt on rebroadcast.
     let mut known_durable_intent = known_store_entry
         .as_ref()
-        .is_some_and(|entry| entry.result.is_none() && !known_store_linked);
+        .is_some_and(|entry| entry.result.is_none() && entry.id.is_none() && !known_store_linked);
     tracing::info!(
         target: "rpc::nonce_snoop",
         "{}",
@@ -1635,16 +1636,21 @@ async fn service_send_raw_txn_inner(
         {
             return Ok(txn_hash);
         }
-        if !known_durable_intent
-            && let Some(refreshed_entry) = service.store.txn_get(txn_hash).await?
+        // Refresh even when the optimistic read found an unsubmitted intent:
+        // a writer can cross the handoff boundary while this request waits for
+        // the signer lock. An earlier intent classification is not permission
+        // to build another note from that now-submitted transaction.
+        let refreshed_entry = service.store.txn_get(txn_hash).await?;
+        let refreshed_handoff = service.store.get_note_handoff_for_tx(&tx_key).await?;
+        if refreshed_entry
+            .as_ref()
+            .is_some_and(|entry| entry.result.is_some() || entry.id.is_some())
+            || refreshed_handoff.is_some()
         {
-            let refreshed_handoff = service.store.get_note_handoff_for_tx(&tx_key).await?;
-            if refreshed_entry.result.is_some() || refreshed_handoff.is_some() {
-                repair_commit_gap_nonce(&service, &signer_str, tx_nonce).await?;
-                return Ok(txn_hash);
-            }
-            known_durable_intent = true;
+            repair_commit_gap_nonce(&service, &signer_str, tx_nonce).await?;
+            return Ok(txn_hash);
         }
+        known_durable_intent = refreshed_entry.is_some();
 
         // R4 — nonce validation. Pre-fix the proxy advanced its tracked nonce
         // only on success and never compared the incoming `tx.nonce` against
@@ -2443,6 +2449,153 @@ mod tests {
         let mut encoded = Vec::new();
         envelope.encode_2718(&mut encoded);
         (format!("0x{}", ::hex::encode(encoded)), signer)
+    }
+
+    #[tokio::test]
+    async fn legacy_miden_id_without_note_link_is_not_redriven_on_rebroadcast() {
+        let service = create_test_service();
+        let calldata = insertGlobalExitRootCall {
+            root: FixedBytes::from([0xD6; 32]),
+        }
+        .abi_encode();
+        let (input, signer) = encode_legacy_tx(calldata);
+        let bytes = hex_decode_prefixed(&input).unwrap();
+        let envelope = TxEnvelope::decode_2718(&mut bytes.as_slice()).unwrap();
+        let hash = unwrap_txn_envelope(envelope.clone()).unwrap().hash;
+        let miden_id =
+            miden_protocol::transaction::TransactionId::from_raw(miden_protocol::Word::from([
+                1u32, 2, 3, 4,
+            ]));
+        service
+            .store
+            .txn_begin(
+                hash,
+                TxnEntry {
+                    id: Some(miden_id),
+                    envelope,
+                    signer,
+                    expires_at: None,
+                    logs: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        let signer_str = format!("{signer:#x}");
+        service
+            .store
+            .nonce_advance_cas(&signer_str, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            service_send_raw_txn(service.clone(), input).await.unwrap(),
+            hash
+        );
+
+        assert_eq!(
+            service.miden_client.test_call_count(),
+            0,
+            "a legacy submission must not build or submit a second note"
+        );
+        let stored = service.store.txn_get(hash).await.unwrap().unwrap();
+        assert_eq!(stored.id, Some(miden_id));
+        assert!(stored.result.is_none());
+        assert!(
+            service
+                .store
+                .get_note_handoff_for_tx(&format!("{hash:#x}"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(service.store.nonce_get(&signer_str).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn pending_intent_is_reclassified_after_waiting_for_signer_lock() {
+        for legacy_id in [false, true] {
+            let service = create_test_service();
+            let calldata = insertGlobalExitRootCall {
+                root: FixedBytes::from([0xD7; 32]),
+            }
+            .abi_encode();
+            let (input, signer) = encode_legacy_tx(calldata);
+            let bytes = hex_decode_prefixed(&input).unwrap();
+            let envelope = TxEnvelope::decode_2718(&mut bytes.as_slice()).unwrap();
+            let hash = unwrap_txn_envelope(envelope.clone()).unwrap().hash;
+            let entry = |id| TxnEntry {
+                id,
+                envelope: envelope.clone(),
+                signer,
+                expires_at: None,
+                logs: vec![],
+            };
+            service.store.txn_begin(hash, entry(None)).await.unwrap();
+            service
+                .store
+                .nonce_advance_cas(&format!("{signer:#x}"), 0)
+                .await
+                .unwrap();
+            let lock = service.per_signer_locks.lock(signer).await;
+            let request = service_send_raw_txn(service.clone(), input);
+            tokio::pin!(request);
+            // In-memory store operations complete immediately, so this drives
+            // the optimistic intent read and stops at the held signer lock.
+            let first_poll = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(request.as_mut(), cx))
+            })
+            .await;
+            assert!(first_poll.is_pending());
+            if legacy_id {
+                let inserted = service
+                    .store
+                    .txn_begin_if_absent(
+                        hash,
+                        entry(Some(miden_protocol::transaction::TransactionId::from_raw(
+                            miden_protocol::Word::from([1u32, 2, 3, 4]),
+                        ))),
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    !inserted,
+                    "the existing pending intent is enriched in place"
+                );
+                assert!(
+                    service
+                        .store
+                        .txn_get(hash)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .id
+                        .is_some()
+                );
+            } else {
+                service
+                    .store
+                    .prepare_note_handoff(&format!("{hash:#x}"), "committed-note", "note", 100)
+                    .await
+                    .unwrap();
+            }
+            drop(lock);
+
+            assert_eq!(request.await.unwrap(), hash);
+            assert_eq!(
+                service.miden_client.test_call_count(),
+                0,
+                "a freshly observed handoff/id must prevent rebuilding the optimistic intent"
+            );
+            assert!(service.store.txn_receipt(hash).await.unwrap().is_none());
+            assert_eq!(
+                service
+                    .store
+                    .nonce_get(&format!("{signer:#x}"))
+                    .await
+                    .unwrap(),
+                1
+            );
+        }
     }
 
     /// Build + encode a legacy tx REALLY signed by `signer_key` with an explicit

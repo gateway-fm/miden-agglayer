@@ -830,6 +830,8 @@ async fn shutdown_signal() {
 /// recovery until every historical ClaimEvent's `claimAsset` calldata has been
 /// re-persisted — otherwise `eth_getTransactionByHash` serves an empty-input
 /// claim and aggkit's full-claim parser stalls on it.
+/// A live node also cannot establish readiness while synthetic projection is
+/// blocked or its callbacks have not completed successfully.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Readiness {
     Ready,
@@ -840,17 +842,26 @@ pub(crate) enum Readiness {
     RecoveringCalldata {
         claims_awaiting_calldata: u64,
     },
+    /// Projection has not completed its initial pass, is blocked, or its sync
+    /// callbacks are paused/failing. Ordinary active catch-up stays ready.
+    RecoveringProjection,
 }
 
 /// Pure readiness decision (unit-testable in isolation): node liveness first,
-/// then the historical-claim calldata-repair backlog.
-pub(crate) fn readiness_from(node_alive: bool, claims_awaiting_calldata: u64) -> Readiness {
+/// then historical-claim calldata repair, then synthetic projection readiness.
+pub(crate) fn readiness_from(
+    node_alive: bool,
+    claims_awaiting_calldata: u64,
+    projection_ready: bool,
+) -> Readiness {
     if !node_alive {
         Readiness::Degraded
     } else if claims_awaiting_calldata > 0 {
         Readiness::RecoveringCalldata {
             claims_awaiting_calldata,
         }
+    } else if !projection_ready {
+        Readiness::RecoveringProjection
     } else {
         Readiness::Ready
     }
@@ -858,6 +869,10 @@ pub(crate) fn readiness_from(node_alive: bool, claims_awaiting_calldata: u64) ->
 
 async fn health_check(State(service): State<ServiceState>) -> impl IntoResponse {
     let node_alive = service.miden_client.is_alive();
+    let projection = service.projection_health.snapshot();
+    let listeners_paused = service.miden_client.listeners_paused();
+    let listeners_healthy = service.miden_client.listeners_healthy();
+    let projection_ready = projection.ready && !listeners_paused && listeners_healthy;
     // #148: withhold readiness while any historical ClaimEvent still lacks its
     // persisted claimAsset calldata (retained-PG + reset-Miden-store recovery),
     // so consumers are never released onto an empty-input claim. In steady state
@@ -877,10 +892,10 @@ async fn health_check(State(service): State<ServiceState>) -> impl IntoResponse 
         }
     };
     ::metrics::gauge!("claim_calldata_repair_backlog").set(backlog as f64);
-    match readiness_from(node_alive, backlog) {
+    match readiness_from(node_alive, backlog, projection_ready) {
         Readiness::Ready => (
             http::StatusCode::OK,
-            axum::Json(serde_json::json!({ "status": "ok" })),
+            axum::Json(serde_json::json!({ "status": "ok", "projection": projection })),
         ),
         Readiness::Degraded => (
             http::StatusCode::SERVICE_UNAVAILABLE,
@@ -894,6 +909,7 @@ async fn health_check(State(service): State<ServiceState>) -> impl IntoResponse 
                 // node-reconnect window (the `recovering`/alive=true window can be skipped
                 // when the same initial tick that flips alive true also drains the backlog).
                 "claims_awaiting_calldata": backlog,
+                "projection": projection,
             })),
         ),
         Readiness::RecoveringCalldata {
@@ -905,6 +921,23 @@ async fn health_check(State(service): State<ServiceState>) -> impl IntoResponse 
                 "reason": "historical claim calldata repair in progress \
                            (retained-PostgreSQL + reset-Miden-store recovery)",
                 "claims_awaiting_calldata": claims_awaiting_calldata,
+                "projection": projection,
+            })),
+        ),
+        Readiness::RecoveringProjection => (
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "status": "recovering",
+                "reason": if listeners_paused {
+                    "projection callbacks paused"
+                } else if !listeners_healthy {
+                    "sync callbacks have not completed successfully"
+                } else if projection.last_error.is_some() {
+                    "synthetic projection blocked; retry pending"
+                } else {
+                    "initial synthetic projection catch-up in progress"
+                },
+                "projection": projection,
             })),
         ),
     }
@@ -1177,25 +1210,31 @@ mod tests {
     fn readiness_gates_on_calldata_backlog() {
         use super::{Readiness, readiness_from};
         // Node down → Degraded regardless of the backlog.
-        assert_eq!(readiness_from(false, 0), Readiness::Degraded);
-        assert_eq!(readiness_from(false, 5), Readiness::Degraded);
+        assert_eq!(readiness_from(false, 0, true), Readiness::Degraded);
+        assert_eq!(readiness_from(false, 5, true), Readiness::Degraded);
         // Node up but claims still awaiting calldata → NOT ready (the #148 gate:
         // consumers are withheld so aggkit is never released onto empty input).
         assert_eq!(
-            readiness_from(true, 3),
+            readiness_from(true, 3, true),
             Readiness::RecoveringCalldata {
                 claims_awaiting_calldata: 3
             }
         );
         assert_eq!(
-            readiness_from(true, 1),
+            readiness_from(true, 1, true),
             Readiness::RecoveringCalldata {
                 claims_awaiting_calldata: 1
             }
         );
         // Positive control — node up + backlog cleared → Ready (steady state /
         // repair complete). Proves the not-ready assertions above are non-vacuous.
-        assert_eq!(readiness_from(true, 0), Readiness::Ready);
+        assert_eq!(readiness_from(true, 0, true), Readiness::Ready);
+        // A responsive node cannot release consumers onto a blocked projector.
+        assert_eq!(
+            readiness_from(true, 0, false),
+            Readiness::RecoveringProjection
+        );
+        assert_eq!(readiness_from(false, 0, false), Readiness::Degraded);
     }
 
     /// Self-review R1 — repro+regression. Pre-fix, every `admin_*` JSON-RPC method
