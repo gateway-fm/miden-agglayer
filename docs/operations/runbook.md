@@ -491,10 +491,15 @@ run would only measure idempotence, not fidelity.
 The submitter nonce ledger is proxy-local and cannot be reconstructed from
 Miden. A restore into a fresh PostgreSQL database therefore records a durable
 rebuild marker. On the next serving boot, a signer with no nonce row may park
-its first observed transaction; after a three-projected-block settle margin,
-the lowest eligible parked nonce becomes that signer's baseline and the
+its first observed transaction; after both three projected blocks and at least
+30 seconds since that row's first durable park, the lowest eligible parked nonce
+becomes that signer's baseline and the
 contiguous run is promoted. Ordinary nonce ordering applies after that
 first-contact seed.
+
+The elapsed-time margin uses the database's insertion timestamp and clock.
+Re-broadcasts and process restarts preserve it. Rapid projection catch-up cannot
+replace this real observation time with already-produced blocks.
 
 The global first-contact window defaults to six hours from the restore stamp
 and is configured with `NONCE_RECOVERY_WINDOW_SECS`. Restarts do not extend it.
@@ -511,6 +516,9 @@ window, admit only the expected pre-loss identities, and verify
 `rpc_nonce_ledger_bootstrapped_total` against that inventory. The
 `rpc_nonce_recovery_mode_expired_total` counter records retirement of the
 global window; already stamped rows remain grandfathered until handled.
+The stamp records recovery-era admission, not prior signer history. The finite
+observation margin reduces arrival-order races; a lower nonce arriving after
+baseline adoption is still rejected and must be resubmitted at the current nonce.
 
 ### Full Miden sqlite reset plus restore
 

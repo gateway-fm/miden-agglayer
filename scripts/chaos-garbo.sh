@@ -50,6 +50,7 @@ FOREIGN_STORE="$PROJECT_DIR/.b2agg-store/chaos-garbo-foreign"
 
 source "$SCRIPT_DIR/lib-l2l2.sh"          # constants, pgq, log helpers, containers
 source "$SCRIPT_DIR/lib-isolated-wallet.sh"
+source "$SCRIPT_DIR/lib-chaos-owned.sh"
 
 FUNDED_KEY="${FUNDED_KEY:-0x12d7de8621a77640c9241b2595ba78ce443d05e94090365ab3bb5e19df82c625}"
 DEST_NETWORK=1
@@ -151,6 +152,7 @@ garbo_private_note() {
     out=$(iso_tool --send-private-note --wallet-id "$WALLET_ID" 2>&1) || {
         glog "GARBO private-note: send FAILED (transient?) — $(echo "$out" | tail -1)"; return 1; }
     note_id=$(echo "$out" | grep '\[private-note\] note-id:' | awk '{print $NF}')
+    [[ "${note_id#0x}" =~ ^[a-fA-F0-9]{64}$ ]] || { glog "GARBO private-note: missing/invalid committed note identity"; return 1; }
     PRIVATE_FIRED=$((PRIVATE_FIRED + 1))
     # PR#145: record the id so the soak can assert its ABSENCE from the proxy
     # store directly (a leak persists rows before it is ever served).
@@ -210,7 +212,7 @@ garbo_foreign_claim() {
         --foreign-bridge-id "$fbid" --foreign-service-id "$fs" --foreign-ger-manager-id "$fg" \
         --scale-exp 10 2>&1) || { glog "GARBO foreign-claim: --submit-foreign-claim FAILED — $(echo "$fc_out" | tail -3)"; return 1; }
     fgi=$(echo "$fc_out" | grep "global-index:" | awk '{print $NF}')
-    [[ -n "$fgi" ]] || { glog "GARBO foreign-claim: could not parse foreign global index"; return 1; }
+    [[ "${fgi#0x}" =~ ^[a-fA-F0-9]{64}$ ]] || { glog "GARBO foreign-claim: could not parse foreign global index"; return 1; }
     FOREIGN_FIRED=$((FOREIGN_FIRED + 1))
     echo "${fgi#0x}" >> "$STATE/foreign_fired"     # survives the background worker
     FOREIGN_GIS="$FOREIGN_GIS ${fgi#0x}"
@@ -221,7 +223,11 @@ garbo_foreign_claim() {
 # Counters come from $STATE, never from memory: both classes run as background
 # workers, so a variable incremented inside one would be lost when its subshell
 # exits and the summary would silently report 0 fired.
-nlines() { grep -c . "$1" 2>/dev/null || echo 0; }
+nlines() {
+    local count
+    count=$(grep -c . "$1" 2>/dev/null || true)
+    printf '%s\n' "${count:-0}"
+}
 write_summary() {
     local pf pa ff fa pids gis
     pf=$(nlines "$STATE/private_fired"); pa=$(nlines "$STATE/private_attempts")
@@ -230,6 +236,7 @@ write_summary() {
     gis=$(tr '\n' ' ' < "$STATE/foreign_fired" 2>/dev/null | xargs || true)
     {
         echo "# chaos-garbo summary $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "GARBO_CLEANUP_OK=${GARBO_CLEANUP_OK:-0}"
         echo "GARBO_PRIVATE_FIRED=$pf"
         echo "GARBO_FOREIGN_FIRED=$ff"
         echo "GARBO_FOREIGN_GIS=\"$gis\""
@@ -244,37 +251,24 @@ write_summary() {
     } > "$GARBO_SUMMARY"
     glog "summary -> $GARBO_SUMMARY (private=$pf/$pa foreign=$ff/$fa)"
 }
-# PR#164 re-review — stopping the PARENT must stop the WORKERS. The soak kills
-# only this script's PID; with a summary-only EXIT trap the private/foreign
-# workers survived as orphans and kept injecting garbage traffic for up to their
-# full duration (900s) — straight through the post-chaos settle window and the
-# completeness verdict that is supposed to run on a QUIET stack. Any "extra"
-# events they produced would be attributed to the product.
-#
-# So: forward termination to both children, REAP them, and only then write the
-# summary — the summary must describe a stopped system, not a running one.
+# Each worker has its own supervised session. Stop-file cancellation is safe
+# even after natural completion, and the supervisor kills its descendants
+# before reporting stopped. Docker containers are independently run-labelled.
 stop_workers() {
-    local pid
-    for pid in "${PRIV_PID:-}" "${FOR_PID:-}"; do
-        [ -n "$pid" ] || continue
-        kill "$pid" 2>/dev/null || true
-    done
-    for pid in "${PRIV_PID:-}" "${FOR_PID:-}"; do
-        [ -n "$pid" ] || continue
-        wait "$pid" 2>/dev/null || true
-    done
+    local failed=0
+    chaos_request_stop "${PRIV_CONTROL:-}" || failed=1
+    chaos_request_stop "${FOR_CONTROL:-}" || failed=1
+    [[ -z "${PRIV_CONTROL:-}" ]] || chaos_wait_owned PRIV_PID "$PRIV_CONTROL" || failed=1
+    [[ -z "${FOR_CONTROL:-}" ]] || chaos_wait_owned FOR_PID "$FOR_CONTROL" || failed=1
+    return "$failed"
 }
-on_exit() { stop_workers; write_summary; }
-trap on_exit EXIT
-# Terminating signals run the EXIT trap via explicit exit, so a `kill` from the
-# soak reaps the workers instead of orphaning them.
-trap 'exit 143' TERM
-trap 'exit 130' INT
-
-rm -rf "$STATE"; mkdir -p "$STATE"
-
-: > "$GARBO_LOG"
-glog "=== chaos-garbo start (dur=${GARBO_DURATION}s seed=$SEED foreign=$GARBO_FOREIGN net=$FOREIGN_NETWORK_ID) ==="
+on_exit() {
+    trap '' TERM INT
+    GARBO_CLEANUP_OK=1
+    stop_workers || GARBO_CLEANUP_OK=0
+    chaos_remove_owned_containers "$ISO_CHAOS_OWNER" || GARBO_CLEANUP_OK=0
+    write_summary
+}
 
 # ── #41: BOTH classes are guaranteed, because they now run CONCURRENTLY ──────
 # Running them in sequence means whichever goes first can starve the other, and
@@ -293,7 +287,6 @@ glog "=== chaos-garbo start (dur=${GARBO_DURATION}s seed=$SEED foreign=$GARBO_FO
 # costs nothing and beats a run that cannot assert containment.
 GARBO_PRIVATE_GUARANTEE_TIMEOUT="${GARBO_PRIVATE_GUARANTEE_TIMEOUT:-900}"
 GARBO_FOREIGN_GUARANTEE_TIMEOUT="${GARBO_FOREIGN_GUARANTEE_TIMEOUT:-900}"
-START=$(date +%s)
 deadline_remaining() { echo $(( $1 - $(date +%s) )); }
 
 private_worker() {
@@ -339,12 +332,38 @@ foreign_worker() {
     return 1
 }
 
-private_worker & PRIV_PID=$!
-foreign_worker & FOR_PID=$!
-wait "$PRIV_PID" 2>/dev/null
-wait "$FOR_PID"  2>/dev/null
+# Re-exec workers with the same configuration, without a second parent trap
+# or state reset. This makes each worker (and every shell/docker CLI below it)
+# a separately owned session without exporting shell functions or arrays.
+if [[ "${1:-}" == --worker ]]; then
+    START="${GARBO_STARTED_AT:?worker needs the parent start time}"
+    case "${2:-}" in
+        private) private_worker; exit $? ;;
+        foreign) foreign_worker; exit $? ;;
+        *) exit 2 ;;
+    esac
+fi
+
+ISO_CHAOS_OWNER="${ISO_CHAOS_OWNER:-garbo-$(python3 -c 'import secrets; print(secrets.token_hex(16))')}"
+export ISO_CHAOS_OWNER
+CONTROL_DIR=$(mktemp -d "${TMPDIR:-/tmp}/chaos-garbo-control.XXXXXX") || exit 2
+PRIV_CONTROL="$CONTROL_DIR/private.stop"; FOR_CONTROL="$CONTROL_DIR/foreign.stop"
+trap on_exit EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+rm -rf "$STATE"; mkdir -p "$STATE"
+: > "$GARBO_LOG"
+glog "=== chaos-garbo start (dur=${GARBO_DURATION}s seed=$SEED foreign=$GARBO_FOREIGN net=$FOREIGN_NETWORK_ID owner=$ISO_CHAOS_OWNER) ==="
+START=$(date +%s)
+export GARBO_STARTED_AT="$START"
+python3 "$SCRIPT_DIR/chaos-owned-process.py" --stop-file "$PRIV_CONTROL" -- \
+    bash "$SCRIPT_DIR/chaos-garbo.sh" --worker private & PRIV_PID=$!
+python3 "$SCRIPT_DIR/chaos-owned-process.py" --stop-file "$FOR_CONTROL" -- \
+    bash "$SCRIPT_DIR/chaos-garbo.sh" --worker foreign & FOR_PID=$!
+chaos_wait_owned PRIV_PID "$PRIV_CONTROL" || glog 'GARBO private worker cleanup failed'
+chaos_wait_owned FOR_PID "$FOR_CONTROL" || glog 'GARBO foreign worker cleanup failed'
 PF=$(nlines "$STATE/private_fired"); FF=$(nlines "$STATE/foreign_fired")
 PA=$(nlines "$STATE/private_attempts"); FA=$(nlines "$STATE/foreign_attempts")
 glog "=== chaos-garbo done: private=$PF foreign=$FF ==="
 glog "garbo attempts vs fired: private=$PA/$PF foreign=$FA/$FF"
-# EXIT trap writes the summary.
+# EXIT trap verifies all sessions/containers stopped, then writes the summary.

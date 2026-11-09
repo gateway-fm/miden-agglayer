@@ -1,13 +1,14 @@
 //! In-memory Store implementation — wraps HashMap/RwLock data structures.
 
 use super::{
-    ClaimFence, FaucetEntry, NoteHandoff, NoteHandoffState, PendingNonceFrontier, QueueBounds,
-    QueueOutcome, QueuedTxn, RecoverablePendingTxn, Store, TxnData, TxnEntry,
-    UnbridgeableBridgeOut, UnclaimableClaim,
+    ClaimFence, ClaimState, FaucetEntry, NoteHandoff, NoteHandoffState, PendingNonceFrontier,
+    QueueBounds, QueueOutcome, QueuedTxn, RecoverablePendingTxn, ReservationState, Store, TxnData,
+    TxnEntry, UnbridgeableBridgeOut, UnclaimableClaim,
 };
 use crate::log_synthesis::{
     GerEntry, L2_GLOBAL_EXIT_ROOT_ADDRESS, LogFilter, SyntheticLog, UPDATE_HASH_CHAIN_VALUE_TOPIC,
 };
+use crate::transaction_lifecycle::ReceiptState;
 use alloy::consensus::TxEnvelope;
 use alloy::primitives::{Address, LogData, TxHash, U256};
 use lru::LruCache;
@@ -37,6 +38,19 @@ struct TxnReceipt {
     next_recovery_at: Option<u64>,
 }
 
+struct QueuedTxnRecord {
+    txn: QueuedTxn,
+    created_at: tokio::time::Instant,
+}
+
+impl QueuedTxnRecord {
+    fn snapshot(&self) -> QueuedTxn {
+        let mut txn = self.txn.clone();
+        txn.parked_for = self.created_at.elapsed();
+        txn
+    }
+}
+
 /// #55 BLOCKER 1 — in-memory fenced admission-lease reservation row.
 #[derive(Clone)]
 struct Reservation {
@@ -44,21 +58,6 @@ struct Reservation {
     state: ReservationState,
     lease_expires_at: std::time::Instant,
     fence: u64,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ReservationState {
-    Executing,
-    ReleasedSuccess,
-    ReleasedFailure,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ClaimState {
-    Executing,
-    Prepared,
-    Submitted,
-    Landed,
 }
 
 #[derive(Clone)]
@@ -175,7 +174,8 @@ pub struct InMemoryStore {
     // SAME note is benign; a different note holding the serial is the attack.
     monitor_burn_serials: RwLock<HashMap<[u8; 32], [u8; 32]>>,
     monitor_twin_notes: RwLock<HashMap<[u8; 32], Vec<[u8; 32]>>>,
-    monitor_expected_mints: RwLock<HashMap<[u8; 32], MonitorExpectedMintRow>>,
+    monitor_expected_mints: RwLock<HashMap<[u8; 32], super::ClaimWatchEntry>>,
+    monitor_expected_mint_generation: std::sync::atomic::AtomicI64,
     // Cantina #4 — permanent claim→expected-MINT-IDENTITY reconciliation
     // history (mirror of monitor_claim_mint_serials): serial → full identity.
     monitor_claim_mint_serials: RwLock<HashMap<[u8; 32], crate::store::ExpectedMint>>,
@@ -188,6 +188,9 @@ pub struct InMemoryStore {
     monitor_test_calls: Mutex<HashMap<&'static str, usize>>,
     #[cfg(test)]
     monitor_test_failures: Mutex<HashSet<&'static str>>,
+
+    #[cfg(test)]
+    txn_commit_pause: Mutex<Option<TxnCommitPause>>,
 
     // Synthetic projector cursor (synthetic-indexer redesign, Phase 2a) —
     // last fully-projected Miden block height. Field-backed mirror of the
@@ -238,20 +241,34 @@ pub struct InMemoryStore {
     // #146 future-nonce queue ("mempool"): signer -> (nonce -> parked tx). A
     // BTreeMap keeps nonces ordered so `peek_queued_min_nonce` is the first key.
     // Field-backed mirror of the PgStore `queued_txns` table (migration 020).
-    queued_txns: RwLock<HashMap<String, std::collections::BTreeMap<u64, QueuedTxn>>>,
-}
-
-#[derive(Clone, Copy)]
-struct MonitorExpectedMintRow {
-    expected_mint: [u8; 32],
-    ticks_pending: u32,
-    alerted: bool,
+    queued_txns: RwLock<HashMap<String, std::collections::BTreeMap<u64, QueuedTxnRecord>>>,
 }
 
 const fn assert_sync<T: Send + Sync>() {}
 const _: () = assert_sync::<InMemoryStore>();
 
+#[cfg(test)]
+type TxnCommitPause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
 impl InMemoryStore {
+    /// Pause one receipt write after its caller enters the store, to test
+    /// ownership while persistence is outstanding without scheduling sleeps.
+    #[cfg(test)]
+    pub(crate) fn pause_next_txn_commit(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.txn_commit_pause.lock() = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
     #[cfg(test)]
     pub(crate) fn monitor_calls(&self, operation: &'static str) -> usize {
         self.monitor_test_calls
@@ -328,6 +345,7 @@ impl InMemoryStore {
             monitor_burn_serials: RwLock::new(HashMap::new()),
             monitor_twin_notes: RwLock::new(HashMap::new()),
             monitor_expected_mints: RwLock::new(HashMap::new()),
+            monitor_expected_mint_generation: std::sync::atomic::AtomicI64::new(0),
             monitor_claim_mint_serials: RwLock::new(HashMap::new()),
             #[cfg(test)]
             fail_list_faucets: std::sync::atomic::AtomicBool::new(false),
@@ -335,6 +353,8 @@ impl InMemoryStore {
             monitor_test_calls: Mutex::new(HashMap::new()),
             #[cfg(test)]
             monitor_test_failures: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            txn_commit_pause: Mutex::new(None),
             projector_cursor: RwLock::new(0),
             reconcile_cursor: RwLock::new(0),
             nonce_ledger_rebuilt: RwLock::new(false),
@@ -1386,13 +1406,19 @@ impl Store for InMemoryStore {
         block_num: u64,
         block_hash: [u8; 32],
     ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        {
+            let pause = self.txn_commit_pause.lock().take();
+            if let Some((entered, release)) = pause {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+        }
         // Once an exact handoff exists, an error is ambiguous until commit,
         // observation, or expiration reconciliation. Never expose status 0.
         let logs_to_add = {
             let links = self.tx_note_links.read();
-            if result.is_err() && links.contains_key(&format!("{tx_hash:#x}")) {
-                return Ok(());
-            }
+            let has_handoff = links.contains_key(&format!("{tx_hash:#x}"));
             let mut txns = self.transactions.lock();
             let Some(receipt) = txns.get_mut(&tx_hash) else {
                 anyhow::bail!("Store: transaction {tx_hash} not found");
@@ -1400,22 +1426,12 @@ impl Store for InMemoryStore {
             // A real Miden landing must always beat a failure observation, and a
             // landed success must never be clobbered. Pending failures are
             // terminal; a later real landing may still heal one to success.
-            enum St {
-                Pending,
-                Failed,
-                Success,
-            }
-            let st = match &receipt.result {
-                None => St::Pending,
-                Some(Ok(_)) => St::Success,
-                Some(Err(_)) => St::Failed,
+            let state = match &receipt.result {
+                None => ReceiptState::Pending,
+                Some(Ok(_)) => ReceiptState::Succeeded,
+                Some(Err(_)) => ReceiptState::Failed,
             };
-            let apply = match (&st, result.is_ok()) {
-                (St::Success, _) => false,
-                (_, true) => true,
-                (St::Pending, false) => true,
-                (St::Failed, false) => false,
-            };
+            let apply = state.accepts_result(result.is_ok(), has_handoff);
             if !apply {
                 tracing::debug!(
                     "Store: txn {tx_hash} terminal transition ignored (success-always-wins CAS)"
@@ -1649,7 +1665,7 @@ impl Store for InMemoryStore {
         // Idempotency / conflict at (signer, nonce) BEFORE the bound checks — an
         // already-parked same-hash re-broadcast must accept even at the bound.
         if let Some(existing) = map.get(&key).and_then(|m| m.get(&nonce)) {
-            return Ok(if existing.tx_hash == tx_hash {
+            return Ok(if existing.txn.tx_hash == tx_hash {
                 QueueOutcome::AlreadyParked
             } else {
                 QueueOutcome::ConflictDifferentHash
@@ -1663,13 +1679,17 @@ impl Store for InMemoryStore {
         }
         map.entry(key.clone()).or_default().insert(
             nonce,
-            QueuedTxn {
-                signer: key,
-                nonce,
-                tx_hash,
-                envelope: envelope.clone(),
-                expires_at,
-                parked_during_recovery,
+            QueuedTxnRecord {
+                txn: QueuedTxn {
+                    signer: key,
+                    nonce,
+                    tx_hash,
+                    envelope: envelope.clone(),
+                    expires_at,
+                    parked_for: std::time::Duration::ZERO,
+                    parked_during_recovery,
+                },
+                created_at: tokio::time::Instant::now(),
             },
         );
         Ok(QueueOutcome::Parked)
@@ -1681,7 +1701,7 @@ impl Store for InMemoryStore {
             .read()
             .get(&signer.to_lowercase())
             .and_then(|m| m.get(&nonce))
-            .cloned())
+            .map(QueuedTxnRecord::snapshot))
     }
 
     async fn delete_queued_txn(
@@ -1695,7 +1715,7 @@ impl Store for InMemoryStore {
         let Some(inner) = map.get_mut(&key) else {
             return Ok(false);
         };
-        if inner.get(&nonce).map(|q| q.tx_hash) != Some(tx_hash) {
+        if inner.get(&nonce).map(|q| q.txn.tx_hash) != Some(tx_hash) {
             return Ok(false);
         }
         inner.remove(&nonce);
@@ -1723,8 +1743,8 @@ impl Store for InMemoryStore {
             .read()
             .values()
             .flat_map(|m| m.values())
-            .find(|q| q.tx_hash == tx_hash)
-            .cloned())
+            .find(|q| q.txn.tx_hash == tx_hash)
+            .map(QueuedTxnRecord::snapshot))
     }
 
     async fn evict_expired_queued_txns(
@@ -1738,8 +1758,8 @@ impl Store for InMemoryStore {
         for (signer, txs) in map.iter_mut() {
             txs.retain(|nonce, q| {
                 // Stamped rows are exempt — see the postgres impl / trait doc.
-                if q.expires_at <= now && !q.parked_during_recovery {
-                    evicted.push((signer.clone(), *nonce, q.tx_hash));
+                if q.txn.expires_at <= now && !q.txn.parked_during_recovery {
+                    evicted.push((signer.clone(), *nonce, q.txn.tx_hash));
                     false
                 } else {
                     true
@@ -1818,11 +1838,8 @@ impl Store for InMemoryStore {
                 // attempt may have crossed an external side-effect boundary, so a
                 // different replacement may only take over an ABANDONED slot (see
                 // the wedge-#5 rule below), never a released or admitted one.
-                let takeover = r.tx_hash == tx_hash
-                    && (matches!(
-                        r.state,
-                        ReservationState::ReleasedFailure | ReservationState::ReleasedSuccess
-                    ) || r.lease_expires_at <= now);
+                let takeover =
+                    r.tx_hash == tx_hash && r.state.can_reacquire_same(r.lease_expires_at <= now);
                 // Wedge #5 — ABANDONED-slot reclamation for a DIFFERENT tx: the
                 // reservation precedes durable admission, so a crash in that
                 // window leaves `executing` + expired lease, and a NORMAL
@@ -1834,20 +1851,16 @@ impl Store for InMemoryStore {
                 // Mirrors the PgStore rule; LRU eviction could theoretically make
                 // an admitted hash look absent here, but this in-memory store is
                 // test/dev-only — PostgreSQL is authoritative in deployments.
-                let abandoned_state = (r.state == ReservationState::Executing
-                    && r.lease_expires_at <= now)
-                    || r.state == ReservationState::ReleasedFailure;
-                let abandoned = r.tx_hash != tx_hash
-                    && abandoned_state
-                    && !self.transactions.lock().contains(&r.tx_hash);
+                let abandoned_cause = r
+                    .state
+                    .abandonment_candidate(r.lease_expires_at <= now)
+                    .filter(|_| {
+                        r.tx_hash != tx_hash && !self.transactions.lock().contains(&r.tx_hash)
+                    });
+                let abandoned = abandoned_cause.is_some();
                 if takeover || abandoned {
                     let fence = r.fence + 1;
-                    if abandoned {
-                        let cause = if r.state == ReservationState::ReleasedFailure {
-                            "released_failure"
-                        } else {
-                            "expired_executing"
-                        };
+                    if let Some(cause) = abandoned_cause {
                         ::metrics::counter!(
                             "nonce_reservation_abandoned_reclaimed_total",
                             "cause" => cause
@@ -2789,43 +2802,98 @@ impl Store for InMemoryStore {
     async fn expected_mint_record(
         &self,
         global_index: &[u8; 32],
-        expected_mint: &[u8; 32],
+        claim_note: &[u8; 32],
     ) -> anyhow::Result<()> {
         let mut map = self.monitor_expected_mints.write();
+        let generation = self
+            .monitor_expected_mint_generation
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |generation| generation.checked_add(1),
+            )
+            .map_err(|_| anyhow::anyhow!("CLAIM watchdog generation overflow"))?
+            + 1;
         map.insert(
             *global_index,
-            MonitorExpectedMintRow {
-                expected_mint: *expected_mint,
+            super::ClaimWatchEntry {
+                global_index: *global_index,
+                claim_note: *claim_note,
                 ticks_pending: 0,
-                alerted: false,
+                alert_pending: false,
+                generation,
             },
         );
         Ok(())
     }
 
     async fn expected_mint_remove(&self, global_index: &[u8; 32]) -> anyhow::Result<()> {
-        self.monitor_expected_mints.write().remove(global_index);
+        let mut map = self.monitor_expected_mints.write();
+        if map.get(global_index).is_some_and(|row| !row.alert_pending) {
+            map.remove(global_index);
+        }
         Ok(())
     }
 
-    async fn expected_mint_load_all(&self) -> anyhow::Result<Vec<([u8; 32], [u8; 32], u32, bool)>> {
-        let map = self.monitor_expected_mints.read();
-        Ok(map
-            .iter()
-            .map(|(gi, row)| (*gi, row.expected_mint, row.ticks_pending, row.alerted))
+    async fn expected_mint_remove_generation(
+        &self,
+        global_index: &[u8; 32],
+        generation: i64,
+    ) -> anyhow::Result<bool> {
+        let mut map = self.monitor_expected_mints.write();
+        if map
+            .get(global_index)
+            .is_some_and(|row| row.generation == generation && !row.alert_pending)
+        {
+            map.remove(global_index);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn expected_mint_load_all(&self) -> anyhow::Result<Vec<super::ClaimWatchEntry>> {
+        Ok(self
+            .monitor_expected_mints
+            .read()
+            .values()
+            .copied()
             .collect())
     }
 
     async fn expected_mint_update_tick(
         &self,
         global_index: &[u8; 32],
+        generation: i64,
         ticks_pending: u32,
-        alerted: bool,
-    ) -> anyhow::Result<()> {
+        alert_pending: bool,
+    ) -> anyhow::Result<bool> {
+        #[cfg(test)]
+        self.monitor_test_call("expected_mint_update_tick")?;
         let mut map = self.monitor_expected_mints.write();
-        if let Some(row) = map.get_mut(global_index) {
-            row.ticks_pending = ticks_pending;
-            row.alerted = alerted;
+        if let Some(row) = map.get_mut(global_index)
+            && row.generation == generation
+            && !row.alert_pending
+        {
+            row.ticks_pending = row.ticks_pending.max(ticks_pending);
+            row.alert_pending = alert_pending;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn expected_mint_acknowledge_alert(
+        &self,
+        global_index: &[u8; 32],
+        generation: i64,
+    ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        self.monitor_test_call("expected_mint_acknowledge_alert")?;
+        let mut map = self.monitor_expected_mints.write();
+        if map
+            .get(global_index)
+            .is_some_and(|row| row.generation == generation && row.alert_pending)
+        {
+            map.remove(global_index);
         }
         Ok(())
     }

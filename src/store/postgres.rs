@@ -4,17 +4,20 @@
 //! with the schema from `migrations/001_initial.sql` applied.
 
 use super::{
-    ClaimFence, FaucetEntry, NoteHandoff, NoteHandoffState, PendingNonceFrontier, QueueBounds,
-    QueueOutcome, QueuedTxn, RecoverablePendingTxn, Store, TxnData, TxnEntry,
-    UnbridgeableBridgeOut, UnbridgeableBridgeOutReason, UnclaimableClaim, UnclaimableReason,
+    ClaimFence, ClaimState, FaucetEntry, NoteHandoff, NoteHandoffState, PendingNonceFrontier,
+    QueueBounds, QueueOutcome, QueuedTxn, RecoverablePendingTxn, ReservationState, Store, TxnData,
+    TxnEntry, UnbridgeableBridgeOut, UnbridgeableBridgeOutReason, UnclaimableClaim,
+    UnclaimableReason,
 };
 use crate::bridge_address::get_bridge_address;
 use crate::log_synthesis::{
     GerEntry, L2_GLOBAL_EXIT_ROOT_ADDRESS, LogFilter, SyntheticLog, UPDATE_HASH_CHAIN_VALUE_TOPIC,
 };
+use crate::transaction_lifecycle::ReceiptState;
 use alloy::consensus::TxEnvelope;
 use alloy::eips::Encodable2718;
 use alloy::primitives::{Address, LogData, TxHash, U256};
+use anyhow::Context;
 use deadpool_postgres::{Manager, Pool};
 use miden_protocol::Word;
 use miden_protocol::account::AccountId;
@@ -531,11 +534,8 @@ impl Store for PgStore {
             .await?;
         row.map(|row| {
             let state: String = row.get(2);
-            let state = match state.as_str() {
-                "prepared" => NoteHandoffState::Prepared,
-                "submitted" => NoteHandoffState::Submitted,
-                other => anyhow::bail!("unknown note handoff state {other:?} for {tx_hash}"),
-            };
+            let state = NoteHandoffState::from_persisted(&state)
+                .with_context(|| format!("decoding handoff for {tx_hash}"))?;
             Ok(NoteHandoff {
                 note_commitment: row.get(0),
                 note_id: row.get(1),
@@ -623,11 +623,11 @@ impl Store for PgStore {
             // note_id would classify it as an orphan and re-prove it every sweep.
             // A missing link row yields a NULL handoff_state via the LEFT JOIN.
             let handoff_state: Option<String> = row.get(5);
-            let handoff = handoff_state.as_deref().map(|state| match state {
-                "prepared" => NoteHandoffState::Prepared,
-                // Legacy rows default handoff_state to 'submitted' (mig 012).
-                _ => NoteHandoffState::Submitted,
-            });
+            let handoff = handoff_state
+                .as_deref()
+                .map(NoteHandoffState::from_persisted)
+                .transpose()
+                .with_context(|| format!("decoding recovery handoff for {hash_str}"))?;
             out.push(RecoverablePendingTxn {
                 tx_hash,
                 signer: row.get::<_, String>(1).to_lowercase(),
@@ -894,8 +894,8 @@ impl Store for PgStore {
             .await?;
         if let Some(row) = row {
             let state: String = row.get(0);
-            match state.as_str() {
-                "prepared" => {
+            match ClaimState::from_persisted(&state)? {
+                ClaimState::Prepared => {
                     txn.execute(
                         "DELETE FROM claimed_indices
                          WHERE owner_tx_hash = $1 AND claim_state = 'prepared'",
@@ -905,11 +905,7 @@ impl Store for PgStore {
                 }
                 // A landed claim is an authoritative fence. Rolling the link
                 // back would reopen attribution and permit a duplicate claim.
-                "landed" => {
-                    txn.rollback().await?;
-                    return Ok(false);
-                }
-                _ => {
+                ClaimState::Landed | ClaimState::Executing | ClaimState::Submitted => {
                     txn.rollback().await?;
                     return Ok(false);
                 }
@@ -1659,12 +1655,8 @@ impl Store for PgStore {
 
         // A real landing may heal a pending/failed observation to success;
         // success itself is monotonic and the first failure remains stable.
-        let apply = match (current_status.as_str(), result.is_ok()) {
-            ("success", _) => false,
-            (_, true) => true,
-            ("pending", false) => !has_handoff,
-            (_, false) => false,
-        };
+        let apply = ReceiptState::from_persisted(&current_status)?
+            .accepts_result(result.is_ok(), has_handoff);
         if !apply {
             tx.rollback().await?;
             tracing::debug!(
@@ -1841,8 +1833,8 @@ impl Store for PgStore {
         ).await?;
         if let Some(claim) = claim {
             let owner: Option<String> = claim.get(0);
-            let state: String = claim.get(1);
-            if owner.as_deref() == Some(hash.as_str()) && state == "landed" {
+            let state = ClaimState::from_persisted(claim.get(1))?;
+            if owner.as_deref() == Some(hash.as_str()) && state == ClaimState::Landed {
                 return Ok(false);
             }
         }
@@ -1885,13 +1877,14 @@ impl Store for PgStore {
         let error_msg: Option<&str> = row.get(1);
         let block_num: i64 = row.get(2);
 
-        match status {
-            "success" => Ok(Some((Ok(()), block_num as u64))),
-            "failed" => Ok(Some((
+        match ReceiptState::from_persisted(status)? {
+            ReceiptState::Succeeded => Ok(Some((Ok(()), block_num as u64))),
+            ReceiptState::Failed => Ok(Some((
                 Err(error_msg.unwrap_or("unknown error").to_string()),
                 block_num as u64,
             ))),
-            _ => Ok(None), // pending
+            ReceiptState::Pending => Ok(None),
+            ReceiptState::Missing => unreachable!("persisted receipt cannot be missing"),
         }
     }
 
@@ -1944,10 +1937,11 @@ impl Store for PgStore {
             anyhow::anyhow!("stored signer for {hash_str} is not a valid Address ({e})")
         })?;
 
-        let result = match status {
-            "success" => Some(Ok(())),
-            "failed" => Some(Err(error_msg.unwrap_or("").to_string())),
-            _ => None,
+        let result = match ReceiptState::from_persisted(status)? {
+            ReceiptState::Succeeded => Some(Ok(())),
+            ReceiptState::Failed => Some(Err(error_msg.unwrap_or("").to_string())),
+            ReceiptState::Pending => None,
+            ReceiptState::Missing => unreachable!("persisted receipt cannot be missing"),
         };
 
         // Fetch logs
@@ -1979,14 +1973,18 @@ impl Store for PgStore {
 
         // Task 3: Deserialize TransactionId from stored hex string
         let miden_id_str: Option<&str> = row.get(0);
-        let id = miden_id_str.and_then(|s| {
-            let hex_str = if s.starts_with("0x") {
-                s.to_string()
-            } else {
-                format!("0x{s}")
-            };
-            parse_transaction_id(&hex_str)
-        });
+        let id = miden_id_str
+            .map(|s| {
+                let hex_str = if s.starts_with("0x") {
+                    s.to_string()
+                } else {
+                    format!("0x{s}")
+                };
+                parse_transaction_id(&hex_str).with_context(|| {
+                    format!("stored Miden transaction ID for {hash_str} cannot be decoded")
+                })
+            })
+            .transpose()?;
 
         Ok(Some(TxnData {
             id,
@@ -2005,8 +2003,7 @@ impl Store for PgStore {
         let client = self.pool.get().await?;
         let rows = client
             .query(
-                "SELECT t.envelope_bytes,
-                        (l.tx_hash IS NULL OR l.handoff_state <> 'submitted') AS unlinked
+                "SELECT t.envelope_bytes, l.handoff_state
                  FROM transactions t
                  LEFT JOIN tx_note_links l ON l.tx_hash = t.tx_hash
                  WHERE lower(t.signer) = lower($1) AND t.status = 'pending'",
@@ -2027,7 +2024,11 @@ impl Store for PgStore {
                     .lowest_pending
                     .map_or(nonce, |current| current.min(nonce)),
             );
-            if row.get::<_, bool>(1) {
+            let handoff = row
+                .get::<_, Option<&str>>(1)
+                .map(NoteHandoffState::from_persisted)
+                .transpose()?;
+            if handoff != Some(NoteHandoffState::Submitted) {
                 frontier.lowest_unlinked = Some(
                     frontier
                         .lowest_unlinked
@@ -2049,10 +2050,10 @@ impl Store for PgStore {
             )
             .await?;
 
-        Ok(rows.first().and_then(|r| {
-            let hash_str: &str = r.get(0);
-            hash_str.parse().ok()
-        }))
+        rows.first().map(|row| {
+            let hash_str: &str = row.get(0);
+            hash_str.parse().with_context(|| format!("stored Ethereum transaction hash for Miden transaction {id_str} cannot be decoded"))
+        }).transpose()
     }
 
     async fn txn_commit_pending(
@@ -2170,10 +2171,12 @@ impl Store for PgStore {
         }
         let mut envelope_bytes = Vec::new();
         envelope.encode_2718(&mut envelope_bytes);
+        // now() is fixed at transaction start, before the queue lock wait.
+        // Observation starts when the row is inserted, not while waiting.
         tx.execute(
             "INSERT INTO queued_txns \
-             (signer, nonce, tx_hash, envelope, expires_at, parked_during_recovery)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+             (signer, nonce, tx_hash, envelope, expires_at, parked_during_recovery, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, clock_timestamp())",
             &[
                 &key,
                 &nonce_db,
@@ -2193,7 +2196,8 @@ impl Store for PgStore {
         let key = signer.to_lowercase();
         let Some(row) = client
             .query_opt(
-                "SELECT tx_hash, envelope, expires_at, parked_during_recovery \
+                "SELECT tx_hash, envelope, expires_at, parked_during_recovery, \
+                 EXTRACT(EPOCH FROM clock_timestamp() - created_at)::double precision \
                  FROM queued_txns WHERE signer = $1 AND nonce = $2",
                 &[&key, &(nonce as i64)],
             )
@@ -2250,7 +2254,8 @@ impl Store for PgStore {
         let Some(row) = client
             .query_opt(
                 "SELECT signer, nonce, tx_hash, envelope, expires_at, \
-                 parked_during_recovery
+                 parked_during_recovery, \
+                 EXTRACT(EPOCH FROM clock_timestamp() - created_at)::double precision
                  FROM queued_txns WHERE tx_hash = $1 LIMIT 1",
                 &[&format!("{tx_hash:#x}")],
             )
@@ -2267,6 +2272,7 @@ impl Store for PgStore {
             envelope: decode_queued_envelope(row.get(3))?,
             expires_at: row.get::<_, i64>(4) as u64,
             parked_during_recovery: row.get(5),
+            parked_for: decode_queued_age(row.get(6))?,
         }))
     }
 
@@ -2278,8 +2284,8 @@ impl Store for PgStore {
         // design decision and the re-broadcast contract that makes it safe).
         let client = self.pool.get().await?;
         // (review round 3, codex B1) Stamped rows are EXEMPT. A
-        // `parked_during_recovery` row is the ONLY proof of a continuing
-        // wallet's post-restore eligibility; evicting it re-creates the exact
+        // `parked_during_recovery` row preserves post-restore admission
+        // eligibility; evicting it re-creates the exact
         // wedge the marker closes — the re-broadcast arrives with the window
         // shut, parks UNSTAMPED, expires, evicts, re-broadcasts, forever, and
         // never reaches "nonce too low" because the empty ledger keeps reading
@@ -2401,7 +2407,7 @@ impl Store for PgStore {
             }
             Some(row) => {
                 let row_hash: String = row.get(0);
-                let state: String = row.get(1);
+                let state = ReservationState::from_persisted(row.get(1))?;
                 let expired: bool = row.get(2);
                 let fence: i64 = row.get(3);
                 // A nonce slot is bound to its first transaction hash. Expiry
@@ -2410,8 +2416,7 @@ impl Store for PgStore {
                 // ambiguous — it may only take over an ABANDONED slot (executing,
                 // lease expired, never durably admitted; wedge-#5 rule below).
                 let same_tx = row_hash.eq_ignore_ascii_case(&hash_str);
-                let takeover = same_tx
-                    && (state == "released_failure" || state == "released_success" || expired);
+                let takeover = same_tx && state.can_reacquire_same(expired);
                 if takeover {
                     let new_fence = fence + 1;
                     tx.execute(
@@ -2459,13 +2464,7 @@ impl Store for PgStore {
                     // `released_success` slots and any slot WITH a durable row
                     // stay permanently hash-bound (receipt identity / pending-tx
                     // machinery).
-                    let reclaim_cause = if state == "released_failure" {
-                        Some("released_failure")
-                    } else if state == "executing" && expired {
-                        Some("expired_executing")
-                    } else {
-                        None
-                    };
+                    let reclaim_cause = state.abandonment_candidate(expired);
                     let abandoned_cause = match reclaim_cause {
                         Some(cause) => {
                             let admitted: bool = tx
@@ -2547,7 +2546,7 @@ impl Store for PgStore {
                 "UPDATE nonce_reservations
              SET lease_expires_at = now() + ($4 || ' seconds')::interval
              WHERE signer = $1 AND nonce = $2 AND tx_hash = $3
-               AND state <> 'released_failure'",
+               AND state IN ('executing', 'released_success')",
                 &[&key, &(nonce as i64), &hash_str, &lease_secs.to_string()],
             )
             .await?;
@@ -3872,20 +3871,19 @@ impl Store for PgStore {
     async fn expected_mint_record(
         &self,
         global_index: &[u8; 32],
-        expected_mint: &[u8; 32],
+        claim_note: &[u8; 32],
     ) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
         client
             .execute(
                 "INSERT INTO monitor_expected_mints \
-                 (global_index, expected_mint, ticks_pending, alerted) \
-                 VALUES ($1, $2, 0, FALSE) \
-                 ON CONFLICT (global_index) DO UPDATE \
-                 SET expected_mint = EXCLUDED.expected_mint, \
-                     ticks_pending = 0, \
-                     alerted = FALSE, \
-                     updated_at = now()",
-                &[&global_index.as_slice(), &expected_mint.as_slice()],
+             (global_index, expected_mint, ticks_pending, alerted, alert_pending) \
+             VALUES ($1, $2, 0, FALSE, FALSE) \
+             ON CONFLICT (global_index) DO UPDATE \
+             SET expected_mint = EXCLUDED.expected_mint, \
+                 ticks_pending = 0, alerted = FALSE, alert_pending = FALSE, \
+                 generation = EXCLUDED.generation, updated_at = now()",
+                &[&global_index.as_slice(), &claim_note.as_slice()],
             )
             .await?;
         Ok(())
@@ -3895,37 +3893,54 @@ impl Store for PgStore {
         let client = self.pool.get().await?;
         client
             .execute(
-                "DELETE FROM monitor_expected_mints WHERE global_index = $1",
+                "DELETE FROM monitor_expected_mints WHERE global_index = $1 AND NOT alert_pending",
                 &[&global_index.as_slice()],
             )
             .await?;
         Ok(())
     }
 
-    async fn expected_mint_load_all(&self) -> anyhow::Result<Vec<([u8; 32], [u8; 32], u32, bool)>> {
+    async fn expected_mint_remove_generation(
+        &self,
+        global_index: &[u8; 32],
+        generation: i64,
+    ) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .execute(
+                "DELETE FROM monitor_expected_mints \
+             WHERE global_index = $1 AND generation = $2 AND NOT alert_pending",
+                &[&global_index.as_slice(), &generation],
+            )
+            .await?
+            > 0)
+    }
+
+    async fn expected_mint_load_all(&self) -> anyhow::Result<Vec<super::ClaimWatchEntry>> {
         let client = self.pool.get().await?;
         let rows = client
             .query(
-                "SELECT global_index, expected_mint, ticks_pending, alerted \
-                 FROM monitor_expected_mints",
+                "SELECT global_index, expected_mint, ticks_pending, alert_pending, generation \
+             FROM monitor_expected_mints",
                 &[],
             )
             .await?;
         let mut out = Vec::with_capacity(rows.len());
-        for r in &rows {
-            let gi: &[u8] = r.get(0);
-            let em: &[u8] = r.get(1);
-            if gi.len() != 32 || em.len() != 32 {
-                continue;
-            }
-            let ticks: i32 = r.get(2);
-            let alerted: bool = r.get(3);
-            out.push((
-                bytes_to_array_32(gi),
-                bytes_to_array_32(em),
-                ticks.max(0) as u32,
-                alerted,
-            ));
+        for row in &rows {
+            let gi: &[u8] = row.get(0);
+            let claim_note: &[u8] = row.get(1);
+            anyhow::ensure!(
+                gi.len() == 32 && claim_note.len() == 32,
+                "invalid CLAIM watchdog identity length"
+            );
+            let ticks: i32 = row.get(2);
+            out.push(super::ClaimWatchEntry {
+                global_index: bytes_to_array_32(gi),
+                claim_note: bytes_to_array_32(claim_note),
+                ticks_pending: ticks.max(0) as u32,
+                alert_pending: row.get(3),
+                generation: row.get(4),
+            });
         }
         Ok(out)
     }
@@ -3933,20 +3948,31 @@ impl Store for PgStore {
     async fn expected_mint_update_tick(
         &self,
         global_index: &[u8; 32],
+        generation: i64,
         ticks_pending: u32,
-        alerted: bool,
+        alert_pending: bool,
+    ) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let ticks_i32 = i32::try_from(ticks_pending).unwrap_or(i32::MAX);
+        Ok(client.execute(
+            "UPDATE monitor_expected_mints \
+             SET ticks_pending = GREATEST(ticks_pending, $1), alert_pending = $2, updated_at = now() \
+             WHERE global_index = $3 AND generation = $4 AND NOT alert_pending",
+            &[&ticks_i32, &alert_pending, &global_index.as_slice(), &generation],
+        ).await? > 0)
+    }
+
+    async fn expected_mint_acknowledge_alert(
+        &self,
+        global_index: &[u8; 32],
+        generation: i64,
     ) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
-        // Bound ticks_pending into i32 range so the column write never
-        // panics on saturating_add edges. INT in postgres is signed 32-bit;
-        // u32::MAX would overflow.
-        let ticks_i32 = i32::try_from(ticks_pending).unwrap_or(i32::MAX);
         client
             .execute(
-                "UPDATE monitor_expected_mints \
-                 SET ticks_pending = $1, alerted = $2, updated_at = now() \
-                 WHERE global_index = $3",
-                &[&ticks_i32, &alerted, &global_index.as_slice()],
+                "DELETE FROM monitor_expected_mints \
+             WHERE global_index = $1 AND generation = $2 AND alert_pending",
+                &[&global_index.as_slice(), &generation],
             )
             .await?;
         Ok(())
@@ -3990,7 +4016,17 @@ fn parse_queued_hash(hash_str: &str) -> anyhow::Result<TxHash> {
         .map_err(|e| anyhow::anyhow!("stored queued tx_hash {hash_str} is invalid ({e})"))
 }
 
-/// Build a `QueuedTxn` from a `SELECT tx_hash, envelope, expires_at` row (#146).
+fn decode_queued_age(seconds: f64) -> anyhow::Result<std::time::Duration> {
+    // A backwards clock adjustment must delay bootstrap without hiding the
+    // parked transaction from ordinary reads or contiguous promotion.
+    if seconds.is_finite() && seconds < 0.0 {
+        return Ok(std::time::Duration::ZERO);
+    }
+    std::time::Duration::try_from_secs_f64(seconds)
+        .context("invalid queued transaction age; refusing nonce bootstrap")
+}
+
+/// Build a queued transaction snapshot, including its store-measured age.
 fn row_to_queued_txn(
     signer: String,
     nonce: u64,
@@ -4003,5 +4039,6 @@ fn row_to_queued_txn(
         envelope: decode_queued_envelope(row.get(1))?,
         expires_at: row.get::<_, i64>(2) as u64,
         parked_during_recovery: row.get(3),
+        parked_for: decode_queued_age(row.get(4))?,
     })
 }

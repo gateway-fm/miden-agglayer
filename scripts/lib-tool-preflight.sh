@@ -28,18 +28,19 @@ preflight_bridge_out_tool() {
     root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
     TOOL_BIN="${TOOL_BIN:-$root/target/debug/bridge-out-tool}"
 
-    if [[ ! -x "$TOOL_BIN" ]]; then
-        # An explicit TOOL_BIN names a binary the caller expects to exist; do
-        # not silently build over the top of a path they chose.
-        if [[ "$TOOL_BIN" != "$root/target/debug/bridge-out-tool" ]]; then
+    if [[ "$TOOL_BIN" != "$root/target/debug/bridge-out-tool" ]]; then
+        # A custom binary is caller-owned; the default workspace helper must
+        # be rebuilt even when it exists, because note roots change with code.
+        if [[ ! -x "$TOOL_BIN" ]]; then
             echo "FATAL: TOOL_BIN='$TOOL_BIN' is not an executable file." >&2
             return 1
         fi
+    else
         build_log="${log_dir:+$log_dir/}preflight-bridge-out-tool-build.log"
         [[ -n "$log_dir" ]] || build_log="$(mktemp)"
-        echo "[preflight] $TOOL_BIN missing — building it now (log: $build_log)"
-        if ! (cd "$root" && cargo build --bin bridge-out-tool) >"$build_log" 2>&1; then
-            echo "FATAL: 'cargo build --bin bridge-out-tool' FAILED — the completeness" >&2
+        echo "[preflight] ensuring $TOOL_BIN matches this checkout (log: $build_log)"
+        if ! (cd "$root" && cargo build --locked --bin bridge-out-tool) >"$build_log" 2>&1; then
+            echo "FATAL: 'cargo build --locked --bin bridge-out-tool' FAILED — the completeness" >&2
             echo "       verdict at the end of this run could not have run either." >&2
             echo "       Last 20 lines of $build_log:" >&2
             tail -20 "$build_log" >&2 || true

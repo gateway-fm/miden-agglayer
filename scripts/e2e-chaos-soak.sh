@@ -48,6 +48,7 @@ ALLOW_LATE="${ALLOW_LATE:-0}"
 # reporting it missing: a report still costs the run.
 # shellcheck source=scripts/lib-tool-preflight.sh
 . "$SCRIPT_DIR/lib-tool-preflight.sh"
+. "$SCRIPT_DIR/lib-chaos-owned.sh"
 preflight_bridge_out_tool || exit 4
 
 CHAOS_LOG="${CHAOS_LOG:-/tmp/chaos-events.log}"
@@ -90,6 +91,32 @@ BASE_PRIV_SKIP=$(counter synthetic_reconciler_private_skipped_total)
 BASE_FOREIGN_SKIP=$(counter claim_event_foreign_skipped_total)
 say "garbo baselines: private_skipped=$BASE_PRIV_SKIP foreign_skipped=$BASE_FOREIGN_SKIP"
 
+# Retained container logs span ordinary restarts; bind the evidence to this
+# exact container generation and exclude alerts from prior recovered history.
+SOAK_STARTED_AT=$(python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())')
+SOAK_PROXY_ID=$(docker inspect "$AGGLAYER_CONTAINER" --format '{{.Id}}') || exit 4
+[[ "$SOAK_PROXY_ID" =~ ^[a-f0-9]{64}$ ]] || exit 4
+SOAK_CONTROL_DIR=$(mktemp -d "$(dirname "$CHAOS_LOG")/chaos-control.XXXXXX") || exit 4
+GARBO_OWNER="garbo-$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+SEEDER_CONTROL="$SOAK_CONTROL_DIR/seeder.stop"
+GARBO_CONTROL="$SOAK_CONTROL_DIR/garbo.stop"
+WATCHDOG_CONTROL="$SOAK_CONTROL_DIR/watchdog.stop"
+BRIDGE_WATCHDOG_CONTROL="$SOAK_CONTROL_DIR/bridge-watchdog.stop"
+
+stop_injectors() {
+    local name control variable failed=0
+    for name in SEEDER GARBO WATCHDOG BRIDGE_WATCHDOG; do
+        control="${name}_CONTROL"
+        chaos_request_stop "${!control}" || failed=1
+    done
+    for name in SEEDER GARBO WATCHDOG BRIDGE_WATCHDOG; do
+        control="${name}_CONTROL"; variable="${name}_PID"
+        [[ -z "${!variable:-}" ]] || chaos_wait_owned "$variable" "${!control}" || failed=1
+    done
+    chaos_remove_owned_containers "$GARBO_OWNER" || failed=1
+    return "$failed"
+}
+
 # ── cancellation safety net ──────────────────────────────────────────────────
 # Injected faults are real: a paused postgres, a disconnected node, a stopped
 # prover/proxy. The injectors restore their own faults on a clean exit, but a
@@ -104,11 +131,7 @@ chaos_cleanup() {
     [ "$CHAOS_CLEANUP_DONE" = "1" ] && return 0
     CHAOS_CLEANUP_DONE=1
     say "cleanup: stopping injectors and reversing any live faults"
-    for pid in "${SEEDER_PID:-}" "${GARBO_PID:-}" "${WATCHDOG_PID:-}" "${BRIDGE_WATCHDOG_PID:-}"; do
-        [ -n "$pid" ] || continue
-        kill "$pid" 2>/dev/null || true
-        wait "$pid" 2>/dev/null || true
-    done
+    stop_injectors || say "ERROR: injector cleanup could not be fully verified"
     docker unpause "${PROJECT}-agglayer-postgres-1" >/dev/null 2>&1 || true
     docker unpause "${PROJECT}-postgres-1" >/dev/null 2>&1 || true
     local net
@@ -130,10 +153,12 @@ trap 'chaos_cleanup; exit 130' INT TERM
 # ── 2. STORM: chaos-seeder + chaos-garbo + mixed loadtest, concurrent ────────
 say "=== STORM: chaos-seeder (${CHAOS_DURATION}s) + chaos-garbo (${GARBO_DURATION}s) + mixed loadtest (N=$N) ==="
 PROJECT="$PROJECT" CHAOS_DURATION="$CHAOS_DURATION" CHAOS_LOG="$CHAOS_LOG" \
-    "$SCRIPT_DIR/chaos-seeder.sh" >/tmp/chaos-seeder.out 2>&1 &
+    python3 "$SCRIPT_DIR/chaos-owned-process.py" --stop-file "$SEEDER_CONTROL" --grace 10 -- \
+    bash "$SCRIPT_DIR/chaos-seeder.sh" >/tmp/chaos-seeder.out 2>&1 &
 SEEDER_PID=$!
-GARBO_DURATION="$GARBO_DURATION" GARBO_LOG="$GARBO_LOG" GARBO_SUMMARY="$GARBO_SUMMARY" \
-    "$SCRIPT_DIR/chaos-garbo.sh" >/tmp/chaos-garbo.out 2>&1 &
+GARBO_DURATION="$GARBO_DURATION" GARBO_LOG="$GARBO_LOG" GARBO_SUMMARY="$GARBO_SUMMARY" ISO_CHAOS_OWNER="$GARBO_OWNER" \
+    python3 "$SCRIPT_DIR/chaos-owned-process.py" --stop-file "$GARBO_CONTROL" --grace 10 -- \
+    bash "$SCRIPT_DIR/chaos-garbo.sh" >/tmp/chaos-garbo.out 2>&1 &
 GARBO_PID=$!
 
 # ── aggkit lost-tx watchdog ─────────────────────────────────────────────────
@@ -145,11 +170,13 @@ WATCHDOG_DIR=$(mktemp -d "$(dirname "$CHAOS_LOG")/chaos-watchdog.XXXXXX") || exi
 : > "$WATCHDOG_HEALS_FILE"
 say "watchdog evidence: $WATCHDOG_DIR"
 PROJECT="$PROJECT" WATCHDOG_DIR="$WATCHDOG_DIR" WATCHDOG_HEALS_FILE="$WATCHDOG_HEALS_FILE" \
+    python3 "$SCRIPT_DIR/chaos-owned-process.py" --stop-file "$WATCHDOG_CONTROL" --grace 10 --drain-timeout 600 -- \
     bash "$SCRIPT_DIR/aggkit-watchdog.sh" >/tmp/chaos-watchdog.out 2>&1 &
 WATCHDOG_PID=$!
 # This separately records state-preserving bridge-service restarts. Fresh
 # per-network iterations are telemetry; delivery and exact-block gates decide PASS.
-python3 "$SCRIPT_DIR/bridge-sync-health.py" --watch --project "$PROJECT" \
+python3 "$SCRIPT_DIR/chaos-owned-process.py" --stop-file "$BRIDGE_WATCHDOG_CONTROL" --grace 10 -- \
+    python3 "$SCRIPT_DIR/bridge-sync-health.py" --watch --project "$PROJECT" \
     --evidence "$WATCHDOG_DIR/bridge-sync" >"$WATCHDOG_DIR/bridge-sync.log" 2>&1 &
 BRIDGE_WATCHDOG_PID=$!
 
@@ -167,15 +194,11 @@ grep -aE "MIXED LOADTEST RESULT|forward ops|back ops|address clash|L1<->Miden rc
 
 # ── 3. stop injectors + FULL restore ─────────────────────────────────────────
 say "=== stopping injectors + restoring all faults ==="
-kill "$SEEDER_PID" 2>/dev/null || true; wait "$SEEDER_PID" 2>/dev/null || true
-kill "$GARBO_PID" 2>/dev/null || true;  wait "$GARBO_PID" 2>/dev/null || true
-kill "$WATCHDOG_PID" 2>/dev/null || true; wait "$WATCHDOG_PID" 2>/dev/null || true
-kill "$BRIDGE_WATCHDOG_PID" 2>/dev/null || true; wait "$BRIDGE_WATCHDOG_PID" 2>/dev/null || true
-# CLEAR the PID variables now that these children are reaped. The EXIT trap
-# runs on the SUCCESS path too, and a reaped PID can already have been reused
-# by an unrelated process on this shared host — signalling it would be someone
-# else's outage caused by our cleanup.
-SEEDER_PID=""; GARBO_PID=""; WATCHDOG_PID=""
+if ! stop_injectors; then
+    say "ERROR: owned injector descendants/containers did not stop cleanly"
+    exit 4
+fi
+# chaos_wait_owned clears EVERY reaped PID, including the bridge watchdog.
 WATCHDOG_HEALS=$(grep -c 'WATCHDOG:' "$WATCHDOG_HEALS_FILE" 2>/dev/null | head -1); WATCHDOG_HEALS=${WATCHDOG_HEALS:-0}
 # belt-and-suspenders restore in case a trap raced (correct container names)
 docker unpause "${PROJECT}-agglayer-postgres-1" >/dev/null 2>&1 || true
@@ -318,12 +341,16 @@ SC_EMIT=$(pgq "SELECT COUNT(*) FROM bridge_out_processed WHERE emitted;")
 SC_UNEMIT=$(pgq "SELECT COUNT(*) FROM bridge_out_processed WHERE emitted = false;")
 SC_UNBRIDGE=$(pgq "SELECT COUNT(*) FROM unbridgeable_bridge_outs;")
 SC_UNCLAIM=$(pgq "SELECT COUNT(*) FROM unclaimable_claims;")
-SC_ALERTED=$(pgq "SELECT COUNT(*) FILTER (WHERE alerted) FROM monitor_expected_mints;")
-say "  store: UHC=${SC_UHC:-?}/inj=${SC_INJ:-?} CLAIM=${SC_CLAIM:-?}/landed=${SC_LANDED:-?} BRIDGE=${SC_BRIDGE:-?}/emit=${SC_EMIT:-?} unemit=${SC_UNEMIT:-?} unbridge=${SC_UNBRIDGE:-?} unclaim=${SC_UNCLAIM:-?}(non-fatal) alerted=${SC_ALERTED:-?}"
+SC_ALERT_PENDING=$(pgq "SELECT COUNT(*) FILTER (WHERE alert_pending) FROM monitor_expected_mints;")
+SC_CLAIM_ALERTS=$(chaos_claim_alert_count "$AGGLAYER_CONTAINER" "$SOAK_PROXY_ID" \
+    "$SOAK_STARTED_AT" "${CHAOS_LOG}.proxy-since-start.log") || SC_CLAIM_ALERTS=unavailable
+
+say "  store: UHC=${SC_UHC:-?}/inj=${SC_INJ:-?} CLAIM=${SC_CLAIM:-?}/landed=${SC_LANDED:-?} BRIDGE=${SC_BRIDGE:-?}/emit=${SC_EMIT:-?} unemit=${SC_UNEMIT:-?} unbridge=${SC_UNBRIDGE:-?} unclaim=${SC_UNCLAIM:-?}(non-fatal) pending_claim_alerts=${SC_ALERT_PENDING:-?} emitted_claim_alerts=$SC_CLAIM_ALERTS"
 STORE_DROP=""
 [[ "${SC_UNEMIT:-1}" != "0" ]]   && STORE_DROP="$STORE_DROP unemitted=${SC_UNEMIT:-?}"
 [[ "${SC_UNBRIDGE:-1}" != "0" ]] && STORE_DROP="$STORE_DROP unbridgeable=${SC_UNBRIDGE:-?}"
-[[ "${SC_ALERTED:-1}" != "0" ]]  && STORE_DROP="$STORE_DROP alerted-mint=${SC_ALERTED:-?}"
+[[ "${SC_ALERT_PENDING:-1}" != "0" ]] && STORE_DROP="$STORE_DROP pending-claim-alert=${SC_ALERT_PENDING:-?}"
+[[ "$SC_CLAIM_ALERTS" != "0" ]] && STORE_DROP="$STORE_DROP emitted-claim-alert=$SC_CLAIM_ALERTS"
 [[ -n "${SC_UHC:-}" && -n "${SC_INJ:-}" && "${SC_UHC}" -lt "${SC_INJ}" ]] 2>/dev/null && STORE_DROP="$STORE_DROP UHC<inj(${SC_UHC}<${SC_INJ})"
 [[ -n "${SC_CLAIM:-}" && -n "${SC_LANDED:-}" && "${SC_CLAIM}" -lt "${SC_LANDED}" ]] 2>/dev/null && STORE_DROP="$STORE_DROP CLAIM<landed(${SC_CLAIM}<${SC_LANDED})"
 [[ -n "${SC_BRIDGE:-}" && -n "${SC_EMIT:-}" && "${SC_BRIDGE}" -lt "${SC_EMIT}" ]] 2>/dev/null && STORE_DROP="$STORE_DROP BRIDGE<emit(${SC_BRIDGE}<${SC_EMIT})"
@@ -350,13 +377,19 @@ fi
 # ── 5b. GARBO containment (the second verdict) ───────────────────────────────
 say "=== (b) garbo containment ==="
 GARBO_OK=1
+[[ "${GARBO_CLEANUP_OK:-0}" == 1 ]] || { GARBO_OK=0; say "  GARBO cleanup evidence missing or failed"; }
 # Foreign-claim class: each fabricated global index must have ZERO ClaimEvent rows.
 FOREIGN_LEAK=0
 for gi_hex in ${GARBO_FOREIGN_GIS:-}; do
     gi_pad=$(python3 -c "print(format(int('$gi_hex',16),'064x'))" 2>/dev/null || echo "")
     [[ -z "$gi_pad" ]] && continue
     rows=$(pgq "SELECT COUNT(*) FROM synthetic_logs WHERE topics[1] = '${CLAIM_EVENT_TOPIC}' AND lower(data) LIKE '0x${gi_pad}%';")
-    if [[ "${rows:-0}" != "0" ]]; then
+    if [[ ! "$rows" =~ ^[0-9]+$ ]]; then
+        say "  GARBO containment query unavailable; cannot certify absence"
+        GARBO_OK=0
+        continue
+    fi
+    if [[ "$rows" != "0" ]]; then
         say "  GARBO LEAK: foreign gi 0x$gi_hex has $rows ClaimEvent row(s) — CONTAINMENT BREACH"
         FOREIGN_LEAK=$((FOREIGN_LEAK + rows)); GARBO_OK=0
     else
@@ -379,7 +412,12 @@ for pid_hex in ${GARBO_PRIVATE_NOTE_IDS:-}; do
     rows=$(pgq "SELECT (SELECT COUNT(*) FROM bridge_out_processed WHERE lower(note_id) LIKE '%${pid_lc}%')
               + (SELECT COUNT(*) FROM tx_note_links WHERE lower(coalesce(note_id,'')) LIKE '%${pid_lc}%' OR lower(coalesce(note_commitment,'')) LIKE '%${pid_lc}%')
               + (SELECT COUNT(*) FROM unbridgeable_bridge_outs WHERE lower(note_id) LIKE '%${pid_lc}%');")
-    if [[ "${rows:-0}" != "0" ]]; then
+    if [[ ! "$rows" =~ ^[0-9]+$ ]]; then
+        say "  GARBO containment query unavailable; cannot certify absence"
+        GARBO_OK=0
+        continue
+    fi
+    if [[ "$rows" != "0" ]]; then
         say "  GARBO LEAK: private note 0x$pid_lc persisted $rows proxy row(s) — CONTAINMENT BREACH"
         PRIVATE_LEAK=$((PRIVATE_LEAK + rows)); GARBO_OK=0
     fi

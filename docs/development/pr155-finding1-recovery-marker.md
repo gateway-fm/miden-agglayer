@@ -1,7 +1,6 @@
 # #146 finding 1 — durable `parked_during_recovery` marker
 
-Codex blocking finding 1 on PR #155. Design settled and every touch point
-located; implementation is the only thing outstanding.
+Historical PR #155 design note, updated with the current recovery policy.
 
 ## The bug
 
@@ -10,15 +9,16 @@ submitting nonce 21 would be refused "expected 0" forever. #90's fix opens a
 bounded **post-rebuild recovery window** during which a signer may adopt a
 baseline: seed its ledger from the lowest parked nonce.
 
-Adoption is not immediate — the sweep first waits `BOOTSTRAP_SETTLE_BLOCKS` to
-be sure no *lower* nonce is still arriving (seeding to 21 while 19 is in flight
-would strand 19). Correct, but it means a tx parked inside the final settle
+Adoption is not immediate: the sweep waits `BOOTSTRAP_SETTLE_BLOCKS` and at least
+30 seconds of store-measured age from first insertion to allow lower nonces to
+arrive. Projected blocks alone can advance instantly during catch-up and cannot
+provide elapsed observation time. This finite margin does not prove that no
+lower nonce will arrive later. A tx parked inside the final settle
 margin cannot be seeded on that sweep, and by the next sweep the global window
 has closed for good. That transaction sits behind nonces that will never arrive.
 It was ACKNOWLEDGED, so nobody resubmits it — #119 reached by another route.
 
-`src/service_send_raw_txn.rs` already documents this as an accepted residual and
-names the fix; this is that fix.
+The durable row stamp carries eligibility beyond the global recovery window.
 
 ## Why the obvious predicate is wrong
 
@@ -29,15 +29,18 @@ deployment a genuinely new wallet could submit nonce 42, park, and be seeded to
 than a bounded one. The predicate cannot distinguish a continuing wallet from a
 new one, so it must not be asked to.
 
-## The fix: proof-carrying eligibility
+## The fix: recovery-era admission eligibility
 
 Stamp the QUEUE ROW at park time with "parked while the recovery window was
 open". Eligibility becomes `global_window_open || row.parked_during_recovery`.
 
-A stamped row is provably a continuing wallet's tx from the rebuild era. A new
-wallet's out-of-order tx never gets stamped, so it can never be amnestied. The
-marker must be durable precisely because its job is to outlive the window and
-survive a restart.
+A stamped row proves admission during recovery, not that the wallet existed
+before the loss. A genuinely new wallet first seen while the window is open
+receives the same stamp. Outside recovery, unstamped out-of-order rows remain
+ordinary queued work. The marker must be durable to outlive the window and
+survive a restart. The 30-second minimum age also survives restart and same-hash
+re-broadcast, using the existing `queued_txns.created_at` timestamp. This bounded
+policy cannot distinguish new and continuing wallets indefinitely.
 
 ## Touch points (verified 2026-08-26)
 
@@ -66,7 +69,8 @@ drill proves the actual property, because the bug exists only after a rebuild:
 
 1. continuing wallet parked inside the final settle margin RECOVERS
    (previously stranded forever), and
-2. a new wallet submitting a high nonce on a fresh store is STILL REFUSED
+2. a new wallet submitting a high nonce on a fresh store stays queued without
+   baseline adoption
    (the round-4 regression must not come back).
 
 Point 2 is the one that matters. Two previous attempts at this predicate were

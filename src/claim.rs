@@ -836,6 +836,14 @@ pub struct PublishClaimTxn {
     pub note_commitment: String,
 }
 
+/// The consumed-note scanner keys CLAIMs by details commitment, independently
+/// of metadata and transaction output ordering (which can include TX_FEE).
+fn claim_consumption_key(note: &Note) -> [u8; 32] {
+    miden_protocol::note::NoteDetails::from(note)
+        .commitment()
+        .as_bytes()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn publish_claim_internal(
     params: claimAssetCall,
@@ -900,11 +908,8 @@ async fn publish_claim_internal(
     // can emit the ClaimEvent under the REAL tx hash (which carries the
     // `claimAsset` calldata aggkit decodes for the claim's GER boundary) instead
     // of a derived hash whose synthetic tx has empty calldata.
-    let note_commitment = hex::encode(
-        miden_protocol::note::NoteDetails::from(&claim_note)
-            .commitment()
-            .as_bytes(),
-    );
+    let claim_details_commitment = claim_consumption_key(&claim_note);
+    let note_commitment = hex::encode(claim_details_commitment);
 
     let expires_at = latest_block_num + claim_receipt_expiration_blocks();
 
@@ -1068,34 +1073,20 @@ async fn publish_claim_internal(
     .await?;
     tracing::info!("submitted claim note txn: {txn_id}, claim_note_id: {claim_note_id}");
 
-    // Cantina #7: record the submitted CLAIM in the expected-MINT tracker
-    // BEFORE awaiting commit. If wait_for_transaction_commit times out (20s)
-    // and we bail!, the entry remains in the tracker. The bridge_out
-    // scanner's tick path then escalates to StaleAlert per global_index,
-    // giving on-call a list of stuck CLAIMs by L1 leaf. On successful
-    // commit (the next code block) we mark_landed to drop the entry.
+    // Track the exact CLAIM's details commitment, matching the consumed-note
+    // scanner. Output position is not identity: the fee machinery can insert a
+    // TX_FEE note before the CLAIM, and NoteId also includes metadata. Creation
+    // commit only proves publication; the watchdog remains until bridge
+    // consumption is observed (or its alert is delivered).
     if let Some(tracker) = expected_mints {
         let global_index_bytes: [u8; 32] = params.globalIndex.to_be_bytes();
-        let claim_id_bytes: [u8; 32] = tx_result
-            .executed_transaction()
-            .output_notes()
-            .iter()
-            .map(|n| match n {
-                miden_protocol::transaction::RawOutputNote::Full(full) => full.id().as_bytes(),
-                miden_protocol::transaction::RawOutputNote::Partial(partial) => {
-                    partial.id().as_bytes()
-                }
-            })
-            .next()
-            .unwrap_or_default();
-        if claim_id_bytes != [0u8; 32]
-            && let Err(e) = tracker
-                .record_expected(global_index_bytes, claim_id_bytes)
-                .await
+        if let Err(e) = tracker
+            .record_expected(global_index_bytes, claim_details_commitment)
+            .await
         {
             // RD-913: tracker is now store-backed. A store hiccup here
-            // means we won't get a StaleAlert later if the MINT is
-            // censored — log it loudly, but don't fail the CLAIM
+            // means we won't get a StaleAlert later if the CLAIM is not
+            // consumed — log it loudly, but don't fail the CLAIM
             // submission itself (the claim has been submitted at this
             // point; refusing to return would just mean the user can't
             // get a receipt for a tx that already went on-chain).
@@ -1103,7 +1094,7 @@ async fn publish_claim_internal(
                 target: "claim",
                 global_index = ?global_index_bytes,
                 error = ?e,
-                "RD-913: expected-MINT record store failure; no staleness alert will fire"
+                "CLAIM consumption watchdog record failed; no staleness alert will fire"
             );
         }
     }
@@ -1123,33 +1114,6 @@ async fn publish_claim_internal(
         )
         .await?;
         tracing::info!("claim tx {txn_id} committed to block");
-        // Cantina #7: mark Landed once `wait_for_transaction_commit`
-        // confirms the CLAIM tx was committed. Aggkit's miden-client
-        // operates on the proxy's service account — it CANNOT observe
-        // the bridge account's consumption of our CLAIM via
-        // NoteFilter::Consumed (the consumed-set returned by miden-client
-        // is restricted to our tracked accounts, not the bridge's). The
-        // commit confirmation is the right closure point: from there,
-        // the bridge's MINT emission is deterministic, and tracking
-        // longer would only fire spurious StaleAlerts.
-        //
-        // We still keep the record_expected → tick path useful: any
-        // CLAIM that fails to commit (tx not in block within 20s) does
-        // NOT reach this branch, so the tracker entry remains and the
-        // tick eventually escalates to StaleAlert with the global_index
-        // for operator triage.
-        if let Some(tracker) = expected_mints {
-            let global_index_bytes: [u8; 32] = params.globalIndex.to_be_bytes();
-            if let Err(e) = tracker.mark_landed(global_index_bytes).await {
-                tracing::warn!(
-                    target: "claim",
-                    global_index = ?global_index_bytes,
-                    error = ?e,
-                    "RD-913: mark_landed store failure; staleness tick will eventually \
-                     time the entry out (one-shot StaleAlert)"
-                );
-            }
-        }
     } else {
         anyhow::bail!("claim tx {txn_id} was submitted but not committed within 20s");
     }
@@ -1372,6 +1336,61 @@ mod tests {
     use crate::store::memory::InMemoryStore;
     use crate::test_helpers::seed_test_faucets;
     use alloy::primitives::address;
+
+    #[tokio::test]
+    async fn committed_claim_creation_keeps_watchdog_until_consumed_identity_is_seen() {
+        use crate::expected_mint_tracker::{ClaimStatus, ExpectedClaimTracker};
+        use alloy_core::sol_types::SolCall;
+        use miden_protocol::crypto::rand::RandomCoin;
+        use std::collections::HashSet;
+
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/claim-deposit-373.json")).unwrap();
+        let input = alloy::hex::decode(fixture["input"].as_str().unwrap()).unwrap();
+        let params = claimAssetCall::abi_decode(&input).unwrap();
+        let accounts = crate::test_helpers::create_test_service().accounts;
+        let note = miden_base_agglayer::ClaimNote::create(
+            claim_storage_from_call(&params, 0).unwrap(),
+            accounts.0.bridge.0,
+            accounts.0.service.0,
+            &mut RandomCoin::new(miden_protocol::Word::from([1u32, 2, 3, 4])),
+        )
+        .unwrap();
+        let key = claim_consumption_key(&note);
+        assert_ne!(
+            key,
+            note.id().as_bytes(),
+            "NoteId is not the scanner's details identity"
+        );
+        let store = Arc::new(InMemoryStore::new());
+        let tracker = ExpectedClaimTracker::new(store.clone());
+        let gi = params.globalIndex.to_be_bytes::<32>();
+        tracker.record_expected(gi, key).await.unwrap();
+        let hash = "0xcreation";
+        let commitment = hex::encode(key);
+        store
+            .prepare_note_handoff(hash, &commitment, &note.id().to_string(), 50)
+            .await
+            .unwrap();
+        // Publication/creation commit confirms the handoff, not consumption.
+        store.confirm_note_handoff(hash, &commitment).await.unwrap();
+        assert_eq!(
+            tracker.tick(&HashSet::new(), 10).await.unwrap(),
+            vec![(gi, ClaimStatus::Pending { ticks_pending: 1 })]
+        );
+        assert_eq!(
+            tracker
+                .tick(&HashSet::from([note.id().as_bytes()]), 10)
+                .await
+                .unwrap(),
+            vec![(gi, ClaimStatus::Pending { ticks_pending: 2 })]
+        );
+        assert_eq!(
+            tracker.tick(&HashSet::from([key]), 10).await.unwrap(),
+            vec![(gi, ClaimStatus::Landed)]
+        );
+        assert_eq!(tracker.pending_count().await.unwrap(), 0);
+    }
 
     #[test]
     fn test_metadata_hash_empty() {

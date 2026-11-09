@@ -78,8 +78,7 @@ case "$test_filter" in
         # bridge-service-l2b), so GUARD on the overlay being up: on the base stack they're
         # skipped with a warning; on the l2l2 stack they run. `e2e-test.sh l2l2` runs the
         # L2<->L2 group (forward/clash/back); the native round-trips exercise a
-        # Miden-originated token to BOTH destinations (->L2B and ->L1). Running them before
-        # cantina13's poison leaf also lets their certificate settlement complete un-wedged.
+        # Miden-originated token to BOTH destinations (->L2B and ->L1).
         if docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'postgres-l2b'; then
             echo "== L2<->L2 group (L2B overlay present) =="
             "$SCRIPT_DIR/e2e-test.sh" l2l2
@@ -109,9 +108,8 @@ case "$test_filter" in
             # --force-recreates aggkit (fresh BridgeL2Sync cursor), leaving bridge-service +
             # aggkit re-syncing. Its own assertions pass, but the follow-on cantina13 tier
             # then cannot get a fresh deposit to ready_for_claim on the still-resyncing
-            # consumers. And it CANNOT be reordered after cantina13 either — cantina13's
-            # poison leaf fail-closed halts the reconcile re-sweep recovery depends on. So it
-            # must run ISOLATED: the dedicated #148 gate runs e2e-recovery-readiness.sh 3x on
+            # consumers. Keep it ISOLATED so consumer resync does not interfere with later
+            # traffic: the dedicated #148 gate runs e2e-recovery-readiness.sh 3x on
             # its own fresh stack (REQUIRE_RECOVERY_READINESS=1). (It used to run here only
             # because it failed fast at step 1 and never reached its destructive step 4.)
             # #149 restore acceptance (native custom-name row + net-2 row survive
@@ -127,10 +125,9 @@ case "$test_filter" in
         echo ""
         # cantina13 recovery — runs AFTER the L2<->L2 + native tiers so its from-scratch
         # DROP + --restore rebuilds the whole multi-network faucet set (L1 net0, L2B net2,
-        # native net1) from on-chain — the finding #62 proof inside the full suite. Its
-        # final phase leaves a self-targeted poison leaf in the LET (Cantina #13
-        # circuit-break repro) that wedges any certificate settlement after it, so only the
-        # L1->L2-only manual-user-claim may follow.
+        # native net1) from on-chain — the finding #62 proof inside the full suite. The
+        # metadata corruption phase withholds readiness; its full restore and fresh
+        # traffic phase proves the blocker cleared before the next tier starts.
         # #149: when the L2B overlay is up (so the native+net-2 prerequisite rows were
         # created by the tiers above), REQUIRE the restore-survival assertion — a missing
         # row then FAILS the gate instead of silently skipping (PR #150 re-review).
@@ -144,8 +141,7 @@ case "$test_filter" in
         # with benign no-op txs and HARD-asserts that a fresh deposit
         # autoclaims), but if it dies mid-leg the sponsor may stay wedged — so
         # nothing that depends on sponsor autoclaim may run after it. Its legs
-        # are L1→L2-only (GER injection via aggoracle, no certificate
-        # settlement), so running after cantina13's poison leaf is safe. The
+        # are L1→L2-only (GER injection via aggoracle, no certificate settlement). The
         # optional ALLOWLIST_LEG=1 phase (restarts the proxy) is NOT enabled
         # here — it is only for disposable stacks, run manually.
         "$SCRIPT_DIR/e2e-manual-user-claim.sh"

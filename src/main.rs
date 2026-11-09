@@ -1150,6 +1150,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?,
     );
+    let projection_health = projector.health();
     tracing::info!(
         "SyntheticProjector registered: the SOLE synthetic-event producer and the SINGLE owner of \
          the synthetic tip. SINGLE-PROCESS ONLY — multiple replicas are NOT supported."
@@ -1324,6 +1325,7 @@ async fn main() -> anyhow::Result<()> {
     // `publish_claim_internal` can record the CLAIM NoteId and the scanner
     // can mark it Landed once it sees the bridge consume it.
     state.expected_mints = expected_mints_handle;
+    state.projection_health = projection_health;
     state.miden_store_dir = miden_store_dir.clone().unwrap_or_default();
     state.miden_api_key = command.miden_api_key;
     // The bounded single writer is the only production write path. Accepted

@@ -58,8 +58,11 @@ watchdog_main() {
     declare -A seen=()
     attempts=0; budget_reported=0
     log "evidence=$WATCHDOG_DIR max_attempts=$WATCHDOG_MAX_ATTEMPTS"
-    while true; do
+    # A stop request drains the current bounded preserve-heal. Killing its
+    # process group mid-copy could leave the only staged state unrestored.
+    while [[ -z "${CHAOS_STOP_FILE:-}" || ! -e "$CHAOS_STOP_FILE" ]]; do
         sleep 30
+        [[ -n "${CHAOS_STOP_FILE:-}" && -e "$CHAOS_STOP_FILE" ]] && break
         watchdog_tick || return 1
     done
 }

@@ -1,238 +1,171 @@
-//! Expected-MINT-NoteId tracker — Cantina #7 monitor.
+//! Durable watchdog for submitted CLAIM-note consumption.
 //!
-//! Cantina #7 reports that the MINT note's NoteId is fully derivable from
-//! public claim data (the bridge_in MASM derives serial from
-//! `CLAIM_PROOF_DATA_KEY`, which is itself public). An attacker watching
-//! pending claims can pre-compute the expected MINT NoteId and submit a
-//! metadata-distinct twin first; batch dedup (keyed on NoteId) discards
-//! the legitimate claim's MINT, censoring the user.
+//! The legacy module, table, and metric names say "expected MINT", but the
+//! observed signal is consumption of the CLAIM by our bridge, not delivery of
+//! its output MINT. The tracker does not prove recipient credit or retry claims.
 //!
-//! The aggkit-side defense (per CANTINA_FIXES.md) is to:
-//! 1. Track each submitted claim's expected MINT NoteId locally.
-//! 2. Periodically check that the expected MINT lands on-chain.
-//! 3. If it doesn't appear within N blocks, retry with backoff; after K
-//!    retries, page on-call.
-//!
-//! ## RD-913 — two bugs fixed here
-//!
-//! **Bug A (in-memory only).** Pre-fix this tracker was `RwLock<HashMap<...>>`.
-//! A graceful shutdown during a pending claim's staleness window lost
-//! the entry — the restart had no record that the CLAIM was still in
-//! flight, so a never-landing MINT never escalated. Recoverable for
-//! in-flight claims (the next `record_expected` after restart will be
-//! made by the resubmission path), but the staleness window restarted
-//! from zero. Post-fix the source of truth is `monitor_expected_mints`.
-//!
-//! **Bug B (StaleAlert fires forever).** Pre-fix `tick()` looped over
-//! the map, pushed `Landed` entries to `to_remove`, but NEVER pushed
-//! `StaleAlert` entries. The entry persisted in the map, so every
-//! subsequent tick (every sync, ≈ every 6s) re-evaluated the same
-//! entry past threshold and emitted another `bridge_expected_mint_stale_total`
-//! increment. After 24h of pager fatigue on a single stuck claim, the
-//! counter would be ~14400 and on-call would have learned to ignore the
-//! metric — exactly the failure mode the metric exists to prevent.
-//!
-//! Post-fix: **one-shot StaleAlert.** When `ticks_pending >= stale_threshold_ticks`
-//! the entry fires `StaleAlert` ONCE, the `alerted` flag is set, and the
-//! entry is removed from the live map. The DB row is also deleted (so
-//! restart doesn't replay the alert). This matches operator intent —
-//! once on-call is paged, the entry's job is done; the operator either
-//! resubmits (which creates a fresh tracker entry) or manually clears the
-//! claim. Continued spamming serves nobody.
+//! AwaitingClaim -> AlertPending is persisted before returning an alert. The
+//! caller emits its log/metric and then acknowledges that exact generation.
+//! Unacknowledged alerts survive restart and are delivered at least once; a
+//! crash after emission and before acknowledgement can produce a duplicate.
+//! Explicit resubmission supersedes the previous watchdog (including a due
+//! alert) with a new generation; stale acknowledgement cannot delete the new
+//! watchdog. Otherwise due alerts remain until acknowledged, even if the claim
+//! subsequently lands.
 
-use lru::LruCache;
-use parking_lot::Mutex;
 use std::collections::HashSet;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use crate::store::Store;
 
-/// 32-byte MINT NoteId.
-pub type MintNoteId = [u8; 32];
-
+/// 32-byte CLAIM note identity observed in the consumed-note inventory.
+pub type ClaimNoteId = [u8; 32];
+/// Compatibility name; these values have always identified CLAIM notes.
+pub type MintNoteId = ClaimNoteId;
 /// 32-byte global index (claim identifier on the L1 side).
 pub type GlobalIndex = [u8; 32];
 
-/// Default in-memory cache capacity (entries).
-/// Small (10k) because in-flight claims at any moment are O(hundreds);
-/// the cache exists primarily to avoid hitting the DB on every tick.
+/// Retained for callers configuring the old cache. Durable rows are read on
+/// every tick; an in-memory mirror is unnecessary for this bounded watchdog.
 pub const DEFAULT_CACHE_CAPACITY: usize = 10_000;
 
-/// Tracks the expected MINT NoteId for each submitted claim and how
-/// many sync ticks have elapsed since submission.
-pub struct ExpectedMintTracker {
-    cache: Mutex<LruCache<GlobalIndex, Entry>>,
+pub struct ExpectedClaimTracker {
     store: Arc<dyn Store>,
 }
+/// Compatibility name for existing submission paths.
+pub type ExpectedMintTracker = ExpectedClaimTracker;
 
+/// Identifies an alert delivery. Generations are never reused, including after
+/// the previous watchdog was deleted and the same claim was submitted again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Entry {
-    expected_mint: MintNoteId,
-    /// Number of sync ticks elapsed since the claim was submitted but
-    /// the expected MINT hasn't been observed on-chain yet.
-    ticks_pending: u32,
-    /// One-shot guard (RD-913 Bug B). Once a StaleAlert has fired for
-    /// this entry, the next tick treats it as already-alerted and skips
-    /// re-firing. The DB row is also deleted at the same time; this
-    /// flag is the in-cache mirror used for crash-recovery: if we crash
-    /// between firing the metric and deleting the row, the next load
-    /// sees `alerted=true` and stays quiet.
-    alerted: bool,
+pub struct ClaimAlertToken {
+    pub generation: i64,
 }
 
-/// Verdict on a single claim's expected-MINT status, used to drive retry
-/// or alert decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MintStatus {
-    /// Expected MINT was observed on-chain. Drop the entry.
+pub enum ClaimStatus {
+    /// The CLAIM was consumed by the bridge. This is not a MINT-delivery receipt.
     Landed,
-    /// Still within retry window — increment ticks and wait.
-    Pending { ticks_pending: u32 },
-    /// Exceeded retry threshold — page on-call. **Fires ONCE per entry**
-    /// (RD-913 Bug B fix). After this, the entry is removed and no
-    /// further alerts fire for this `global_index` until the next
-    /// `record_expected` call.
-    StaleAlert { ticks_pending: u32 },
+    Pending {
+        ticks_pending: u32,
+    },
+    /// Persisted delivery pending; acknowledge only after emitting the alert.
+    StaleAlert {
+        ticks_pending: u32,
+        token: ClaimAlertToken,
+    },
 }
+/// Compatibility name for existing monitor integrations.
+pub type MintStatus = ClaimStatus;
 
-impl ExpectedMintTracker {
+impl ExpectedClaimTracker {
     pub fn new(store: Arc<dyn Store>) -> Self {
-        Self::with_capacity(store, DEFAULT_CACHE_CAPACITY)
+        Self { store }
     }
 
-    pub fn with_capacity(store: Arc<dyn Store>, capacity: usize) -> Self {
-        let cap = NonZeroUsize::new(capacity.max(1)).expect("non-zero by construction");
-        Self {
-            cache: Mutex::new(LruCache::new(cap)),
-            store,
-        }
+    pub fn with_capacity(store: Arc<dyn Store>, _capacity: usize) -> Self {
+        Self::new(store)
     }
 
-    /// Register a claim's expected MINT NoteId. Called immediately after
-    /// a successful CLAIM submission. Upserts: re-registering the same
-    /// global_index resets the staleness window.
+    /// Record a submitted CLAIM note. Explicit resubmission supersedes any old
+    /// watchdog/undelivered alert for this claim and starts a fresh generation.
     pub async fn record_expected(
         &self,
         global_index: GlobalIndex,
-        expected_mint: MintNoteId,
+        claim_note: ClaimNoteId,
     ) -> anyhow::Result<()> {
         self.store
-            .expected_mint_record(&global_index, &expected_mint)
-            .await?;
-        self.cache.lock().put(
-            global_index,
-            Entry {
-                expected_mint,
-                ticks_pending: 0,
-                alerted: false,
-            },
-        );
-        Ok(())
+            .expected_mint_record(&global_index, &claim_note)
+            .await
     }
 
-    /// Update the tracker on each sync tick. `landed_mint_ids` is the set
-    /// of CLAIM/MINT IDs observed consumed since the previous call. For
-    /// each tracked claim:
-    /// - if its expected MINT is in `landed_mint_ids`: drop (Landed)
-    /// - else increment `ticks_pending`; if `>= stale_threshold_ticks`
-    ///   AND we haven't already alerted, fire StaleAlert ONCE and drop
-    ///   the entry; otherwise Pending.
-    ///
-    /// Returns a vector of `(global_index, status)` for every tracked
-    /// claim, in stable order. Entries reported as `Landed` or
-    /// `StaleAlert` are removed both from the cache and from the
-    /// persistent store — `StaleAlert` is one-shot per `record_expected`.
     pub async fn tick(
         &self,
-        landed_mint_ids: &HashSet<MintNoteId>,
+        consumed_claim_ids: &HashSet<ClaimNoteId>,
         stale_threshold_ticks: u32,
-    ) -> anyhow::Result<Vec<(GlobalIndex, MintStatus)>> {
-        // Source of truth: load every live entry from the store. The
-        // cache mirrors this, but we reload on every tick to handle:
-        //   - cache evictions (a long-lived stale entry could have been
-        //     pushed out of the cache by burstier observations),
-        //   - restart recovery (cache starts empty on boot),
-        //   - cross-process consistency (only one proxy is expected, but
-        //     defensive).
+    ) -> anyhow::Result<Vec<(GlobalIndex, ClaimStatus)>> {
         let rows = self.store.expected_mint_load_all().await?;
-
         let mut results = Vec::with_capacity(rows.len());
-        let mut to_remove: Vec<GlobalIndex> = Vec::new();
-
-        for (gi, expected_mint, ticks_pending, alerted) in rows {
-            if landed_mint_ids.contains(&expected_mint) {
-                results.push((gi, MintStatus::Landed));
-                to_remove.push(gi);
+        for row in rows {
+            // Once due, delivery remains pending even if the claim lands before
+            // the next scan. Only acknowledgement may remove the pending alert.
+            if row.alert_pending {
+                results.push((
+                    row.global_index,
+                    ClaimStatus::StaleAlert {
+                        ticks_pending: row.ticks_pending,
+                        token: ClaimAlertToken {
+                            generation: row.generation,
+                        },
+                    },
+                ));
                 continue;
             }
-
-            let next_ticks = ticks_pending.saturating_add(1);
-            if next_ticks >= stale_threshold_ticks && !alerted {
-                // RD-913 Bug B fix: fire StaleAlert ONCE per entry.
-                // Push to to_remove AND mark alerted so the row is gone
-                // before the next tick; the in-cache `alerted=true`
-                // covers the crash-window between fire-and-delete.
-                results.push((
-                    gi,
-                    MintStatus::StaleAlert {
-                        ticks_pending: next_ticks,
-                    },
-                ));
-                to_remove.push(gi);
-            } else if alerted {
-                // Already alerted previously (crash recovery path).
-                // Don't re-fire; let the deletion below clear it.
-                to_remove.push(gi);
-            } else {
-                // Still within retry window.
-                self.store
-                    .expected_mint_update_tick(&gi, next_ticks, false)
-                    .await?;
+            if consumed_claim_ids.contains(&row.claim_note) {
+                if self
+                    .store
+                    .expected_mint_remove_generation(&row.global_index, row.generation)
+                    .await?
                 {
-                    let mut cache = self.cache.lock();
-                    cache.put(
-                        gi,
-                        Entry {
-                            expected_mint,
-                            ticks_pending: next_ticks,
-                            alerted: false,
-                        },
-                    );
+                    results.push((row.global_index, ClaimStatus::Landed));
                 }
-                results.push((
-                    gi,
-                    MintStatus::Pending {
-                        ticks_pending: next_ticks,
-                    },
-                ));
+                continue;
             }
+            let next_ticks = row.ticks_pending.saturating_add(1);
+            let alert_pending = next_ticks >= stale_threshold_ticks;
+            // Compare-and-update: a concurrent resubmission must retain its new
+            // window, and another ticker cannot move an alert back to pending.
+            if !self
+                .store
+                .expected_mint_update_tick(
+                    &row.global_index,
+                    row.generation,
+                    next_ticks,
+                    alert_pending,
+                )
+                .await?
+            {
+                continue;
+            }
+            let status = if alert_pending {
+                ClaimStatus::StaleAlert {
+                    ticks_pending: next_ticks,
+                    token: ClaimAlertToken {
+                        generation: row.generation,
+                    },
+                }
+            } else {
+                ClaimStatus::Pending {
+                    ticks_pending: next_ticks,
+                }
+            };
+            results.push((row.global_index, status));
         }
-
-        for gi in &to_remove {
-            self.store.expected_mint_remove(gi).await?;
-            self.cache.lock().pop(gi);
-        }
-
-        // Stable order for deterministic test assertions.
         results.sort_by_key(|(gi, _)| *gi);
         Ok(results)
     }
 
-    /// Count of currently-tracked (i.e. live in the store) entries.
-    /// Reads from the store, not the cache — the store is authoritative.
+    /// Call after the alert log/metric has been emitted. A failed acknowledgement
+    /// leaves durable delivery pending; the next tick may emit it again.
+    pub async fn acknowledge_alert(
+        &self,
+        global_index: GlobalIndex,
+        token: ClaimAlertToken,
+    ) -> anyhow::Result<()> {
+        self.store
+            .expected_mint_acknowledge_alert(&global_index, token.generation)
+            .await
+    }
+
     pub async fn pending_count(&self) -> anyhow::Result<usize> {
         Ok(self.store.expected_mint_load_all().await?.len())
     }
 
-    /// Mark a tracked global_index as Landed without going through the tick
-    /// path. Used by the claim path once `wait_for_transaction_commit`
-    /// confirms the CLAIM tx was committed: from there the bridge's MINT
-    /// emission is deterministic.
+    /// Clear an awaiting CLAIM only after authoritative bridge-consumption
+    /// evidence, never merely the creation transaction committing. Already-due
+    /// alerts remain pending until delivered and acknowledged.
     pub async fn mark_landed(&self, global_index: GlobalIndex) -> anyhow::Result<()> {
-        self.store.expected_mint_remove(&global_index).await?;
-        self.cache.lock().pop(&global_index);
-        Ok(())
+        self.store.expected_mint_remove(&global_index).await
     }
 }
 
@@ -241,180 +174,188 @@ mod tests {
     use super::*;
     use crate::store::memory::InMemoryStore;
 
-    fn store() -> Arc<dyn Store> {
-        Arc::new(InMemoryStore::new())
+    fn setup() -> (Arc<InMemoryStore>, ExpectedClaimTracker) {
+        let store = Arc::new(InMemoryStore::new());
+        let tracker = ExpectedClaimTracker::new(store.clone());
+        (store, tracker)
     }
 
-    /// Cantina #7 + RD-913 Bug B — repro+regression. The lifecycle is:
-    /// tick 1 → Pending(1); tick 2 lands A (Landed, dropped); tick 3 B
-    /// hits threshold → StaleAlert ONCE; tick 4 must NOT re-fire (Bug B
-    /// would have produced a second StaleAlert here; post-fix the entry
-    /// is gone and the result list is empty).
-    #[tokio::test]
-    async fn cantina_7_expected_mint_tracker_lifecycle() {
-        let t = ExpectedMintTracker::new(store());
-        let gi_a: GlobalIndex = [0xAAu8; 32];
-        let gi_b: GlobalIndex = [0xBBu8; 32];
-        let mint_a: MintNoteId = [0x11u8; 32];
-        let mint_b: MintNoteId = [0x22u8; 32];
-
-        t.record_expected(gi_a, mint_a).await.unwrap();
-        t.record_expected(gi_b, mint_b).await.unwrap();
-        assert_eq!(t.pending_count().await.unwrap(), 2);
-
-        // Tick 1: nothing landed yet.
-        let landed: HashSet<MintNoteId> = HashSet::new();
-        let r = t.tick(&landed, 3).await.unwrap();
-        assert_eq!(r.len(), 2);
-        for (_, status) in &r {
-            assert!(matches!(status, MintStatus::Pending { ticks_pending: 1 }));
+    fn alert_token(results: &[(GlobalIndex, ClaimStatus)]) -> ClaimAlertToken {
+        match results[0].1 {
+            ClaimStatus::StaleAlert { token, .. } => token,
+            other => panic!("expected due alert, got {other:?}"),
         }
+    }
 
-        // Tick 2: A's mint lands; B still pending.
-        let mut landed = HashSet::new();
-        landed.insert(mint_a);
-        let r = t.tick(&landed, 3).await.unwrap();
-        // Stable order: gi_a (0xAA) < gi_b (0xBB).
-        assert_eq!(r[0], (gi_a, MintStatus::Landed));
-        assert!(matches!(r[1], (g, MintStatus::Pending { ticks_pending: 2 }) if g == gi_b));
-        // A is dropped from the store.
-        assert_eq!(t.pending_count().await.unwrap(), 1);
-
-        // Tick 3: B still pending, ticks_pending=3 hits threshold →
-        // StaleAlert ONCE. Bug B fix: B is now removed too.
-        let r = t.tick(&HashSet::new(), 3).await.unwrap();
-        assert_eq!(r.len(), 1);
-        assert!(matches!(r[0], (g, MintStatus::StaleAlert { ticks_pending: 3 }) if g == gi_b));
-        assert_eq!(t.pending_count().await.unwrap(), 0);
-
-        // Tick 4 (the bug-B regression check): the map is empty, NO
-        // further StaleAlert fires for gi_b.
-        let r = t.tick(&HashSet::new(), 3).await.unwrap();
-        assert!(
-            r.is_empty(),
-            "expected no alerts after the one-shot StaleAlert; got {r:?}"
+    #[tokio::test]
+    async fn consumed_claim_is_removed_while_other_claim_keeps_its_window() {
+        let (_, tracker) = setup();
+        tracker.record_expected([1; 32], [11; 32]).await.unwrap();
+        tracker.record_expected([2; 32], [22; 32]).await.unwrap();
+        let results = tracker.tick(&HashSet::from([[11; 32]]), 3).await.unwrap();
+        assert_eq!(
+            results,
+            vec![
+                ([1; 32], ClaimStatus::Landed),
+                ([2; 32], ClaimStatus::Pending { ticks_pending: 1 }),
+            ]
         );
+        assert_eq!(tracker.pending_count().await.unwrap(), 1);
     }
 
-    /// A claim whose MINT lands on the FIRST tick (zero censorship) is
-    /// reported as Landed, not Pending.
     #[tokio::test]
-    async fn cantina_7_first_tick_landing() {
-        let t = ExpectedMintTracker::new(store());
-        let gi: GlobalIndex = [0x42u8; 32];
-        let mint: MintNoteId = [0x99u8; 32];
-        t.record_expected(gi, mint).await.unwrap();
-
-        let mut landed = HashSet::new();
-        landed.insert(mint);
-        let r = t.tick(&landed, 5).await.unwrap();
-        assert_eq!(r, vec![(gi, MintStatus::Landed)]);
-        assert_eq!(t.pending_count().await.unwrap(), 0);
+    async fn restart_preserves_pending_window_and_due_unacknowledged_alert() {
+        let (store, tracker) = setup();
+        tracker.record_expected([1; 32], [11; 32]).await.unwrap();
+        assert_eq!(
+            tracker.tick(&HashSet::new(), 2).await.unwrap()[0].1,
+            ClaimStatus::Pending { ticks_pending: 1 }
+        );
+        drop(tracker);
+        let tracker = ExpectedClaimTracker::new(store.clone());
+        let due = tracker.tick(&HashSet::new(), 2).await.unwrap();
+        assert!(matches!(
+            due[0].1,
+            ClaimStatus::StaleAlert {
+                ticks_pending: 2,
+                ..
+            }
+        ));
+        drop(tracker); // Crash before the caller emits the alert.
+        let tracker = ExpectedClaimTracker::new(store.clone());
+        assert_eq!(tracker.tick(&HashSet::new(), 2).await.unwrap(), due);
+        tracker
+            .acknowledge_alert([1; 32], alert_token(&due))
+            .await
+            .unwrap();
+        drop(tracker);
+        let tracker = ExpectedClaimTracker::new(store);
+        assert!(tracker.tick(&HashSet::new(), 2).await.unwrap().is_empty());
     }
 
-    /// A claim never re-observed but threshold is `u32::MAX` stays
-    /// Pending forever — no spurious StaleAlert.
     #[tokio::test]
-    async fn cantina_7_high_threshold_stays_pending() {
-        let t = ExpectedMintTracker::new(store());
-        let gi: GlobalIndex = [0x42u8; 32];
-        let mint: MintNoteId = [0x99u8; 32];
-        t.record_expected(gi, mint).await.unwrap();
+    async fn failed_acknowledgement_redelivers_until_acknowledged() {
+        let (store, tracker) = setup();
+        tracker.record_expected([1; 32], [11; 32]).await.unwrap();
+        let due = tracker.tick(&HashSet::new(), 1).await.unwrap();
+        store.fail_monitor_operation("expected_mint_acknowledge_alert", true);
+        assert!(
+            tracker
+                .acknowledge_alert([1; 32], alert_token(&due))
+                .await
+                .is_err()
+        );
+        let restarted = ExpectedClaimTracker::new(store.clone());
+        assert_eq!(restarted.tick(&HashSet::new(), 1).await.unwrap(), due);
+        store.fail_monitor_operation("expected_mint_acknowledge_alert", false);
+        restarted
+            .acknowledge_alert([1; 32], alert_token(&due))
+            .await
+            .unwrap();
+        assert!(restarted.tick(&HashSet::new(), 1).await.unwrap().is_empty());
+    }
 
-        for i in 1..10u32 {
-            let r = t.tick(&HashSet::new(), u32::MAX).await.unwrap();
-            assert!(
-                matches!(r[0], (g, MintStatus::Pending { ticks_pending }) if g == gi && ticks_pending == i)
+    #[tokio::test]
+    async fn due_alert_must_be_durable_before_it_can_be_emitted() {
+        let (store, tracker) = setup();
+        tracker.record_expected([1; 32], [11; 32]).await.unwrap();
+        store.fail_monitor_operation("expected_mint_update_tick", true);
+        assert!(tracker.tick(&HashSet::new(), 1).await.is_err());
+        let row = store.expected_mint_load_all().await.unwrap()[0];
+        assert_eq!(row.ticks_pending, 0);
+        assert!(!row.alert_pending);
+        store.fail_monitor_operation("expected_mint_update_tick", false);
+        assert!(matches!(
+            tracker.tick(&HashSet::new(), 1).await.unwrap()[0].1,
+            ClaimStatus::StaleAlert { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn resubmission_supersedes_old_alert_without_accepting_its_stale_ack_or_tick() {
+        let (store, tracker) = setup();
+        tracker.record_expected([1; 32], [11; 32]).await.unwrap();
+        let due = tracker.tick(&HashSet::new(), 1).await.unwrap();
+        let old = alert_token(&due);
+        tracker.record_expected([1; 32], [11; 32]).await.unwrap();
+        let resumed = store.expected_mint_load_all().await.unwrap();
+        assert_eq!(
+            resumed.len(),
+            1,
+            "resubmission intentionally supersedes the old alert"
+        );
+        assert!(!resumed[0].alert_pending);
+        assert_ne!(resumed[0].generation, old.generation);
+        tracker.acknowledge_alert([1; 32], old).await.unwrap();
+        assert!(
+            !store
+                .expected_mint_update_tick(&[1; 32], old.generation, 99, true)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .expected_mint_remove_generation(&[1; 32], old.generation)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            tracker.tick(&HashSet::new(), 3).await.unwrap()[0].1,
+            ClaimStatus::Pending { ticks_pending: 1 }
+        );
+        let new_due = tracker.tick(&HashSet::new(), 1).await.unwrap();
+        assert_ne!(alert_token(&new_due), old);
+        tracker.acknowledge_alert([1; 32], old).await.unwrap();
+        assert_eq!(tracker.tick(&HashSet::new(), 1).await.unwrap(), new_due);
+    }
+
+    #[tokio::test]
+    async fn generation_is_not_reused_after_the_previous_row_was_deleted() {
+        let (_, tracker) = setup();
+        tracker.record_expected([1; 32], [11; 32]).await.unwrap();
+        let old = alert_token(&tracker.tick(&HashSet::new(), 1).await.unwrap());
+        tracker.acknowledge_alert([1; 32], old).await.unwrap();
+        tracker.record_expected([1; 32], [11; 32]).await.unwrap();
+        let due = tracker.tick(&HashSet::new(), 1).await.unwrap();
+        assert_ne!(alert_token(&due), old);
+        tracker.acknowledge_alert([1; 32], old).await.unwrap();
+        assert_eq!(tracker.tick(&HashSet::new(), 1).await.unwrap(), due);
+    }
+
+    #[tokio::test]
+    async fn late_claim_consumption_does_not_silently_delete_a_due_alert() {
+        let (_, tracker) = setup();
+        tracker.record_expected([1; 32], [11; 32]).await.unwrap();
+        let due = tracker.tick(&HashSet::new(), 1).await.unwrap();
+        tracker.mark_landed([1; 32]).await.unwrap();
+        assert_eq!(
+            tracker.tick(&HashSet::from([[11; 32]]), 1).await.unwrap(),
+            due
+        );
+        tracker
+            .acknowledge_alert([1; 32], alert_token(&due))
+            .await
+            .unwrap();
+        assert_eq!(tracker.pending_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn acknowledged_alert_is_one_shot_and_large_threshold_stays_pending() {
+        let (_, tracker) = setup();
+        tracker.record_expected([1; 32], [11; 32]).await.unwrap();
+        for ticks_pending in 1..10 {
+            assert_eq!(
+                tracker.tick(&HashSet::new(), u32::MAX).await.unwrap()[0].1,
+                ClaimStatus::Pending { ticks_pending }
             );
         }
-    }
-
-    /// RD-913 Bug B — explicit StaleAlert one-shot test. Threshold=2, drive
-    /// past it 10 times; assert exactly ONE StaleAlert, and no entries
-    /// remain after.
-    #[tokio::test]
-    async fn rd913_stale_alert_fires_once_only() {
-        let t = ExpectedMintTracker::new(store());
-        let gi: GlobalIndex = [0xCCu8; 32];
-        let mint: MintNoteId = [0xDDu8; 32];
-        t.record_expected(gi, mint).await.unwrap();
-
-        let mut stale_alerts = 0;
+        let due = tracker.tick(&HashSet::new(), 10).await.unwrap();
+        tracker
+            .acknowledge_alert([1; 32], alert_token(&due))
+            .await
+            .unwrap();
         for _ in 0..10 {
-            let r = t.tick(&HashSet::new(), 2).await.unwrap();
-            for (_, status) in &r {
-                if matches!(status, MintStatus::StaleAlert { .. }) {
-                    stale_alerts += 1;
-                }
-            }
+            assert!(tracker.tick(&HashSet::new(), 10).await.unwrap().is_empty());
         }
-        assert_eq!(
-            stale_alerts, 1,
-            "StaleAlert must fire exactly once per record_expected (RD-913 Bug B)"
-        );
-        assert_eq!(t.pending_count().await.unwrap(), 0);
-    }
-
-    /// RD-913 Bug A — restart simulation. record_expected, drop tracker,
-    /// re-instantiate, tick and confirm the entry is still tracked.
-    /// Pre-fix the new tracker started with zero entries (in-memory map
-    /// gone), so the in-flight claim's staleness window restarted.
-    #[tokio::test]
-    async fn rd913_restart_preserves_pending_entries() {
-        let store: Arc<dyn Store> = store();
-        let gi: GlobalIndex = [0xEEu8; 32];
-        let mint: MintNoteId = [0xFFu8; 32];
-
-        let t1 = ExpectedMintTracker::new(store.clone());
-        t1.record_expected(gi, mint).await.unwrap();
-        // Drive one tick so ticks_pending becomes 1.
-        let r = t1.tick(&HashSet::new(), 5).await.unwrap();
-        assert!(matches!(r[0].1, MintStatus::Pending { ticks_pending: 1 }));
-        drop(t1);
-
-        // Restart: brand-new tracker, cache empty.
-        let t2 = ExpectedMintTracker::new(store.clone());
-        assert_eq!(t2.pending_count().await.unwrap(), 1);
-
-        // Continue ticking against the SAME threshold. Pre-restart we did
-        // one tick; t2 picks up ticks_pending=1 from the DB and advances
-        // to 2, then 3, etc.
-        let r = t2.tick(&HashSet::new(), 5).await.unwrap();
-        assert!(matches!(r[0].1, MintStatus::Pending { ticks_pending: 2 }));
-        let r = t2.tick(&HashSet::new(), 5).await.unwrap();
-        assert!(matches!(r[0].1, MintStatus::Pending { ticks_pending: 3 }));
-        let r = t2.tick(&HashSet::new(), 5).await.unwrap();
-        assert!(matches!(r[0].1, MintStatus::Pending { ticks_pending: 4 }));
-        let r = t2.tick(&HashSet::new(), 5).await.unwrap();
-        // ticks_pending becomes 5 → >= threshold → StaleAlert fires.
-        assert!(matches!(
-            r[0].1,
-            MintStatus::StaleAlert { ticks_pending: 5 }
-        ));
-        assert_eq!(t2.pending_count().await.unwrap(), 0);
-    }
-
-    /// RD-913 — re-recording the same global_index resets the staleness
-    /// window AND the alerted flag. Lets operators safely resubmit a
-    /// previously-stalealertd claim without it being suppressed.
-    #[tokio::test]
-    async fn rd913_resubmission_resets_window() {
-        let t = ExpectedMintTracker::new(store());
-        let gi: GlobalIndex = [0x12u8; 32];
-        let mint: MintNoteId = [0x34u8; 32];
-
-        t.record_expected(gi, mint).await.unwrap();
-        // Burn through to StaleAlert in a single tick (threshold=1 fires
-        // immediately when ticks_pending becomes 1).
-        let r = t.tick(&HashSet::new(), 1).await.unwrap();
-        assert!(matches!(r[0].1, MintStatus::StaleAlert { .. }));
-        assert_eq!(t.pending_count().await.unwrap(), 0);
-
-        // Re-register (operator resubmitted the CLAIM after triage).
-        t.record_expected(gi, mint).await.unwrap();
-        // First tick is Pending(1), NOT StaleAlert — the resubmission
-        // reset the window.
-        let r = t.tick(&HashSet::new(), 3).await.unwrap();
-        assert!(matches!(r[0].1, MintStatus::Pending { ticks_pending: 1 }));
     }
 }

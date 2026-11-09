@@ -2,8 +2,9 @@
 """Pre-fund a bounded load stage on the local Anvil E2E fixture.
 
 One durable intent precedes each transfer. An interrupted/failed send is never
-repeated automatically: a later invocation must observe the required balance
-or fail. Funding happens BEFORE fault injection, never inside its deadline.
+repeated automatically. Operator-owned native faucets are outside this proxy's
+funding scope; unresolved older transfers to them remain recorded and fenced.
+Funding happens BEFORE fault injection, never inside its deadline.
 """
 import argparse
 import fcntl
@@ -33,12 +34,18 @@ def local_url(url):
     return url
 
 
-def rpc(url, method):
+def rpc(url, method, params=None, token=None):
+    headers = {'Content-Type': 'application/json'}
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
     request = urllib.request.Request(local_url(url), data=json.dumps(
-        {'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': []}).encode(),
-        headers={'Content-Type': 'application/json'})
+        {'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params or []}).encode(),
+        headers=headers)
     with urllib.request.urlopen(request, timeout=10) as response:
-        return json.load(response)['result']
+        result = json.load(response)
+    if 'error' in result or 'result' not in result:
+        raise RuntimeError(f'{method} did not return an authoritative result')
+    return result['result']
 
 
 def validate_binding(info, url, internal_port):
@@ -55,8 +62,20 @@ def validate_chain(url, expected):
 
 def save(path, value):
     temporary = path.with_suffix('.tmp')
-    temporary.write_text(json.dumps(value, indent=2) + '\n')
+    with temporary.open('w') as output:
+        output.write(json.dumps(value, indent=2) + '\n')
+        output.flush()
+        os.fsync(output.fileno())
     temporary.replace(path)
+    sync_directory(path.parent)
+
+
+def sync_directory(path):
+    directory = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def sample_metrics(body, fee_faucet, now):
@@ -92,6 +111,65 @@ def sample_metrics(body, fee_faucet, now):
     return int(maximum), {account: int(balance) for account, balance in balances.items()}
 
 
+def funding_scope(accounts, faucets, network, manifest):
+    """Mirror OwnershipDuty: only local-origin faucets are externally owned.
+
+    FeeVaultMonitor deliberately observes native faucets too. Observation does
+    not grant their signing keys to the proxy. Unknown accounts remain in scope;
+    only authoritative registry metadata can exclude an account.
+    """
+    if type(network) is not int or not 0 <= network <= 0xffffffff:
+        raise ValueError('invalid proxy network ID')
+    if not isinstance(faucets, list):
+        raise ValueError('invalid faucet registry response')
+    protected = {manifest['service'], manifest['ger_manager']}
+    if not protected <= accounts.keys():
+        raise ValueError('fee metrics do not cover both manifest accounts')
+    registered, excluded = set(), {}
+    for row in faucets:
+        if not isinstance(row, dict):
+            raise ValueError('invalid faucet registry row')
+        account, origin = row.get('faucet_id'), row.get('origin_network')
+        if (not isinstance(account, str) or not ID.fullmatch(account)
+                or type(origin) is not int or not 0 <= origin <= 0xffffffff):
+            raise ValueError('invalid faucet registry identity or origin network')
+        if account in registered:
+            raise ValueError('duplicate faucet registry identity')
+        registered.add(account)
+        if account in protected:
+            raise ValueError('faucet registry contradicts manifest account ownership')
+        if origin == network:
+            excluded[account] = {'reason': 'operator-owned native faucet',
+                                 'origin_network': origin}
+    if not registered <= accounts.keys():
+        raise ValueError('fee metrics do not cover the complete faucet registry')
+    return sorted(accounts.keys() - excluded.keys()), excluded
+
+
+def read_funding_scope(url, env, accounts, manifest):
+    # networkID(), unlike eth_chainId, returns the AggLayer network identity
+    # used by admin_registerNativeFaucet and the ownership monitor.
+    encoded = rpc(url, 'eth_call', [{'data': '0xbab161bf'}, 'latest'])
+    if not isinstance(encoded, str) or not re.fullmatch(r'0x[0-9a-fA-F]{64}', encoded):
+        raise ValueError('invalid proxy network ID response')
+    token = env.get('ADMIN_API_KEY')
+    if not token:
+        raise ValueError('proxy admin key unavailable for authoritative faucet scope')
+    faucets = rpc(url, 'admin_listFaucets', token=token)
+    network = int(encoded, 16)
+    managed, excluded = funding_scope(accounts, faucets, network, manifest)
+    return managed, excluded, network
+
+
+def checked_observation(sample, scope, expected_cap, expected_accounts, expected_scope):
+    cap, balances = sample()
+    if cap != expected_cap:
+        raise ValueError('fee policy changed during funding')
+    if scope(balances) != expected_scope or balances.keys() != expected_accounts:
+        raise ValueError('fee account ownership or coverage changed during funding')
+    return balances
+
+
 def required_balances(accounts, service, cap, cascades, cascade_txns, operations):
     if not 0 <= cascades <= 256 or not 0 <= operations <= 10000 or not 1 <= cascade_txns <= 100000:
         raise ValueError('stage fee budget exceeds fixture bounds')
@@ -103,34 +181,139 @@ def required_balances(accounts, service, cap, cascades, cascade_txns, operations
     return required
 
 
-def ensure_budget(path, identity, required, cap, observe, send, wait_seconds=300, pause=time.sleep):
+def pending_intents(path, identity, balances, excluded):
+    """Keep unresolved transfers fenced even after their scope is corrected."""
+    archive = path.with_name(path.stem + '-pending')
+    if archive.exists() and not archive.is_dir():
+        raise RuntimeError('invalid funding intent archive directory')
+    paths = sorted(archive.glob('*.json')) if archive.exists() else []
     if path.exists():
-        previous = json.loads(path.read_text())
-        if previous.get('status') == 'pending':
-            if previous['identity'] != identity:
-                raise RuntimeError('unresolved funding intent belongs to a different fixture; inspect it before proceeding')
-            balances = observe()
-            if any(balances.get(account, -1) < amount for account, amount in previous['required'].items()):
-                raise RuntimeError('funding outcome remains ambiguous; refusing to submit again')
-            previous['status'] = 'observed'
+        paths.append(path)
+    pending = []
+    for previous_path in paths:
+        previous = json.loads(previous_path.read_text())
+        # A later current intent carries references to unresolved older sends.
+        # Missing evidence must not silently remove their ambiguity fences.
+        for reference in previous.get('pending_outside_scope', []):
+            referenced = Path(reference['path'])
+            if referenced.parent != archive or not referenced.is_file():
+                raise RuntimeError('missing referenced funding intent archive')
+        if previous.get('status') == 'observed' and previous_path == path:
+            continue
+        if previous.get('status') != 'pending':
+            raise RuntimeError('invalid funding intent status; refusing to submit')
+        if previous['identity'] != identity:
+            raise RuntimeError('unresolved funding intent belongs to a different fixture; inspect it before proceeding')
+        targets = transfer_requirements(previous)
+        archived_path = (archive / (hashlib.sha256(previous_path.read_bytes()).hexdigest() + '.json')
+                         if previous_path == path else previous_path)
+        acknowledged = (archive_observations(archived_path, previous, balances)
+                        if archived_path.exists() else {})
+        unmet = {account: amount for account, amount in targets.items()
+                 if account not in acknowledged
+                 if balances.get(account, -1) < amount}
+        if unmet.keys() - excluded.keys():
+            raise RuntimeError('funding outcome remains ambiguous; refusing to submit again')
+        if unmet:
+            pending.append({'path': str(previous_path), 'unobserved_required': unmet})
+        elif previous_path == path:
+            previous.update(status='observed', after=balances, observed_at=time.time())
             save(path, previous)
+    return pending
+
+
+def transfer_requirements(record):
+    # A previous budget includes accounts that needed no transfer. Their later
+    # ordinary spending cannot make the outcome of that send ambiguous.
+    required, transfers = record.get('required'), record.get('transfers')
+    if not isinstance(required, dict) or not isinstance(transfers, dict) or not transfers:
+        raise RuntimeError('invalid funding intent targets')
+    if not transfers.keys() <= required.keys():
+        raise RuntimeError('funding intent transfer lacks its observation threshold')
+    for account, amount in transfers.items():
+        threshold = required[account]
+        if (not ID.fullmatch(account) or type(amount) is not int or amount <= 0
+                or type(threshold) is not int or threshold <= 0):
+            raise RuntimeError('invalid funding intent transfer or threshold')
+    return {account: required[account] for account in transfers}
+
+
+def archive_observations(path, record, balances):
+    """Acknowledge individual observations without altering original evidence.
+
+    A mixed managed/native send can be partially observed. Once a transferred
+    managed target was observed, its later spending must not resurrect its old
+    ambiguity fence. The unobserved native targets keep their fences.
+    """
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if path.name != digest + '.json':
+        raise RuntimeError('funding intent archive content mismatch')
+    targets = transfer_requirements(record)
+    acknowledgement = path.with_suffix('.observed')
+    observed = {}
+    if acknowledgement.exists():
+        saved = json.loads(acknowledgement.read_text())
+        observed = saved['balances']
+        if (saved['intent_sha256'] != digest or saved['identity'] != record['identity']
+                or not isinstance(observed, dict)
+                or not observed.keys() <= targets.keys()
+                or any(type(value) is not int or value < targets[account]
+                       for account, value in observed.items())):
+            raise RuntimeError('invalid archived funding observations')
+    newly_observed = {account: balances[account] for account, amount in targets.items()
+                      if account not in observed and balances.get(account, -1) >= amount}
+    if newly_observed:
+        observed.update(newly_observed)
+        save(acknowledgement, {'intent_sha256': digest, 'identity': record['identity'],
+                               'balances': observed})
+    return observed
+
+
+def archive_pending(path, balances):
+    """Copy exact original bytes durably before replacing the current intent."""
+    payload = path.read_bytes()
+    archive = path.with_name(path.stem + '-pending')
+    archive.mkdir(mode=0o700, exist_ok=True)
+    sync_directory(archive.parent)
+    destination = archive / (hashlib.sha256(payload).hexdigest() + '.json')
+    if destination.exists():
+        if destination.read_bytes() != payload:
+            raise RuntimeError('funding intent archive identity collision')
+    else:
+        temporary = destination.with_suffix('.tmp')
+        with temporary.open('wb') as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        temporary.replace(destination)
+    sync_directory(archive)
+    archive_observations(destination, json.loads(payload), balances)
+    return destination
+
+
+def ensure_budget(path, identity, required, cap, observe, send, wait_seconds=300,
+                  pause=time.sleep, excluded=None):
+    excluded = excluded or {}
+    if required.keys() & excluded.keys():
+        raise ValueError('funding requirements overlap excluded native accounts')
     balances = observe()
+    pending = pending_intents(path, identity, balances, excluded)
     transfers = {account: amount - balances.get(account, 0) + cap * 16
                  for account, amount in required.items() if balances.get(account, -1) < amount}
+    # Preserve partial observations even when this invocation needs no send.
+    # Otherwise later spending could resurrect an already resolved target.
+    for prior in pending:
+        if prior['path'] == str(path):
+            prior['path'] = str(archive_pending(path, balances))
     if not transfers:
-        return {'status': 'sufficient', 'required': required, 'balances': balances}
+        return {'status': 'sufficient', 'required': required, 'balances': balances,
+                'excluded_native': excluded, 'pending_outside_scope': pending}
     if sum(transfers.values()) > 100_000_000:
         raise ValueError('fee transfer exceeds per-stage test funding ceiling')
     record = {'status': 'pending', 'identity': identity, 'required': required,
-              'before': balances, 'transfers': transfers, 'created_at': time.time()}
-    save(path, record)  # Includes fsync below before a command can submit.
-    with path.open('rb') as durable:
-        os.fsync(durable.fileno())
-    directory = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
+              'before': balances, 'transfers': transfers, 'created_at': time.time(),
+              'excluded_native': excluded, 'pending_outside_scope': pending}
+    save(path, record)
     # No retry on timeout/nonzero: the transfer may have been admitted.
     record['command_output'] = send(transfers)
     save(path, record)
@@ -212,14 +395,12 @@ def main():
         if cap == 0:
             print('fee preflight: zero-fee chain')
             return
-        if not {manifest['service'], manifest['ger_manager']} <= balances.keys():
-            raise ValueError('fee metrics do not cover both manifest accounts')
-        required = required_balances(balances, manifest['service'], cap, args.new_faucets, cascade_txns, args.operations)
+        managed, excluded, network = read_funding_scope(args.proxy_rpc, env, balances, manifest)
+        required = required_balances(managed, manifest['service'], cap, args.new_faucets, cascade_txns, args.operations)
         def observe():
-            current_cap, current = sample()
-            if current_cap != cap:
-                raise ValueError('fee policy changed during funding')
-            return current
+            return checked_observation(
+                sample, lambda current: read_funding_scope(args.proxy_rpc, env, current, manifest),
+                cap, balances.keys(), (managed, excluded, network))
         def send(transfers):
             command = ['docker', 'exec', funder, 'bridge-out-tool', '--store-dir',
                 f'/tmp/stage-fee-funder-{time.time_ns()}', '--node-url', 'http://miden-node:57291',
@@ -228,7 +409,9 @@ def main():
             for account, amount in transfers.items():
                 command.extend(['--fund', f'{account}={amount}'])
             return run(*command, timeout=600)
-        result = ensure_budget(state_dir / 'last-intent.json', identity, required, cap, observe, send)
+        result = ensure_budget(state_dir / 'last-intent.json', identity, required, cap,
+                               observe, send, excluded=excluded)
+        result['proxy_network'] = network
         if args.evidence:
             save(args.evidence, result)
         print(json.dumps(result))

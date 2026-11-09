@@ -103,6 +103,26 @@ pg() {
     docker exec "$PG_CONTAINER" psql -U agglayer -d agglayer_store -tA -c "$1"
 }
 
+# The node can keep syncing while publication is halted. Check both the HTTP
+# readiness verdict and the projector's own blocker, rather than accepting a
+# connection failure (or an unrelated health failure) as proof of the gate.
+projection_health_is() {
+    local response code body
+    response=$(curl -sS -m5 -w '\n%{http_code}' "$L2_RPC/health") || return 1
+    code=${response##*$'\n'}
+    body=${response%$'\n'*}
+    [[ "$code" == "$1" ]] || return 1
+    printf '%s' "$body" | python3 -c '
+import json, sys
+expected = sys.argv[1] == "true"
+projection = json.load(sys.stdin).get("projection", {})
+assert projection.get("ready") is expected
+assert expected or projection.get("last_error")
+' "$2"
+}
+export -f projection_health_is
+export L2_RPC
+
 # Current L2 block number (decimal).
 l2_block_number() {
     curl -sf "$L2_RPC" -H 'Content-Type: application/json' \
@@ -406,6 +426,9 @@ wait_for "fail-closed halt on unrecoverable metadata" \
     "docker logs --since $B_PHASE_TS $AGGLAYER_CONTAINER 2>&1 | grep -qiE 'unrecoverable ERC-20 metadata|reserved but its BridgeEvent was never emitted'" \
     120 5
 pass "Corruption DETECTED — projector HALTED fail-closed (loud, no silent getLogs gap)"
+wait_for "blocked projection withholds consumer readiness" \
+    "projection_health_is 503 false" 60 2
+pass "Readiness is 503 with the projection blocker recorded despite a live node"
 
 UNRECOVERABLE_AFTER=$(proxy_metric bridge_out_metadata_unrecoverable_total)
 [[ "$UNRECOVERABLE_AFTER" -gt "$UNRECOVERABLE_BEFORE" ]] \
@@ -561,6 +584,9 @@ wait_for "projector resumed (frontier clear)" \
     "docker logs --since $MARK_B $AGGLAYER_CONTAINER 2>&1 | grep -qE 'caught up to (the Miden tip|the projection ceiling)'" \
     120 5
 pass "Projector RESUMED — getLogs contiguous, aggkit un-wedged"
+wait_for "recovered projection restores consumer readiness" \
+    "projection_health_is 200 true" 60 2
+pass "Readiness returned to 200 after a complete successful projection pass"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Phase C — POST-RECOVERY LIVENESS (1 in + 1 out). The rebuilt-from-scratch proxy

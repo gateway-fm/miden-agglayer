@@ -1,22 +1,30 @@
 use crate::accounts_config;
+use crate::accounts_config::initialization::{InitBinding, InitCheckpoint};
 use crate::accounts_config::{AccountIdBech32, AccountsConfig};
 use crate::accounts_config::{FundingManifest, load_funding_manifest, save_funding_manifest};
-use crate::faucet_ops;
-use crate::fee_funding::{self, FeeSnapshot};
-use crate::metrics::ProofKind;
+use crate::faucet_provisioning::{self, FaucetStep, StepJournal};
+use crate::fee_funding::{self, DeployKind, DeploymentPlan, FeeSnapshot};
 use crate::miden_client::MidenClient;
 use crate::miden_client::MidenClientLib;
 use crate::proxy_keystore::ProxyKeystore;
 use crate::remote_signer::SignerRole;
 use anyhow::Context;
-use miden_base_agglayer::{BridgeRoles, MetadataHash};
+use miden_base_agglayer::{BridgeRoles, ConfigAggBridgeNote, ConversionMetadata, MetadataHash};
 use miden_client::crypto::FeltRng;
 use miden_client::keystore::Keystore;
+use miden_client::transaction::{PaymentNoteDescription, TransactionRequestBuilder};
 use miden_protocol::account::auth::{AuthSecretKey, PublicKeyCommitment};
 use miden_protocol::account::{Account, AccountId, AccountType};
 use miden_protocol::address::NetworkId;
+use miden_protocol::{
+    Felt,
+    asset::{Asset, FungibleAsset},
+    block::BlockNumber,
+    note::NoteType,
+};
 use miden_standards::account::auth::{Approver, AuthSingleSig};
 use miden_standards::account::wallets::BasicWallet;
+use miden_standards::interop::eth::EthAddress;
 use miden_tx::auth::TransactionAuthenticator;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -114,9 +122,8 @@ pub async fn create_auth_component(
     Ok((auth_component, Some(key_pair)))
 }
 
-/// Options for `--init` (#201). Account deployment itself lives in
-/// `fee_funding::deploy_account`, which is fee-aware (empty-txn deploy on a
-/// zero-fee chain; consume-the-funding-note deploy on a fee-charging one).
+/// Options for `--init`. Identities and prepared sends are checkpointed before
+/// publication; fee-aware deployment decisions are shared with direct tooling.
 #[derive(Debug, Clone)]
 pub struct InitOptions {
     /// Build + persist `service`/`ger_manager`, write `funding.toml` and exit
@@ -129,32 +136,13 @@ pub struct InitOptions {
     pub miden_store_dir: Option<PathBuf>,
 }
 
-async fn add_bridge(
+async fn build_bridge(
     client: &mut MidenClientLib,
-    _keystore: Arc<ProxyKeystore>,
     service_id: AccountId,
     ger_manager_id: AccountId,
     network_id: u32,
     fee: &FeeSnapshot,
-    funding_wait: std::time::Duration,
 ) -> anyhow::Result<Account> {
-    // 0.16.0-alpha.5: the AggLayer network id is a per-bridge storage slot
-    // again (agglayer::bridge::network_id, written once at account creation —
-    // the 0.15.3 model; alpha.4 briefly regressed it to a compile-time MASM
-    // constant). Must match the id the L1 RollupManager assigns this rollup,
-    // or claims fail destination-network checks on both ends. 0.16 also split
-    // the GER-manager role into injector + remover; we assign both roles to
-    // the same ger_manager account (mirrors the upstream rust-sdk reference).
-    // rc.4: role-based bridge creation. The service account administers the
-    // bridge (RBAC ADMIN) and holds the faucet-manager role; the GER manager
-    // holds both injector and remover (mirrors the pre-rc single-manager
-    // deployment; role membership is ADMIN-changeable at runtime now). The
-    // account also carries the mandatory fee components — zero fees against
-    // the chain's real fee faucet.
-    let fee_faucet_id = crate::fee_policy::fee_faucet_id_from_chain(client).await?;
-    // 0.17 split note repricing (FEE_MNGR) and emergency pause (PAUSER) off
-    // ADMIN into their own roles; the service account keeps both, exactly the
-    // authority it had as ADMIN on 0.16.
     let roles = BridgeRoles::new(
         std::collections::BTreeSet::from([service_id]),
         std::collections::BTreeSet::from([ger_manager_id]),
@@ -163,61 +151,17 @@ async fn add_bridge(
         std::collections::BTreeSet::from([service_id]),
     )
     .map_err(|e| anyhow::anyhow!("bridge role construction failed: {e}"))?;
-    let account = crate::network_accounts::bridge_account_builder(
+    Ok(crate::network_accounts::bridge_account_builder(
         client.rng().draw_word(),
         service_id,
         roles,
         network_id,
-        fee_faucet_id,
+        fee.fee_faucet_id,
     )?
-    .build()
-    .map_err(|e| anyhow::anyhow!("bridge account build failed: {e}"))?;
-    client.add_account(&account, false).await?;
-
-    // #201: zero-fee chain → empty-txn deploy (unchanged). Fee-charging chain →
-    // fails loudly (network account; see fee_funding::DeployKind).
-    fee_funding::deploy_account(
-        client,
-        account.id(),
-        "bridge",
-        fee_funding::DeployKind::NetworkAccount { funder: service_id },
-        ProofKind::Init,
-        fee,
-        funding_wait,
-    )
-    .await?;
-
-    Ok(account)
+    .build()?)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn add_faucet(
-    client: &mut MidenClientLib,
-    token_symbol: &str,
-    decimals: u8,
-    origin_token_address: &[u8; 20],
-    origin_network: u32,
-    scale: u8,
-    service_id: AccountId,
-    bridge_account_id: AccountId,
-    metadata_hash: MetadataHash,
-) -> anyhow::Result<Account> {
-    faucet_ops::create_and_register_faucet(
-        client,
-        token_symbol,
-        decimals,
-        origin_token_address,
-        origin_network,
-        scale,
-        service_id,
-        bridge_account_id,
-        metadata_hash,
-        false, // proxy-created faucet: bridge-owned mint/burn (not Miden-native)
-    )
-    .await
-}
-
-async fn add_wallet(
+async fn build_wallet(
     client: &mut MidenClientLib,
     keystore: Arc<ProxyKeystore>,
     role: Option<SignerRole>,
@@ -258,6 +202,15 @@ async fn add_wallet(
     if let Some(key_pair) = key_pair.as_ref() {
         keystore.add_key(key_pair, account.id()).await?;
     }
+    Ok(account)
+}
+
+async fn add_wallet(
+    client: &mut MidenClientLib,
+    keystore: Arc<ProxyKeystore>,
+    role: Option<SignerRole>,
+) -> anyhow::Result<Account> {
+    let account = build_wallet(client, keystore, role).await?;
     client.add_account(&account, false).await?;
     Ok(account)
 }
@@ -301,56 +254,178 @@ pub async fn create_standalone_wallet(
     Ok(account)
 }
 
-/// Build — or, after `--print-funding` (or a fee-charging `--init` that timed
-/// out waiting for funding), RELOAD — the two KMS-keyed accounts (#201).
+/// Recover the checkpoint's identity without overwriting an optimistic local
+/// snapshot. A missing local account is imported, or reconstructed from its
+/// saved creation seed only after the node authoritatively reports absence.
+async fn restore_initial_account(
+    client: &mut MidenClientLib,
+    saved: &Account,
+) -> anyhow::Result<()> {
+    if client.get_account(saved.id()).await?.is_some() {
+        return Ok(());
+    }
+    match client.import_account_by_id(saved.id()).await {
+        Ok(()) => Ok(()),
+        Err(miden_client::ClientError::AccountNotFoundOnChain(id)) if id == saved.id() => {
+            anyhow::ensure!(
+                saved.is_new(),
+                "saved account {id} is absent on chain and has no initial creation state"
+            );
+            client.add_account(saved, false).await?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 async fn kms_accounts(
     client: &mut MidenClientLib,
     keystore: Arc<ProxyKeystore>,
     opts: &InitOptions,
     fee: &FeeSnapshot,
+    checkpoint: &InitCheckpoint,
 ) -> anyhow::Result<(Account, Account)> {
-    if let Some(manifest) = load_funding_manifest(opts.miden_store_dir.clone())? {
-        let service = reload_account(client, manifest.service_id()?, "service").await?;
-        let ger_manager = reload_account(client, manifest.ger_manager_id()?, "ger_manager").await?;
-        tracing::info!(
-            service = %AccountIdBech32(service.id()),
-            ger_manager = %AccountIdBech32(ger_manager.id()),
-            "resuming --init from funding.toml: reusing the accounts it records (#201)"
+    let legacy = load_funding_manifest(opts.miden_store_dir.clone())?;
+    if let Some(manifest) = &legacy {
+        anyhow::ensure!(
+            manifest.fee_faucet()? == fee.fee_faucet_id
+                && manifest.verification_base_fee == fee.verification_base_fee,
+            "funding.toml does not match this chain's fee parameters"
         );
-        return Ok((service, ger_manager));
     }
-    let service = add_wallet(client, keystore.clone(), Some(SignerRole::Service)).await?;
-    let ger_manager = add_wallet(client, keystore, Some(SignerRole::GerManager)).await?;
-    if fee.charges_fees() {
-        // Fee-charging chain and nobody ran --print-funding first: persist the
-        // manifest NOW so whoever is watching (operator, e2e fee-funder) can fund
-        // the accounts this init is about to wait on. A re-run after a funding
-        // timeout then RESUMES these accounts instead of orphaning them behind
-        // a fresh random seed.
-        let manifest = FundingManifest::new(service.id(), ger_manager.id(), fee);
-        let path = save_funding_manifest(&manifest, opts.miden_store_dir.clone())?;
-        tracing::warn!("{}", manifest.instructions(&path));
+    let mut accounts = Vec::new();
+    for (name, role) in [
+        ("service", SignerRole::Service),
+        ("ger_manager", SignerRole::GerManager),
+    ] {
+        let legacy_id = legacy
+            .as_ref()
+            .map(|manifest| {
+                if name == "service" {
+                    manifest.service_id()
+                } else {
+                    manifest.ger_manager_id()
+                }
+            })
+            .transpose()?;
+        let saved = checkpoint.account(name)?;
+        let account = if let Some(saved) = saved {
+            if let Some(id) = legacy_id {
+                anyhow::ensure!(
+                    saved.id() == id,
+                    "funding.toml {name} differs from initialization checkpoint"
+                );
+            }
+            restore_initial_account(client, &saved).await?;
+            saved
+        } else if let Some(id) = legacy_id {
+            if client.get_account(id).await?.is_none() {
+                client
+                    .import_account_by_id(id)
+                    .await
+                    .with_context(|| format!("cannot reload {name} recorded in funding.toml"))?;
+            }
+            let account = client
+                .get_account(id)
+                .await?
+                .context("funding account missing after import")?;
+            checkpoint.reserve_account(name, &account)?
+        } else {
+            let account = build_wallet(client, keystore.clone(), Some(role)).await?;
+            // Key persistence precedes this checkpoint; no transaction or SDK
+            // account insertion can expose an identity before it is durable.
+            let account = checkpoint.reserve_account(name, &account)?;
+            client.add_account(&account, false).await?;
+            account
+        };
+        if keystore.is_remote() {
+            let bound: PublicKeyCommitment = account
+                .storage()
+                .get_item(AuthSingleSig::public_key_slot())?
+                .into();
+            let configured = keystore.resolve_role_commitments()?;
+            anyhow::ensure!(
+                configured.get(&role) == Some(&bound),
+                "saved {name} account is bound to a different remote signer key"
+            );
+            keystore.bind_account(account.id(), bound);
+        }
+        accounts.push(account);
     }
+    let ger_manager = accounts.pop().expect("GER account");
+    let service = accounts.pop().expect("service account");
+    // Persist even on a fee-free chain: retries must retain these identities.
+    let manifest = FundingManifest::new(service.id(), ger_manager.id(), fee);
+    save_funding_manifest(&manifest, opts.miden_store_dir.clone())?;
     Ok((service, ger_manager))
 }
 
-/// Reload an account `funding.toml` records; import it from the node if the
-/// local row is gone (the same recovery path `verify_remote_bindings` uses).
-async fn reload_account(
+/// Funding, deployment and registration all use the same prepared-send
+/// journal. In particular a timed-out service cascade cannot produce a second
+/// random payment on restart, even when the SDK never applied the first one.
+#[allow(clippy::too_many_arguments)]
+async fn deploy_initial_account(
     client: &mut MidenClientLib,
-    id: AccountId,
+    checkpoint: &InitCheckpoint,
     name: &str,
-) -> anyhow::Result<Account> {
-    if client.get_account(id).await?.is_none() {
-        client.import_account_by_id(id).await.map_err(|e| {
-            anyhow::anyhow!("cannot reload the {name} account {id} recorded in funding.toml: {e}")
-        })?;
+    account: AccountId,
+    kind: DeployKind,
+    fee: &FeeSnapshot,
+    wait: std::time::Duration,
+) -> anyhow::Result<()> {
+    let deployed = if checkpoint.load(name, FaucetStep::Deploy).await?.is_some() {
+        false // the journal reconciles the saved deployment's exact effect
+    } else {
+        fee_funding::deployment_exists_on_chain(client, account, name).await?
+    };
+    let plan = fee_funding::deployment_plan(deployed, kind, fee);
+    if plan == DeploymentPlan::AlreadyDeployed {
+        return Ok(());
     }
-    client.get_account(id).await?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "the {name} account {id} recorded in funding.toml is unavailable locally and on the node"
+    if let DeploymentPlan::CascadeThenConsume { funder } = plan {
+        faucet_provisioning::drive_step(
+            client,
+            checkpoint,
+            name,
+            FaucetStep::Fund,
+            account,
+            funder,
+            async |client: &mut MidenClientLib| {
+                let asset = Asset::from(FungibleAsset::new(
+                    fee.fee_faucet_id,
+                    fee_funding::cascade_amount(fee),
+                )?);
+                Ok(TransactionRequestBuilder::new()
+                    .expiration_delta(crate::claim::submission_note_expiration_delta())
+                    .build_pay_to_id(
+                        PaymentNoteDescription::new(vec![asset], funder, account),
+                        NoteType::Public,
+                        client.rng(),
+                    )?)
+            },
         )
-    })
+        .await?;
+    }
+    faucet_provisioning::drive_step(
+        client,
+        checkpoint,
+        name,
+        FaucetStep::Deploy,
+        account,
+        account,
+        async |client: &mut MidenClientLib| {
+            let builder = TransactionRequestBuilder::new()
+                .expiration_delta(crate::claim::submission_note_expiration_delta());
+            if plan == DeploymentPlan::EmptyTransaction {
+                Ok(builder.build()?)
+            } else {
+                let notes =
+                    fee_funding::wait_for_funding_notes(client, account, name, fee, wait).await?;
+                Ok(builder.build_consume_notes(notes)?)
+            }
+        },
+    )
+    .await
 }
 
 async fn add_accounts(
@@ -359,62 +434,112 @@ async fn add_accounts(
     network_id: u32,
     opts: &InitOptions,
     fee: &FeeSnapshot,
+    checkpoint: &InitCheckpoint,
 ) -> anyhow::Result<Accounts> {
-    let (service, ger_manager) = kms_accounts(client, keystore.clone(), opts, fee).await?;
-    let wait = opts.funding_wait;
-    fee_funding::deploy_account(
+    let (service, ger_manager) = kms_accounts(client, keystore, opts, fee, checkpoint).await?;
+    deploy_initial_account(
         client,
-        ger_manager.id(),
+        checkpoint,
         "ger_manager",
-        fee_funding::DeployKind::Wallet,
-        ProofKind::Init,
+        ger_manager.id(),
+        DeployKind::Wallet,
         fee,
-        wait,
+        opts.funding_wait,
     )
     .await?;
     if fee.charges_fees() {
-        // Historically `service` deployed lazily on its first claim. On a
-        // fee-charging chain it must consume its operator funding note FIRST:
-        // the cascade sends below are its own transactions, and it pays them.
-        fee_funding::deploy_account(
+        deploy_initial_account(
             client,
-            service.id(),
+            checkpoint,
             "service",
-            fee_funding::DeployKind::Wallet,
-            ProofKind::Init,
+            service.id(),
+            DeployKind::Wallet,
             fee,
-            wait,
+            opts.funding_wait,
         )
         .await?;
     }
-    // The bridge is keyless (service administers it) and deploys via its own
-    // transaction inside add_bridge. It is a NETWORK account: on a fee-charging
-    // chain it cannot consume a P2ID, so its vault must come from a
-    // FeeSponsorshipNote paired with a feature note it accepts (the #201
-    // follow-up); until then a fee-charging init fails loudly there.
-    let bridge = add_bridge(
+    let bridge = if let Some(saved) = checkpoint.account("bridge")? {
+        restore_initial_account(client, &saved).await?;
+        saved
+    } else {
+        let account = build_bridge(client, service.id(), ger_manager.id(), network_id, fee).await?;
+        let account = checkpoint.reserve_account("bridge", &account)?;
+        client.add_account(&account, false).await?;
+        account
+    };
+    deploy_initial_account(
         client,
-        keystore.clone(),
-        service.id(),
-        ger_manager.id(),
-        network_id,
+        checkpoint,
+        "bridge",
+        bridge.id(),
+        DeployKind::NetworkAccount {
+            funder: service.id(),
+        },
         fee,
-        wait,
+        opts.funding_wait,
     )
     .await?;
-    // ETH: 18 origin decimals → 8 miden decimals (scale=10). Native ETH has empty metadata on
-    // the L1 bridge, so the faucet's stored metadata_hash is keccak256("") — matches any
-    // CLAIM leaf_data.metadata_hash for ETH deposits.
-    let faucet_eth = add_faucet(
+    let faucet_eth = if let Some(saved) = checkpoint.account("faucet_eth")? {
+        restore_initial_account(client, &saved).await?;
+        saved
+    } else {
+        let account = crate::network_accounts::faucet_account_builder(
+            client.rng().draw_word(),
+            "ETH",
+            8,
+            Felt::new(u64::from(FungibleAsset::MAX_AMOUNT))?,
+            Felt::new(0)?,
+            service.id(),
+            bridge.id(),
+            fee.fee_faucet_id,
+        )?
+        .build()?;
+        let account = checkpoint.reserve_account("faucet_eth", &account)?;
+        client.add_account(&account, false).await?;
+        account
+    };
+    deploy_initial_account(
         client,
-        "ETH",
-        8,
-        &[0u8; 20],
-        0,
-        10,
+        checkpoint,
+        "faucet_eth",
+        faucet_eth.id(),
+        DeployKind::NetworkAccount {
+            funder: service.id(),
+        },
+        fee,
+        opts.funding_wait,
+    )
+    .await?;
+    faucet_provisioning::drive_step(
+        client,
+        checkpoint,
+        "faucet_eth",
+        FaucetStep::Register,
+        faucet_eth.id(),
         service.id(),
-        bridge.id(),
-        MetadataHash::from_abi_encoded(&[]),
+        async |client: &mut MidenClientLib| {
+            let note = ConfigAggBridgeNote::create(
+                ConversionMetadata {
+                    faucet_account_id: faucet_eth.id(),
+                    origin_token_address: EthAddress::new([0; 20]),
+                    scale: 10,
+                    origin_network: 0,
+                    is_native: false,
+                    metadata_hash: MetadataHash::from_abi_encoded(&[]),
+                },
+                service.id(),
+                bridge.id(),
+                client.rng(),
+            )?;
+            Ok(TransactionRequestBuilder::new()
+                .own_output_notes(vec![note])
+                .foreign_accounts([crate::miden_client::network_target_foreign_account(
+                    bridge.id(),
+                )?])
+                .expiration_delta(crate::claim::submission_note_expiration_delta())
+                .build()?)
+        },
     )
     .await?;
     Ok(Accounts {
@@ -473,24 +598,30 @@ async fn init_internal(
              asset (#201)"
         );
     }
+    let genesis = client
+        .get_block_header_by_num(BlockNumber::GENESIS)
+        .await?
+        .context("genesis unavailable for initialization binding")?
+        .0;
+    let checkpoint = InitCheckpoint::open(
+        miden_store_dir.clone(),
+        InitBinding {
+            genesis: hex::encode(genesis.commitment().as_bytes()),
+            network: network_id,
+            fee_faucet: fee.fee_faucet_id.to_hex(),
+            base_fee: fee.verification_base_fee,
+            cascade_amount: fee_funding::cascade_amount(&fee),
+        },
+    )?;
     if opts.print_funding {
-        let path = accounts_config::funding_manifest_path(miden_store_dir.clone())?;
-        if let Some(existing) = load_funding_manifest(miden_store_dir.clone())? {
-            // Re-printing must never rebuild: a second --print-funding after the
-            // operator already funded the recorded accounts would orphan them.
-            tracing::info!("funding.toml already exists — re-printing it, accounts NOT rebuilt");
-            println!("{}", existing.instructions(&path));
-            return Ok(path);
-        }
-        let service = add_wallet(client, keystore.clone(), Some(SignerRole::Service)).await?;
-        let ger_manager = add_wallet(client, keystore, Some(SignerRole::GerManager)).await?;
+        let (service, ger_manager) =
+            kms_accounts(client, keystore, &opts, &fee, &checkpoint).await?;
         let manifest = FundingManifest::new(service.id(), ger_manager.id(), &fee);
-        let path = save_funding_manifest(&manifest, miden_store_dir)?;
-        // Operator-facing: this IS the deliverable of --print-funding.
+        let path = accounts_config::funding_manifest_path(miden_store_dir)?;
         println!("{}", manifest.instructions(&path));
         return Ok(path);
     }
-    let accounts = add_accounts(client, keystore, network_id, &opts, &fee).await?;
+    let accounts = add_accounts(client, keystore, network_id, &opts, &fee, &checkpoint).await?;
 
     // Wait for the NTX builder to process account creation transactions
     // before submitting notes that target those accounts.
@@ -501,7 +632,7 @@ async fn init_internal(
     }
     tracing::info!("account settlement complete");
 
-    // Faucet bridge registration is handled in create_and_register_faucet (via add_faucet)
+    // The durable registration journal has observed the exact config note on chain.
 
     // 0.16: the 0.15-era register_p2id_script dummy-note step is gone. P2ID
     // notes are NoteType::Public and carry their script, and 0.16 requires
@@ -660,6 +791,47 @@ mod tests {
         crate::proxy_keystore::ProxyKeystore::local(
             miden_client::keystore::FilesystemKeyStore::new(dir).expect("filesystem keystore"),
         )
+    }
+
+    #[tokio::test]
+    async fn zero_fee_initialization_reuses_both_wallets_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Some(dir.path().to_path_buf());
+        let fee = FeeSnapshot {
+            verification_base_fee: 0,
+            fee_faucet_id: AccountId::from_hex("0x18101fa522c174b165efd4f70a0385").unwrap(),
+        };
+        let binding = InitBinding {
+            genesis: "test-genesis".into(),
+            network: 0,
+            fee_faucet: fee.fee_faucet_id.to_hex(),
+            base_fee: 0,
+            cascade_amount: 0,
+        };
+        let opts = InitOptions {
+            print_funding: false,
+            funding_wait: std::time::Duration::ZERO,
+            miden_store_dir: path.clone(),
+        };
+        let mut client = crate::test_helpers::offline_miden_client_lib().await;
+        let keystore = Arc::new(local_keystore());
+        let checkpoint = InitCheckpoint::open(path.clone(), binding.clone()).unwrap();
+        let (service, ger) = kms_accounts(&mut client, keystore.clone(), &opts, &fee, &checkpoint)
+            .await
+            .unwrap();
+        let manifest = load_funding_manifest(path.clone()).unwrap().unwrap();
+        assert_eq!(manifest.service_id().unwrap(), service.id());
+        assert_eq!(manifest.ger_manager_id().unwrap(), ger.id());
+        assert_eq!(manifest.fund_service, 0);
+        drop(checkpoint);
+        let restarted = InitCheckpoint::open(path, binding).unwrap();
+        let (reused_service, reused_ger) =
+            kms_accounts(&mut client, keystore, &opts, &fee, &restarted)
+                .await
+                .unwrap();
+        assert_eq!(reused_service, service);
+        assert_eq!(reused_ger, ger);
+        assert_eq!(client.get_account_headers().await.unwrap().len(), 2);
     }
 
     /// PR #160 review: this branch's ONLY security-sensitive behaviour is which

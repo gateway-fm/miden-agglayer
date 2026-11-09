@@ -693,3 +693,210 @@ async fn faucet_note_reconciliation_uses_node_without_local_apply() {
             .is_err()
     );
 }
+
+#[test]
+fn step_action_keeps_admission_boundary_and_effect_precedence_explicit() {
+    let saved = prepared(4, 164, 1);
+    assert_eq!(
+        step_action(None, false, 100).unwrap(),
+        StepAction::Prepare { generation: 0 }
+    );
+    for height in [100, 164] {
+        assert_eq!(
+            step_action(Some(&saved), false, height).unwrap(),
+            StepAction::Replay
+        );
+    }
+    assert_eq!(
+        step_action(Some(&saved), false, 165).unwrap(),
+        StepAction::Prepare { generation: 5 }
+    );
+    for height in [100, 164, 165] {
+        assert_eq!(
+            step_action(Some(&saved), true, height).unwrap(),
+            StepAction::Complete
+        );
+    }
+    let overflow = prepared(u32::MAX, 164, 1);
+    assert!(step_action(Some(&overflow), false, 165).is_err());
+    assert_eq!(
+        step_action(Some(&overflow), true, 165).unwrap(),
+        StepAction::Complete
+    );
+}
+
+/// Uses the production file journal, closes its OS lock, and reads a fresh
+/// checkpoint at each restart. Only the chain and disk survive a lost result.
+#[tokio::test]
+async fn bootstrap_checkpoint_restarts_exact_funding_deployment_and_registration() {
+    use crate::accounts_config::initialization::{InitBinding, InitCheckpoint};
+    let binding = InitBinding {
+        genesis: "test-genesis".into(),
+        network: 9,
+        fee_faucet: "fee".into(),
+        base_fee: 7,
+        cascade_amount: 1234,
+    };
+    let account = Account::builder([67; 32])
+        .account_type(AccountType::Public)
+        .with_components(miden_client::testing::Auth::IncrNonce)
+        .with_component(miden_standards::account::wallets::BasicWallet)
+        .build()
+        .unwrap();
+    for interruption in [
+        Interruption::BeforeSend,
+        Interruption::AfterSend,
+        Interruption::AfterCommit,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Some(dir.path().to_path_buf());
+        let mut chain = Chain {
+            height: 100,
+            ..Default::default()
+        };
+        for step in [FaucetStep::Fund, FaucetStep::Deploy, FaucetStep::Register] {
+            let journal = InitCheckpoint::open(path.clone(), binding.clone()).unwrap();
+            journal.reserve_account("bridge", &account).unwrap();
+            assert!(
+                resume_step(
+                    &journal,
+                    "bridge",
+                    step,
+                    &mut FaultRuntime {
+                        chain: &mut chain,
+                        interruption,
+                        unreadable: false,
+                    }
+                )
+                .await
+                .is_err()
+            );
+            let saved = journal.load("bridge", step).await.unwrap().unwrap();
+            drop(journal);
+            let restarted = InitCheckpoint::open(path.clone(), binding.clone()).unwrap();
+            assert_eq!(restarted.account("bridge").unwrap().unwrap(), account);
+            let creates = chain.created.len();
+            resume_step(
+                &restarted,
+                "bridge",
+                step,
+                &mut FaultRuntime {
+                    chain: &mut chain,
+                    interruption: Interruption::None,
+                    unreadable: false,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(chain.created.len(), creates);
+            assert!(chain.landed.contains(&saved.proven));
+            let sends = chain.sent.len();
+            // Publication alone completes the registration handoff. A delayed
+            // NTX consumer must not cause another random config note.
+            resume_step(
+                &restarted,
+                "bridge",
+                step,
+                &mut FaultRuntime {
+                    chain: &mut chain,
+                    interruption: Interruption::None,
+                    unreadable: false,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(chain.sent.len(), sends);
+        }
+        assert_eq!(chain.created.len(), 3);
+        assert_eq!(chain.landed.len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn bootstrap_expiry_never_replaces_uncertain_or_still_admissible_send() {
+    use crate::accounts_config::initialization::{InitBinding, InitCheckpoint};
+    let dir = tempfile::tempdir().unwrap();
+    let path = Some(dir.path().to_path_buf());
+    let binding = InitBinding {
+        genesis: "A".into(),
+        network: 0,
+        fee_faucet: "F".into(),
+        base_fee: 7,
+        cascade_amount: 1,
+    };
+    let account = Account::builder([68; 32])
+        .account_type(AccountType::Public)
+        .with_components(miden_client::testing::Auth::IncrNonce)
+        .with_component(miden_standards::account::wallets::BasicWallet)
+        .build()
+        .unwrap();
+    let journal = InitCheckpoint::open(path.clone(), binding.clone()).unwrap();
+    journal.reserve_account("faucet_eth", &account).unwrap();
+    let mut chain = Chain {
+        height: 100,
+        ..Default::default()
+    };
+    assert!(
+        resume_step(
+            &journal,
+            "faucet_eth",
+            FaucetStep::Fund,
+            &mut FaultRuntime {
+                chain: &mut chain,
+                interruption: Interruption::AfterSend,
+                unreadable: false,
+            }
+        )
+        .await
+        .is_err()
+    );
+    drop(journal);
+    let restarted = InitCheckpoint::open(path, binding).unwrap();
+    chain.height = 164;
+    assert!(
+        resume_step(
+            &restarted,
+            "faucet_eth",
+            FaucetStep::Fund,
+            &mut FaultRuntime {
+                chain: &mut chain,
+                interruption: Interruption::AfterSend,
+                unreadable: false,
+            }
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(chain.created.len(), 1);
+    assert_eq!(chain.sent[0], chain.sent[1]);
+    chain.height = 165;
+    assert!(
+        resume_step(
+            &restarted,
+            "faucet_eth",
+            FaucetStep::Fund,
+            &mut FaultRuntime {
+                chain: &mut chain,
+                interruption: Interruption::None,
+                unreadable: true,
+            }
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(chain.created.len(), 1);
+    resume_step(
+        &restarted,
+        "faucet_eth",
+        FaucetStep::Fund,
+        &mut FaultRuntime {
+            chain: &mut chain,
+            interruption: Interruption::None,
+            unreadable: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(chain.created.len(), 2);
+    assert_eq!(chain.sent.last().unwrap().generation, 1);
+}

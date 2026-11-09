@@ -24,6 +24,17 @@ use miden_protocol::note::{NoteId, Nullifier};
 use miden_protocol::transaction::TransactionId;
 use std::sync::Arc;
 
+/// Durable CLAIM-consumption watchdog state. `alert_pending` distinguishes a
+/// due alert awaiting delivery from a claim still inside its observation window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClaimWatchEntry {
+    pub global_index: [u8; 32],
+    pub claim_note: [u8; 32],
+    pub ticks_pending: u32,
+    pub alert_pending: bool,
+    pub generation: i64,
+}
+
 // ── eth_getLogs safety ceiling (Cantina #12) ─────────────────────────
 
 /// OOM backstop on the number of **matching** logs a single `eth_getLogs`
@@ -160,6 +171,63 @@ pub enum NonceReservation {
     HeldByOther(TxHash),
 }
 
+/// Durable ownership of a signer/nonce slot. Lease expiry alone never proves
+/// that a different transaction may replace a durably admitted owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReservationState {
+    Executing,
+    ReleasedSuccess,
+    ReleasedFailure,
+}
+
+impl ReservationState {
+    #[cfg(feature = "postgres")]
+    fn from_persisted(state: &str) -> anyhow::Result<Self> {
+        match state {
+            "executing" => Ok(Self::Executing),
+            "released_success" => Ok(Self::ReleasedSuccess),
+            "released_failure" => Ok(Self::ReleasedFailure),
+            other => anyhow::bail!("unknown nonce reservation state {other:?}"),
+        }
+    }
+
+    fn can_reacquire_same(self, expired: bool) -> bool {
+        self != Self::Executing || expired
+    }
+
+    /// A candidate still requires proof that its previous owner was never
+    /// durably admitted, under the backend's reservation lock/transaction.
+    fn abandonment_candidate(self, expired: bool) -> Option<&'static str> {
+        match self {
+            Self::ReleasedFailure => Some("released_failure"),
+            Self::Executing if expired => Some("expired_executing"),
+            Self::Executing | Self::ReleasedSuccess => None,
+        }
+    }
+}
+
+/// Ownership of a bridge claim advances independently of its RPC receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimState {
+    Executing,
+    Prepared,
+    Submitted,
+    Landed,
+}
+
+impl ClaimState {
+    #[cfg(feature = "postgres")]
+    fn from_persisted(state: &str) -> anyhow::Result<Self> {
+        match state {
+            "executing" => Ok(Self::Executing),
+            "prepared" => Ok(Self::Prepared),
+            "submitted" => Ok(Self::Submitted),
+            "landed" => Ok(Self::Landed),
+            other => anyhow::bail!("unknown claim ownership state {other:?}"),
+        }
+    }
+}
+
 /// Fenced ownership token for an in-progress claim submission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaimFence {
@@ -173,6 +241,19 @@ pub enum NoteHandoffState {
     Prepared,
     /// The transaction committed or the exact note was later observed.
     Submitted,
+}
+
+impl NoteHandoffState {
+    /// Every store reader must interpret durable handoff states identically.
+    /// Unknown state is corruption, not permission to retry or inferred success.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn from_persisted(state: &str) -> anyhow::Result<Self> {
+        match state {
+            "prepared" => Ok(Self::Prepared),
+            "submitted" => Ok(Self::Submitted),
+            other => anyhow::bail!("unknown note handoff state {other:?}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,6 +457,11 @@ pub struct QueuedTxn {
     pub envelope: TxEnvelope,
     /// Block number after which the expiry sweep drops this parked tx.
     pub expires_at: u64,
+    /// Elapsed time since the first durable park, measured by the store at this
+    /// read. Re-broadcasts preserve that origin; projected block catch-up does
+    /// not advance this clock. Future timestamps clamp to zero; nonfinite or
+    /// unrepresentable persisted ages fail the read.
+    pub parked_for: std::time::Duration,
     /// True iff this row was parked while the #90 post-rebuild recovery window
     /// was open. Carried durably so a tx parked inside the final settle margin
     /// stays eligible for baseline adoption after the global window closes.
@@ -960,8 +1046,8 @@ pub trait Store: Send + Sync + 'static {
     /// queue with no operator remedy short of hand-editing the table.
     ///
     /// EXEMPTION (review round 3): rows with `parked_during_recovery` are NOT
-    /// evicted. That stamp is the only proof of a continuing wallet's
-    /// post-restore eligibility; evicting it re-creates the wedge the marker
+    /// evicted. That stamp preserves the row's recovery-era admission
+    /// eligibility; evicting it re-creates the wedge the marker
     /// closes (re-broadcast parks unstamped forever against an empty ledger).
     /// The exempt population is bounded — stamps are only mintable while the
     /// recovery window is open — and leaves via adoption + promotion.
@@ -1238,34 +1324,45 @@ pub trait Store: Send + Sync + 'static {
         Ok(true)
     }
 
-    /// Persist an expected-MINT entry for a submitted claim. (Cantina #7)
-    /// Upserts on global_index — re-submission of the same claim resets
-    /// the staleness window, which matches the in-memory contract.
+    /// Persist a submitted CLAIM watchdog, giving every resubmission a new
+    /// generation. Legacy method/table names are retained for compatibility.
     async fn expected_mint_record(
         &self,
         _global_index: &[u8; 32],
-        _expected_mint: &[u8; 32],
+        _claim_note: &[u8; 32],
     ) -> anyhow::Result<()> {
         Ok(())
     }
-    /// Delete the entry for `global_index` (called on Landed / mark_landed).
+    /// Remove an awaiting CLAIM; a due alert requires explicit acknowledgement.
     async fn expected_mint_remove(&self, _global_index: &[u8; 32]) -> anyhow::Result<()> {
         Ok(())
     }
-    /// Load all live entries for the staleness tick. Each row carries
-    /// `(global_index, expected_mint, ticks_pending, alerted)`.
-    async fn expected_mint_load_all(&self) -> anyhow::Result<Vec<([u8; 32], [u8; 32], u32, bool)>> {
+    async fn expected_mint_remove_generation(
+        &self,
+        _global_index: &[u8; 32],
+        _generation: i64,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    /// Load awaiting claims and due alerts. Pending alerts remain durable until
+    /// emission is acknowledged, including across restarts.
+    async fn expected_mint_load_all(&self) -> anyhow::Result<Vec<ClaimWatchEntry>> {
         Ok(Vec::new())
     }
-    /// Persist updated tick / alerted flags after a tick. Default impl
-    /// no-ops so InMemoryStore-only callers (tests) don't have to wire
-    /// it through — those callers reconstruct the tracker from the
-    /// in-memory cache directly.
+    /// Update only the matching generation while it is still awaiting a claim.
     async fn expected_mint_update_tick(
         &self,
         _global_index: &[u8; 32],
+        _generation: i64,
         _ticks_pending: u32,
-        _alerted: bool,
+        _alert_pending: bool,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    async fn expected_mint_acknowledge_alert(
+        &self,
+        _global_index: &[u8; 32],
+        _generation: i64,
     ) -> anyhow::Result<()> {
         Ok(())
     }

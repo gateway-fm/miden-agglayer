@@ -42,6 +42,145 @@ async fn pg_store() -> Option<PgStore> {
 }
 
 #[tokio::test]
+async fn pgstore_queued_observation_age_survives_repark_and_excludes_lock_wait() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let url = std::env::var("DATABASE_URL").unwrap();
+    let (mut client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    let signer = "0x7373737373737373737373737373737373737373";
+    let hash = TxHash::from([0x74; 32]);
+    let entry = dummy_txn_entry();
+    let bounds = super::QueueBounds {
+        per_signer: 256,
+        global: 4096,
+    };
+
+    // A transaction may wait for the global queue lock. Its begin timestamp
+    // must not count toward observing a queue row that does not exist yet.
+    let blocker = client.transaction().await.unwrap();
+    blocker
+        .batch_execute("SELECT pg_advisory_xact_lock(hashtext('queued_txns_bounds'))")
+        .await
+        .unwrap();
+    let queuer = PgStore::new(&url).await.unwrap();
+    let envelope = entry.envelope.clone();
+    let queued = tokio::spawn(async move {
+        queuer
+            .queue_txn(signer, 1, hash, &envelope, 3600, true, bounds)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = blocker
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_locks waiting JOIN pg_locks held \
+                 ON held.locktype = waiting.locktype AND held.database = waiting.database \
+                 AND held.classid = waiting.classid AND held.objid = waiting.objid \
+                 AND held.objsubid = waiting.objsubid \
+                 WHERE waiting.locktype = 'advisory' AND NOT waiting.granted \
+                 AND held.granted AND held.pid = pg_backend_pid())",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("queue insertion never waited on the held advisory lock");
+    let released_at: f64 = blocker
+        .query_one(
+            "SELECT EXTRACT(EPOCH FROM clock_timestamp())::double precision",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    blocker.commit().await.unwrap();
+    assert_eq!(queued.await.unwrap().unwrap(), super::QueueOutcome::Parked);
+    let created_at: f64 = client.query_one(
+        "SELECT EXTRACT(EPOCH FROM created_at)::double precision FROM queued_txns WHERE signer = $1 AND nonce = 1", &[&signer])
+        .await.unwrap().get(0);
+    assert!(
+        created_at >= released_at,
+        "pre-insertion lock wait was counted as queue observation"
+    );
+
+    // Age the durable row directly instead of spending real time in the test.
+    let original: f64 = client.query_one(
+        "UPDATE queued_txns SET created_at = clock_timestamp() - interval '45 seconds' WHERE signer = $1 AND nonce = 1 \
+         RETURNING EXTRACT(EPOCH FROM created_at)::double precision", &[&signer]).await.unwrap().get(0);
+    assert!(
+        store
+            .get_queued_txn(signer, 1)
+            .await
+            .unwrap()
+            .unwrap()
+            .parked_for
+            >= std::time::Duration::from_secs(45)
+    );
+    assert_eq!(
+        store
+            .queue_txn(signer, 1, hash, &entry.envelope, 9999, false, bounds)
+            .await
+            .unwrap(),
+        super::QueueOutcome::AlreadyParked
+    );
+    let after_repark: f64 = client.query_one(
+        "SELECT EXTRACT(EPOCH FROM created_at)::double precision FROM queued_txns WHERE signer = $1 AND nonce = 1", &[&signer])
+        .await.unwrap().get(0);
+    assert_eq!(
+        original, after_repark,
+        "rebroadcast reset the first observation time"
+    );
+    let reopened = PgStore::new(&url).await.unwrap();
+    for snapshot in [
+        reopened.get_queued_txn(signer, 1).await.unwrap().unwrap(),
+        reopened.queued_txn_by_hash(hash).await.unwrap().unwrap(),
+    ] {
+        assert!(snapshot.parked_for >= std::time::Duration::from_secs(45));
+        assert!(snapshot.parked_during_recovery);
+        assert_eq!(snapshot.expires_at, 3600);
+    }
+    client.execute(
+        "UPDATE queued_txns SET created_at = clock_timestamp() + interval '1 minute' WHERE signer = $1 AND nonce = 1",
+        &[&signer],
+    ).await.unwrap();
+    for snapshot in [
+        reopened.get_queued_txn(signer, 1).await.unwrap().unwrap(),
+        reopened.queued_txn_by_hash(hash).await.unwrap().unwrap(),
+    ] {
+        assert_eq!(
+            snapshot.parked_for,
+            std::time::Duration::ZERO,
+            "a future timestamp must delay bootstrap without hiding the queued transaction"
+        );
+    }
+    for invalid in ["'infinity'::timestamptz", "'-infinity'::timestamptz"] {
+        client
+            .execute(
+                &format!(
+                    "UPDATE queued_txns SET created_at = {invalid} WHERE signer = $1 AND nonce = 1"
+                ),
+                &[&signer],
+            )
+            .await
+            .unwrap();
+        assert!(reopened.get_queued_txn(signer, 1).await.is_err());
+        assert!(reopened.queued_txn_by_hash(hash).await.is_err());
+    }
+    store.delete_queued_txn(signer, 1, hash).await.unwrap();
+}
+
+#[tokio::test]
 async fn pgstore_invalid_claim_fences_receipts_and_owners() {
     let Some(store) = pg_store().await else {
         return;
@@ -1256,9 +1395,82 @@ async fn test_pgstore_rd913_twin_notes() {
     assert!(commitments.contains(&c2));
 }
 
-/// PgStore round-trip for monitor_expected_mints. Record → load → tick
-/// updates → remove. Exercises the full state machine the
-/// `ExpectedMintTracker` drives.
+/// Run the actual upgrade against temporary legacy tables, including an old
+/// fee-note identity that only the fenced CLAIM handoff can repair.
+#[tokio::test]
+async fn test_pgstore_claim_watchdog_upgrade_repairs_proven_identity_and_retains_unknown_alerts() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let connection = tokio::spawn(connection);
+    client
+        .batch_execute(
+            "CREATE TEMP TABLE monitor_expected_mints (
+        global_index BYTEA PRIMARY KEY, expected_mint BYTEA NOT NULL,
+        ticks_pending INT NOT NULL DEFAULT 0, alerted BOOLEAN NOT NULL DEFAULT FALSE);
+        CREATE TEMP TABLE claimed_indices (global_index TEXT PRIMARY KEY, owner_tx_hash TEXT);
+        CREATE TEMP TABLE tx_note_links (tx_hash TEXT PRIMARY KEY, note_commitment TEXT NOT NULL);",
+        )
+        .await
+        .unwrap();
+    for index in 1..=3u8 {
+        let mut gi = [0u8; 32];
+        gi[31] = index;
+        client
+            .execute(
+                "INSERT INTO monitor_expected_mints VALUES ($1,$2,60,TRUE)",
+                &[&gi.as_slice(), &[0xEEu8; 32].as_slice()],
+            )
+            .await
+            .unwrap();
+    }
+    client
+        .batch_execute(
+            "INSERT INTO claimed_indices VALUES ('0x1','owner'),('0x3','invalid');
+        INSERT INTO tx_note_links VALUES ('owner',repeat('ab',32)),('invalid','malformed');",
+        )
+        .await
+        .unwrap();
+    client
+        .batch_execute(include_str!(
+            "../../migrations/030_claim_watchdog_delivery.sql"
+        ))
+        .await
+        .unwrap();
+    let rows = client
+        .query(
+            "SELECT global_index, expected_mint, ticks_pending, alert_pending,
+        generation FROM monitor_expected_mints ORDER BY global_index",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3, "upgrade must never discard legacy watchdogs");
+    for (i, row) in rows.iter().enumerate() {
+        let expected: Vec<u8> = row.get(1);
+        assert_eq!(
+            expected,
+            if i == 0 {
+                vec![0xAB; 32]
+            } else {
+                vec![0xEE; 32]
+            }
+        );
+        assert_eq!(row.get::<_, i32>(2), 60);
+        assert!(
+            row.get::<_, bool>(3),
+            "due delivery must survive identity repair"
+        );
+        assert!(row.get::<_, i64>(4) > 0);
+    }
+    drop(client);
+    connection.await.unwrap().unwrap();
+}
+
+/// Real PostgreSQL acknowledgement generations protect resumed watchdogs.
 #[tokio::test]
 async fn test_pgstore_rd913_expected_mints() {
     let Some(store) = pg_store().await else {
@@ -1266,26 +1478,95 @@ async fn test_pgstore_rd913_expected_mints() {
     };
     let mut gi = [0u8; 32];
     gi[..8].copy_from_slice(&rand_u64().to_be_bytes());
-    let mint = [0xCCu8; 32];
-
-    store.expected_mint_record(&gi, &mint).await.unwrap();
-    let rows = store.expected_mint_load_all().await.unwrap();
-    let found = rows.iter().find(|(g, _, _, _)| *g == gi).unwrap();
-    assert_eq!(found.1, mint);
-    assert_eq!(found.2, 0);
-    assert!(!found.3);
-
-    // Bump tick + alerted flag.
-    store.expected_mint_update_tick(&gi, 5, true).await.unwrap();
-    let rows = store.expected_mint_load_all().await.unwrap();
-    let found = rows.iter().find(|(g, _, _, _)| *g == gi).unwrap();
-    assert_eq!(found.2, 5);
-    assert!(found.3);
-
-    // Remove. The row should be gone.
+    let claim = [0xCCu8; 32];
+    store.expected_mint_record(&gi, &claim).await.unwrap();
+    let row = store
+        .expected_mint_load_all()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.global_index == gi)
+        .unwrap();
+    assert_eq!(row.claim_note, claim);
+    assert_eq!(row.ticks_pending, 0);
+    assert!(!row.alert_pending);
+    assert!(
+        store
+            .expected_mint_update_tick(&gi, row.generation, 5, true)
+            .await
+            .unwrap()
+    );
     store.expected_mint_remove(&gi).await.unwrap();
-    let rows = store.expected_mint_load_all().await.unwrap();
-    assert!(rows.iter().all(|(g, _, _, _)| *g != gi));
+    let due = store
+        .expected_mint_load_all()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.global_index == gi)
+        .unwrap();
+    assert!(due.alert_pending);
+    assert_eq!(due.ticks_pending, 5);
+
+    store.expected_mint_record(&gi, &claim).await.unwrap();
+    store
+        .expected_mint_acknowledge_alert(&gi, row.generation)
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .expected_mint_update_tick(&gi, row.generation, 99, true)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .expected_mint_remove_generation(&gi, row.generation)
+            .await
+            .unwrap()
+    );
+    let resumed = store
+        .expected_mint_load_all()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.global_index == gi)
+        .unwrap();
+    assert_ne!(resumed.generation, row.generation);
+    assert_eq!(resumed.ticks_pending, 0);
+    assert!(
+        store
+            .expected_mint_update_tick(&gi, resumed.generation, 5, true)
+            .await
+            .unwrap()
+    );
+    store
+        .expected_mint_acknowledge_alert(&gi, resumed.generation)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .expected_mint_load_all()
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.global_index != gi)
+    );
+
+    store.expected_mint_record(&gi, &claim).await.unwrap();
+    let recreated = store
+        .expected_mint_load_all()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.global_index == gi)
+        .unwrap();
+    assert_ne!(recreated.generation, resumed.generation);
+    assert!(
+        store
+            .expected_mint_remove_generation(&gi, recreated.generation)
+            .await
+            .unwrap()
+    );
 }
 
 // ── Cantina MA#18 — unbridgeable bridge-outs ─────────────────
@@ -1560,6 +1841,146 @@ async fn test_pgstore_s9_corrupt_envelope_row_surfaces_error() {
     assert!(
         msg.contains("cannot be decoded"),
         "error must say the envelope failed to decode, got: {msg}"
+    );
+}
+
+/// Unknown persisted states must not be interpreted differently by RPC reads,
+/// recovery enumeration, and mutation paths. A refusal leaves evidence intact.
+#[tokio::test]
+async fn test_pgstore_unknown_lifecycle_states_fail_closed() {
+    let Some(store) = pg_store().await else {
+        return;
+    };
+    let url = std::env::var("DATABASE_URL").unwrap();
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    let tx_hash = TxHash::from([0x72; 32]);
+    let hash = format!("{tx_hash:#x}");
+    store.txn_begin(tx_hash, dummy_txn_entry()).await.unwrap();
+    client
+        .execute(
+            "UPDATE transactions SET status = 'unknown' WHERE tx_hash = $1",
+            &[&hash],
+        )
+        .await
+        .unwrap();
+    assert!(store.txn_receipt(tx_hash).await.is_err());
+    assert!(store.txn_get(tx_hash).await.is_err());
+    assert!(store.txn_commit(tx_hash, Ok(()), 5, [0; 32]).await.is_err());
+    let status: String = client
+        .query_one(
+            "SELECT status FROM transactions WHERE tx_hash = $1",
+            &[&hash],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        status, "unknown",
+        "corruption must not be overwritten as success"
+    );
+
+    client
+        .execute(
+            "UPDATE transactions SET status = 'pending' WHERE tx_hash = $1",
+            &[&hash],
+        )
+        .await
+        .unwrap();
+    client
+        .execute(
+            "UPDATE transactions SET miden_tx_id = 'malformed' WHERE tx_hash = $1",
+            &[&hash],
+        )
+        .await
+        .unwrap();
+    assert!(
+        store.txn_get(tx_hash).await.is_err(),
+        "a recorded submission cannot become an unlinked intent"
+    );
+    client
+        .execute(
+            "UPDATE transactions SET miden_tx_id = NULL WHERE tx_hash = $1",
+            &[&hash],
+        )
+        .await
+        .unwrap();
+    let miden_id =
+        miden_protocol::transaction::TransactionId::from_raw(miden_protocol::Word::default());
+    client
+        .execute(
+            "UPDATE transactions SET tx_hash = 'malformed', miden_tx_id = $2 WHERE tx_hash = $1",
+            &[&hash, &miden_id.to_hex()],
+        )
+        .await
+        .unwrap();
+    assert!(store.txn_pending_by_miden_id(miden_id).await.is_err());
+    client
+        .execute(
+            "UPDATE transactions SET tx_hash = $1, miden_tx_id = NULL WHERE tx_hash = 'malformed'",
+            &[&hash],
+        )
+        .await
+        .unwrap();
+    store
+        .prepare_note_handoff(&hash, "lifecycle-commitment", "lifecycle-note", 10)
+        .await
+        .unwrap();
+    client
+        .execute(
+            "UPDATE tx_note_links SET handoff_state = 'unknown' WHERE tx_hash = $1",
+            &[&hash],
+        )
+        .await
+        .unwrap();
+    assert!(store.get_note_handoff_for_tx(&hash).await.is_err());
+    assert!(store.recoverable_pending_txns(10_000).await.is_err());
+    assert!(
+        store
+            .pending_nonce_frontier(&format!("{:#x}", Address::ZERO))
+            .await
+            .is_err()
+    );
+
+    let signer = "0x7272727272727272727272727272727272727272";
+    let lease = std::time::Duration::from_secs(90);
+    store
+        .reserve_nonce(signer, 0, tx_hash, lease)
+        .await
+        .unwrap();
+    client.execute("UPDATE nonce_reservations SET state = 'unknown', lease_expires_at = now() - interval '1 second' WHERE signer = $1 AND nonce = 0", &[&signer]).await.unwrap();
+    assert!(
+        store
+            .reserve_nonce(signer, 0, tx_hash, lease)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .reserve_nonce(signer, 0, TxHash::from([0x73; 32]), lease)
+            .await
+            .is_err()
+    );
+    assert!(
+        !store
+            .renew_reservation(signer, 0, tx_hash, lease)
+            .await
+            .unwrap(),
+        "invalid state cannot renew execution ownership"
+    );
+    let state: String = client
+        .query_one(
+            "SELECT state FROM nonce_reservations WHERE signer = $1 AND nonce = 0",
+            &[&signer],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        state, "unknown",
+        "expiry must not grant ownership of an invalid row"
     );
 }
 

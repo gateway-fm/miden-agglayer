@@ -951,6 +951,19 @@ pub(crate) fn dump_note_for_quarantine(note: &InputNoteRecord) -> String {
     out
 }
 
+/// New watchdogs use the metadata-independent details commitment. Older
+/// releases recorded NoteId; retain that evidence too when metadata survives.
+/// Both keys are admitted only for a CLAIM consumed by our own bridge.
+fn record_consumed_claim_identity(
+    note: &InputNoteRecord,
+    consumed: &mut std::collections::HashSet<[u8; 32]>,
+) {
+    consumed.insert(note.details_commitment().as_bytes());
+    if let Some(note_id) = note.id() {
+        consumed.insert(note_id.as_bytes());
+    }
+}
+
 /// Per-scan outcome of the monitor pass — returned so wiring tests can assert
 /// alert decisions directly instead of scraping global metrics.
 #[derive(Debug, Default)]
@@ -1044,9 +1057,7 @@ impl BridgeOutScanner {
                 if let Some(landed_claim) = cache.observations.get(&key) {
                     outcome.cached += 1;
                     if *landed_claim {
-                        outcome
-                            .landed_claim_ids
-                            .insert(note.details_commitment().as_bytes());
+                        record_consumed_claim_identity(note, &mut outcome.landed_claim_ids);
                     }
                 } else {
                     work.push((note, key, NoteProvenanceFacts::from_note(note), true));
@@ -1177,7 +1188,7 @@ impl BridgeOutScanner {
                 // landed" signal for this proxy's expected-MINT tracker.
                 MonitoredNoteKind::Claim => {
                     if facts.consumer == Some(self.bridge_account_id) {
-                        outcome.landed_claim_ids.insert(id_bytes);
+                        record_consumed_claim_identity(note, &mut outcome.landed_claim_ids);
                     }
                 }
                 // Cantina #5 — unchanged from main. PR #123 does not alter
@@ -1745,36 +1756,39 @@ impl SyncListener for BridgeOutScanner {
             );
         }
 
-        // Cantina #7 — tick the expected-MINT tracker with the CLAIM IDs we
-        // observed consumed this sync. Stale entries (CLAIM not consumed
-        // within 60 sync ticks ≈ 6 minutes at default cadence) fire a
-        // critical metric and log so on-call can investigate.
-        //
-        // RD-913 Bug B fix: `tick()` now fires StaleAlert **once** per
-        // record_expected, then removes the entry. The pre-fix forever-loop
-        // behaviour (re-firing every 6s until process death) is gone — see
-        // `expected_mint_tracker` module docs.
+        // CLAIM-consumption watchdog (legacy expected-MINT metric name).
+        // Persist due delivery before emitting; acknowledge only afterward.
+        // A crash between emission and ack may duplicate an alert, never lose it.
         match self.expected_mints.tick(&landed_claim_ids, 60).await {
             Ok(tracker_results) => {
                 for (gi, status) in tracker_results {
-                    if let crate::expected_mint_tracker::MintStatus::StaleAlert { ticks_pending } =
-                        status
+                    if let crate::expected_mint_tracker::ClaimStatus::StaleAlert {
+                        ticks_pending,
+                        token,
+                    } = status
                     {
                         metrics::counter!("bridge_expected_mint_stale_total").increment(1);
                         tracing::error!(
-                            target: "bridge_out::expected_mint",
+                            target: "bridge_out::claim_consumption",
                             global_index = ?gi,
                             ticks_pending,
-                            "Cantina #7: expected MINT NoteId never landed within threshold"
+                            generation = token.generation,
+                            "CLAIM consumption was not observed within the watchdog threshold"
                         );
+                        if let Err(error) = self.expected_mints.acknowledge_alert(gi, token).await {
+                            tracing::warn!(
+                                target: "bridge_out::claim_consumption",
+                                global_index = ?gi, %error,
+                                "CLAIM watchdog alert acknowledgement failed; delivery will retry"
+                            );
+                        }
                     }
                 }
             }
-            Err(e) => {
+            Err(error) => {
                 tracing::warn!(
-                    target: "bridge_out::expected_mint",
-                    error = ?e,
-                    "RD-913: expected-MINT tracker tick store failure; will retry next sync"
+                    target: "bridge_out::claim_consumption", %error,
+                    "CLAIM watchdog store failure; will retry next sync"
                 );
             }
         }
@@ -3213,6 +3227,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consumed_claim_supports_legacy_and_new_watchdogs_on_cold_and_cached_passes() {
+        let ids = prov_ids();
+        let (store, scanner) = scanner_with_faucets(&[ids.faucet_a], ids.bridge).await;
+        let (claim, _, _) = claim_note_realistic(
+            0,
+            [0; 20],
+            embedded_address(ids.local_service),
+            100,
+            Some(ids.local_service),
+            Some(ids.bridge),
+            Some(ids.bridge),
+        );
+        let legacy = claim.id().unwrap().as_bytes();
+        let current = claim.details_commitment().as_bytes();
+        assert_ne!(legacy, current);
+        for pass in 0..2 {
+            store.expected_mint_record(&[1; 32], &legacy).await.unwrap();
+            store
+                .expected_mint_record(&[2; 32], &current)
+                .await
+                .unwrap();
+            // Unknown historical output (possibly TX_FEE) must not be silently
+            // completed by an unrelated consumed CLAIM.
+            store
+                .expected_mint_record(&[3; 32], &[0xFF; 32])
+                .await
+                .unwrap();
+            let observed = scanner
+                .scan_consumed_notes_monitors(std::slice::from_ref(&claim))
+                .await;
+            assert_eq!(observed.cached, pass);
+            let statuses = scanner
+                .expected_mints
+                .tick(&observed.landed_claim_ids, 1)
+                .await
+                .unwrap();
+            assert_eq!(
+                statuses[0],
+                ([1; 32], crate::expected_mint_tracker::ClaimStatus::Landed)
+            );
+            assert_eq!(
+                statuses[1],
+                ([2; 32], crate::expected_mint_tracker::ClaimStatus::Landed)
+            );
+            let crate::expected_mint_tracker::ClaimStatus::StaleAlert { token, .. } = statuses[2].1
+            else {
+                panic!("unknown legacy identity must retain its due alert");
+            };
+            scanner
+                .expected_mints
+                .acknowledge_alert([3; 32], token)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn monitor_cache_rechecks_late_consumer_and_metadata() {
         let ids = prov_ids();
         let (store, scanner) = scanner_with_faucets(&[ids.faucet_a], ids.bridge).await;
@@ -3233,11 +3304,26 @@ mod tests {
         let with_metadata = make(Some(ids.local_service), Some(ids.bridge));
         let twin = make(Some(ids.foreign_service), Some(ids.bridge));
         assert_eq!(unknown.details_commitment(), twin.details_commitment());
-        for (note, landed) in [
-            (&unknown, 0),
-            (&attributed, 1),
-            (&with_metadata, 1),
-            (&twin, 1),
+        for (note, expected_landed) in [
+            (&unknown, std::collections::HashSet::new()),
+            (
+                &attributed,
+                std::collections::HashSet::from([attributed.details_commitment().as_bytes()]),
+            ),
+            (
+                &with_metadata,
+                std::collections::HashSet::from([
+                    with_metadata.details_commitment().as_bytes(),
+                    with_metadata.id().unwrap().as_bytes(),
+                ]),
+            ),
+            (
+                &twin,
+                std::collections::HashSet::from([
+                    twin.details_commitment().as_bytes(),
+                    twin.id().unwrap().as_bytes(),
+                ]),
+            ),
         ] {
             let out = scanner
                 .scan_consumed_notes_monitors(std::slice::from_ref(note))
@@ -3246,7 +3332,7 @@ mod tests {
             if std::ptr::eq(note, &twin) {
                 assert_eq!(out.twin_alerts, vec![twin.details_commitment().as_bytes()]);
             }
-            assert_eq!(out.landed_claim_ids.len(), landed);
+            assert_eq!(out.landed_claim_ids, expected_landed);
         }
         assert_eq!(store.monitor_calls("claim_mint_expected_record"), 1);
         assert_eq!(
@@ -3463,7 +3549,13 @@ mod tests {
                     (1, 1, 0)
                 );
                 assert!(evicted.forged_mint_alerts.is_empty());
-                assert_eq!(evicted.landed_claim_ids.len(), 1);
+                assert_eq!(
+                    evicted.landed_claim_ids,
+                    std::collections::HashSet::from([
+                        notes[0].details_commitment().as_bytes(),
+                        notes[0].id().unwrap().as_bytes(),
+                    ])
+                );
             }
         }
     }

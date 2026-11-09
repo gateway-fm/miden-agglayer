@@ -26,12 +26,14 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
+use miden_client::store::{InputNoteRecord, NoteFilter};
 use miden_client::transaction::{PaymentNoteDescription, TransactionRequestBuilder};
 use miden_protocol::MAX_TX_EXECUTION_CYCLES;
 use miden_protocol::account::AccountId;
 use miden_protocol::asset::{Asset, FungibleAsset};
 use miden_protocol::block::BlockNumber;
 use miden_protocol::note::{Note, NoteType};
+use miden_standards::note::{P2idNote, P2idNoteStorage};
 
 use crate::accounts_config::AccountIdBech32;
 use crate::metrics::ProofKind;
@@ -58,6 +60,8 @@ pub fn cascade_reserve_targets() -> u64 {
     budget("FEE_TXN_BUDGET_CASCADE_TARGETS", INIT_CASCADE_TARGETS + 10)
 }
 const FUNDING_POLL: Duration = Duration::from_secs(5);
+/// Bound the work done while the monitor holds the shared client.
+const MAX_FEE_NOTES_PER_TICK: usize = 32;
 
 /// The chain's fee parameters, read from the genesis header (constant for the
 /// chain's lifetime; the sync-height header is the fallback, as in `fee_policy`).
@@ -131,35 +135,105 @@ fn carries_fee_asset(note: &Note, fee: &FeeSnapshot) -> bool {
     })
 }
 
-/// Poll until `account_id` has at least one consumable note carrying the fee
-/// asset, syncing between polls. The first miss logs the exact funding
-/// instruction so an operator watching the log knows what to send where.
-/// Consume every pending fee-asset note addressed to `account_id` (a top-up).
+/// Select committed P2ID top-ups for this account without executing note scripts.
+///
+/// Carrying the fee asset does not authorize a note to run against a wallet.
+/// Check the script and storage before signing, including during deployment.
+/// Convert records individually so an incomplete record cannot block funding.
+fn select_fee_notes(
+    records: impl IntoIterator<Item = InputNoteRecord>,
+    account_id: AccountId,
+    fee: &FeeSnapshot,
+) -> Vec<Note> {
+    let mut notes = Vec::new();
+    for record in records {
+        let note_id = record.id();
+        let note: Note = match record.try_into() {
+            Ok(note) => note,
+            Err(error) => {
+                ::metrics::counter!("fee_topup_note_skipped_total", "reason" => "record")
+                    .increment(1);
+                tracing::warn!(
+                    ?note_id,
+                    ?error,
+                    "fee top-up note record is incomplete; skipped"
+                );
+                continue;
+            }
+        };
+        if !carries_fee_asset(&note, fee) {
+            continue;
+        }
+        // Extra assets can invoke an unrelated faucet's callback even in a P2ID.
+        if note.assets().num_assets() != 1 {
+            ::metrics::counter!("fee_topup_note_skipped_total", "reason" => "assets").increment(1);
+            tracing::warn!(note_id = %note.id(), "fee top-up note carries extra assets; skipped");
+            continue;
+        }
+        if note.details().script().root() != P2idNote::script_root() {
+            ::metrics::counter!("fee_topup_note_skipped_total", "reason" => "script").increment(1);
+            tracing::warn!(note_id = %note.id(), "fee top-up note has non-P2ID script; skipped");
+            continue;
+        }
+        let storage = match P2idNoteStorage::try_from(note.details().storage().items()) {
+            Ok(storage) => storage,
+            Err(error) => {
+                ::metrics::counter!("fee_topup_note_skipped_total", "reason" => "storage")
+                    .increment(1);
+                tracing::warn!(note_id = %note.id(), %error, "fee top-up note has invalid P2ID storage; skipped");
+                continue;
+            }
+        };
+        if storage.target() != account_id {
+            continue;
+        }
+        notes.push(note);
+        if notes.len() == MAX_FEE_NOTES_PER_TICK {
+            break;
+        }
+    }
+    notes
+}
+
+/// Consume pending P2ID fee-asset notes addressed to `account_id` (a top-up).
 /// Nobody else would: the ntx-builder only executes network notes, and a
 /// wallet's proxy-side transactions never look for stray P2IDs. The consumed
 /// note pays for its own consume, so this works on an empty vault too.
+/// Each note is submitted separately so a failed top-up does not block others.
 pub async fn consume_fee_notes(
     client: &mut MidenClientLib,
     account_id: AccountId,
     fee: &FeeSnapshot,
 ) -> anyhow::Result<usize> {
-    let mut notes = Vec::new();
-    for (record, _) in client.get_consumable_notes(Some(account_id)).await? {
-        let Ok(note) = <_ as TryInto<Note>>::try_into(record) else {
-            continue;
-        };
-        if carries_fee_asset(&note, fee) {
-            notes.push(note);
+    let notes = select_fee_notes(
+        client.get_input_notes(NoteFilter::Committed).await?,
+        account_id,
+        fee,
+    );
+    let mut consumed = 0;
+    for note in notes {
+        let note_id = note.id();
+        let result = async {
+            let request = TransactionRequestBuilder::new().build_consume_notes(vec![note])?;
+            crate::miden_client::submit_new_transaction(client, account_id, request).await
+        }
+        .await;
+        match result {
+            Ok(_) => {
+                consumed += 1;
+                ::metrics::counter!("fee_topup_note_consumed_total").increment(1);
+            }
+            Err(error) => {
+                ::metrics::counter!("fee_topup_note_failed_total").increment(1);
+                tracing::warn!(%note_id, error = %format!("{error:#}"),
+                    "fee top-up note failed to consume; will retry next tick");
+            }
         }
     }
-    let n = notes.len();
-    if n > 0 {
-        let request = TransactionRequestBuilder::new().build_consume_notes(notes)?;
-        crate::miden_client::submit_new_transaction(client, account_id, request).await?;
-    }
-    Ok(n)
+    Ok(consumed)
 }
 
+/// Poll for committed P2ID funding notes, logging funding instructions on a miss.
 pub async fn wait_for_funding_notes(
     client: &mut MidenClientLib,
     account_id: AccountId,
@@ -171,15 +245,11 @@ pub async fn wait_for_funding_notes(
     let mut announced = false;
     loop {
         client.sync_state().await?;
-        let mut notes = Vec::new();
-        for (record, _) in client.get_consumable_notes(Some(account_id)).await? {
-            let note: Note = record
-                .try_into()
-                .map_err(|e| anyhow!("consumable note for {name} is not a full note: {e:?}"))?;
-            if carries_fee_asset(&note, fee) {
-                notes.push(note);
-            }
-        }
+        let notes = select_fee_notes(
+            client.get_input_notes(NoteFilter::Committed).await?,
+            account_id,
+            fee,
+        );
         if !notes.is_empty() {
             tracing::info!(
                 account = name,
@@ -242,8 +312,18 @@ pub async fn fund_from_service(
     )
     .await
     .with_context(|| format!("service could not fund {name} (is service itself funded?)"))?;
-    crate::miden_client::wait_for_transaction_commit(client, txn_id, 30, Duration::from_secs(2))
-        .await?;
+    let committed = crate::miden_client::wait_for_transaction_commit(
+        client,
+        txn_id,
+        30,
+        Duration::from_secs(2),
+    )
+    .await?;
+    anyhow::ensure!(
+        committed,
+        "funding transaction {txn_id} for {name} was submitted but not observed committed; \
+         reconcile its exact transaction before sending another funding payment"
+    );
     client.sync_state().await?;
     Ok(())
 }
@@ -260,6 +340,100 @@ pub enum DeployKind {
     /// A network account (bridge, faucet): `funder` (service) cascade-sends
     /// the P2ID first, then the deploy consumes it.
     NetworkAccount { funder: AccountId },
+}
+
+/// Deployment policy after authoritative chain reconciliation. This decision
+/// is shared by direct tooling and the durable initialization driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeploymentPlan {
+    AlreadyDeployed,
+    EmptyTransaction,
+    AwaitOperatorFunding,
+    CascadeThenConsume { funder: AccountId },
+}
+
+pub(crate) fn deployment_plan(
+    deployed: bool,
+    kind: DeployKind,
+    fee: &FeeSnapshot,
+) -> DeploymentPlan {
+    if deployed {
+        DeploymentPlan::AlreadyDeployed
+    } else if !fee.charges_fees() {
+        DeploymentPlan::EmptyTransaction
+    } else {
+        match kind {
+            DeployKind::Wallet => DeploymentPlan::AwaitOperatorFunding,
+            DeployKind::NetworkAccount { funder } => DeploymentPlan::CascadeThenConsume { funder },
+        }
+    }
+}
+
+/// Reconcile publication before deciding whether deployment is complete.
+/// SDK account state includes locally applied, uncommitted transactions, so a
+/// positive local nonce is never sufficient evidence that an account exists.
+pub(crate) async fn deployment_exists_on_chain(
+    client: &mut MidenClientLib,
+    account_id: AccountId,
+    name: &str,
+) -> anyhow::Result<bool> {
+    use miden_client::store::TransactionFilter;
+    use miden_client::transaction::TransactionStatus;
+
+    client.sync_state().await?;
+    // Do not overwrite an optimistic wallet snapshot while it has pending
+    // transactions. Reconcile those exact submissions before importing state or
+    // constructing any new deployment/cascade transaction.
+    for transaction in client
+        .get_transactions(TransactionFilter::Uncommitted)
+        .await?
+    {
+        if transaction.details.account_id != account_id
+            || !matches!(transaction.status, TransactionStatus::Pending)
+        {
+            continue;
+        }
+        let committed = crate::miden_client::wait_for_transaction_commit(
+            client,
+            transaction.id,
+            20,
+            Duration::from_secs(1),
+        )
+        .await?;
+        anyhow::ensure!(
+            committed,
+            "deployment reconciliation for {name}: transaction {} was submitted but not observed \
+             committed; retaining the exact pending transaction without another deployment",
+            transaction.id
+        );
+    }
+    match client.import_account_by_id(account_id).await {
+        Ok(()) => {
+            let account = client
+                .get_account(account_id)
+                .await?
+                .context("deployed account missing after authoritative import")?;
+            anyhow::ensure!(
+                !account.is_new(),
+                "node returned an undeployed account for {name}"
+            );
+            Ok(true)
+        }
+        Err(miden_client::ClientError::AccountNotFoundOnChain(missing))
+            if missing == account_id =>
+        {
+            let account = client.get_account(account_id).await?.with_context(|| {
+                format!("initial account for {name} is missing from the client store")
+            })?;
+            anyhow::ensure!(
+                account.is_new(),
+                "{name} is absent on chain but its local account has already advanced; \
+                 reconcile the account before retrying deployment"
+            );
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Deploy `account_id` on-chain.
@@ -281,32 +455,25 @@ pub async fn deploy_account(
     fee: &FeeSnapshot,
     wait: Duration,
 ) -> anyhow::Result<()> {
-    if fee.charges_fees() {
-        // Resume: --init reuses the accounts funding.toml records. One that was
-        // already deployed (nonce > 0) must not wait for a second funding note
-        // that will never come — its note was consumed by the first deploy.
-        client.sync_state().await?;
-        if let Some(account) = client.get_account(account_id).await?
-            && !account.is_new()
-        {
-            tracing::info!(
-                account = name,
-                account_id = %AccountIdBech32(account_id),
-                nonce = %account.nonce(),
-                "already deployed on-chain — skipping deploy (#201)"
-            );
-            return Ok(());
-        }
-        if let DeployKind::NetworkAccount { funder } = kind {
-            fund_from_service(client, funder, account_id, name, cascade_amount(fee), fee).await?;
-        }
+    let plan = deployment_plan(
+        deployment_exists_on_chain(client, account_id, name).await?,
+        kind,
+        fee,
+    );
+    if plan == DeploymentPlan::AlreadyDeployed {
+        tracing::info!(account = name, account_id = %AccountIdBech32(account_id),
+            "account exists on chain — skipping deployment");
+        return Ok(());
+    }
+    if let DeploymentPlan::CascadeThenConsume { funder } = plan {
+        fund_from_service(client, funder, account_id, name, cascade_amount(fee), fee).await?;
     }
     tracing::info!(
         "deploying {} account {} ...",
         name,
         AccountIdBech32(account_id)
     );
-    let request = if !fee.charges_fees() {
+    let request = if plan == DeploymentPlan::EmptyTransaction {
         TransactionRequestBuilder::new().build()?
     } else {
         let notes = wait_for_funding_notes(client, account_id, name, fee, wait).await?;
@@ -319,7 +486,7 @@ pub async fn deploy_account(
         crate::miden_client::submit_new_transaction(client, account_id, request),
     )
     .await?;
-    tracing::info!("deployed {name} account with txn_id {txn_id}");
+    tracing::info!("submitted deployment for {name} account with txn_id {txn_id}");
 
     let committed = crate::miden_client::wait_for_transaction_commit(
         client,
@@ -328,11 +495,18 @@ pub async fn deploy_account(
         Duration::from_secs(1),
     )
     .await?;
-    if committed {
-        tracing::info!("deploy tx {txn_id} committed");
-    }
+    anyhow::ensure!(
+        committed,
+        "deployment transaction {txn_id} for {name} was submitted but not observed committed; \
+         synchronize and reconcile the account before retrying deployment"
+    );
+    tracing::info!("deploy tx {txn_id} committed");
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "fee_funding_tests.rs"]
+mod note_tests;
 
 #[cfg(test)]
 mod tests {
