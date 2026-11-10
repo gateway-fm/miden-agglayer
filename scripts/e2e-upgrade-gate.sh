@@ -26,13 +26,22 @@
 # N=30 runs first, so every drill has organic history above the last restore and
 # classifies itself "mixed" (fidelity above, idempotence below) on its own.
 #
+# Every step runs under scripts/e2e-evidence-sidecar.sh (EVIDENCE=0 disables):
+# test-e2e tears its stack down on a red tier, so the post-mortem below often
+# finds no containers — the sidecar's per-step logs + DB snapshots are the
+# evidence. It is stopped when the step returns, not on log idleness.
+#
 # Env: GATE_TAG (results dir prefix, default "gate"), GATE_TS (resume into an
 # existing dir), SKIP_PHASE_A=1, HALT_AFTER_REPEATS, MAX_CYCLES, PREFLIGHT_GRACE
-# (seconds a non-healthy stack may take to recover before a cycle, default 1800).
-# Results: e2e-results/<GATE_TAG>-<TS>/{results.tsv,growth.tsv,gate.log,logs/}
+# (seconds a non-healthy stack may take to recover before a cycle, default 1800),
+# EVIDENCE (default 1).
+# Results: e2e-results/<GATE_TAG>-<TS>/{results.tsv,growth.tsv,gate.log,logs/,evidence/}
 # ══════════════════════════════════════════════════════════════════════════════
 set -uo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || exit 1
+# Phase B's host tools are built with cargo on demand; a nohup/cron launch has
+# no login PATH (release gate 76926b2: every Phase B step "cargo: command not found").
+command -v cargo >/dev/null || { [[ -f "$HOME/.cargo/env" ]] && . "$HOME/.cargo/env"; }
 TS="${GATE_TS:-$(date -u +%Y%m%dT%H%M%SZ)}"
 R="e2e-results/${GATE_TAG:-gate}-$TS"; mkdir -p "$R/logs"
 TSV="$R/results.tsv"; [[ -f "$TSV" ]] || printf 'phase\tstep\tstatus\tsecs\tlog\n' > "$TSV"
@@ -83,9 +92,16 @@ post_mortem() { # $1 label
 LAST_RC=0
 run() { # run <phase> <step> <cmd...>   (sets LAST_RC)
     local phase="$1" step="$2"; shift 2
-    local lg="$R/logs/$phase-$step.log" t0 st
+    local lg="$R/logs/$phase-$step.log" ev="$R/evidence/$phase-$step" t0 st side=""
     log "$phase $step START"
+    : > "$lg"
+    if [[ "${EVIDENCE:-1}" == "1" ]]; then
+        SINCE="$(date -u +%FT%TZ)" IDLE=86400 scripts/e2e-evidence-sidecar.sh "$lg" "$ev" \
+            > "$R/logs/$phase-$step.sidecar.log" 2>&1 &
+        side=$!
+    fi
     t0=$(date +%s); "${BASE_ENV[@]}" "$@" > "$lg" 2>&1; LAST_RC=$?
+    [[ -n "$side" ]] && { mkdir -p "$ev"; touch "$ev/STOP"; wait "$side"; }
     st=PASS; (( LAST_RC != 0 )) && st=FAIL
     printf '%s\t%s\t%s\t%s\t%s\n' "$phase" "$step" "$st" "$(( $(date +%s) - t0 ))" "$lg" >> "$TSV"
     log "$phase $step $st rc=$LAST_RC ($(( $(date +%s) - t0 ))s)"
