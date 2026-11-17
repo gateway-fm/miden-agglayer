@@ -108,6 +108,16 @@ pub(crate) async fn service_estimate_gas(
         && data.starts_with(&claimAssetCall::SELECTOR)
         && let Ok(call) = claimAssetCall::abi_decode(&data)
     {
+        if let Err(error) = crate::claim::validate_metadata_size(&call.metadata) {
+            return Err(JsonRpcResponse::error(
+                answer_id,
+                JsonRpcError::new(
+                    JsonRpcErrorReason::ApplicationError(EXECUTION_REVERTED_CODE),
+                    format!("execution reverted: {error}"),
+                    serde_json::Value::String("0x".to_string()),
+                ),
+            ));
+        }
         let combined = crate::ger::combined_ger(&call.mainnetExitRoot.0, &call.rollupExitRoot.0);
         let (claimed, ger_applied) =
             crate::applied_state::claim_and_ger_applied(&service, call.globalIndex, &combined)
@@ -249,6 +259,46 @@ mod tests {
                 .unwrap()
         );
         assert!(!service.store.is_claimed(&call.globalIndex).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn estimate_metadata_boundary_matches_admission() {
+        for len in [
+            crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES,
+            crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES + 1,
+        ] {
+            let service = create_test_service();
+            let mut call = claimAssetCall::abi_decode(
+                &hex_decode_prefixed(&claim_calldata([0; 32], [0; 32])).unwrap(),
+            )
+            .unwrap();
+            call.metadata = vec![0x42; len].into();
+            crate::claim_proof::set_valid_root(&mut call);
+            let ger = crate::ger::combined_ger(&call.mainnetExitRoot.0, &call.rollupExitRoot.0);
+            service
+                .store
+                .commit_ger_event_atomic(1, [0; 32], "0xseed", &ger, None, None, 0)
+                .await
+                .unwrap();
+            let result = service_estimate_gas(
+                service.clone(),
+                estimate_request(&format!("0x{}", alloy::hex::encode(call.abi_encode()))),
+            )
+            .await;
+            if len == crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES {
+                assert!(result.is_ok());
+            } else {
+                let json = serde_json::to_value(result.unwrap_err()).unwrap();
+                assert_eq!(json["error"]["code"], 3);
+                assert!(
+                    json["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("metadata exceeds bridge event limit")
+                );
+            }
+            assert_eq!(service.miden_client.test_call_count(), 0);
+        }
     }
 
     /// Applied claim wins over GER readiness and returns the exact AggKit shim shape.

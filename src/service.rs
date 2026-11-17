@@ -14,7 +14,7 @@ use crate::service_zkevm::{service_zkevm_get_exit_roots_by_ger, service_zkevm_ge
 use alloy::primitives::TxHash;
 use anyhow::Context;
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum_jrpc::error::{JsonRpcError, JsonRpcErrorReason};
@@ -49,21 +49,20 @@ use tower_http::trace::TraceLayer;
 
 /// Maximum size in bytes for an inbound JSON-RPC request body.
 ///
-/// Self-review R6 — without an explicit cap, axum's default body limit (2 MB) is the
-/// only protection. JSON-RPC requests are typically tiny; an unauthenticated caller
-/// posting megabytes of garbage is purely DoS. 256 KB is comfortable headroom for
-/// legitimate payloads (a typical `eth_sendRawTransaction` carrying a CLAIM proof is
-/// ~17 KB; an `eth_getLogs` with the maximum allowed filter arrays is well below 200 KB).
+/// Allow a claim containing any supported L1 metadata preimage, hex encoded,
+/// plus 64 KiB for the two Merkle proofs, signed envelope and JSON framing.
+/// A smaller transport limit would strand otherwise valid L1 deposits.
 ///
 /// Decompression posture: the JSON-RPC route does NOT install
 /// `tower_http::decompression::DecompressionLayer`, so `Content-Encoding: gzip`
 /// (or any other encoding) reaches the JSON extractor as the compressed payload —
-/// `serde_json` then rejects it with a parse error. The 256 KB cap therefore
+/// `serde_json` then rejects it with a parse error. The explicit cap therefore
 /// applies to wire bytes, which is the right scope. If a future commit adds
 /// auto-decompression, that layer MUST be ordered after `RequestBodyLimitLayer`
 /// or supplemented with an output-size guard so a small gzip-bomb cannot
 /// inflate past the cap.
-pub const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024;
+pub const MAX_REQUEST_BODY_BYTES: usize =
+    2 * crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES + 64 * 1024;
 use url::Url;
 
 async fn json_rpc_endpoint(
@@ -977,7 +976,7 @@ pub async fn serve(
 ///
 /// Audit H5 — previously `/metrics` was mounted AFTER `.with_state(...)`, which
 /// put it on a separate sub-router that escaped the `GovernorLayer` (per-IP
-/// rate limit) and `RequestBodyLimitLayer` (256 KB cap). An unauthenticated
+/// rate limit) and `RequestBodyLimitLayer` (explicit body cap). An unauthenticated
 /// caller could flood `/metrics` without throttling, and the Prometheus
 /// rendering (which iterates every series) was an unbounded DoS surface. All
 /// routes are now mounted BEFORE `.with_state(...)` so the layer chain applies
@@ -1005,6 +1004,9 @@ pub(crate) fn build_app(
 
     Router::new()
         .route("/", post(json_rpc_endpoint))
+        // Raise axum's extractor limit too; otherwise its default 2 MiB rejects
+        // legitimate hex-encoded claims before the shared transport ceiling.
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .route("/health", get(health_check))
         // H5 — /metrics mounted here (before .with_state) so it inherits the
         // governor + body-limit layers below.
@@ -1447,30 +1449,80 @@ mod tests {
     }
 
     /// Self-review R6 — repro+regression. The limit constant must be (a) at least as
-    /// big as the largest legitimate payload (worst case: an `eth_sendRawTransaction`
-    /// carrying a CLAIM proof — ~17 KB — plus headroom for an upper-bounded
-    /// `eth_getLogs` filter), and (b) much smaller than axum's default 2 MB so the
-    /// tower-http layer actually does the rejecting.
-    ///
-    /// Pre-fix (no `RequestBodyLimitLayer`), the only protection was axum's default
-    /// (2 MB). Post-fix the limit is explicit and pinned by this test.
+    /// big as a maximum-size supported claim including hex encoding and proofs.
     #[test]
     fn r6_request_body_limit_is_explicit_and_in_band() {
-        // Must be >= 17 KB (largest legitimate aggkit payload observed in fixtures).
         const _: () = assert!(
-            MAX_REQUEST_BODY_BYTES >= 17 * 1024,
-            "limit too small for legitimate aggkit payloads"
+            MAX_REQUEST_BODY_BYTES
+                == 2 * crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES + 64 * 1024
         );
-        // Must be much smaller than axum default 2 MB (otherwise the new layer is a no-op).
-        const _: () = assert!(
-            MAX_REQUEST_BODY_BYTES < 1024 * 1024,
-            "limit too generous — must stay below axum default 2 MB"
-        );
+    }
+
+    #[tokio::test]
+    async fn large_claim_crosses_http_extractor_and_oversized_body_is_rejected() {
+        use alloy_core::sol_types::SolCall;
+        use std::net::SocketAddr;
+        let state = crate::test_helpers::create_test_service();
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/claim-deposit-373.json")).unwrap();
+        let raw = hex::decode(fixture["input"].as_str().unwrap().trim_start_matches("0x")).unwrap();
+        let mut call = crate::claim::claimAssetCall::abi_decode(&raw).unwrap();
+        call.metadata = vec![0x42; crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES].into();
+        crate::claim_proof::set_valid_root(&mut call);
+        let ger = crate::ger::combined_ger(&call.mainnetExitRoot.0, &call.rollupExitRoot.0);
+        state
+            .store
+            .commit_ger_event_atomic(1, [0; 32], "0xseed", &ger, None, None, 0)
+            .await
+            .unwrap();
+        let body = serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"eth_estimateGas",
+            "params":[{"data":format!("0x{}", hex::encode(call.abi_encode()))}]})
+        .to_string();
+        assert!(body.len() > 2 * 1024 * 1024);
+        assert!(body.len() < MAX_REQUEST_BODY_BYTES);
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let app = build_app(state, recorder.handle());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/");
+        let response = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let json: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(json["result"], "0x0", "{json}");
+        let mut oversized = body;
+        oversized.extend(std::iter::repeat_n(
+            ' ',
+            MAX_REQUEST_BODY_BYTES + 1 - oversized.len(),
+        ));
+        let response = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(oversized)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 413);
+        server.abort();
     }
 
     /// Audit H5 — `/metrics` MUST be inside the governor layer chain. Pre-fix it
     /// was mounted after `.with_state(...)`, escaping the per-IP rate limiter and
-    /// the 256 KB body cap, so an unauthenticated caller could flood it without
+    /// the request-body cap, so an unauthenticated caller could flood it without
     /// throttling (Prometheus rendering is an unbounded DoS surface).
     ///
     /// This drives the real `build_app` over a real TCP listener with a tight

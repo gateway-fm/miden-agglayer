@@ -1965,14 +1965,14 @@ impl BridgeOutScanner {
 // BRIDGE EVENT ABI ENCODING
 // ================================================================================================
 
-/// Maximum metadata payload size accepted by `encode_bridge_event_data`.
-///
-/// 64 KB matches the largest legitimate metadata block we expect (ABI-encoded
-/// `(string name, string symbol, uint8 decimals)` for normal ERC-20s sits well
-/// below 1 KB; 64 KB is generous for any future variant). Without an explicit
-/// cap, a misuse passing huge metadata would allocate `metadata.len() + 9*32`
-/// bytes per call and OOM the indexer on a single bad event.
-pub const MAX_BRIDGE_EVENT_METADATA_BYTES: usize = 64 * 1024;
+/// Maximum metadata supported throughout claim storage and bridge-out.
+/// Ethereum L1 caps transactions at 2^24 gas (EIP-7825); LOG data alone costs
+/// 8 gas/byte, so even a transaction doing nothing else emits at most 2 MiB.
+/// Actual BridgeEvent metadata is smaller because execution and ABI fields also
+/// cost gas. This conservative ceiling covers L1 deposits without discarding
+/// preimages. Unverified HTTP input remains bounded separately, with room for
+/// hex encoding and claim proofs. Revisit for origins with different gas rules.
+pub const MAX_BRIDGE_EVENT_METADATA_BYTES: usize = 2 * 1024 * 1024;
 
 /// ABI-encode BridgeEvent data for synthetic log emission.
 ///
@@ -4817,7 +4817,11 @@ mod tests {
             &note,
             99,
             UnbridgeableBridgeOutReason::MetadataTooLarge,
-            "origin.metadata.len()=70000 exceeds MAX_BRIDGE_EVENT_METADATA_BYTES=65536".to_string(),
+            format!(
+                "origin.metadata.len()={} exceeds MAX_BRIDGE_EVENT_METADATA_BYTES={}",
+                MAX_BRIDGE_EVENT_METADATA_BYTES + 1,
+                MAX_BRIDGE_EVENT_METADATA_BYTES
+            ),
         )
         .await;
 

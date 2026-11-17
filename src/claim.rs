@@ -325,6 +325,7 @@ async fn find_or_create_faucet(
     client: &mut MidenClientLib,
     accounts: &AccountsConfig,
 ) -> anyhow::Result<Faucet> {
+    validate_metadata_size(metadata)?;
     let origin_address = token_address.0.0;
     // One retry is permitted: if the single-flight provisioner fails, an awaiter
     // may loop once and become the new provisioner (the entry has been cleared).
@@ -407,6 +408,7 @@ async fn provision_faucet(
     client: &mut MidenClientLib,
     accounts: &AccountsConfig,
 ) -> anyhow::Result<Faucet> {
+    validate_metadata_size(metadata)?;
     // 1. Re-check the store. If a racing first-claim already registered the
     //    faucet (or a prior failed cohort's retry did), reuse it rather than
     //    deploying a second one.
@@ -508,9 +510,8 @@ async fn provision_faucet(
         })?;
         // The claimAsset metadata IS the authoritative preimage for this token
         // (same abi.encode(name,symbol,decimals) whose keccak is the faucet's
-        // MetadataHash), so prefer it over the on-chain recovery result — capped
-        // exactly like the auto-create path (Cantina #13).
-        entry.metadata = cap_stored_faucet_metadata(metadata, &token_address);
+        // MetadataHash), so prefer it over the on-chain recovery result.
+        entry.metadata = checked_faucet_metadata(metadata)?;
         let (miden_decimals, origin_token_decimals) = (entry.miden_decimals, entry.origin_decimals);
         store.register_faucet(entry).await?;
         ::metrics::counter!("faucet_recovered_existing_total").increment(1);
@@ -574,15 +575,9 @@ async fn provision_faucet(
     )
     .await?;
 
-    // 4. Save to store
-    //
-    // Cantina #13 — the metadata is attacker-controlled L1 `claimAsset` calldata
-    // and is otherwise unbounded. Cap it at storage: if it exceeds the bridge-out
-    // emit cap, persist EMPTY rather than the oversized blob. Empty-for-oversized
-    // is safe — the bridge-out emit site already gates oversized metadata, and the
-    // (#91) Layer-2 recovery re-derives bounded metadata from L1 — so we never need
-    // to keep the giant preimage around.
-    let stored_metadata = cap_stored_faucet_metadata(metadata, &token_address);
+    // Preserve the exact preimage committed on-chain. Admission has already
+    // checked the emit limit; never substitute empty bytes for a non-empty hash.
+    let stored_metadata = checked_faucet_metadata(metadata)?;
     let entry = FaucetEntry {
         faucet_id: faucet_account.id(),
         origin_address: token_address.0.0,
@@ -593,8 +588,7 @@ async fn provision_faucet(
         scale,
         // Cantina #13 — store the raw ABI metadata preimage (same bytes whose
         // keccak256 is the faucet's MetadataHash) so a future bridge-out emits
-        // the real metadata in its synthetic BridgeEvent. Empty for native ETH
-        // and for oversized blobs (capped above).
+        // the real metadata in its synthetic BridgeEvent. Empty for native ETH.
         metadata: stored_metadata,
     };
     store.register_faucet(entry).await?;
@@ -610,31 +604,22 @@ fn bytes32_array_to_smt_nodes(values: [FixedBytes<32>; 32]) -> [SmtNode; 32] {
     values.map(|v| SmtNode::new(v.0))
 }
 
-/// Cantina #13 — cap attacker-controlled L1 `claimAsset` metadata before it is
-/// persisted in the faucet registry. The calldata is otherwise unbounded; an
-/// oversized blob would bloat storage and (without the bridge-out emit-site
-/// guard) drive a huge allocation when synthesizing a BridgeEvent.
-///
-/// If the metadata exceeds the bridge-out emit cap we persist EMPTY rather than
-/// the oversized blob. Empty-for-oversized is safe: the bridge-out emit site
-/// already gates oversized metadata, and the (#91) Layer-2 recovery re-derives
-/// bounded metadata from L1 — so we never need to keep the giant preimage.
-fn cap_stored_faucet_metadata(
-    metadata: &Bytes,
-    token_address: &alloy::primitives::Address,
-) -> Vec<u8> {
-    if metadata.len() > crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES {
-        ::metrics::counter!("faucet_metadata_too_large_at_store_total").increment(1);
-        tracing::warn!(
-            token_address = %token_address,
-            metadata_len = metadata.len(),
-            cap = crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES,
-            "claim: ERC-20 metadata exceeds cap; storing empty metadata for faucet (Cantina #13)"
-        );
-        Vec::new()
-    } else {
-        metadata.to_vec()
-    }
+/// Claims must be round-trippable through the BridgeEvent encoder before any
+/// faucet registration or CLAIM publication. The hash commits to the entire
+/// preimage, so truncating or replacing oversized metadata loses exit data.
+pub(crate) fn validate_metadata_size(metadata: &[u8]) -> anyhow::Result<()> {
+    let cap = crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES;
+    anyhow::ensure!(
+        metadata.len() <= cap,
+        "claim metadata exceeds bridge event limit: {} > {cap} bytes",
+        metadata.len(),
+    );
+    Ok(())
+}
+
+fn checked_faucet_metadata(metadata: &Bytes) -> anyhow::Result<Vec<u8>> {
+    validate_metadata_size(metadata)?;
+    Ok(metadata.to_vec())
 }
 
 /// Decode the agglayer mainnet flag from a `globalIndex` U256.
@@ -863,6 +848,7 @@ async fn publish_claim_internal(
     // the two prove attempts are split across the outcome label.
     local_prover_fallback: Option<Arc<dyn TransactionProver + Send + Sync>>,
 ) -> anyhow::Result<PublishClaimTxn> {
+    validate_metadata_size(&params.metadata)?;
     let faucet = crate::metrics::meter_writer_stage(
         "claim",
         "faucet",
@@ -1180,6 +1166,7 @@ pub(crate) async fn publish_claim(
     expected_mints: Option<Arc<crate::expected_mint_tracker::ExpectedMintTracker>>,
     submission_fence: crate::service_send_raw_txn::ClaimSubmissionFence,
 ) -> anyhow::Result<PublishClaimTxn> {
+    validate_metadata_size(&params.metadata)?;
     // Submit with runtime self-heal, mirroring the pattern in
     // `src/ger.rs::insert_ger`. If the inner Miden submission rejects with
     // `AccountDataNotFound` (local sqlite row missing — typically after a
@@ -1768,10 +1755,9 @@ mod tests {
     /// Cantina #13 — bounded metadata is stored verbatim (preimage preserved so
     /// a later bridge-out emits the real ABI metadata).
     #[test]
-    fn cap_stored_faucet_metadata_keeps_bounded() {
-        let token = address!("00000000000000000000000000000000000000aa");
+    fn checked_faucet_metadata_keeps_bounded() {
         let small = Bytes::from(vec![0xABu8; 128]);
-        let stored = cap_stored_faucet_metadata(&small, &token);
+        let stored = checked_faucet_metadata(&small).unwrap();
         assert_eq!(stored, small.to_vec(), "bounded metadata must be preserved");
 
         // Exactly at the cap is still kept (boundary).
@@ -1780,30 +1766,91 @@ mod tests {
             crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES
         ]);
         assert_eq!(
-            cap_stored_faucet_metadata(&at_cap, &token).len(),
+            checked_faucet_metadata(&at_cap).unwrap().len(),
             crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES,
             "metadata exactly at the cap must be stored, not dropped"
         );
 
         // Empty (native ETH) stays empty.
-        assert!(cap_stored_faucet_metadata(&Bytes::new(), &token).is_empty());
+        assert!(checked_faucet_metadata(&Bytes::new()).unwrap().is_empty());
     }
 
-    /// Cantina #13 — oversized attacker-controlled metadata is stored as EMPTY,
-    /// never the giant blob.
     #[test]
-    fn cap_stored_faucet_metadata_drops_oversized() {
+    fn deposit_metadata_above_legacy_cap_preserves_exact_preimage() {
+        for len in [65_537, crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES] {
+            let metadata = Bytes::from(vec![0x42; len]);
+            let stored = checked_faucet_metadata(&metadata).unwrap();
+            assert_eq!(stored, metadata.as_ref());
+            assert_eq!(
+                MetadataHash::from_abi_encoded(&stored),
+                MetadataHash::from_abi_encoded(&metadata)
+            );
+            let encoded = crate::bridge_out::encode_bridge_event_data_checked(
+                0, 0, &[1; 20], 1, &[2; 20], 1, &stored, 0,
+            )
+            .unwrap();
+            let raw = hex::decode(encoded.trim_start_matches("0x")).unwrap();
+            // Eight static ABI words followed by the dynamic bytes length.
+            assert_eq!(&raw[9 * 32..9 * 32 + len], metadata.as_ref());
+        }
+    }
+
+    #[test]
+    fn real_l1_boundary_metadata_survives_storage_and_recovery() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/l1-metadata-boundary.json"))
+                .unwrap();
+        let name = "\0".repeat(fixture["name_bytes"].as_u64().unwrap() as usize);
+        let metadata = Bytes::from(crate::metadata_recovery::rederive_token_metadata(
+            &name,
+            fixture["symbol"].as_str().unwrap(),
+            fixture["decimals"].as_u64().unwrap() as u8,
+        ));
+        assert_eq!(
+            metadata.len(),
+            fixture["metadata_bytes"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            hex::encode(MetadataHash::from_abi_encoded(&metadata).as_bytes()),
+            fixture["metadata_keccak256"].as_str().unwrap()
+        );
         let token = address!("00000000000000000000000000000000000000aa");
+        assert_eq!(
+            faucet_ops::parse_token_metadata(&metadata, &token).unwrap(),
+            ("BOUND".into(), 18)
+        );
+        let stored = checked_faucet_metadata(&metadata).unwrap();
+        assert_eq!(stored, metadata.as_ref());
+        // Legacy rows that discarded these bytes can recover when the origin
+        // token still returns the original name/symbol/decimals.
+        let recovered = crate::metadata_recovery::resolve_emit_metadata(
+            &token.0.0,
+            &[],
+            &[crate::metadata_recovery::MetadataCandidate {
+                name,
+                symbol: "BOUND".into(),
+                decimals: 18,
+            }],
+            Some(*MetadataHash::from_abi_encoded(&metadata).as_bytes()),
+        );
+        assert_eq!(
+            recovered,
+            crate::metadata_recovery::EmitMetadata::Recovered(stored.clone())
+        );
+        crate::bridge_out::encode_bridge_event_data_checked(
+            0, 0, &token.0.0, 1, &[2; 20], 1, &stored, 0,
+        )
+        .unwrap();
+    }
+
+    /// Oversized metadata must fail rather than discard the committed preimage.
+    #[test]
+    fn checked_faucet_metadata_rejects_oversized() {
         let huge = Bytes::from(vec![
             0x42u8;
             crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES + 1
         ]);
-        let stored = cap_stored_faucet_metadata(&huge, &token);
-        assert!(
-            stored.is_empty(),
-            "oversized metadata must be replaced with empty, got {} bytes",
-            stored.len()
-        );
+        assert!(checked_faucet_metadata(&huge).is_err());
     }
 
     #[test]

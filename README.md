@@ -183,8 +183,8 @@ The same listener serves:
 - `GET /health` — readiness gate (`200` only when the Miden client is alive **and** no historical claim still awaits calldata repair). `503` on node connection loss (`status: degraded`) **or** while the claim-calldata repair backlog is non-zero (`status: recovering`, retained-PostgreSQL + reset-Miden-store recovery); both surface `claims_awaiting_calldata`. See `docs/operations/runbook.md`.
 - `GET /metrics` — Prometheus exposition
 
-All routes share the configured per-IP rate limit and 256 KiB request-body
-limit. The default rate is 500 requests/second with a burst of 500.
+All routes share the configured per-IP rate limit and 4 MiB + 64 KiB request-body
+limit (2 MiB metadata, hex encoding, and claim proof/envelope headroom). The default rate is 500 requests/second with a burst of 500.
 
 ## L2 to L1 auto-claimer
 

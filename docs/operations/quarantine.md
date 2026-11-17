@@ -53,7 +53,7 @@ The enum and Postgres decoder currently support:
 | `unknown_faucet` | The asset faucet had no local registry identity, so origin token fields could not be derived |
 | `amount_overflow` | Reverse decimal scaling could not fit the L1 amount |
 | `atomic_commit_failed` | The atomic synthetic-event/processed-state store commit failed and rolled back |
-| `metadata_too_large` | Validated metadata exceeded the 64 KiB event cap |
+| `metadata_too_large` | Validated metadata exceeded the L1-gas-derived 2 MiB event ceiling |
 
 Rows are first-write-wins by `note_id`; repeated observation does not replace
 the original evidence.
