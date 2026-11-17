@@ -217,6 +217,7 @@ make test-postgres   # PgStore tests; requires DATABASE_URL
 make test-e2e        # fresh full stack, E2E suite, teardown
 make e2e-up          # fresh stack left running
 make e2e-test        # run the main E2E script against that stack
+make e2e-large-metadata # fresh stack: huge metadata round trip and recovery
 make e2e-down
 make help            # every current target
 ```
@@ -227,6 +228,13 @@ test state must be retained.
 
 See [Running the E2E stack](docs/RUNNING-E2E.md) for required local images and
 fixture generation.
+
+The full E2E suite includes a real ERC-20 deposit with 350,208 bytes of
+nonzero metadata. It checks exact mint/return balances, byte-for-byte event
+metadata, live recovery of a cleared preimage, and missing-row recovery after
+resetting the proxy client store. To run only this case against an existing
+disposable stack, use `./scripts/e2e-large-metadata.sh`; it restarts the proxy
+and changes only its test token's registry row.
 
 ## Recovery and upgrades
 

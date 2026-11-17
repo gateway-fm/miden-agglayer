@@ -75,6 +75,8 @@ test-unit: ## Run unit tests (no docker needed)
 
 .PHONY: test-scripts
 test-scripts: ## Syntax-check + run the shell guard test harnesses (no docker needed)
+	bash -n scripts/e2e-large-metadata.sh
+	python3 -m py_compile scripts/lib-large-metadata.py
 	cargo build --locked --profile=$(CARGO_PROFILE) --bin bridge-out-tool
 	bash -n scripts/lib-tool-preflight.sh scripts/test-tool-preflight.sh
 	bash scripts/test-tool-preflight.sh
@@ -494,6 +496,10 @@ e2e-l2-to-l1-autoclaim: ensure-sponsor-key e2e-l1-to-l2 ## Spin up stack + L1→
 .PHONY: e2e-cantina13
 e2e-cantina13: e2e-up ## Spin up stack + run Cantina #13 Layer-2 metadata recovery test (recover, validate, quarantine)
 	$(COMPOSE_ENV) ./scripts/e2e-cantina13-metadata-recovery.sh
+
+.PHONY: e2e-large-metadata
+e2e-large-metadata: e2e-up ## Huge L1 metadata: round trip, live recovery, and reset-client restore/replay
+	$(COMPOSE_ENV) ./scripts/e2e-large-metadata.sh
 
 .PHONY: e2e-restore
 e2e-restore: e2e-up ## Spin up stack + run disaster recovery restore test

@@ -27,11 +27,23 @@ L2_RPC="${L2_RPC:-http://127.0.0.1:8546}"
 INTERVAL="${INTERVAL:-10}"
 MARGIN="${MARGIN:-2}"
 B2AGG_TOPIC="0x501781209a1f8899323b96b4ef08b168df93e0a90c673d1e4cce39366cb62f9b"
-B2AGG_ROOT="${B2AGG_ROOT:-fae9ac3f6b4a64fde2e6e03a847cb0f4b9d0f4ab1cf7aa99d6de52bc8d087098}"
+# Protocol upgrades change script roots. A stale literal silently produces an
+# empty note set, so obtain the root from the same binary being accepted.
+if [ -z "${B2AGG_ROOT:-}" ]; then
+  if [ -n "${TOOL_BIN:-}" ]; then
+    ROOTS=$("$TOOL_BIN" --print-script-roots --store-dir /tmp --node-url http://x) || exit 1
+  else
+    ROOTS=$(docker exec "$PROXY_CONTAINER" bridge-out-tool \
+      --print-script-roots --store-dir /tmp --node-url http://x) || exit 1
+  fi
+  B2AGG_ROOT=$(printf '%s\n' "$ROOTS" | awk -F= '$1=="b2agg"{print $2; exit}')
+fi
+B2AGG_ROOT="${B2AGG_ROOT#0x}"
+[[ "$B2AGG_ROOT" =~ ^[[:xdigit:]]{64}$ ]] || { echo "invalid/missing canonical B2AGG root" >&2; exit 1; }
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 ts() { TZ=${TZ_DISPLAY:-Europe/Berlin} date '+%H:%M:%S'; }
-echo "[$(ts)] completeness watcher up: project=$PROJECT interval=${INTERVAL}s margin=${MARGIN} blocks"
+echo "[$(ts)] completeness watcher up: project=$PROJECT interval=${INTERVAL}s margin=${MARGIN} blocks root=$B2AGG_ROOT"
 ALERTED=""
 while true; do
   sleep "$INTERVAL"
