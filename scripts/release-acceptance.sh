@@ -131,6 +131,8 @@ verify_monitor_evidence() {
         || fail "completeness watcher never started (see $wout)"
     grep -aq "OK notes=" "$wout" \
         || fail "completeness watcher completed no clean diff cycle — no positive evidence it sampled the chain (see $wout)"
+    grep -aEq 'OK notes=[1-9][0-9]* logs=' "$wout" \
+        || fail "completeness watcher never matched a consumed note — empty-note samples cannot certify the full E2E + N=30 workload (see $wout)"
     # Immutability: its own summary must be present with polls>0.
     summary="$(grep -aE "IMMUTABILITY: polls=" "$iout" | tail -1)"
     [ -n "$summary" ] \

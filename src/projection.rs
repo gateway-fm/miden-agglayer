@@ -578,18 +578,17 @@ pub async fn project_b2agg_note(
             // sequence and halts aggkit bridgesync (the projector's emitted-frontier gate
             // will also refuse to seal past it). There is no safe "tombstone" — any faked
             // event either double-spends a balance (BalanceUnderflow) or advances the LER
-            // with a leaf that isn't the real exit. So bail: the operator recovers by fixing
-            // the metadata/identity — the safe path being a full DB backup + drop +
-            // `--restore` rebuild from the authoritative on-chain state (never a partial
-            // patch of a corrupted row).
+            // with a leaf that isn't the real exit. Recovery needs the exact preimage;
+            // rebuilding a database cannot recreate bytes discarded by an older binary.
             ::metrics::counter!(METADATA_UNRECOVERABLE_METRIC).increment(1);
             anyhow::bail!(
                 "restore: bridge-out note {dedup_key} (faucet {faucet_id}, origin_network {}) has \
                  unrecoverable ERC-20 metadata — refusing to emit or skip past it (a reserved-but-\
                  unemitted leaf gaps getLogs and halts aggkit bridgesync). This indicates a \
-                 corrupted/half-recovered faucet row. Recover by backing up, DROPPING the proxy DB, \
-                 and re-running `--restore` to rebuild the faucet identity + metadata from on-chain \
-                 (or backfill the faucet's registry metadata / L1 RPC), then restart.",
+                 missing or mismatched metadata preimage. Preserve the proxy DB and transaction \
+                 envelopes. Recover the exact bytes from the original claimAsset calldata or the \
+                 origin token, verify against the bridge metadata hash, then backfill and replay. \
+                 Dropping the DB or running --restore alone cannot recover discarded bytes.",
                 origin.origin_network,
             );
         }
@@ -2007,6 +2006,71 @@ mod tests {
             B2AggRestoreOutcome::Skipped,
             "a correctly-processed bridge-out note must be a benign skip, not flagged",
         );
+    }
+
+    #[tokio::test]
+    async fn large_deposit_metadata_projects_and_replays_without_gapping_frontier() {
+        for len in [65_537, crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES] {
+            let store: StdArc<dyn Store> = StdArc::new(InMemoryStore::new());
+            let (faucet_id, bridge_id, _) = ma3_accounts();
+            let metadata = vec![0x42; len];
+            crate::claim::validate_metadata_size(&metadata).unwrap();
+            store
+                .register_faucet(crate::store::FaucetEntry {
+                    faucet_id,
+                    origin_address: [0x11; 20],
+                    origin_network: 0,
+                    symbol: "TEST".into(),
+                    origin_decimals: 18,
+                    miden_decimals: 8,
+                    scale: 10,
+                    metadata: metadata.clone(),
+                })
+                .await
+                .unwrap();
+            let note = ma3_b2agg_input_note(faucet_id, Some(bridge_id));
+            let note_id = ma3_note_id(&note, bridge_id);
+            let first = project_b2agg_note(
+                &store,
+                &note,
+                note_id,
+                bridge_id,
+                7,
+                1,
+                [7; 32],
+                get_bridge_address(),
+                None,
+                &crate::metadata_recovery::NetworkRpcMap::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(first, B2AggRestoreOutcome::Emitted);
+            assert!(store.is_note_processed(&note_id.to_hex()).await.unwrap());
+            let filter = crate::log_synthesis::LogFilter {
+                from_block: Some("0x0".into()),
+                to_block: Some("0x1".into()),
+                ..Default::default()
+            };
+            let logs = store.get_logs(&filter, 1).await.unwrap();
+            assert_eq!(logs.len(), 1);
+            let raw = hex::decode(logs[0].data.trim_start_matches("0x")).unwrap();
+            assert_eq!(&raw[9 * 32..9 * 32 + len], metadata.as_slice());
+            project_b2agg_note(
+                &store,
+                &note,
+                note_id,
+                bridge_id,
+                7,
+                1,
+                [7; 32],
+                get_bridge_address(),
+                None,
+                &crate::metadata_recovery::NetworkRpcMap::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(store.get_logs(&filter, 1).await.unwrap().len(), 1);
+        }
     }
 
     /// Cantina #13 DoS guard: a faucet whose metadata exceeds the encoder cap

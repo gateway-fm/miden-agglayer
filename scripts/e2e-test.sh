@@ -134,6 +134,9 @@ case "$test_filter" in
         REQUIRE_S149_RESTORE="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'postgres-l2b' && echo 1 || echo 0)" \
             "$SCRIPT_DIR/e2e-cantina13-metadata-recovery.sh"
         echo ""
+        # Real huge L1 metadata: round trip, live recovery, reset-client restore.
+        "$SCRIPT_DIR/e2e-large-metadata.sh"
+        echo ""
         # VERY LAST in the suite — defense in depth: the manual-user-claim
         # script deliberately front-runs the sponsor's autoclaimer, which
         # wedges the sponsor's ethtxmanager head nonce MID-RUN. The script

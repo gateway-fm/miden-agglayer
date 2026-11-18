@@ -134,7 +134,7 @@ log "Pre-restart: tip=$TIP_PRE persisted reconcile_cursor=$PRE_CURSOR"
 step "Restarting $AGGLAYER_CONTAINER (PG is untouched)..."
 # Timestamp for `docker logs --since` — everything we grep below must come
 # from AFTER the restart, or we'd read the previous boot's genesis sweep.
-RESTART_TS="$(date -u '+%Y-%m-%dT%H:%M:%S')"
+RESTART_TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 docker restart "$AGGLAYER_CONTAINER" >/dev/null
 wait_for "miden-agglayer back up" \
     "curl -sf '$L2_RPC' -X POST -H 'Content-Type: application/json' \
@@ -165,15 +165,20 @@ pass "first post-restart sweep window ($FIRST_FROM) is near the tip ($TIP_POST)"
 # field name and value (`reconcile_cursor\x1b[0m: 181`), which silently breaks
 # any field-value regex on the raw stream.
 BOOT_LINE="$(docker logs --since "$RESTART_TS" "$AGGLAYER_CONTAINER" 2>&1 \
-    | sed 's/\x1b\[[0-9;]*m//g' \
-    | grep -F 'note reconciler: sweep cursor loaded' | head -1 || true)"
+    | python3 -c 'import re,sys
+for line in sys.stdin:
+    if "note reconciler: sweep cursor loaded" in line:
+        print(re.sub(r"\x1b\[[0-9;]*m", "", line).strip())
+        break' || true)"
 if [[ -z "$BOOT_LINE" ]]; then
     fail "post-restart boot log line 'note reconciler: sweep cursor loaded' not found"
 fi
 # tracing renders structured fields as `reconcile_cursor: N` (colon-space),
 # not `reconcile_cursor=N` — accept both so a formatter change doesn't
 # silently blank the capture (pinned format: synthetic_projector.rs boot line).
-LOADED="$(sed -n 's/.*reconcile_cursor[:=] *\([0-9]\+\).*/\1/p' <<<"$BOOT_LINE")"
+LOADED="$(printf '%s' "$BOOT_LINE" | python3 -c 'import re,sys
+match = re.search(r"\breconcile_cursor[:=]\s*(\d+)", sys.stdin.read())
+print(match.group(1) if match else "")')"
 log "Boot log reports loaded reconcile_cursor=$LOADED"
 # >= not ==: the sweep keeps advancing between our PG snapshot and the actual
 # process stop (all the more with the concurrent catch-up), so the persisted

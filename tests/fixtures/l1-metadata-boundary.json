@@ -1,0 +1,10 @@
+{
+  "description": "Real L1 bridgeAsset fixture deposit with generated zero-filled ERC-20 name, measured on isolated Anvil under the EIP-7825 transaction gas ceiling",
+  "transaction_gas_limit": 16777216,
+  "gas_used": 16494590,
+  "name_bytes": 379264,
+  "symbol": "BOUND",
+  "decimals": 18,
+  "metadata_bytes": 379456,
+  "metadata_keccak256": "db386b4b729a1e0b1bd6e311de1af7f01078f8040ad0b2a0fdae3a0386a43cc3"
+}

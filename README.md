@@ -183,8 +183,8 @@ The same listener serves:
 - `GET /health` — readiness gate (`200` only when the Miden client is alive **and** no historical claim still awaits calldata repair). `503` on node connection loss (`status: degraded`) **or** while the claim-calldata repair backlog is non-zero (`status: recovering`, retained-PostgreSQL + reset-Miden-store recovery); both surface `claims_awaiting_calldata`. See `docs/operations/runbook.md`.
 - `GET /metrics` — Prometheus exposition
 
-All routes share the configured per-IP rate limit and 256 KiB request-body
-limit. The default rate is 500 requests/second with a burst of 500.
+All routes share the configured per-IP rate limit and 4 MiB + 64 KiB request-body
+limit (2 MiB metadata, hex encoding, and claim proof/envelope headroom). The default rate is 500 requests/second with a burst of 500.
 
 ## L2 to L1 auto-claimer
 
@@ -217,6 +217,7 @@ make test-postgres   # PgStore tests; requires DATABASE_URL
 make test-e2e        # fresh full stack, E2E suite, teardown
 make e2e-up          # fresh stack left running
 make e2e-test        # run the main E2E script against that stack
+make e2e-large-metadata # fresh stack: huge metadata round trip and recovery
 make e2e-down
 make help            # every current target
 ```
@@ -227,6 +228,13 @@ test state must be retained.
 
 See [Running the E2E stack](docs/RUNNING-E2E.md) for required local images and
 fixture generation.
+
+The full E2E suite includes a real ERC-20 deposit with 350,208 bytes of
+nonzero metadata. It checks exact mint/return balances, byte-for-byte event
+metadata, live recovery of a cleared preimage, and missing-row recovery after
+resetting the proxy client store. To run only this case against an existing
+disposable stack, use `./scripts/e2e-large-metadata.sh`; it restarts the proxy
+and changes only its test token's registry row.
 
 ## Recovery and upgrades
 

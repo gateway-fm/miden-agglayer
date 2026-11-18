@@ -136,6 +136,7 @@ echo "── verify_monitor_evidence (positive evidence + no fail-open) ──�
 TDIR="$(mktemp -d)"; trap 'rm -rf "$TDIR"' EXIT
 printf '%s\n' '[12:00:00] completeness watcher up: project=proj' 'OK notes=5 logs=5 cut=40' > "$TDIR/watch.ok"
 printf '%s\n' '[12:00:00] completeness watcher up: project=proj' > "$TDIR/watch.nocycle"
+printf '%s\n' '[12:00:00] completeness watcher up: project=proj' 'OK notes=0 logs=5 cut=40' > "$TDIR/watch.zero-notes"
 printf '%s\n' 'OK notes=5 logs=5 cut=40' > "$TDIR/watch.nostart"
 printf '%s\n' '[12:00:00] completeness watcher up: project=proj' 'OK notes=5 logs=5 cut=40' \
        '[12:01:00] ████ COMPLETENESS VIOLATION DETECTED ████' > "$TDIR/watch.viol"
@@ -151,6 +152,7 @@ assert_reject "immut output missing"       "verify_monitor_evidence $TDIR/watch.
 assert_reject "immut output empty"         "verify_monitor_evidence $TDIR/watch.ok $TDIR/empty"
 assert_reject "watcher never started"      "verify_monitor_evidence $TDIR/watch.nostart $TDIR/immut.ok"
 assert_reject "watcher no diff cycle"      "verify_monitor_evidence $TDIR/watch.nocycle $TDIR/immut.ok"
+assert_reject "watcher empty-note scan"    "verify_monitor_evidence $TDIR/watch.zero-notes $TDIR/immut.ok"
 assert_reject "immut no summary (crashed)" "verify_monitor_evidence $TDIR/watch.ok $TDIR/immut.nosummary"
 assert_reject "immut polls=0"              "verify_monitor_evidence $TDIR/watch.ok $TDIR/immut.zeropolls"
 assert_reject "watcher violation"          "verify_monitor_evidence $TDIR/watch.viol $TDIR/immut.ok"

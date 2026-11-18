@@ -44,6 +44,7 @@ pub(crate) fn decode_write_call(
     if params_encoded.starts_with(&claimAssetCall::SELECTOR) {
         tracing::debug!("claimAsset call");
         let params = claimAssetCall::abi_decode(params_encoded)?;
+        crate::claim::validate_metadata_size(&params.metadata)?;
         tracing::debug!(target: concat!(module_path!(), "::debug"), "claimAsset call params: {params:?}");
         Ok(crate::writer_worker::DecodedWriteCall::Claim {
             params: Box::new(params),
@@ -481,6 +482,8 @@ pub(crate) async fn worker_handle_claim_asset(
     txn_envelope: TxEnvelope,
     signer: Address,
 ) -> anyhow::Result<()> {
+    // Persisted jobs admitted by an older binary must pass the same limit.
+    crate::claim::validate_metadata_size(&params.metadata)?;
     // Only claims where destinationNetwork matches our network_id are processed.
     //
     // RD-703 — `service.network_id` is `u32` (validated at startup in
@@ -4808,6 +4811,103 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    // Use a valid proof and parseable ERC-20 metadata with trailing bytes: the
+    // metadata hash commits to every byte, even bytes the ABI parser ignores.
+    fn metadata_boundary_claim(len: usize) -> claimAssetCall {
+        let mut call = claimAssetCall::abi_decode(&claim_calldata(
+            U256::from(0x6517u64),
+            resolvable_dest(),
+            U256::from(1_000_000u64),
+        ))
+        .unwrap();
+        call.originTokenAddress = Address::repeat_byte(0xab);
+        let mut metadata = vec![0u8; len];
+        metadata[31] = 96; // name offset
+        metadata[63] = 160; // symbol offset
+        metadata[95] = 18;
+        metadata[127] = 4;
+        metadata[128..132].copy_from_slice(b"TEST");
+        metadata[191] = 4;
+        metadata[192..196].copy_from_slice(b"TEST");
+        call.metadata = metadata.into();
+        crate::claim_proof::set_valid_root(&mut call);
+        call
+    }
+
+    #[tokio::test]
+    async fn oversized_metadata_rejected_before_claim_admission_and_replay() {
+        let service = create_test_service();
+        let store = service.store.clone();
+        let call = metadata_boundary_claim(crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES + 1);
+        crate::claim_proof::validate(&call).unwrap();
+        crate::faucet_ops::parse_token_metadata(&call.metadata, &call.originTokenAddress).unwrap();
+        let calldata = call.abi_encode();
+        seed_claim_ger(&store, &calldata).await;
+        let key = alloy::signers::local::PrivateKeySigner::random();
+        let (input, hash) = encode_tx_signed_with_nonce(&key, calldata, 0);
+        let before_faucets = store.list_faucets().await.unwrap().len();
+        let error = service_send_raw_txn(service.clone(), input)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("metadata exceeds bridge event limit"),
+            "{error:#}"
+        );
+        assert_eq!(
+            store
+                .nonce_get(&format!("{:#x}", key.address()))
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(store.txn_get(hash).await.unwrap().is_none());
+        assert!(store.txn_receipt(hash).await.unwrap().is_none());
+        assert!(
+            !crate::applied_state::claim_terminal(&service, call.globalIndex)
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.list_faucets().await.unwrap().len(), before_faucets);
+        assert_eq!(count_claim_events(&store).await, 0);
+        assert_eq!(service.miden_client.test_call_count(), 0);
+
+        // An older binary may already have durably queued the envelope. Bypass
+        // decoding/admission to verify the worker also rejects before publishing.
+        let (_, envelope) = decode_signed_test_envelope(&key, &call);
+        let error = worker_handle_claim_asset(&service, call, hash, envelope, key.address())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("metadata exceeds bridge event limit"),
+            "{error:#}"
+        );
+        assert_eq!(service.miden_client.test_call_count(), 0);
+    }
+
+    fn decode_signed_test_envelope(
+        key: &alloy::signers::local::PrivateKeySigner,
+        call: &claimAssetCall,
+    ) -> (TxHash, TxEnvelope) {
+        let (input, hash) = encode_tx_signed_with_nonce(key, call.abi_encode(), 0);
+        let raw = ::hex::decode(input.trim_start_matches("0x")).unwrap();
+        (hash, TxEnvelope::decode_2718(&mut raw.as_slice()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn metadata_at_cap_passes_claim_admission() {
+        let service = create_test_service();
+        let call = metadata_boundary_claim(crate::bridge_out::MAX_BRIDGE_EVENT_METADATA_BYTES);
+        seed_claim_ger(&service.store, &call.abi_encode()).await;
+        let decoded = decode_write_call(&call.abi_encode().into()).unwrap();
+        validate_before_nonce_reservation(&service, &decoded)
+            .await
+            .unwrap();
     }
 
     async fn seed_claim_ger(store: &std::sync::Arc<dyn crate::store::Store>, data: &[u8]) {
