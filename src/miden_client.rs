@@ -272,20 +272,21 @@ type BoxFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>;
 type BoxFutureFactory =
     Box<dyn for<'c> FnOnce(&'c mut MidenClientLib) -> BoxFuture<'c> + Send + 'static>;
 
-/// Require an exact aggregate `GetNotesById` response. The gRPC client handles request
-/// chunking; callers must still reject omissions before advancing any durable cursor.
+/// Require the aggregate `GetNotesById` response to cover exactly the requested IDs.
+/// A note ID can have inclusions in multiple blocks, so it can appear in multiple rows.
+/// Missing or unexpected IDs still prevent the caller from advancing its durable cursor.
 pub(crate) fn ensure_complete_note_response(
     requested: &[NoteId],
     returned: &[NoteId],
 ) -> anyhow::Result<()> {
     let expected: BTreeSet<_> = requested.iter().copied().collect();
     let actual: BTreeSet<_> = returned.iter().copied().collect();
-    if returned.len() != requested.len() || actual != expected {
+    if actual != expected {
         anyhow::bail!(
-            "get_notes_by_id returned an incomplete response: requested {}, received {} unique of {} rows",
-            requested.len(),
-            actual.len(),
-            returned.len()
+            "get_notes_by_id returned an incomplete or unexpected response: {} missing IDs, {} unexpected IDs ({} rows)",
+            expected.difference(&actual).count(),
+            actual.difference(&expected).count(),
+            returned.len(),
         );
     }
     Ok(())
@@ -1351,6 +1352,30 @@ async fn wait_for_transaction_commit_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use miden_protocol::{Felt, Word};
+
+    #[test]
+    fn complete_note_response_accepts_repeated_note_ids() {
+        // Testnet returned all ten requested IDs in a different order, with a
+        // second inclusion of the first ID at a different block.
+        let requested = (1..=10)
+            .map(|id| NoteId::from_raw(Word::new([Felt::new(id).unwrap(); 4])))
+            .collect::<Vec<_>>();
+        let mut returned = requested.iter().rev().copied().collect::<Vec<_>>();
+        returned.push(requested[0]);
+
+        ensure_complete_note_response(&requested, &returned).unwrap();
+    }
+
+    #[test]
+    fn complete_note_response_rejects_missing_and_unexpected_ids() {
+        let [first, second, unexpected] =
+            [1, 2, 3].map(|id| NoteId::from_raw(Word::new([Felt::new(id).unwrap(); 4])));
+        let requested = [first, second];
+
+        assert!(ensure_complete_note_response(&requested, &[first, first]).is_err());
+        assert!(ensure_complete_note_response(&requested, &[first, second, unexpected]).is_err());
+    }
 
     #[test]
     fn an_overlapping_pause_invalidates_the_entire_listener_pass() {
