@@ -1012,9 +1012,9 @@ impl SyntheticProjector {
         if missing.is_empty() {
             return Ok(());
         }
-        // GrpcClient chunks this call using the node-advertised limit. The aggregate response
-        // must still be exact; otherwise advancing the reconcile cursor would lose the only
-        // opportunity to persist a headerless input's identity.
+        // GrpcClient chunks this call using the node-advertised limit. Require every
+        // requested ID before advancing the reconcile cursor, which would otherwise lose
+        // the opportunity to persist a headerless input's identity.
         let fetched = rpc
             .get_notes_by_id(missing)
             .await
